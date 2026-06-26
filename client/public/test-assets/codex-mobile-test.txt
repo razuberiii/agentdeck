@@ -1,0 +1,3 @@
+Codex Mobile file card test
+
+If this appears as a tappable download card inside the chat, the file receive path is working.

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Reset Codex Mobile</title>
+  <style>
+    html,body{height:100%;margin:0;background:#080d10;color:#edf3f6;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+    main{height:100%;display:grid;place-items:center;padding:24px;text-align:center}
+    div{display:grid;gap:10px}
+    b{font-size:20px}
+    span{color:#8fa0aa}
+  </style>
+</head>
+<body>
+  <main><div><b>正在刷新 Codex Mobile</b><span>清理旧 PWA 缓存并重新载入</span></div></main>
+  <script>
+    (async () => {
+      try {
+        if ('serviceWorker' in navigator) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((reg) => reg.unregister()));
+        }
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((key) => caches.delete(key)));
+        }
+      } catch {}
+      location.replace('/?v=8&reset=' + Date.now());
+    })();
+  </script>
+</body>
+</html>

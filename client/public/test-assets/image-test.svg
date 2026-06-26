@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" fill="#080d10"/>
+  <circle cx="512" cy="338" r="56" fill="#20a779"/>
+  <path d="M486 340l21 22 41-56" fill="none" stroke="#f4fbf8" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M238 682l164-220 124 150 92-106 168 176H238z" fill="none" stroke="#edf3f6" stroke-width="34" stroke-linejoin="round"/>
+  <text x="512" y="795" fill="#edf3f6" font-family="Inter, Arial, sans-serif" font-size="76" font-weight="800" text-anchor="middle" letter-spacing="0">IMAGE TEST</text>
+</svg>

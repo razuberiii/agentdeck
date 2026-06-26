@@ -1,0 +1,13 @@
+node_modules/
+server/dist/
+server/public/
+test-artifacts/
+
+.env
+*.log
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+.DS_Store
+*.local-*
