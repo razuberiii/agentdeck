@@ -133,6 +133,7 @@ function SessionView({id}:{id:string}){
   const [menuPage,setMenuPage]=useState<'main'|'mode'|'manage'>('main');
   const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const mountedRef=useRef(false); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true);
   useEffect(()=>{ mountedRef.current=true; setLoading(true); setEvents([]); setLive([]); setApprovals([]); setText(localStorage.getItem(draftKey(id)) || ''); setAttachments([]); load(); connect(); const on=()=>setOnline(navigator.onLine); const poll=window.setInterval(()=>{ if(mountedRef.current && wsRef.current?.readyState!==WebSocket.OPEN) load(true); },5000); addEventListener('online',on); addEventListener('offline',on); return()=>{ mountedRef.current=false; window.clearInterval(poll); removeEventListener('online',on); removeEventListener('offline',on); if(reconnectRef.current) clearTimeout(reconnectRef.current); wsRef.current?.close(); }; },[id]);
+  useEffect(()=>{ setModels(null); api('/api/models').then(setModels).catch(()=>{}); },[id]);
   useEffect(()=>{ if(nearBottomRef.current) requestAnimationFrame(()=>feedRef.current?.scrollTo({top:feedRef.current.scrollHeight})); },[events,live]);
   useEffect(()=>{ const el=textareaRef.current; if(!el)return; el.style.height='auto'; el.style.height=Math.min(el.scrollHeight, 180)+'px'; },[text]);
   useEffect(()=>{ if(text.trim()) localStorage.setItem(draftKey(id), text); else localStorage.removeItem(draftKey(id)); },[id,text]);
@@ -154,13 +155,13 @@ function SessionView({id}:{id:string}){
   async function openModelPicker(){ setMenu(false); setModelOpen(true); if(!models) try{ setModels(await api('/api/models')); } catch(e:any){ toast('error','模型列表读取失败：'+shortError(e)); } }
   async function setSessionModel(model:string){ setBusy('model'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({model})}); setSession(s=>s?{...s,model}:s); setModelOpen(false); haptic(); toast('success','已切换模型'); } catch(e:any){ toast('error','模型切换失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function answerApproval(req:ApprovalRequest, decision:'accept'|'decline'){ setBusy('approval:'+req.requestId); try{ await api('/api/approvals/'+encodeURIComponent(req.requestId),{method:'POST',body:JSON.stringify({decision,method:req.method})}); setApprovals(v=>v.filter(a=>a.requestId!==req.requestId)); haptic(); toast(decision==='accept'?'success':'info', decision==='accept'?'已允许':'已拒绝'); } catch(e:any){ toast('error','授权回复失败：'+shortError(e)); } finally{ setBusy(''); } }
-  const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=liveStatus(live,session?.status);
+  const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=liveStatus(live,session?.status); const activeModel=session?.model || status?.defaultModel || catalogCurrent(models);
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
-    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(session?.model || status?.defaultModel)} · {modeLabel(session?.permission_mode)} · {online?(connected?'online':'reconnecting'):'offline'}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
+    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · {online?(connected?'online':'reconnecting'):'offline'}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
     {!online&&<InlineNotice tone="error" text="网络离线，发送会在连接恢复后可用。"/>}
     {online&&!connected&&<InlineNotice tone="info" text="正在重新连接会话。"/>}
     {menu&&<><button className="menuScrim" aria-label="关闭菜单" onClick={closeMenu}/><nav className="moreMenu">
-      {menuPage==='main'&&<><button disabled={!!busy} onClick={openModelPicker}><b>模型</b><span>{modelLabel(session?.model || status?.defaultModel)}</span></button><button disabled={!!busy} onClick={()=>setMenuPage('mode')}><b>权限模式</b><span>{modeLabel(session?.permission_mode)}</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); showDiff(); }}><b>Diff</b><span>查看当前改动</span></button><button disabled={!!busy} onClick={()=>setMenuPage('manage')}><b>会话管理</b><span>改名、Fork、归档</span></button></>}
+      {menuPage==='main'&&<><button disabled={!!busy} onClick={openModelPicker}><b>模型</b><span>{modelLabel(activeModel)}</span></button><button disabled={!!busy} onClick={()=>setMenuPage('mode')}><b>权限模式</b><span>{modeLabel(session?.permission_mode)}</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); showDiff(); }}><b>Diff</b><span>查看当前改动</span></button><button disabled={!!busy} onClick={()=>setMenuPage('manage')}><b>会话管理</b><span>改名、Fork、归档</span></button></>}
       {menuPage==='mode'&&<><button className="menuBack" onClick={()=>setMenuPage('main')}>‹ 权限模式</button><button disabled={!!busy} className={session?.permission_mode==='yolo'?'active':''} onClick={()=>setSessionMode('yolo')}><b>YOLO</b><span>自动允许写入和命令</span></button><button disabled={!!busy} className={session?.permission_mode==='workspace-write'?'active':''} onClick={()=>setSessionMode('workspace-write')}><b>Workspace</b><span>写工作区前确认</span></button><button disabled={!!busy} className={session?.permission_mode==='read-only'?'active':''} onClick={()=>setSessionMode('read-only')}><b>Read Only</b><span>只读模式</span></button></>}
       {menuPage==='manage'&&<><button className="menuBack" onClick={()=>setMenuPage('main')}>‹ 会话管理</button><button disabled={!!busy} onClick={()=>{ closeMenu(); rename(); }}><b>改名</b><span>修改当前标题</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); fork(); }}><b>Fork</b><span>复制成新会话</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); archive(); }}><b>{session?.archived?'恢复':'归档'}</b><span>{session?.archived?'移回会话列表':'从列表中收起'}</span></button><button disabled={!!busy} className="dangerText" onClick={()=>{ closeMenu(); setConfirmDelete(true); }}><b>删除</b><span>不可撤销</span></button></>}
     </nav></>}
@@ -174,7 +175,7 @@ function SessionView({id}:{id:string}){
     </footer>
     {confirmDelete&&<ConfirmDialog title="删除会话？" detail="会删除本地索引并尝试删除 Codex 会话文件。此操作不可撤销。" confirm="删除" onCancel={()=>setConfirmDelete(false)} onConfirm={del}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
-    {modelOpen&&<ModelSheet models={models?.models||[]} value={session?.model || ''} defaultModel={status?.defaultModel || models?.current || ''} busy={busy==='model'} onPick={setSessionModel} onClose={()=>setModelOpen(false)}/>}
+    {modelOpen&&<ModelSheet models={models?.models||[]} value={activeModel} busy={busy==='model'} onPick={setSessionModel} onClose={()=>setModelOpen(false)}/>}
     {viewer&&<ImageViewer image={viewer} onClose={()=>setViewer(null)}/>}
   </main>;
 }
@@ -375,6 +376,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   const [models,setModels]=useState<any>(null);
   const [loginJob,setLoginJob]=useState<any>(null);
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
+  const [page,setPage]=useState<'main'|'mode'|'model'|'account'>('main');
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
   useEffect(()=>{ api('/api/models').then(setModels).catch(()=>{}); },[]);
   async function syncSettings(){ const next=await onChanged(); if(next) setLocalData((current:any)=>mergeSettingsData(current, next)); }
@@ -386,18 +388,25 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   }
   useEffect(()=>{ if(!loginJob?.id || loginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/profile-login/'+loginJob.id); setLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录未完成'); } }catch{} },1500); return()=>window.clearInterval(timer); },[loginJob?.id,loginJob?.status]);
   async function setDefaultMode(mode:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultMode:mode})}); haptic(); toast('success','已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
-  async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model}})); haptic(); toast('success','默认模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
+  async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model}})); haptic(); toast('success','模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
   async function switchProfile(id:string){ try{ await api(`/api/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id); haptic(); toast('success','切换成功'); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } finally { await syncSettings(); } }
   async function deviceLogin(id:string, isNew=false){ try{ const r=await api(`/api/profiles/${id}/login/device`,{method:'POST',body:JSON.stringify({newProfile:isNew})}); setLoginJob(r.job); toast('info','登录流程已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function loginNewProfile(){ try{ const r=await api('/api/profiles',{method:'POST',body:JSON.stringify({name:'Codex Account'})}); await syncSettings(); await deviceLogin(r.profile.id, true); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function removeProfile(profile:any){ try{ await api(`/api/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteProfile(null); await syncSettings(); } catch(e:any){ toast('error','删除失败：'+shortError(e)); } }
-  return <Sheet onClose={onClose} title="设置" subtitle="沙盒模式和 Codex 账户">
+  const currentModel = localData?.settings?.defaultModel || catalogCurrent(models);
+  const activeProfile = (localData?.profiles||[]).find((p:any)=>p.active) || localData?.activeProfile;
+  const title = page==='main' ? '设置' : page==='mode' ? '沙盒' : page==='model' ? '模型' : 'Codex 账户';
+  const subtitle = page==='main' ? '会话行为和账户' : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? modelLabel(currentModel) : profileLabel(activeProfile);
+  return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button onClick={()=>setPage('main')}>返回</button>:undefined}>
     <div className="settingsGrid">
-      <section><b>默认沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>
-      <section><b>默认模型</b><ModelPicker models={models?.models||[]} value={localData?.settings?.defaultModel || ''} defaultModel={models?.current || ''} onPick={setDefaultModel}/></section>
-      <section><b>Codex 账户</b><div className="profileList">{(localData?.profiles||[]).map((p:any)=><ProfileRow key={p.id} profile={p} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section>
-      <section><b>登录新账户</b><button onClick={loginNewProfile}>开始登录</button></section>
-      {loginJob&&<LoginJobPanel job={loginJob}/>}
+      {page==='main'&&<div className="settingsNav">
+        <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
+        <button onClick={()=>setPage('model')}><span><b>模型</b><small>{modelLabel(currentModel)}</small></span><i>›</i></button>
+        <button onClick={()=>setPage('account')}><span><b>Codex 账户</b><small>{profileLabel(activeProfile)}</small></span><i>›</i></button>
+      </div>}
+      {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
+      {page==='model'&&<section><b>模型</b><ModelPicker models={models?.models||[]} value={currentModel} onPick={setDefaultModel}/></section>}
+      {page==='account'&&<><section><b>账户</b><div className="profileList">{(localData?.profiles||[]).map((p:any)=><ProfileRow key={p.id} profile={p} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
     </div>
     {deleteProfile&&<ConfirmDialog title="删除账户？" detail={`删除 ${profileLabel(deleteProfile)} 的本地登录配置。当前账户不能删除。`} confirm="删除" onCancel={()=>setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
   </Sheet>;
@@ -441,20 +450,20 @@ function extractDeviceCode(text:string){
   const match=cleaned.match(/\b([A-Z0-9]{4})\s*-\s*([A-Z0-9]{4,5})\b/i);
   return match ? `${match[1]}-${match[2]}`.toUpperCase() : '';
 }
-function modelLabel(model?:string){ return model ? model.replace(/^gpt-/, 'GPT-').replace(/^o(\d)/, 'o$1') : '默认模型'; }
+function modelLabel(model?:string){ return model ? model.replace(/^gpt-/, 'GPT-').replace(/^o(\d)/, 'o$1') : '读取中'; }
+function catalogCurrent(catalog:any){ return catalog?.current || catalog?.models?.find((m:ModelOption)=>m.isDefault)?.model || catalog?.models?.[0]?.model || ''; }
 function modelOptionLabel(model:ModelOption){
   const name = model.displayName || model.model;
   return name === model.model ? name : `${name} (${model.model})`;
 }
-function ModelPicker({models,value,defaultModel,onPick}:{models:ModelOption[];value:string;defaultModel?:string;onPick:(model:string)=>void}){
+function ModelPicker({models,value,onPick}:{models:ModelOption[];value:string;onPick:(model:string)=>void}){
   return <div className="modelChoices">
-    <button className={`modelChoice ${!value?'active':''}`} onClick={()=>onPick('')}><span><b>默认模型</b><small>{defaultModel ? modelLabel(defaultModel) : '跟随 Codex 配置'}</small></span><i/></button>
     {!models.length&&<div className="modelLoading">正在读取 Codex 模型列表</div>}
     {models.map(m=><button key={m.id||m.model} className={`modelChoice ${value===m.model?'active':''}`} onClick={()=>onPick(m.model)}><span><b>{modelOptionLabel(m)}</b>{m.description&&<small>{m.description}</small>}</span><i/></button>)}
   </div>;
 }
-function ModelSheet({models,value,defaultModel,busy,onPick,onClose}:{models:ModelOption[];value:string;defaultModel?:string;busy:boolean;onPick:(model:string)=>void;onClose:()=>void}){
-  return <Sheet className="modelSheet" onClose={onClose} title="切换模型" subtitle="从下一条消息开始生效"><ModelPicker models={models} value={value} defaultModel={defaultModel} onPick={m=>!busy&&onPick(m)}/></Sheet>;
+function ModelSheet({models,value,busy,onPick,onClose}:{models:ModelOption[];value:string;busy:boolean;onPick:(model:string)=>void;onClose:()=>void}){
+  return <Sheet className="modelSheet" onClose={onClose} title="切换模型" subtitle="从下一条消息开始生效"><ModelPicker models={models} value={value} onPick={m=>!busy&&onPick(m)}/></Sheet>;
 }
 function ModeButtons({value,onPick}:{value:string;onPick:(mode:string)=>void}){ return <div className="modeButtons"><button className={value==='yolo'?'active':''} onClick={()=>onPick('yolo')}>YOLO</button><button className={value==='workspace-write'?'active':''} onClick={()=>onPick('workspace-write')}>Workspace</button><button className={value==='read-only'?'active':''} onClick={()=>onPick('read-only')}>Read Only</button></div>; }
 function QuotaBar({title,limitWindow}:{title:string;limitWindow:any}){

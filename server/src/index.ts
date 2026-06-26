@@ -459,7 +459,7 @@ async function effectiveModel(row:any) { return cleanModel(row?.model) || (await
 async function modelCatalog(includeHidden = false) {
   const [models, config] = await Promise.allSettled([codex.models(includeHidden), codex.config()]);
   const data = models.status === 'fulfilled' ? (models.value?.data || []) : [];
-  const current = config.status === 'fulfilled' ? cleanModel(config.value?.config?.model || config.value?.model) : '';
+  const current = (config.status === 'fulfilled' ? cleanModel(config.value?.config?.model || config.value?.model) : '') || cleanModel(data.find((m:any)=>m?.isDefault)?.id || data[0]?.id || data.find((m:any)=>m?.isDefault)?.model || data[0]?.model);
   return {
     models: data.map((m:any)=>({ id:String(m.id || m.model), model:String(m.id || m.model), actualModel:String(m.model || m.id), displayName:String(m.displayName || m.model || m.id), description:String(m.description || ''), hidden:!!m.hidden, isDefault:!!m.isDefault, inputModalities:m.inputModalities || [], upgrade:m.upgrade || null })),
     current,
