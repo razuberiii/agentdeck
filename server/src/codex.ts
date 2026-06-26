@@ -67,7 +67,7 @@ export class CodexBridge extends EventEmitter {
   async unarchive(threadId: string) { await this.ensure(); return this.request('thread/unarchive', { threadId }); }
   async fork(threadId: string, cwd?: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/fork', { threadId, cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }); }
   async startTurn(threadId: string, input: any[], cwd: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('turn/start', { threadId, cwd, approvalPolicy: opts.approvalPolicy, sandboxPolicy: { type: sandboxPolicyType(opts.sandboxMode) }, input }); }
-  async interrupt(threadId: string) { await this.ensure(); return this.request('turn/interrupt', { threadId }); }
+  async interrupt(threadId: string, turnId: string) { await this.ensure(); return this.request('turn/interrupt', { threadId, turnId }); }
 }
 export type TurnOptions = { approvalPolicy: string; sandboxMode: string };
 function defaultTurnOptions(): TurnOptions { return { approvalPolicy:'never', sandboxMode:'danger-full-access' }; }

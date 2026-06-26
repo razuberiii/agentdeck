@@ -35,6 +35,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://codex.rubusoo.c
 const db = new Db(path.join(DATA_DIR, 'codex-mobile.sqlite3'));
 const codex = new CodexBridge('/home/ubuntu', DEFAULT_CODEX_HOME);
 const clients = new Map<string, Set<any>>();
+const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
+const activeTurns = new Map<string, string>();
 const chunkedMessages = new Map<string, { sessionId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
 type LoginJob = { id:string; profileId:string; output:string[]; status:'running'|'done'|'error'; code?:number|null; error?:string; startedAt:number; newProfile?:boolean; loginUrl?:string; deviceCode?:string };
@@ -224,8 +226,17 @@ app.get('/api/sessions/:id/files/:artifactId', { preHandler: ensureAuth }, async
   reply.header('Cache-Control', 'private, max-age=86400');
   return reply.type(String(artifact.mime)).send(await readFile(String(artifact.path)));
 });
-app.post('/api/sessions/:id/stop', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); await codex.interrupt(threadId).catch(()=>{}); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); return {ok:true}; });
-app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any) => { const decision = req.body?.decision === 'decline' ? 'decline' : 'accept'; codex.respond(req.params.requestId, approvalResponse(String(req.body?.method || ''), decision)); return {ok:true}; });
+app.post('/api/sessions/:id/stop', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); return {ok:true}; });
+app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
+  cleanupPendingApprovals();
+  const requestKey = String(req.params.requestId);
+  const pending = pendingApprovals.get(requestKey);
+  if (!pending) return reply.code(404).send({error:'approval request not found'});
+  pendingApprovals.delete(requestKey);
+  const decision = req.body?.decision === 'decline' ? 'decline' : 'accept';
+  codex.respond(pending.id, approvalResponse(pending.method, decision));
+  return {ok:true};
+});
 app.get('/api/wireguard/config/:name', { preHandler: ensureAuth }, async (req:any, reply) => {
   const name = String(req.params.name || '');
   if (!/^[A-Za-z0-9_.-]+\.conf$/.test(name)) return reply.code(404).send({error:'not found'});
@@ -244,12 +255,34 @@ app.get('/icons/:file', async (req:any, reply) => {
 });
 app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : []); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e.message})); } }); ws.on('close', () => { for (const set of clients.values()) set.delete(ws); }); });
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
-codex.on('notification', async (msg:any) => { const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id); if (sid) { if (msg.method === 'thread/tokenUsage/updated') threadTokenUsage.set(sid, msg.params?.tokenUsage); if (shouldBroadcastCodexNotification(msg)) broadcast(sid, { type:'codex', method:msg.method, params:msg.params }); if (msg.method === 'turn/completed') { const row = await findSession(sid); const anchorItemId = row ? await latestAgentItemId(sid, String(row.project_dir)).catch(()=>null) : null; const found = row ? await scanArtifacts(sid, String(row.project_dir), artifactScanStarts.get(sid) || Date.now(), anchorItemId) : []; artifactScanStarts.delete(sid); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]); if (found.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) } }); } if (msg.method === 'thread/status/changed') await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[statusName(msg.params?.status),Date.now(),sid]).catch(()=>{}); }});
+codex.on('notification', async (msg:any) => {
+  const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id);
+  if (sid) {
+    if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(sid, String(msg.params.turn.id));
+    if (msg.method === 'thread/tokenUsage/updated') threadTokenUsage.set(sid, msg.params?.tokenUsage);
+    if (shouldBroadcastCodexNotification(msg)) broadcast(sid, { type:'codex', method:msg.method, params:msg.params });
+    if (msg.method === 'turn/completed') {
+      activeTurns.delete(sid);
+      const row = await findSession(sid);
+      const anchorItemId = row ? await latestAgentItemId(sid, String(row.project_dir)).catch(()=>null) : null;
+      const found = row ? await scanArtifacts(sid, String(row.project_dir), artifactScanStarts.get(sid) || Date.now(), anchorItemId) : [];
+      artifactScanStarts.delete(sid);
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
+      if (found.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) } });
+    }
+    if (msg.method === 'thread/status/changed') await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[statusName(msg.params?.status),Date.now(),sid]).catch(()=>{});
+  }
+});
 codex.on('request', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId);
   const row = sid ? await findSession(sid) : null;
+  if (!row || sessionMode(row) === 'yolo') {
+    codex.respond(msg.id, approvalResponse(msg.method, 'accept'));
+    return;
+  }
+  pendingApprovals.set(String(msg.id), { id: msg.id, method: String(msg.method || ''), createdAt: Date.now() });
+  cleanupPendingApprovals();
   if (sid) broadcast(sid, { type:'approval', requestId: msg.id, method: msg.method, params: msg.params });
-  if (!row || sessionMode(row) === 'yolo') codex.respond(msg.id, approvalResponse(msg.method, 'accept'));
 });
 codex.on('stderr', (line:string) => app.log.warn({ codex: line }));
 await codex.ensure();
@@ -471,7 +504,9 @@ function projectNameFromPath(p:string){ return p.split(path.sep).filter(Boolean)
 async function joinAndResume(id:string, ws:any){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if(!clients.has(threadId)) clients.set(threadId,new Set()); clients.get(threadId)!.add(ws); if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row))).catch(()=>{}); ws.send(JSON.stringify({type:'joined', sessionId:threadId})); }
 function broadcast(id:string, msg:any){ for(const ws of clients.get(id) || []) if(ws.readyState === 1) ws.send(JSON.stringify(msg)); }
 async function sendTurn(id:string, text:string, attachments:any[] = []){ const row = await findSession(id); if(!row) throw new Error('session not found'); const threadId = String(row.codex_thread_id || row.id); const input = await buildTurnInput(threadId, text, attachments); const title = autoTitle(text, String(row.project_dir), String(row.title || '')); const opts = modeOptions(sessionMode(row)); await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null); if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); await codex.setName(threadId, title).catch(()=>{}); broadcast(threadId,{type:'sessionTitle', title}); } artifactScanStarts.set(threadId, Date.now() - 1500); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); await codex.startTurn(threadId, input, String(row.project_dir), opts); }
-async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); await codex.interrupt(threadId).catch(()=>{}); }
+async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); }
+async function interruptTurn(threadId:string, cwd?:string){ const turnId = activeTurns.get(threadId) || await activeTurnId(threadId, cwd); if (!turnId) throw new Error('没有正在运行的 turn 可停止'); await codex.interrupt(threadId, turnId); activeTurns.delete(threadId); }
+async function activeTurnId(threadId:string, cwd?:string){ const read = await codex.readThread(threadId, true).catch(async () => { if (cwd) await codex.resumeThread(threadId, cwd).catch(()=>null); return codex.readThread(threadId, true); }); const turns = read.thread?.turns || []; for (let i = turns.length - 1; i >= 0; i--) if (turns[i]?.status === 'inProgress' && turns[i]?.id) return String(turns[i].id); return null; }
 async function sessionIdForThread(threadId?:string){ if(!threadId) return null; const row = await findSession(threadId); return row?.codex_thread_id ? String(row.codex_thread_id) : threadId; }
 async function latestAgentItemId(threadId:string, cwd:string){
   const read = await codex.readThread(threadId, true).catch(async () => { await codex.resumeThread(threadId, cwd).catch(()=>null); return codex.readThread(threadId, true); });
@@ -491,6 +526,7 @@ function startChunkedMessage(msg:any){ const id = String(msg.messageId || ''); c
 function appendChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); const chunk = String(msg.chunk || ''); state.size += Buffer.byteLength(chunk); if (state.size > 25 * 1024 * 1024) { chunkedMessages.delete(id); throw new Error('message too large'); } state.chunks.push(chunk); }
 async function finishChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); chunkedMessages.delete(id); const payload = JSON.parse(state.chunks.join('')); await sendTurn(state.sessionId, String(payload.text || ''), Array.isArray(payload.attachments) ? payload.attachments : []); }
 function cleanupChunkedMessages(){ const cutoff = Date.now() - 10 * 60 * 1000; for (const [id, state] of chunkedMessages) if (state.createdAt < cutoff) chunkedMessages.delete(id); }
+function cleanupPendingApprovals(){ const cutoff = Date.now() - 10 * 60 * 1000; for (const [id, state] of pendingApprovals) if (state.createdAt < cutoff) pendingApprovals.delete(id); }
 function statusName(status:any){ if (!status) return 'idle'; if (typeof status === 'string') return status; return status.type || 'idle'; }
 function approvalResponse(method:string, decision:'accept'|'decline' = 'accept'){
   if (method.includes('permissions')) return decision === 'decline'
