@@ -6,7 +6,7 @@ type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string;
 type Capabilities = { imageInput:boolean; imageOutput:boolean; attachmentTypes:string[]; maxAttachmentBytes:number };
 type Session = { id:string; codex_thread_id:string; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
-type ModelOption = { id:string; model:string; displayName:string; description?:string; hidden?:boolean; isDefault?:boolean; inputModalities?:string[]; upgrade?:string|null };
+type ModelOption = { id:string; model:string; actualModel?:string; displayName:string; description?:string; hidden?:boolean; isDefault?:boolean; inputModalities?:string[]; upgrade?:string|null };
 type Attachment = { id:string; name:string; type:string; size:number; url:string; previewUrl?:string; uploading?:boolean; error?:string };
 type DisplayEvent = { key:string; role:'user'|'assistant'|'system'|'command'|'file'|'reasoning'|'image'; title?:string; text:string; meta?:string; open?:boolean; attachments?:Attachment[]; images?:Attachment[]; files?:Attachment[] };
 type Toast = { id:string; kind:'success'|'error'|'info'; text:string };
@@ -442,7 +442,7 @@ function ModelPicker({models,value,defaultModel,onPick}:{models:ModelOption[];va
     <input className="search" value={q} onChange={e=>setQ(e.target.value)} placeholder="搜索模型"/>
     <div className="modelList">
       <button className={`modelRow ${!value?'active':''}`} onClick={()=>onPick('')}><b>默认模型</b><span>{defaultModel ? modelLabel(defaultModel) : '跟随 Codex 配置'}</span></button>
-      {filtered.map(m=><button key={m.id||m.model} className={`modelRow ${value===m.model?'active':''}`} disabled={!!m.upgrade} onClick={()=>onPick(m.model)}><b>{m.displayName || m.model}</b><span>{m.model}{m.description?` · ${m.description}`:''}{m.upgrade?' · 需要升级':''}</span></button>)}
+      {filtered.map(m=><button key={m.id||m.model} className={`modelRow ${value===m.model?'active':''}`} onClick={()=>onPick(m.model)}><b>{m.displayName || m.model}</b><span>{m.actualModel || m.model}{m.description?` · ${m.description}`:''}{m.upgrade?` · Codex 建议 ${m.upgrade}`:''}</span></button>)}
       {!models.length&&<div className="modelEmpty">正在读取模型列表</div>}
       {!!models.length&&!filtered.length&&<div className="modelEmpty">没有匹配模型</div>}
     </div>

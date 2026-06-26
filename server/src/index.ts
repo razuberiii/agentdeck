@@ -461,7 +461,7 @@ async function modelCatalog(includeHidden = false) {
   const data = models.status === 'fulfilled' ? (models.value?.data || []) : [];
   const current = config.status === 'fulfilled' ? cleanModel(config.value?.config?.model || config.value?.model) : '';
   return {
-    models: data.map((m:any)=>({ id:String(m.id || m.model), model:String(m.model || m.id), displayName:String(m.displayName || m.model || m.id), description:String(m.description || ''), hidden:!!m.hidden, isDefault:!!m.isDefault, inputModalities:m.inputModalities || [], upgrade:m.upgrade || null })),
+    models: data.map((m:any)=>({ id:String(m.id || m.model), model:String(m.id || m.model), actualModel:String(m.model || m.id), displayName:String(m.displayName || m.model || m.id), description:String(m.description || ''), hidden:!!m.hidden, isDefault:!!m.isDefault, inputModalities:m.inputModalities || [], upgrade:m.upgrade || null })),
     current,
     error: models.status === 'rejected' ? models.reason?.message || String(models.reason) : null,
   };
