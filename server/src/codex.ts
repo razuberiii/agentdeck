@@ -56,8 +56,8 @@ export class CodexBridge extends EventEmitter {
   }
   respond(id: number|string, result: any) { this.proc?.stdin.write(JSON.stringify({ id, result }) + '\n'); }
   notify(method: string, params?: any) { const body:any = { method }; if (params !== undefined) body.params = params; this.proc?.stdin.write(JSON.stringify(body) + '\n'); }
-  async startThread(cwd: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/start', { cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }); }
-  async resumeThread(threadId: string, cwd?: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/resume', { threadId, cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }); }
+  async startThread(cwd: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/start', withModel({ cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }, opts)); }
+  async resumeThread(threadId: string, cwd?: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/resume', withModel({ threadId, cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }, opts)); }
   async readThread(threadId: string, includeTurns = true) { await this.ensure(); return this.request('thread/read', { threadId, includeTurns }); }
   async listThreads(archived = false, limit = 100) { await this.ensure(); return this.request('thread/list', { archived, limit, sortKey: 'updated_at', sortDirection: 'desc' }); }
   async setName(threadId: string, name: string) { await this.ensure(); return this.request('thread/name/set', { threadId, name }); }
@@ -65,12 +65,15 @@ export class CodexBridge extends EventEmitter {
   async rateLimits() { await this.ensure(); return this.request('account/rateLimits/read'); }
   async archive(threadId: string) { await this.ensure(); return this.request('thread/archive', { threadId }); }
   async unarchive(threadId: string) { await this.ensure(); return this.request('thread/unarchive', { threadId }); }
-  async fork(threadId: string, cwd?: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/fork', { threadId, cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }); }
-  async startTurn(threadId: string, input: any[], cwd: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('turn/start', { threadId, cwd, approvalPolicy: opts.approvalPolicy, sandboxPolicy: { type: sandboxPolicyType(opts.sandboxMode) }, input }); }
+  async models(includeHidden = false) { await this.ensure(); return this.request('model/list', { includeHidden, limit: 200 }); }
+  async config(cwd?: string) { await this.ensure(); return this.request('config/read', { cwd, includeLayers:false }); }
+  async fork(threadId: string, cwd?: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('thread/fork', withModel({ threadId, cwd, approvalPolicy: opts.approvalPolicy, sandbox: opts.sandboxMode }, opts)); }
+  async startTurn(threadId: string, input: any[], cwd: string, opts: TurnOptions = defaultTurnOptions()) { await this.ensure(); return this.request('turn/start', withModel({ threadId, cwd, approvalPolicy: opts.approvalPolicy, sandboxPolicy: { type: sandboxPolicyType(opts.sandboxMode) }, input }, opts)); }
   async interrupt(threadId: string, turnId: string) { await this.ensure(); return this.request('turn/interrupt', { threadId, turnId }); }
 }
-export type TurnOptions = { approvalPolicy: string; sandboxMode: string };
+export type TurnOptions = { approvalPolicy: string; sandboxMode: string; model?: string | null };
 function defaultTurnOptions(): TurnOptions { return { approvalPolicy:'never', sandboxMode:'danger-full-access' }; }
+function withModel<T extends Record<string, any>>(params:T, opts:TurnOptions) { if (opts.model) (params as any).model = opts.model; return params; }
 function sandboxPolicyType(mode:string) {
   if (mode === 'read-only') return 'readOnly';
   if (mode === 'workspace-write') return 'workspaceWrite';

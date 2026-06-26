@@ -2,10 +2,11 @@ import React, { createContext, useContext, useEffect, useMemo, useRef, useState 
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
-type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; codex:any; capabilities:Capabilities; activeProfile?:any };
+type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultModel?:string; codex:any; capabilities:Capabilities; activeProfile?:any };
 type Capabilities = { imageInput:boolean; imageOutput:boolean; attachmentTypes:string[]; maxAttachmentBytes:number };
-type Session = { id:string; codex_thread_id:string; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; archived?:number; created_at?:number; updated_at?:number };
+type Session = { id:string; codex_thread_id:string; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
+type ModelOption = { id:string; model:string; displayName:string; description?:string; hidden?:boolean; isDefault?:boolean; inputModalities?:string[]; upgrade?:string|null };
 type Attachment = { id:string; name:string; type:string; size:number; url:string; previewUrl?:string; uploading?:boolean; error?:string };
 type DisplayEvent = { key:string; role:'user'|'assistant'|'system'|'command'|'file'|'reasoning'|'image'; title?:string; text:string; meta?:string; open?:boolean; attachments?:Attachment[]; images?:Attachment[]; files?:Attachment[] };
 type Toast = { id:string; kind:'success'|'error'|'info'; text:string };
@@ -113,7 +114,7 @@ function Home(){
 function SessionRow({session,onArchive}:{session:Session;onArchive:()=>void}){
   return <article className="sessionRow">
     <button className="sessionMain" onClick={()=>location.hash='#/s/'+session.id}>
-      <b>{session.title}</b><span>{projectName(session.project_dir)} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
+      <b>{session.title}</b><span>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
     </button>
     <button className="thinBtn" onClick={onArchive}>{session.archived?'恢复':'归档'}</button>
   </article>;
@@ -128,7 +129,7 @@ function SessionView({id}:{id:string}){
   const [session,setSession]=useState<Session|null>(null); const [events,setEvents]=useState<DisplayEvent[]>([]); const [live,setLive]=useState<any[]>([]);
   const [loading,setLoading]=useState(true);
   const [text,setText]=useState(''); const [attachments,setAttachments]=useState<Attachment[]>([]); const [status,setStatus]=useState<Status|null>(null);
-  const [busy,setBusy]=useState(''); const [online,setOnline]=useState(navigator.onLine); const [connected,setConnected]=useState(false); const [diff,setDiff]=useState(''); const [menu,setMenu]=useState(false); const [confirmDelete,setConfirmDelete]=useState(false); const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [viewer,setViewer]=useState<Attachment|null>(null); const [showBottom,setShowBottom]=useState(false); const [drag,setDrag]=useState(false); const [approvals,setApprovals]=useState<ApprovalRequest[]>([]);
+  const [busy,setBusy]=useState(''); const [online,setOnline]=useState(navigator.onLine); const [connected,setConnected]=useState(false); const [diff,setDiff]=useState(''); const [menu,setMenu]=useState(false); const [modelOpen,setModelOpen]=useState(false); const [models,setModels]=useState<any>(null); const [confirmDelete,setConfirmDelete]=useState(false); const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [viewer,setViewer]=useState<Attachment|null>(null); const [showBottom,setShowBottom]=useState(false); const [drag,setDrag]=useState(false); const [approvals,setApprovals]=useState<ApprovalRequest[]>([]);
   const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const mountedRef=useRef(false); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true);
   useEffect(()=>{ mountedRef.current=true; setLoading(true); setEvents([]); setLive([]); setApprovals([]); setText(localStorage.getItem(draftKey(id)) || ''); setAttachments([]); load(); connect(); const on=()=>setOnline(navigator.onLine); const poll=window.setInterval(()=>{ if(mountedRef.current && wsRef.current?.readyState!==WebSocket.OPEN) load(true); },5000); addEventListener('online',on); addEventListener('offline',on); return()=>{ mountedRef.current=false; window.clearInterval(poll); removeEventListener('online',on); removeEventListener('offline',on); if(reconnectRef.current) clearTimeout(reconnectRef.current); wsRef.current?.close(); }; },[id]);
   useEffect(()=>{ if(nearBottomRef.current) requestAnimationFrame(()=>feedRef.current?.scrollTo({top:feedRef.current.scrollHeight})); },[events,live]);
@@ -147,13 +148,15 @@ function SessionView({id}:{id:string}){
   async function showDiff(){ setBusy('diff'); try{ setDiff((await api('/api/sessions/'+id+'/diff')).diff || 'No diff'); } catch(e:any){ toast('error','Diff 读取失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota')); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
   async function setSessionMode(mode:string){ setBusy('mode'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({mode})}); setSession(s=>s?{...s,permission_mode:mode}:s); setMenu(false); haptic(); toast('success','已切换为 '+modeLabel(mode)); } catch(e:any){ toast('error','模式切换失败：'+shortError(e)); } finally{ setBusy(''); } }
+  async function openModelPicker(){ setMenu(false); setModelOpen(true); if(!models) try{ setModels(await api('/api/models')); } catch(e:any){ toast('error','模型列表读取失败：'+shortError(e)); } }
+  async function setSessionModel(model:string){ setBusy('model'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({model})}); setSession(s=>s?{...s,model}:s); setModelOpen(false); haptic(); toast('success','已切换模型'); } catch(e:any){ toast('error','模型切换失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function answerApproval(req:ApprovalRequest, decision:'accept'|'decline'){ setBusy('approval:'+req.requestId); try{ await api('/api/approvals/'+encodeURIComponent(req.requestId),{method:'POST',body:JSON.stringify({decision,method:req.method})}); setApprovals(v=>v.filter(a=>a.requestId!==req.requestId)); haptic(); toast(decision==='accept'?'success':'info', decision==='accept'?'已允许':'已拒绝'); } catch(e:any){ toast('error','授权回复失败：'+shortError(e)); } finally{ setBusy(''); } }
   const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=liveStatus(live,session?.status);
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
-    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modeLabel(session?.permission_mode)} · {online?(connected?'online':'reconnecting'):'offline'}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={()=>setMenu(v=>!v)}>⋯</button></header>
+    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(session?.model || status?.defaultModel)} · {modeLabel(session?.permission_mode)} · {online?(connected?'online':'reconnecting'):'offline'}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={()=>setMenu(v=>!v)}>⋯</button></header>
     {!online&&<InlineNotice tone="error" text="网络离线，发送会在连接恢复后可用。"/>}
     {online&&!connected&&<InlineNotice tone="info" text="正在重新连接会话。"/>}
-    {menu&&<nav className="moreMenu"><button disabled={!!busy} onClick={showDiff}>Diff</button><button disabled={!!busy} onClick={()=>setSessionMode('yolo')}>YOLO</button><button disabled={!!busy} onClick={()=>setSessionMode('workspace-write')}>Workspace</button><button disabled={!!busy} onClick={()=>setSessionMode('read-only')}>Read Only</button><button disabled={!!busy} onClick={rename}>改名</button><button disabled={!!busy} onClick={fork}>Fork</button><button disabled={!!busy} onClick={archive}>{session?.archived?'恢复':'归档'}</button><button disabled={!!busy} className="dangerText" onClick={()=>setConfirmDelete(true)}>删除</button></nav>}
+    {menu&&<nav className="moreMenu"><button disabled={!!busy} onClick={showDiff}>Diff</button><button disabled={!!busy} onClick={openModelPicker}>模型</button><button disabled={!!busy} onClick={()=>setSessionMode('yolo')}>YOLO</button><button disabled={!!busy} onClick={()=>setSessionMode('workspace-write')}>Workspace</button><button disabled={!!busy} onClick={()=>setSessionMode('read-only')}>Read Only</button><button disabled={!!busy} onClick={rename}>改名</button><button disabled={!!busy} onClick={fork}>Fork</button><button disabled={!!busy} onClick={archive}>{session?.archived?'恢复':'归档'}</button><button disabled={!!busy} className="dangerText" onClick={()=>setConfirmDelete(true)}>删除</button></nav>}
     {diff&&<DiffPanel diff={diff} onClose={()=>setDiff('')}/>}
     <section className={`feed ${!loading&&!rendered.length&&!approvals.length?'emptyFeed':''}`} ref={feedRef as any} onScroll={onScroll}>{loading?<LoadingRows count={5}/>:<>{rendered.map((e,i)=><EventCard key={e.key||i} e={e} onImage={setViewer}/>)}{approvals.map(a=><ApprovalCard key={a.requestId} req={a} busy={busy==='approval:'+a.requestId} onAnswer={answerApproval}/>)}{!rendered.length&&!approvals.length&&<EmptyState title="没有可显示的对话" detail="发送新消息后会显示回复"/>}</>}</section>
     {showBottom&&<button className="jumpBottom" onClick={()=>{nearBottomRef.current=true;feedRef.current?.scrollTo({top:feedRef.current.scrollHeight,behavior:'smooth'});setShowBottom(false)}}>回到底部</button>}
@@ -164,6 +167,7 @@ function SessionView({id}:{id:string}){
     </footer>
     {confirmDelete&&<ConfirmDialog title="删除会话？" detail="会删除本地索引并尝试删除 Codex 会话文件。此操作不可撤销。" confirm="删除" onCancel={()=>setConfirmDelete(false)} onConfirm={del}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
+    {modelOpen&&<ModelSheet models={models?.models||[]} value={session?.model || ''} defaultModel={status?.defaultModel || models?.current || ''} busy={busy==='model'} onPick={setSessionModel} onClose={()=>setModelOpen(false)}/>}
     {viewer&&<ImageViewer image={viewer} onClose={()=>setViewer(null)}/>}
   </main>;
 }
@@ -361,9 +365,11 @@ function findDeepEmail(value:any):string|null{
 function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Promise<any>;onClose:()=>void}){
   const toast=useToast();
   const [localData,setLocalData]=useState<any>(data);
+  const [models,setModels]=useState<any>(null);
   const [loginJob,setLoginJob]=useState<any>(null);
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
+  useEffect(()=>{ api('/api/models').then(setModels).catch(()=>{}); },[]);
   async function syncSettings(){ const next=await onChanged(); if(next) setLocalData((current:any)=>mergeSettingsData(current, next)); }
   function markActiveProfile(id:string){
     setLocalData((d:any)=>{
@@ -373,6 +379,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   }
   useEffect(()=>{ if(!loginJob?.id || loginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/profile-login/'+loginJob.id); setLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录未完成'); } }catch{} },1500); return()=>window.clearInterval(timer); },[loginJob?.id,loginJob?.status]);
   async function setDefaultMode(mode:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultMode:mode})}); haptic(); toast('success','已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
+  async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model}})); haptic(); toast('success','默认模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
   async function switchProfile(id:string){ try{ await api(`/api/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id); haptic(); toast('success','切换成功'); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } finally { await syncSettings(); } }
   async function deviceLogin(id:string, isNew=false){ try{ const r=await api(`/api/profiles/${id}/login/device`,{method:'POST',body:JSON.stringify({newProfile:isNew})}); setLoginJob(r.job); toast('info','登录流程已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function loginNewProfile(){ try{ const r=await api('/api/profiles',{method:'POST',body:JSON.stringify({name:'Codex Account'})}); await syncSettings(); await deviceLogin(r.profile.id, true); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
@@ -380,6 +387,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   return <Sheet onClose={onClose} title="设置" subtitle="沙盒模式和 Codex 账户">
     <div className="settingsGrid">
       <section><b>默认沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>
+      <section><b>默认模型</b><ModelPicker models={models?.models||[]} value={localData?.settings?.defaultModel || ''} defaultModel={models?.current || ''} onPick={setDefaultModel}/></section>
       <section><b>Codex 账户</b><div className="profileList">{(localData?.profiles||[]).map((p:any)=><ProfileRow key={p.id} profile={p} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section>
       <section><b>登录新账户</b><button onClick={loginNewProfile}>开始登录</button></section>
       {loginJob&&<LoginJobPanel job={loginJob}/>}
@@ -425,6 +433,23 @@ function extractDeviceCode(text:string){
   const cleaned=text.replace(/[^A-Za-z0-9-]+/g,' ');
   const match=cleaned.match(/\b([A-Z0-9]{4})\s*-\s*([A-Z0-9]{4,5})\b/i);
   return match ? `${match[1]}-${match[2]}`.toUpperCase() : '';
+}
+function modelLabel(model?:string){ return model ? model.replace(/^gpt-/, 'GPT-').replace(/^o(\d)/, 'o$1') : '默认模型'; }
+function ModelPicker({models,value,defaultModel,onPick}:{models:ModelOption[];value:string;defaultModel?:string;onPick:(model:string)=>void}){
+  const [q,setQ]=useState('');
+  const filtered=models.filter(m=>(m.displayName+' '+m.model+' '+(m.description||'')).toLowerCase().includes(q.toLowerCase()));
+  return <div className="modelPicker">
+    <input className="search" value={q} onChange={e=>setQ(e.target.value)} placeholder="搜索模型"/>
+    <div className="modelList">
+      <button className={`modelRow ${!value?'active':''}`} onClick={()=>onPick('')}><b>默认模型</b><span>{defaultModel ? modelLabel(defaultModel) : '跟随 Codex 配置'}</span></button>
+      {filtered.map(m=><button key={m.id||m.model} className={`modelRow ${value===m.model?'active':''}`} disabled={!!m.upgrade} onClick={()=>onPick(m.model)}><b>{m.displayName || m.model}</b><span>{m.model}{m.description?` · ${m.description}`:''}{m.upgrade?' · 需要升级':''}</span></button>)}
+      {!models.length&&<div className="modelEmpty">正在读取模型列表</div>}
+      {!!models.length&&!filtered.length&&<div className="modelEmpty">没有匹配模型</div>}
+    </div>
+  </div>;
+}
+function ModelSheet({models,value,defaultModel,busy,onPick,onClose}:{models:ModelOption[];value:string;defaultModel?:string;busy:boolean;onPick:(model:string)=>void;onClose:()=>void}){
+  return <Sheet className="modelSheet" onClose={onClose} title="切换模型" subtitle="从下一条消息开始生效"><ModelPicker models={models} value={value} defaultModel={defaultModel} onPick={m=>!busy&&onPick(m)}/></Sheet>;
 }
 function ModeButtons({value,onPick}:{value:string;onPick:(mode:string)=>void}){ return <div className="modeButtons"><button className={value==='yolo'?'active':''} onClick={()=>onPick('yolo')}>YOLO</button><button className={value==='workspace-write'?'active':''} onClick={()=>onPick('workspace-write')}>Workspace</button><button className={value==='read-only'?'active':''} onClick={()=>onPick('read-only')}>Read Only</button></div>; }
 function QuotaBar({title,limitWindow}:{title:string;limitWindow:any}){
