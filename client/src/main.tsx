@@ -435,18 +435,19 @@ function extractDeviceCode(text:string){
   return match ? `${match[1]}-${match[2]}`.toUpperCase() : '';
 }
 function modelLabel(model?:string){ return model ? model.replace(/^gpt-/, 'GPT-').replace(/^o(\d)/, 'o$1') : '默认模型'; }
+function modelOptionLabel(model:ModelOption){
+  const name = model.displayName || model.model;
+  return name === model.model ? name : `${name} (${model.model})`;
+}
 function ModelPicker({models,value,defaultModel,onPick}:{models:ModelOption[];value:string;defaultModel?:string;onPick:(model:string)=>void}){
-  const [q,setQ]=useState('');
-  const filtered=models.filter(m=>(m.displayName+' '+m.model+' '+(m.description||'')).toLowerCase().includes(q.toLowerCase()));
-  return <div className="modelPicker">
-    <input className="search" value={q} onChange={e=>setQ(e.target.value)} placeholder="搜索模型"/>
-    <div className="modelList">
-      <button className={`modelRow ${!value?'active':''}`} onClick={()=>onPick('')}><b>默认模型</b><span>{defaultModel ? modelLabel(defaultModel) : '跟随 Codex 配置'}</span></button>
-      {filtered.map(m=><button key={m.id||m.model} className={`modelRow ${value===m.model?'active':''}`} onClick={()=>onPick(m.model)}><b>{m.displayName || m.model}</b><span>{m.actualModel || m.model}{m.description?` · ${m.description}`:''}{m.upgrade?` · Codex 建议 ${m.upgrade}`:''}</span></button>)}
-      {!models.length&&<div className="modelEmpty">正在读取模型列表</div>}
-      {!!models.length&&!filtered.length&&<div className="modelEmpty">没有匹配模型</div>}
-    </div>
-  </div>;
+  return <label className="modelSelectWrap">
+    <span>模型</span>
+    <select className="modelSelect" value={value} disabled={!models.length} onChange={e=>onPick(e.target.value)}>
+      <option value="">默认模型{defaultModel ? ` (${modelLabel(defaultModel)})` : ''}</option>
+      {models.map(m=><option key={m.id||m.model} value={m.model}>{modelOptionLabel(m)}</option>)}
+    </select>
+    <small>{models.length ? '使用 Codex 返回的模型列表，从下一条消息开始生效' : '正在读取 Codex 模型列表'}</small>
+  </label>;
 }
 function ModelSheet({models,value,defaultModel,busy,onPick,onClose}:{models:ModelOption[];value:string;defaultModel?:string;busy:boolean;onPick:(model:string)=>void;onClose:()=>void}){
   return <Sheet className="modelSheet" onClose={onClose} title="切换模型" subtitle="从下一条消息开始生效"><ModelPicker models={models} value={value} defaultModel={defaultModel} onPick={m=>!busy&&onPick(m)}/></Sheet>;
