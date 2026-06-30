@@ -1,18 +1,20 @@
-import { spawn } from 'node:child_process';
+import Database from 'better-sqlite3';
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
+
 export type Row = Record<string, string | number | null>;
+
 export class Db {
-  private chain: Promise<unknown> = Promise.resolve();
+  private conn: Database.Database | null = null;
   constructor(private file: string) {}
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.chain.then(fn, fn);
-    this.chain = next.catch(() => undefined);
-    return next;
-  }
+
   async init() {
     await mkdir(path.dirname(this.file), { recursive: true });
-    await this.run(`PRAGMA journal_mode=WAL;
+    const db = this.open();
+    db.pragma('journal_mode = WAL');
+    db.pragma('busy_timeout = 5000');
+    db.pragma('foreign_keys = ON');
+    db.exec(`
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, codex_thread_id TEXT UNIQUE, project_dir TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, permission_mode TEXT NOT NULL, approval_policy TEXT NOT NULL, sandbox_mode TEXT NOT NULL, model TEXT, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);
@@ -21,30 +23,50 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS codex_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, codex_home TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT PRIMARY KEY, count INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
   }
-  async run(sql: string, params: unknown[] = []) { return this.enqueue(async () => { await this.exec([], this.sql(sql, params)); }); }
-  async get(sql: string, params: unknown[] = []): Promise<Row | null> { const rows = await this.all(sql, params); return rows[0] ?? null; }
+
+  async run(sql: string, params: unknown[] = []) {
+    const db = this.open();
+    if (!params.length && this.isMultiStatement(sql)) {
+      db.exec(sql);
+      return { changes: 0, lastInsertRowid: 0 };
+    }
+    const info = db.prepare(sql).run(this.bind(sql, params));
+    return { changes: info.changes, lastInsertRowid: Number(info.lastInsertRowid) };
+  }
+
+  async get(sql: string, params: unknown[] = []): Promise<Row | null> {
+    return (this.open().prepare(sql).get(this.bind(sql, params)) as Row | undefined) ?? null;
+  }
+
   async all(sql: string, params: unknown[] = []): Promise<Row[]> {
-    return this.enqueue(async () => {
-      const stdout = await this.exec(['-json'], this.sql(sql, params));
-      const text = stdout.trim(); return text ? JSON.parse(text) : [];
-    });
+    return this.open().prepare(sql).all(this.bind(sql, params)) as Row[];
   }
-  private exec(args: string[], sql: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const child = spawn('sqlite3', ['-batch', ...args, this.file], { stdio: ['pipe', 'pipe', 'pipe'] });
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      child.stdout.on('data', d => stdout.push(Buffer.from(d)));
-      child.stderr.on('data', d => stderr.push(Buffer.from(d)));
-      child.on('error', reject);
-      child.on('close', code => {
-        if (code === 0) resolve(Buffer.concat(stdout).toString('utf8'));
-        else reject(new Error(`sqlite3 exited ${code}: ${Buffer.concat(stderr).toString('utf8')}`));
-      });
-      child.stdin.end(`.timeout 5000\n${this.terminated(sql)}\n`);
-    });
+
+  transaction<T>(fn: () => T): T {
+    return this.open().transaction(fn)();
   }
-  private terminated(sql: string) { return /;\s*$/.test(sql) ? sql : `${sql};`; }
-  private sql(sql: string, params: unknown[]) { return sql.replace(/\?(\d+)/g, (_, n) => this.quote(params[Number(n) - 1])); }
-  private quote(v: unknown) { if (v === null || v === undefined) return 'null'; if (typeof v === 'number') return String(v); return `'${String(v).replaceAll("'", "''")}'`; }
+
+  close() {
+    if (!this.conn) return;
+    this.conn.pragma('wal_checkpoint(TRUNCATE)');
+    this.conn.close();
+    this.conn = null;
+  }
+
+  private open() {
+    if (!this.conn) this.conn = new Database(this.file);
+    return this.conn;
+  }
+
+  private isMultiStatement(sql: string) {
+    return sql.split(';').filter(part => part.trim()).length > 1;
+  }
+
+  private bind(sql: string, params: unknown[]) {
+    if (!params.length) return [];
+    if (!/\?\d+/.test(sql)) return params;
+    const bound: Record<string, unknown> = {};
+    params.forEach((value, index) => { bound[String(index + 1)] = value; });
+    return bound;
+  }
 }
