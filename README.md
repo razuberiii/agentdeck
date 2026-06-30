@@ -1,193 +1,119 @@
 # Agent Deck
 
-Agent Deck 是一个面向手机浏览器的本地 Agent 控制台。它把 Codex CLI、Google Antigravity、会话状态、工作区选择、附件上传、图片预览和文件产物下载整合成一个可安装的 PWA，让你可以从手机上打开、继续和管理本机上的 Agent 会话。
+Agent Deck 是一个面向手机浏览器的本机 Agent 控制台。当前生产域名是 `https://codex.rubusoo.com`。
 
-当前项目由三部分组成：
+## 架构
 
-- Web 网关：Fastify API、WebSocket、鉴权、附件与静态资源服务。
-- 持久运行时：独立的 Agent runtime，负责保存会话事件、断线恢复、SSE 订阅和 Codex 账户运行状态。
-- Codex app-server：以 systemd 模板服务独立运行，供 runtime 通过 WebSocket 调用。
+请求链路是：
 
-## 主要能力
+`Browser/PWA -> Web gateway -> persistent runtime -> Codex app-server`
 
-- 在移动端创建、继续、停止 Codex 会话。
-- 扫描允许访问的工作区目录，并在指定项目中启动会话。
-- 支持多 Codex profile 切换，以及 Google Antigravity profile 的登录和切换。
-- 支持创建 Antigravity 会话并调用 Google 官方 CLI 执行一次性任务。
-- 支持文本、图片和附件输入，生成图片和产物文件可以在会话中预览或下载。
-- 会话可重命名、归档、取消归档、删除，并可查看项目 diff。
-- WebSocket 重连后可以按事件序号恢复输出，避免刷新或断线丢失正在运行的 turn。
-- 运行时状态写入 SQLite，项目代码更新时不移动用户数据。
-- 提供 PWA manifest、service worker 和图标，适合添加到手机桌面使用。
+- Browser/PWA：React 前端，通过 HTTP API 拉取快照，通过 WebSocket join 会话、发送消息和接收事件。
+- Web gateway：Fastify 服务，负责登录 Cookie、CSRF、Origin 校验、会话列表、附件、产物、WebSocket 转发和 runtime subscription。
+- persistent runtime：独立 Fastify 服务，持有 Codex 账户运行状态、SQLite 事件库、SSE push subscription、上游 thread resume/read。
+- Codex app-server：Codex CLI 的 app-server，由 systemd 模板服务运行，runtime 通过 JSON-RPC/WebSocket 调用。
 
-## Antigravity 支持状态
+## 事件流与重连边界
 
-项目内已经接入 Google Antigravity，当前属于能用但仍有已知限制的状态：
+浏览器进入 Codex 会话时，Web 会先按 `lastSequence` replay 已持久化 runtime events，然后幂等建立 runtime SSE subscription。idle 会话也会订阅；idle 只表示当前没有运行中的 turn，不表示下次发送前不需要事件回传通道。
 
-- 可以在设置里选择 `Antigravity`，登录 Google 账户，切换 Antigravity profile，并为新会话选择 Antigravity 模型。
-- Antigravity 会话会记录在本地 SQLite 中，用户消息和最终回复可以在移动端会话页中查看。
-- 当前发送消息时调用的是 Google 官方 CLI 的一次性命令形态，也就是类似 `agy --print <prompt>` 的非交互执行。
-- 不能像 Codex 一样使用 TUI 或 ACP 长连接协议，因为 Google Antigravity 目前没有提供可用的 ACP 接口。
-- 因为只能走一次性调用，所以它没有完整的 Codex runtime 能力：不能恢复真实上游交互线程，不能像 Codex 那样持续订阅结构化事件，图片附件也暂未接入 Antigravity。
-- 停止生成会终止当前 CLI 子进程，但会话上下文主要由 Agent Deck 本地记录，不等同于 Google CLI 原生 TUI 的完整上下文体验。
+用户发送消息时，Web 会再次幂等确保 subscription 已存在或正在建立，然后调用 runtime `turn/start`。前端会收到消息提交状态：`received`、`persisted`、`accepted`、`running`、`completed` 或 `failed`。`turn/start` 失败时会显示错误并保留输入以便重试。
 
-简而言之：Codex 是当前的一等支持路径；Antigravity 是可用的补充 provider，适合从手机上发起单轮或短任务，但不要把它当成 Google 官方 TUI 的远程镜像。
+恢复能力边界：
 
-## 目录结构
+- 浏览器刷新或断线：Web 会补发已经成功持久化的事件。
+- Web 重启：浏览器重连后重新 join，会重建 runtime subscription。
+- runtime 重启：runtime 会读取本地 running/recovering 会话，向 app-server 执行 thread read/resume 校准状态。
+- app-server 重启：runtime 会尝试重新连接并恢复上游 thread。
+- 极端 runtime 崩溃：关键事件采用持久化后广播；高频 delta 批量写入，尚未 flush 的片段仍可能丢失。
+- 上游 thread 丢失：runtime 会尝试创建替代 thread，并注入本地恢复上下文；模型内部完整上下文不能保证无损。
 
-- `client/src/main.tsx`：React 前端入口。
-- `client/src/styles.css`：移动端优先的界面样式。
-- `client/public/`：PWA manifest、service worker、图标和测试静态资源。
-- `server/src/index.ts`：Web 网关，包含 API、WebSocket、鉴权、会话索引、上传和产物服务。
-- `server/src/agentdeck-runtime.ts`：持久 Agent runtime，负责会话、事件、恢复和 Codex app-server 连接。
-- `server/src/codex.ts`：连接 `codex app-server` 的 JSON-RPC 客户端。
-- `server/src/runtime-client.ts`：Web 网关调用 runtime 的客户端。
-- `server/src/db.ts`：SQLite 初始化和访问封装。
-- `server/src/workspaces.ts`：工作区白名单校验和项目扫描。
-- `deploy/`：systemd 单元、安装脚本、切换脚本、回滚脚本和运行时验证脚本。
-- `scripts/backup.sh`：运行数据备份脚本。
+## 数据文件
 
-## 环境要求
+运行数据在 `/opt/data/agentdeck`：
 
-- Node.js 20 或更高版本。
-- 主机可用 SQLite。
-- 已安装 OpenAI Codex CLI，并且 `codex` 命令可用。
-- 一个可写的数据目录，默认是 `/opt/data/agentdeck`。
-- 生产部署使用 systemd，默认项目目录是 `/opt/stacks/agentdeck`。
+- `agentdeck.sqlite3`：Web gateway 会话索引、用户、settings、附件/产物索引。
+- `agentdeck-runtime.sqlite3`：runtime sessions、events、accounts、runtime_instances。
+- `agentdeck-runtime.sqlite3-wal` / `agentdeck-runtime.sqlite3-shm`：SQLite WAL 辅助文件。
+- `profiles/`：Codex profile 目录。
+- `antigravity-profiles/`：Antigravity profile 目录。
+- `shared/sessions/`：共享 Codex session 文件。
+- `shared/generated_images/`：生成图片。
+- `attachments/`：上传附件。
+- `web.env`、`runtime.env`、`agentdeck-app-server-default.env`：systemd 环境文件。
 
-## 本地开发
-
-安装依赖：
-
-```bash
-npm install
-```
-
-直接运行 TypeScript 版 Web 服务：
-
-```bash
-npm run dev
-```
-
-运行持久 runtime：
-
-```bash
-npm run dev:runtime
-```
-
-构建服务端和前端：
-
-```bash
-npm run build
-```
-
-启动构建后的 Web 服务：
-
-```bash
-npm start
-```
-
-常用脚本：
-
-- `npm run build:server`：只编译服务端 TypeScript。
-- `npm run build:client`：只构建 React 前端。
-- `npm run runtime`：启动构建后的持久 runtime。
+备份 SQLite 时应同时备份主库和 WAL/SHM，或先停止相关服务再复制。当前备份脚本应覆盖两个 SQLite 数据库；恢复后用 `npm run test:e2e` 和会话列表读取验证。
 
 ## 配置
 
-应用通过环境变量配置。当前 systemd 部署会读取 `/opt/data/agentdeck` 下的环境文件：
+常用环境变量：
 
-- `/opt/data/agentdeck/web.env`
-- `/opt/data/agentdeck/runtime.env`
-- `/opt/data/agentdeck/agentdeck-app-server-default.env`
+- `ADMIN_PASSWORD`：首次登录密码。
+- `COOKIE_SECRET`：签名 Cookie 密钥，必须稳定保存。
+- `DATA_DIR`：默认 `/opt/data/agentdeck`。
+- `CODEX_HOME`：默认 `/home/ubuntu/.codex`。
+- `HOST` / `PORT`：Web 监听地址和端口，默认 `127.0.0.1:3842`。
+- `RUNTIME_HOST` / `RUNTIME_PORT`：runtime 监听地址和端口，默认 `127.0.0.1:3852`。
+- `RUNTIME_TOKEN`：runtime 控制接口 token。`RUNTIME_HOST` 不是 loopback 时必须配置。
+- `AGENT_RUNTIME_URL`：Web 调用 runtime 的地址。
+- `AGENT_RUNTIME_TOKEN`：Web 调用 runtime 时使用的 Bearer token；不要发送到前端。
+- `USE_AGENT_RUNTIME=1`：启用 persistent runtime。
+- `ALLOWED_WORKSPACES`：工作区根目录列表。
+- `ALLOWED_ORIGINS`：浏览器 WebSocket Origin 白名单，多个值逗号分隔。生产必须包含 `https://codex.rubusoo.com`；如需要 HTTP 访问也要显式加入对应 Origin。
 
-常用变量：
+`ALLOWED_ORIGINS` 只校验浏览器 WebSocket 请求来自哪个页面 Origin。它不是 Codex API 白名单，不是登录用户列表，也不是服务器访问控制列表。没有 Origin 的非浏览器客户端当前不会被 Origin 白名单拒绝，但仍需要有效登录 Cookie。
 
-- `ADMIN_PASSWORD`：首次登录用的管理员密码。
-- `COOKIE_SECRET`：签名 Cookie 的稳定密钥。
-- `DATA_DIR`：运行数据目录，默认 `/opt/data/agentdeck`。
-- `CODEX_HOME`：Codex 配置目录，默认 `/home/ubuntu/.codex`。
-- `HOST`：Web 网关监听地址，默认 `127.0.0.1`。
-- `PORT`：Web 网关监听端口，默认 `3842`。
-- `RUNTIME_HOST`：runtime 监听地址，默认 `127.0.0.1`。
-- `RUNTIME_PORT`：runtime 监听端口，默认 `3852`。
-- `AGENT_RUNTIME_URL`：Web 网关访问 runtime 的地址，生产默认 `http://127.0.0.1:3852`。
-- `USE_AGENT_RUNTIME`：设为 `1` 时 Web 网关使用持久 runtime。
-- `ALLOWED_WORKSPACES`：允许打开的工作区根目录，多个路径用逗号分隔。
-- `ALLOWED_ORIGINS`：允许连接 WebSocket 的浏览器 Origin，多个值用逗号分隔。
-- `CODEX_APP_SERVER_LISTEN`：Codex app-server 监听地址，例如 `ws://127.0.0.1:4668`。
-- `CODEX_APP_SERVER_PORT_BASE`：runtime 为 Codex app-server 分配端口时使用的基础端口。
+## 本地开发与质量命令
 
-## 生产部署
+```bash
+npm install
+npm run dev:runtime
+npm run dev
+npm run build
+npm run typecheck
+npm test
+npm run test:e2e
+npm run lint
+```
 
-当前部署使用三个 systemd 服务：
+本地 HTTP 开发如果使用 Secure cookie，需要走 localhost 或调整开发反向代理；生产应使用 HTTPS，并确保反向代理保留正确的 `Host`、`Origin` 和转发头。
+
+## systemd
+
+当前生产服务：
+
+```bash
+sudo systemctl status agentdeck-app-server@default.service --no-pager
+sudo systemctl status agentdeck-runtime.service --no-pager
+sudo systemctl status agentdeck-web.service --no-pager
+```
+
+重启当前 AgentDeck stack：
 
 ```bash
 sudo systemctl restart agentdeck-app-server@default.service
 sudo systemctl restart agentdeck-runtime.service
 sudo systemctl restart agentdeck-web.service
-sudo systemctl status agentdeck-app-server@default.service agentdeck-runtime.service agentdeck-web.service
 ```
 
-安装或刷新 systemd 单元：
+runtime 会使用 `sudo systemctl` 管理默认 app-server，也可能使用 `sudo systemd-run` 启动非默认账户 app-server。生产部署应配置最小 sudoers，只允许 AgentDeck 相关 unit 的 start/stop/restart/status 以及受控的 transient app-server 启动命令；不要默认要求无限制免密 sudo。
 
-```bash
-deploy/install-units.sh
-```
+## 安全边界
 
-构建并切换到当前生产形态：
+当前服务以 `ubuntu` 用户运行，并共享 `/home/ubuntu`、项目目录和 Agent token 可见范围。systemd 配置有 `ProtectSystem=full`、`PrivateTmp=true` 和 `ReadWritePaths`，但这不是强隔离。Codex app-server 使用 `approval_policy="never"` 和 `sandbox_mode="danger-full-access"`，只应运行在可信机器和受控网络中。
 
-```bash
-deploy/cutover.sh
-```
+未认证 `/api/status` 只返回最小公开信息。需要登录后才返回 workspace roots、Codex home、provider、profile 和 runtime 状态。
 
-代码更新后的常规流程：
+## Rollback
 
-```bash
-npm run build
-sudo systemctl restart agentdeck-runtime.service agentdeck-web.service
-```
+当前 `deploy/rollback.sh` 不是完整版本回滚平台；不要把它理解为一定能恢复上一版代码、构建产物、env、systemd unit 和数据库迁移前状态。当前部署流程更接近“重启当前 stack/恢复当前服务形态”。需要真正 rollback 时，应使用发布目录、`current/previous` symlink、env/unit 快照和数据库迁移前备份。
 
-如果变更涉及 Codex app-server 环境或 systemd 单元，也需要重启模板服务：
+## Antigravity
 
-```bash
-sudo systemctl restart agentdeck-app-server@default.service
-```
+Antigravity 目前是补充 provider：
 
-## 验证与回滚
+- 支持 profile 登录/切换、会话创建、普通文本发送和基本回复展示。
+- 当前通过 Google 官方 CLI 的一次性命令执行，不是 Codex runtime 等价长连接。
+- 不承诺图片发送、图片理解、结构化工具调用、长任务恢复或完整连续上游会话能力。
 
-运行 runtime 验证：
-
-```bash
-node deploy/verify-runtime.mjs
-node deploy/e2e-runtime.mjs
-```
-
-生产切换失败时，`deploy/cutover.sh` 会调用：
-
-```bash
-deploy/rollback.sh
-```
-
-也可以手动执行回滚脚本恢复到旧服务形态。
-
-## 运行数据
-
-运行数据放在仓库外，便于代码更新和部署切换：
-
-- SQLite 数据库：`/opt/data/agentdeck/agentdeck.sqlite3`
-- Codex profiles：`/opt/data/agentdeck/profiles/`
-- Antigravity profiles：`/opt/data/agentdeck/antigravity-profiles/`
-- 共享 Codex 会话：`/opt/data/agentdeck/shared/sessions`
-- 上传附件：`/opt/data/agentdeck/attachments/`
-- systemd 环境文件：`/opt/data/agentdeck/*.env`
-
-仓库内的 `.tools/` 目录只用于本地验证日志和临时探测文件，不属于发布内容。
-
-## 安全说明
-
-- Web API 使用登录 Cookie 和 CSRF Token。
-- 写操作需要有效登录和 CSRF 请求头。
-- WebSocket 会校验登录 Cookie 和允许的 Origin。
-- systemd 服务默认以 `ubuntu` 用户运行，并通过 `ReadWritePaths` 限定主要写入路径。
-- Codex app-server 当前以 `approval_policy="never"` 和 `sandbox_mode="danger-full-access"` 启动，只应部署在可信机器和受控网络环境中。
+Codex 仍是当前一等支持路径。
