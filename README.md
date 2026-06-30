@@ -1,20 +1,20 @@
 # AgentDeck
 
-AgentDeck is a self-hosted web and mobile PWA client for running Codex sessions through a persistent runtime.
+AgentDeck 是一个自托管的 Web / 移动端 PWA 客户端，用于通过持久运行时管理和继续 Codex 会话。
 
-## Features
+## 功能
 
-- Codex Web / PWA client for desktop and mobile browsers.
-- Multiple Codex profiles and account switching.
-- Session list, session history, rename, archive, fork, and delete actions.
-- Persistent AgentDeck runtime for session metadata and event storage.
-- Event replay after page refresh, browser reconnect, or Web gateway restart.
-- File and image attachment upload for supported providers.
-- Project diff view and generated artifact download.
-- Optional Google Antigravity provider support for basic text tasks.
-- Mobile-first interface with installable PWA assets.
+- Codex Web / PWA 客户端，适配桌面和移动浏览器。
+- 多 Codex profile 与账户切换。
+- 会话列表、历史记录、重命名、归档、Fork 和删除。
+- AgentDeck runtime 持久化会话元数据和事件。
+- 页面刷新、浏览器重连或 Web 网关重启后可补发已持久化事件。
+- 支持文件和图片附件上传，具体能力取决于 provider。
+- 支持项目 diff 查看和生成产物下载。
+- 可选 Google Antigravity provider，用于基础文本任务。
+- 移动端优先界面，包含可安装 PWA 资源。
 
-## Architecture
+## 架构
 
 ```text
 Browser / PWA
@@ -23,34 +23,34 @@ Browser / PWA
   -> Codex app-server
 ```
 
-- **Browser / PWA**: Loads session snapshots, joins sessions over WebSocket, sends messages, and renders streamed events.
-- **Web gateway**: Fastify API and WebSocket server for auth, CSRF checks, Origin checks, session indexing, attachments, artifacts, and runtime subscriptions.
-- **AgentDeck runtime**: Long-running service that stores runtime sessions and events in SQLite, manages Codex account runtimes, and exposes SSE streams to the Web gateway.
-- **Codex app-server**: Codex CLI app-server process used by the runtime for JSON-RPC calls.
+- **Browser / PWA**：加载会话快照，通过 WebSocket 加入会话、发送消息并渲染流式事件。
+- **Web gateway**：Fastify API 与 WebSocket 服务，负责鉴权、CSRF、Origin 校验、会话索引、附件、产物和 runtime 订阅。
+- **AgentDeck runtime**：长期运行的服务，将 runtime 会话和事件写入 SQLite，管理 Codex 账户运行状态，并向 Web gateway 暴露 SSE 事件流。
+- **Codex app-server**：由 runtime 调用的 Codex CLI app-server 进程，负责执行 Codex JSON-RPC 请求。
 
-## Requirements
+## 环境要求
 
-- Node.js 18 or newer.
-- npm.
-- SQLite.
-- OpenAI Codex CLI with `codex app-server` support.
-- Linux for the included systemd examples. Other process managers can be used if they run the same Web and runtime entry points.
+- Node.js 18 或更高版本。
+- npm。
+- SQLite。
+- OpenAI Codex CLI，并支持 `codex app-server`。
+- Linux 可直接使用仓库中的 systemd 示例；其他进程管理器也可以运行相同的 Web 和 runtime 入口。
 
-## Quick Start
+## 快速开始
 
-Install dependencies:
+安装依赖：
 
 ```bash
 npm install
 ```
 
-Build the server and client:
+构建服务端和前端：
 
 ```bash
 npm run build
 ```
 
-Start the runtime:
+启动 runtime：
 
 ```bash
 DATA_DIR=.data \
@@ -59,7 +59,7 @@ RUNTIME_PORT=3852 \
 npm run runtime
 ```
 
-Start the Web gateway in another shell:
+在另一个终端启动 Web gateway：
 
 ```bash
 DATA_DIR=.data \
@@ -71,57 +71,57 @@ COOKIE_SECRET='change-me-random-32-bytes' \
 npm start
 ```
 
-Open:
+打开：
 
 ```text
 http://127.0.0.1:3842
 ```
 
-## Configuration
+## 配置
 
-| Variable | Default | Purpose |
+| 变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | Web gateway listen host. |
-| `PORT` | `3842` | Web gateway listen port. |
-| `DATA_DIR` | `/var/lib/agentdeck` | Main data directory for Web state, uploads, profiles, and SQLite files. |
-| `ADMIN_PASSWORD` | none | Initial admin login password. Set this in production. |
-| `COOKIE_SECRET` | generated at process start | Cookie signing secret. Set a stable random value in production. |
-| `ALLOWED_ORIGINS` | `http://localhost:3842,http://127.0.0.1:3842` | Browser WebSocket Origin allowlist. Example: `ALLOWED_ORIGINS=https://agentdeck.example.com`. |
-| `USE_AGENT_RUNTIME` | unset | Set to `1` to route Codex sessions through the persistent runtime. |
-| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | URL the Web gateway uses to call the runtime. |
-| `AGENT_RUNTIME_TOKEN` | unset | Bearer token used by the Web gateway when the runtime requires one. |
-| `RUNTIME_HOST` | `127.0.0.1` | Runtime listen host. |
-| `RUNTIME_PORT` | `3852` | Runtime listen port. |
-| `RUNTIME_TOKEN` | unset | Required when `RUNTIME_HOST` is not loopback. |
-| `RUNTIME_DB` | `$DATA_DIR/agentdeck-runtime.sqlite3` | Runtime SQLite database path. |
-| `CODEX_HOME` | `$HOME/.codex` | Codex profile/config directory. |
-| `ALLOWED_WORKSPACES` | current working directory and `/opt/projects` | Comma-separated workspace roots shown in the UI. |
-| `ANTIGRAVITY_BIN` | `agy` | Optional Antigravity CLI command path. |
+| `HOST` | `127.0.0.1` | Web gateway 监听地址。 |
+| `PORT` | `3842` | Web gateway 监听端口。 |
+| `DATA_DIR` | `/var/lib/agentdeck` | 主数据目录，用于 Web 状态、上传文件、profiles 和 SQLite 文件。 |
+| `ADMIN_PASSWORD` | 无 | 初始管理员登录密码，生产环境必须设置。 |
+| `COOKIE_SECRET` | 进程启动时生成 | Cookie 签名密钥，生产环境应设置稳定随机值。 |
+| `ALLOWED_ORIGINS` | `http://localhost:3842,http://127.0.0.1:3842` | 浏览器 WebSocket Origin 白名单。例如：`ALLOWED_ORIGINS=https://agentdeck.example.com`。 |
+| `USE_AGENT_RUNTIME` | 未启用 | 设置为 `1` 后，Codex 会话通过持久 runtime 运行。 |
+| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | Web gateway 调用 runtime 的 URL。 |
+| `AGENT_RUNTIME_TOKEN` | 未设置 | runtime 要求 token 时，Web gateway 使用的 Bearer token。 |
+| `RUNTIME_HOST` | `127.0.0.1` | runtime 监听地址。 |
+| `RUNTIME_PORT` | `3852` | runtime 监听端口。 |
+| `RUNTIME_TOKEN` | 未设置 | `RUNTIME_HOST` 不是 loopback 时必须设置。 |
+| `RUNTIME_DB` | `$DATA_DIR/agentdeck-runtime.sqlite3` | runtime SQLite 数据库路径。 |
+| `CODEX_HOME` | `$HOME/.codex` | Codex profile / 配置目录。 |
+| `ALLOWED_WORKSPACES` | 当前工作目录和 `/opt/projects` | UI 中可选择的工作区根目录，多个路径用逗号分隔。 |
+| `ANTIGRAVITY_BIN` | `agy` | 可选 Antigravity CLI 命令路径。 |
 
-## Production Deployment
+## 生产部署
 
-A typical production deployment uses:
+典型生产部署通常包含：
 
-- A reverse proxy such as Nginx, Caddy, or Traefik.
-- HTTPS for browser access.
-- A process manager such as systemd, Docker, or another supervisor.
-- Environment files outside the Git working tree.
-- Runtime bound to loopback unless a token is configured.
+- 反向代理，例如 Nginx、Caddy 或 Traefik。
+- 浏览器访问使用 HTTPS。
+- 使用 systemd、Docker 或其他进程管理器。
+- 环境变量文件放在 Git 工作树之外。
+- runtime 默认只监听本机；如需非本机访问，必须配置 token。
 
-Example WebSocket Origin configuration:
+WebSocket Origin 示例：
 
 ```bash
 ALLOWED_ORIGINS=https://agentdeck.example.com
 ```
 
-If the runtime must listen on a non-loopback interface, configure a token on both services:
+如果 runtime 必须监听非 loopback 地址，请在 runtime 和 Web gateway 两侧配置同一个 token：
 
 ```bash
 RUNTIME_TOKEN=replace-with-random-token
 AGENT_RUNTIME_TOKEN=replace-with-random-token
 ```
 
-The repository includes generic systemd unit examples under `deploy/systemd/`. They use:
+仓库在 `deploy/systemd/` 下提供通用 systemd unit 示例，默认形态如下：
 
 ```text
 User=agentdeck
@@ -129,54 +129,54 @@ WorkingDirectory=/opt/agentdeck
 EnvironmentFile=/etc/agentdeck/*.env
 ```
 
-Adjust paths, user names, and permissions for your deployment.
+请根据自己的部署路径、用户和权限模型调整这些示例。
 
-## Data and Backup
+## 数据与备份
 
-Back up the configured `DATA_DIR`. Important files and directories include:
+请备份配置的 `DATA_DIR`。重要文件和目录包括：
 
 - `agentdeck.sqlite3`
 - `agentdeck-runtime.sqlite3`
-- SQLite `-wal` and `-shm` files when services are running
+- 服务运行期间可能存在的 SQLite `-wal` 和 `-shm` 文件
 - `profiles/`
 - `antigravity-profiles/`
 - `shared/sessions/`
 - `shared/generated_images/`
 - `attachments/`
 
-Use SQLite's `.backup` command or stop the services before copying database files. Keep environment files and secrets out of public repositories.
+备份数据库时建议使用 SQLite 的 `.backup` 命令，或先停止相关服务再复制数据库文件。环境文件和密钥不要提交到公开仓库。
 
-## Security
+## 安全
 
-- Use HTTPS in production.
-- Set a strong, stable `COOKIE_SECRET`.
-- Keep `ADMIN_PASSWORD`, `COOKIE_SECRET`, and runtime tokens private.
-- Keep the runtime on `127.0.0.1` unless you have configured `RUNTIME_TOKEN`.
-- Do not expose Codex app-server directly to the public internet.
-- Codex may be able to read or write files inside configured workspaces depending on its sandbox and approval settings.
-- Restrict `ALLOWED_WORKSPACES` to directories you intend AgentDeck to access.
+- 生产环境建议使用 HTTPS。
+- 配置强随机且稳定的 `COOKIE_SECRET`。
+- 不要公开 `ADMIN_PASSWORD`、`COOKIE_SECRET` 或 runtime token。
+- runtime 默认应监听 `127.0.0.1`；如果改为非本机访问，必须配置 `RUNTIME_TOKEN`。
+- 不要把 Codex app-server 直接暴露到公网。
+- Codex 可能根据 sandbox 和 approval 设置读写工作区文件。
+- 只把确实希望 AgentDeck 访问的目录加入 `ALLOWED_WORKSPACES`。
 
-## Recovery Behavior
+## 恢复行为
 
-AgentDeck can replay events that have already been persisted when a browser disconnects, a page refreshes, or the Web gateway restarts.
+浏览器断线、页面刷新或 Web gateway 重启后，AgentDeck 可以补发已经成功持久化的事件。
 
-When the runtime or Codex app-server restarts, AgentDeck attempts to reconnect and resume known sessions. If an upstream thread no longer exists, AgentDeck may create a replacement thread and continue with local history as context.
+runtime 或 Codex app-server 重启时，AgentDeck 会尝试重新连接并恢复已知会话。如果上游 thread 不存在，AgentDeck 可能创建替代 thread，并使用本地历史作为上下文继续。
 
-High-frequency streaming deltas are batched. In an extreme crash, stream fragments that were not yet persisted may be lost.
+高频流式 delta 会批量写入。在极端崩溃情况下，尚未持久化的流式片段可能丢失。
 
 ## Antigravity
 
-AgentDeck can create Antigravity sessions, manage Antigravity profiles, send plain text prompts, and display basic replies.
+AgentDeck 可以创建 Antigravity 会话、管理 Antigravity profiles、发送普通文本 prompt，并展示基础回复。
 
-Notes:
+说明：
 
-- Antigravity support uses the available CLI command as a task runner.
-- It is not equivalent to Codex runtime streaming.
-- Image input, structured tool calls, long-running recovery, and full upstream conversational continuity are not currently guaranteed for Antigravity sessions.
+- Antigravity 支持基于可用 CLI 命令执行任务。
+- 它不等同于 Codex runtime 的结构化流式会话。
+- Antigravity 会话目前不保证图片输入、结构化工具调用、长任务恢复或完整上游连续会话能力。
 
-## Development
+## 开发
 
-Run the standard checks:
+运行标准检查：
 
 ```bash
 npm install
@@ -187,7 +187,7 @@ npm test
 npm run test:e2e
 ```
 
-Useful development commands:
+常用开发命令：
 
 ```bash
 npm run dev
@@ -196,32 +196,32 @@ npm run build:server
 npm run build:client
 ```
 
-## Troubleshooting
+## 常见问题
 
-### WebSocket Origin Rejected
+### WebSocket Origin 被拒绝
 
-Add the browser page origin to `ALLOWED_ORIGINS`. For production:
+把浏览器页面的 Origin 加入 `ALLOWED_ORIGINS`。生产示例：
 
 ```bash
 ALLOWED_ORIGINS=https://agentdeck.example.com
 ```
 
-### Runtime Cannot Connect
+### runtime 无法连接
 
-Check that the runtime process is running and that `AGENT_RUNTIME_URL` points to it. If `RUNTIME_TOKEN` is set, configure the same value as `AGENT_RUNTIME_TOKEN` for the Web gateway.
+确认 runtime 进程正在运行，并且 `AGENT_RUNTIME_URL` 指向正确地址。如果设置了 `RUNTIME_TOKEN`，Web gateway 也需要配置相同值的 `AGENT_RUNTIME_TOKEN`。
 
-### Codex app-server Is Not Running
+### Codex app-server 没有启动
 
-Confirm the Codex CLI is installed and that `codex app-server` works. If using systemd, inspect the app-server unit logs.
+确认 Codex CLI 已安装，并且 `codex app-server` 可用。如果使用 systemd，请查看 app-server unit 日志。
 
-### SQLite Permission Errors
+### SQLite 权限错误
 
-Ensure the service user can read and write `DATA_DIR`, including SQLite WAL and SHM files.
+确认服务用户可以读写 `DATA_DIR`，包括 SQLite WAL 和 SHM 文件。
 
-### Reverse Proxy Issues
+### 反向代理配置问题
 
-Ensure the proxy forwards WebSocket upgrades, preserves the correct `Host` and `Origin`, and serves HTTPS with a valid certificate.
+确认反向代理转发 WebSocket upgrade，并保留正确的 `Host` 和 `Origin`。生产环境应配置有效 HTTPS 证书。
 
 ## License
 
-No license file is currently included.
+当前仓库尚未包含 license 文件。
