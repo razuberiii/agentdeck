@@ -505,6 +505,8 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE sessions ADD COLUMN active_turn_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN interruption_reason TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
+  await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN sequence INTEGER').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN event_type TEXT').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN payload_json TEXT').catch(()=>{});

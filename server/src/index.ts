@@ -29,6 +29,8 @@ const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 16 * 1024 * 1024);
+const ARCHIVED_SESSION_RETENTION_DAYS = Number(process.env.ARCHIVED_SESSION_RETENTION_DAYS || 30);
+const ARCHIVED_SESSION_CLEANUP_INTERVAL_MS = Number(process.env.ARCHIVED_SESSION_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const IMAGE_TYPES: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/pjpeg': '.jpg', 'image/webp': '.webp' };
 const ARTIFACT_TYPES: Record<string, string> = { '.txt':'text/plain; charset=utf-8', '.log':'text/plain; charset=utf-8', '.json':'application/json; charset=utf-8', '.csv':'text/csv; charset=utf-8', '.patch':'text/plain; charset=utf-8', '.diff':'text/plain; charset=utf-8', '.zip':'application/zip', '.tar.gz':'application/gzip', '.conf':'application/x-wireguard-profile', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp' };
 const ARTIFACT_SKIP_DIRS = new Set(['.git','node_modules','dist','build','.next','.vite','coverage','vendor']);
@@ -74,10 +76,14 @@ await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN model_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN workspace_path TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN provider_session_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
+await runtimeDb.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
 await db.run("UPDATE sessions SET provider_id='codex' WHERE provider_id IS NULL OR provider_id=''").catch(()=>{});
 await db.run('UPDATE sessions SET provider_session_id=codex_thread_id WHERE provider_session_id IS NULL AND codex_thread_id IS NOT NULL').catch(()=>{});
 await db.run('UPDATE sessions SET workspace_path=project_dir WHERE workspace_path IS NULL').catch(()=>{});
 await db.run('UPDATE sessions SET model_id=model WHERE model_id IS NULL AND model IS NOT NULL').catch(()=>{});
+await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
+await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS agent_messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)').catch(()=>{});
@@ -102,6 +108,7 @@ app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   },
   runtime: await runtime.diagnostics().catch((e:any)=>({ error:e?.message || String(e) })),
 }));
+app.post('/api/maintenance/cleanup-archived', { preHandler: ensureAuth }, async () => cleanupArchivedSessions('manual'));
 app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const settings = await appSettings();
   const provider = normalizeProvider(req.query?.provider) || settings.activeProvider;
@@ -412,10 +419,39 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
   return { session: await indexedSession(read.thread), thread: read.thread, branch: await gitBranch(read.thread.cwd), interrupted: (row?.status === 'interrupted') };
 });
 app.patch('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); const provider = normalizeProvider(row?.provider_id) || 'codex'; const title = String(req.body?.title || '').trim(); const mode = normalizeMode(req.body?.mode); if (title) { if (provider === 'codex') { if (USE_AGENT_RUNTIME) await runtime.setSessionTitle(threadId, title).catch(()=>{}); else await codex.setName(threadId, title); } await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title, Date.now(), threadId]); } if (mode) { const fields = modeFields(mode); await db.run('UPDATE sessions SET permission_mode=?1, approval_policy=?2, sandbox_mode=?3, updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',[fields.permission_mode, fields.approval_policy, fields.sandbox_mode, Date.now(), threadId]); } if (Object.prototype.hasOwnProperty.call(req.body || {}, 'model')) { const model = provider === 'antigravity' ? cleanAgentModel(req.body?.model) : cleanModel(req.body?.model); await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model || null, Date.now(), threadId]); } return {ok:true}; });
-app.post('/api/sessions/:id/archive', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); if (!USE_AGENT_RUNTIME) await codex.archive(threadId).catch((e:any)=>app.log.warn({err:e.message}, 'official thread archive failed; archiving local index only')); await db.run('UPDATE sessions SET archived=1, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2',[Date.now(), threadId]); return {ok:true}; });
-app.post('/api/sessions/:id/unarchive', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); if (!USE_AGENT_RUNTIME) await codex.unarchive(threadId).catch((e:any)=>app.log.warn({err:e.message}, 'official thread unarchive failed; restoring local index only')); await db.run('UPDATE sessions SET archived=0, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2',[Date.now(), threadId]); return {ok:true}; });
+app.post('/api/sessions/:id/archive', { preHandler: ensureAuth }, async (req:any) => {
+  const row = await findSession(req.params.id);
+  const threadId = String(row?.codex_thread_id || req.params.id);
+  const now = Date.now();
+  if (!USE_AGENT_RUNTIME) await codex.archive(threadId).catch((e:any)=>app.log.warn({err:e.message}, 'official thread archive failed; archiving local index only'));
+  await db.run('UPDATE sessions SET archived=1, archived_at=?1, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2', [now, threadId]);
+  await runtimeDb.run('UPDATE sessions SET archived=1, archived_at=?1, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2 OR upstream_thread_id=?2', [now, threadId]).catch(()=>{});
+  return {ok:true};
+});
+app.post('/api/sessions/:id/unarchive', { preHandler: ensureAuth }, async (req:any) => {
+  const row = await findSession(req.params.id);
+  const threadId = String(row?.codex_thread_id || req.params.id);
+  const now = Date.now();
+  if (!USE_AGENT_RUNTIME) await codex.unarchive(threadId).catch((e:any)=>app.log.warn({err:e.message}, 'official thread unarchive failed; restoring local index only'));
+  await db.run('UPDATE sessions SET archived=0, archived_at=NULL, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2', [now, threadId]);
+  await runtimeDb.run('UPDATE sessions SET archived=0, archived_at=NULL, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2 OR upstream_thread_id=?2', [now, threadId]).catch(()=>{});
+  return {ok:true};
+});
 app.post('/api/sessions/:id/fork', { preHandler: ensureAuth }, async (req:any, reply) => { if (USE_AGENT_RUNTIME) return reply.code(409).send({error:'runtime 模式暂不支持 Fork，未创建重复会话'}); const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); const mode = sessionMode(row); const model = await effectiveModel(row); const forked = await codex.fork(threadId, row?.project_dir ? String(row.project_dir) : undefined, modeOptions(mode, model)); await upsertThread(forked.thread, { status:'idle', model, ...modeFields(mode) }); return sessionDto(forked.thread, { model, ...modeFields(mode) }); });
-app.delete('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => { const row = await findSession(req.params.id); if (!row) return reply.code(404).send({error:'not found'}); const threadId = String(row.codex_thread_id || row.id); let filePath:string|null = null; if (!USE_AGENT_RUNTIME) { try { const read = await codex.readThread(threadId, false); filePath = read.thread.path; await codex.archive(threadId).catch(()=>{}); } catch {} if (filePath) await deleteRollout(filePath); } await db.run('DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1',[threadId]); return {ok:true}; });
+app.delete('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const row = await findSession(req.params.id);
+  const runtimeRow = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1 OR upstream_thread_id=?1', [String(req.params.id)]).catch(()=>null);
+  if (!row && !runtimeRow) return reply.code(404).send({error:'not found'});
+  const ids = sessionIdentitySet(row, runtimeRow, String(req.params.id));
+  if (!USE_AGENT_RUNTIME) {
+    const threadId = String(row?.codex_thread_id || row?.id || req.params.id);
+    let filePath:string|null = null;
+    try { const read = await codex.readThread(threadId, false); filePath = read.thread.path; await codex.archive(threadId).catch(()=>{}); } catch {}
+    if (filePath) await deleteRollout(filePath);
+  }
+  const result = await hardDeleteSessionData(ids);
+  return {ok:true, deleted:result};
+});
 app.get('/api/sessions/:id/diff', { preHandler: ensureAuth }, async (req:any, reply) => { const row = await findSession(req.params.id); if (!row) return reply.code(404).send({error:'not found'}); return { diff: await gitDiff(String(row.project_dir)) }; });
 app.post('/api/sessions/:id/attachments', { preHandler: ensureAuth }, async (req:any, reply) => {
   const row = await findSession(req.params.id);
@@ -549,6 +585,8 @@ if (USE_AGENT_RUNTIME) await runtime.ensureDefaultCodexAccount().catch((e:any) =
 else await codex.ensure();
 const host = process.env.HOST || '127.0.0.1'; const port = Number(process.env.PORT || 3842);
 await app.listen({ host, port });
+setTimeout(() => cleanupArchivedSessions('startup').catch(e => app.log.error({ err:e }, 'archived session cleanup failed')), 30_000).unref();
+setInterval(() => cleanupArchivedSessions('scheduled').catch(e => app.log.error({ err:e }, 'archived session cleanup failed')), Math.max(60_000, ARCHIVED_SESSION_CLEANUP_INTERVAL_MS)).unref();
 process.on('SIGTERM', () => requestGracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => requestGracefulShutdown('SIGINT'));
 function activeAgentTurnCount() { return activeCodexSessions.size + activeAntigravityTurns.size; }
@@ -1471,6 +1509,104 @@ function approvalResponse(method:string, decision:'accept'|'decline' = 'accept')
   return { decision };
 }
 async function deleteRollout(filePath:string){ const sessionsRoot = realpathSync(path.join(codex.getCodexHome(),'sessions')); if (!existsSync(filePath)) return; const rp = realpathSync(filePath); if (rp === sessionsRoot || !rp.startsWith(sessionsRoot + path.sep)) throw new Error('refusing to delete outside Codex sessions'); await execFileAsync('rm', ['-f', rp]); }
+function sessionIdentitySet(...rows:any[]) {
+  const ids = new Set<string>();
+  for (const row of rows) {
+    if (!row) continue;
+    if (typeof row === 'string') ids.add(row);
+    for (const key of ['id','codex_thread_id','provider_session_id','upstream_thread_id']) {
+      const value = row?.[key];
+      if (value) ids.add(String(value));
+    }
+  }
+  return [...ids].filter(Boolean);
+}
+async function hardDeleteSessionData(ids:string[]) {
+  const unique = [...new Set(ids.filter(Boolean))];
+  const result = { ids:unique, webRows:0, runtimeRows:0, attachmentDirs:0, rolloutFiles:0 };
+  for (const id of unique) {
+    await db.run('DELETE FROM events WHERE session_id=?1', [id]).catch(()=>{});
+    await db.run('DELETE FROM artifacts WHERE session_id=?1', [id]).catch(()=>{});
+    await db.run('DELETE FROM agent_messages WHERE session_id=?1', [id]).catch(()=>{});
+    await runtimeDb.run('DELETE FROM events WHERE session_id=?1', [id]).catch(()=>{});
+    await runtimeDb.run('DELETE FROM artifacts WHERE session_id=?1', [id]).catch(()=>{});
+  }
+  for (const id of unique) {
+    result.webRows += await deleteSessionRows(db, id, false);
+    result.runtimeRows += await deleteSessionRows(runtimeDb, id, true);
+    try {
+      if (await deleteSessionAttachmentDir(id)) result.attachmentDirs++;
+    } catch (e:any) {
+      app.log.warn({ id, err:e?.message || String(e) }, 'failed to delete session attachment directory');
+    }
+    try {
+      result.rolloutFiles += await deleteSharedRolloutFiles(id);
+    } catch (e:any) {
+      app.log.warn({ id, err:e?.message || String(e) }, 'failed to delete shared rollout files');
+    }
+  }
+  return result;
+}
+async function deleteSessionRows(database:Db, id:string, includeUpstream:boolean) {
+  const before = await database.get('SELECT COUNT(*) AS count FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1' + (includeUpstream ? ' OR upstream_thread_id=?1' : ''), [id]).catch(()=>({count:0} as any));
+  await database.run('DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1' + (includeUpstream ? ' OR upstream_thread_id=?1' : ''), [id]).catch(()=>{});
+  return Number(before?.count || 0);
+}
+async function deleteSessionAttachmentDir(id:string) {
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(id)) return false;
+  const root = path.resolve(ATTACHMENTS_DIR);
+  const dir = path.resolve(root, id);
+  if (dir === root || !dir.startsWith(root + path.sep) || !existsSync(dir)) return false;
+  await rm(dir, { recursive:true, force:true });
+  return true;
+}
+async function deleteSharedRolloutFiles(id:string) {
+  if (!/^[A-Za-z0-9_-]{8,100}$/.test(id) || !existsSync(SHARED_SESSIONS_DIR)) return 0;
+  let deleted = 0;
+  const root = realpathSync(SHARED_SESSIONS_DIR);
+  async function walk(dir:string) {
+    let entries:any[] = [];
+    try { entries = await readdir(dir, { withFileTypes:true }); } catch { return; }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) { await walk(file); continue; }
+      if (!entry.isFile() || !entry.name.startsWith('rollout-') || !entry.name.endsWith('.jsonl') || !entry.name.includes(id)) continue;
+      const rp = realpathSync(file);
+      if (rp.startsWith(root + path.sep)) {
+        await rm(rp, { force:true });
+        deleted++;
+      }
+    }
+  }
+  await walk(root);
+  return deleted;
+}
+async function cleanupArchivedSessions(reason = 'scheduled') {
+  if (!Number.isFinite(ARCHIVED_SESSION_RETENTION_DAYS) || ARCHIVED_SESSION_RETENTION_DAYS <= 0) return { disabled:true };
+  const cutoff = Date.now() - ARCHIVED_SESSION_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const webRows = await db.all(
+    "SELECT * FROM sessions WHERE archived=1 AND COALESCE(archived_at,updated_at,created_at)<?1 AND status NOT IN ('running','inProgress') LIMIT 50",
+    [cutoff]
+  ).catch(()=>[]);
+  const runtimeRows = await runtimeDb.all(
+    "SELECT * FROM sessions WHERE archived=1 AND COALESCE(archived_at,updated_at,created_at)<?1 AND status NOT IN ('running','inProgress') AND active_turn_id IS NULL LIMIT 50",
+    [cutoff]
+  ).catch(()=>[]);
+  const byId = new Map<string, any[]>();
+  for (const row of [...webRows, ...runtimeRows]) {
+    const key = String(row.id || row.codex_thread_id || row.upstream_thread_id || '');
+    if (!key) continue;
+    byId.set(key, [...(byId.get(key) || []), row]);
+  }
+  const deleted:any[] = [];
+  for (const rows of byId.values()) {
+    const ids = sessionIdentitySet(...rows);
+    if (!ids.length) continue;
+    deleted.push(await hardDeleteSessionData(ids));
+  }
+  if (deleted.length) app.log.info({ reason, retentionDays:ARCHIVED_SESSION_RETENTION_DAYS, sessions:deleted.length, deleted }, 'archived session cleanup completed');
+  return { retentionDays:ARCHIVED_SESSION_RETENTION_DAYS, sessions:deleted.length, deleted };
+}
 async function buildTurnInput(threadId:string, text:string, attachments:any[]){
   const input:any[] = [];
   if (text.trim()) input.push({ type:'text', text, text_elements: [] });
