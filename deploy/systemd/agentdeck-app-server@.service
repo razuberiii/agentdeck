@@ -7,16 +7,16 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/stacks/codex-mobile
+WorkingDirectory=/opt/stacks/agentdeck
 Environment=HOME=/home/ubuntu
-EnvironmentFile=/opt/data/codex-mobile/codex-app-server-%i.env
+EnvironmentFile=/opt/data/agentdeck/agentdeck-app-server-%i.env
 ExecStart=/usr/local/bin/codex app-server --listen ${CODEX_APP_SERVER_LISTEN} -c approval_policy=\"never\" -c sandbox_mode=\"danger-full-access\"
 Restart=always
 RestartSec=2
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/data/codex-mobile /opt/stacks/codex-mobile /home/ubuntu /tmp /run
+ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /home/ubuntu /tmp /run
 
 [Install]
 WantedBy=multi-user.target

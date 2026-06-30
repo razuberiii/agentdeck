@@ -1,5 +1,5 @@
 {
-  "name": "agent-deck",
+  "name": "agentdeck",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -8,9 +8,9 @@
     "build:server": "tsc -p server/tsconfig.json",
     "build:client": "vite build --config client/vite.config.ts",
     "start": "node server/dist/index.js",
-    "runtime": "node server/dist/agent-runtime.js",
+    "runtime": "node server/dist/agentdeck-runtime.js",
     "dev": "tsx server/src/index.ts",
-    "dev:runtime": "tsx server/src/agent-runtime.ts"
+    "dev:runtime": "tsx server/src/agentdeck-runtime.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^9.4.0",

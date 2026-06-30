@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const runtime = process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852';
-const cwd = process.env.E2E_CWD || '/opt/stacks/codex-mobile';
+const cwd = process.env.E2E_CWD || '/opt/stacks/agentdeck';
 
 function request(method, path, body) {
   const url = new URL(path, runtime);
@@ -74,7 +74,7 @@ function sequenceContinuous(items) {
 const result = { startedAt:new Date().toISOString(), checks:[] };
 await request('POST', '/codex/accounts/default');
 const appPid0 = await pgrep('codex app-server --listen ws://127.0.0.1:4668');
-const runtimePid0 = await pgrep('node .*agent-runtime.js');
+const runtimePid0 = await pgrep('node .*agentdeck-runtime.js');
 result.appPid0 = appPid0;
 result.runtimePid0 = runtimePid0;
 assert(appPid0, 'missing app-server pid before e2e');
@@ -95,21 +95,21 @@ result.turnId = turnId;
 assert(turnId, 'missing turn id');
 await sleep(8000);
 
-await systemctl('restart', 'codex-mobile-web.service');
+await systemctl('restart', 'agentdeck-web.service');
 await sleep(4000);
 const appPidAfterWeb = await pgrep('codex app-server --listen ws://127.0.0.1:4668');
-const runtimePidAfterWeb = await pgrep('node .*agent-runtime.js');
+const runtimePidAfterWeb = await pgrep('node .*agentdeck-runtime.js');
 result.appPidAfterWeb = appPidAfterWeb;
 result.runtimePidAfterWeb = runtimePidAfterWeb;
 assert(appPidAfterWeb === appPid0, 'web restart changed app-server pid');
 assert(runtimePidAfterWeb === runtimePid0, 'web restart changed runtime pid');
 result.checks.push('web_restart_preserved_pids');
 
-await systemctl('restart', 'agent-runtime.service');
+await systemctl('restart', 'agentdeck-runtime.service');
 await sleep(5000);
 await request('POST', '/codex/accounts/default');
 const appPidAfterRuntime = await pgrep('codex app-server --listen ws://127.0.0.1:4668');
-const runtimePidAfterRuntime = await pgrep('node .*agent-runtime.js');
+const runtimePidAfterRuntime = await pgrep('node .*agentdeck-runtime.js');
 result.appPidAfterRuntime = appPidAfterRuntime;
 result.runtimePidAfterRuntime = runtimePidAfterRuntime;
 assert(appPidAfterRuntime === appPid0, 'runtime restart changed app-server pid');
@@ -143,7 +143,7 @@ const stopped = await request('GET', `/sessions/${stopSession.session.id}`);
 result.stopStatus = stopped.session.status;
 result.checks.push('stop_idempotent');
 
-await systemctl('restart', 'codex-app-server@default.service');
+await systemctl('restart', 'agentdeck-app-server@default.service');
 await sleep(5000);
 const appPidAfterAppRestart = await pgrep('codex app-server --listen ws://127.0.0.1:4668');
 result.appPidAfterAppRestart = appPidAfterAppRestart;

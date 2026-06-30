@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=${ROOT:-/opt/stacks/codex-mobile}
-DATA_DIR=${DATA_DIR:-/opt/data/codex-mobile}
+ROOT=${ROOT:-/opt/stacks/agentdeck}
+DATA_DIR=${DATA_DIR:-/opt/data/agentdeck}
 LOG=${LOG:-$ROOT/.tools/install-units.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
 exec >>"$LOG" 2>&1
@@ -25,9 +25,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sudo install -m 0644 "$ROOT/deploy/systemd/codex-mobile-web.service" /etc/systemd/system/codex-mobile-web.service
-sudo install -m 0644 "$ROOT/deploy/systemd/agent-runtime.service" /etc/systemd/system/agent-runtime.service
-sudo install -m 0644 "$ROOT/deploy/systemd/codex-app-server@.service" /etc/systemd/system/codex-app-server@.service
+sudo install -m 0644 "$ROOT/deploy/systemd/agentdeck-web.service" /etc/systemd/system/agentdeck-web.service
+sudo install -m 0644 "$ROOT/deploy/systemd/agentdeck-runtime.service" /etc/systemd/system/agentdeck-runtime.service
+sudo install -m 0644 "$ROOT/deploy/systemd/agentdeck-app-server@.service" /etc/systemd/system/agentdeck-app-server@.service
 
 if [ ! -f "$DATA_DIR/web.env" ]; then
   if [ -f "$DATA_DIR/.env" ]; then
@@ -41,13 +41,13 @@ if [ ! -f "$DATA_DIR/runtime.env" ]; then
   sudo install -m 0600 "$ROOT/deploy/systemd/env/runtime.env.example" "$DATA_DIR/runtime.env"
 fi
 
-if [ ! -f "$DATA_DIR/codex-app-server-default.env" ]; then
+if [ ! -f "$DATA_DIR/agentdeck-app-server-default.env" ]; then
   {
     echo "HOME=/home/ubuntu"
     echo "CODEX_HOME=${CODEX_HOME:-/home/ubuntu/.codex}"
     echo "CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668"
-  } | sudo tee "$DATA_DIR/codex-app-server-default.env" >/dev/null
-  sudo chmod 0600 "$DATA_DIR/codex-app-server-default.env"
+  } | sudo tee "$DATA_DIR/agentdeck-app-server-default.env" >/dev/null
+  sudo chmod 0600 "$DATA_DIR/agentdeck-app-server-default.env"
 fi
 
 sudo systemctl daemon-reload

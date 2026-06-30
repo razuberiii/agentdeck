@@ -1,7 +1,7 @@
 {
   "name": "Agent Deck",
   "short_name": "Agent Deck",
-  "id": "/?app=codex-mobile-v21",
+  "id": "/?app=agentdeck-v21",
   "start_url": "/?v=21",
   "scope": "/",
   "display": "standalone",
@@ -9,25 +9,25 @@
   "theme_color": "#080d10",
   "icons": [
     {
-      "src": "/icons/codex-mobile-v4-192.png",
+      "src": "/icons/agentdeck-v4-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/icons/codex-mobile-v4-512.png",
+      "src": "/icons/agentdeck-v4-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/icons/codex-mobile-v4-maskable-192.png",
+      "src": "/icons/agentdeck-v4-maskable-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "maskable"
     },
     {
-      "src": "/icons/codex-mobile-v4-maskable-512.png",
+      "src": "/icons/agentdeck-v4-maskable-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

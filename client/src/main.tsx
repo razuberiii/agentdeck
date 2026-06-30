@@ -13,7 +13,7 @@ type DisplayEvent = { key:string; role:'user'|'assistant'|'system'|'command'|'fi
 type Toast = { id:string; kind:'success'|'error'|'info'; text:string };
 type ApprovalRequest = { requestId:string; method:string; params:any };
 
-const FALLBACK_WORKSPACE = '/opt/stacks/codex-mobile';
+const FALLBACK_WORKSPACE = '/opt/stacks/agentdeck';
 const APP_NAME = 'Agent Deck';
 const CHUNK_SIZE = 24 * 1024;
 const PUBLIC_UPLOAD_TARGET_BYTES = 650 * 1024;
@@ -22,7 +22,7 @@ const ToastContext = createContext<(kind:Toast['kind'], text:string)=>void>(()=>
 
 function getCookie(n:string){ return document.cookie.split('; ').find(x=>x.startsWith(n+'='))?.split('=')[1] || ''; }
 async function api(url:string, opts:any = {}) {
-  const csrf = getCookie('codex_mobile_csrf');
+  const csrf = getCookie('agentdeck_csrf');
   const headers:any = {'x-csrf-token': csrf, ...(opts.headers || {})};
   if (opts.body !== undefined && !headers['content-type']) headers['content-type'] = 'application/json';
   const r = await fetch(url, {...opts, headers, credentials:'same-origin'});
@@ -602,9 +602,9 @@ function EmptyState({title,detail}:{title:string;detail:string}){ return <div cl
 function LoadingRows({count=4}:{count?:number}){ return <div className="loadingRows" aria-label="正在加载">{Array.from({length:count}).map((_,i)=><div className="skeletonRow" key={i}><i/><span/><small/></div>)}</div>; }
 function ErrorState({title,detail,action,onAction}:{title:string;detail:string;action:string;onAction:()=>void}){ return <div className="errorState"><b>{title}</b><span>{detail}</span><button onClick={onAction}>{action}</button></div>; }
 function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <div className={`notice ${tone}`}>{text}</div>; }
-function draftKey(id:string){ return `codex-mobile:draft:${id}`; }
-function draftAttachmentsKey(id:string){ return `codex-mobile:draftAttachments:${id}`; }
-function sequenceKey(id:string){ return `codex-mobile:lastSequence:${id}`; }
+function draftKey(id:string){ return `agentdeck:draft:${id}`; }
+function draftAttachmentsKey(id:string){ return `agentdeck:draftAttachments:${id}`; }
+function sequenceKey(id:string){ return `agentdeck:lastSequence:${id}`; }
 function loadDraftAttachments(id:string):Attachment[]{
   try {
     const items = JSON.parse(localStorage.getItem(draftAttachmentsKey(id)) || '[]');

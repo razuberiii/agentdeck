@@ -20,7 +20,7 @@ import { RuntimeClient } from './runtime-client.js';
 import { AntigravityProvider, type AgentProviderId } from './providers.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 const execFileAsync = promisify(execFile);
-const DATA_DIR = process.env.DATA_DIR || '/opt/data/codex-mobile';
+const DATA_DIR = process.env.DATA_DIR || '/opt/data/agentdeck';
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || '/home/ubuntu/.codex';
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const ANTIGRAVITY_PROFILES_DIR = path.join(DATA_DIR, 'antigravity-profiles');
@@ -36,11 +36,11 @@ const ARTIFACT_TYPES: Record<string, string> = { '.txt':'text/plain; charset=utf
 const ARTIFACT_SKIP_DIRS = new Set(['.git','node_modules','dist','build','.next','.vite','coverage','vendor']);
 const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
 const artifactScanStarts = new Map<string, number>();
-const COOKIE_NAME = 'codex_mobile_session';
-const CSRF_COOKIE = 'codex_mobile_csrf';
+const COOKIE_NAME = 'agentdeck_session';
+const CSRF_COOKIE = 'agentdeck_csrf';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://codex.rubusoo.com,http://codex.rubusoo.com,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
-const db = new Db(path.join(DATA_DIR, 'codex-mobile.sqlite3'));
-const runtimeDb = new Db(process.env.RUNTIME_DB || path.join(DATA_DIR, 'agent-runtime.sqlite3'));
+const db = new Db(path.join(DATA_DIR, 'agentdeck.sqlite3'));
+const runtimeDb = new Db(process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime.sqlite3'));
 const codex = new CodexBridge('/home/ubuntu', DEFAULT_CODEX_HOME);
 const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
@@ -60,7 +60,7 @@ type AntigravityLoginJob = LoginJob & { providerId:'antigravity'; authCodePrompt
 const antigravityLoginJobs = new Map<string, AntigravityLoginJob>();
 const antigravityLoginChildren = new Map<string, any>();
 const roots = await existingRoots((process.env.ALLOWED_WORKSPACES || '/opt/stacks,/opt/projects,/home/ubuntu,/opt/data,/etc/nginx,/etc/systemd/system').split(',').map(s=>s.trim()).filter(Boolean));
-const DEFAULT_WORKSPACE_DIR = roots.find(r => r === '/opt/stacks/codex-mobile' || r.endsWith('/codex-mobile')) || roots[0];
+const DEFAULT_WORKSPACE_DIR = roots.find(r => r === '/opt/stacks/agentdeck' || r.endsWith('/agentdeck')) || roots[0];
 const PROJECTS_CACHE_MS = Number(process.env.PROJECTS_CACHE_MS || 30_000);
 const CODEX_STATUS_CACHE_MS = Number(process.env.CODEX_STATUS_CACHE_MS || 60_000);
 let projectsCache: { expiresAt:number; promise?:Promise<any[]>; value?:any[] } = { expiresAt: 0 };
@@ -728,7 +728,7 @@ async function activateProfile(id:string) {
   await db.run('UPDATE codex_profiles SET active=1, updated_at=?1 WHERE id=?2', [Date.now(), id]);
 }
 async function syncDefaultCodexAppServerEnv(codexHome:string) {
-  const file = path.join(DATA_DIR, 'codex-app-server-default.env');
+  const file = path.join(DATA_DIR, 'agentdeck-app-server-default.env');
   const body = [
     'HOME=/home/ubuntu',
     `CODEX_HOME=${codexHome}`,
@@ -1643,8 +1643,8 @@ function decorateThreadImages(thread:any, threadId:string, projectDir:string){
 }
 function imageUrl(threadId:string, filePath:string){ return `/api/sessions/${encodeURIComponent(threadId)}/image-file/${encodeURIComponent(signPathToken(filePath))}`; }
 function attachmentUrlFromPath(threadId:string, filePath:string){ try { const root = realpathSync(path.join(ATTACHMENTS_DIR, threadId)); const rp = realpathSync(filePath); if (!rp.startsWith(root + path.sep)) return null; const id = path.basename(rp).replace(/\.[^.]+$/, ''); return `/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(id)}`; } catch { return null; } }
-function signPathToken(filePath:string){ const payload = Buffer.from(filePath).toString('base64url'); const sig = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'codex-mobile').update(payload).digest('base64url'); return `${payload}~${sig}`; }
-function verifyPathToken(token:string){ const [payload, sig] = token.includes('~') ? token.split('~') : token.split('.'); if (!payload || !sig) return null; const expected = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'codex-mobile').update(payload).digest('base64url'); if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; return Buffer.from(payload, 'base64url').toString(); }
+function signPathToken(filePath:string){ const payload = Buffer.from(filePath).toString('base64url'); const sig = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); return `${payload}~${sig}`; }
+function verifyPathToken(token:string){ const [payload, sig] = token.includes('~') ? token.split('~') : token.split('.'); if (!payload || !sig) return null; const expected = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; return Buffer.from(payload, 'base64url').toString(); }
 function imageFileAllowed(filePath:string, projectDir:string, threadId:string){
   try {
     if (!mimeFromPath(filePath) || !existsSync(filePath)) return false;

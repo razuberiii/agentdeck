@@ -13,8 +13,8 @@ import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
 
 const execFileAsync = promisify(execFile);
-const DATA_DIR = process.env.RUNTIME_DATA_DIR || process.env.DATA_DIR || '/opt/data/codex-mobile';
-const DB_FILE = process.env.RUNTIME_DB || path.join(DATA_DIR, 'agent-runtime.sqlite3');
+const DATA_DIR = process.env.RUNTIME_DATA_DIR || process.env.DATA_DIR || '/opt/data/agentdeck';
+const DB_FILE = process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime.sqlite3');
 const HOST = process.env.RUNTIME_HOST || '127.0.0.1';
 const PORT = Number(process.env.RUNTIME_PORT || 3852);
 const CODEX_PORT_BASE = Number(process.env.CODEX_APP_SERVER_PORT_BASE || 4520);
@@ -22,7 +22,7 @@ const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAUL
 const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || '/home/ubuntu/.codex';
 const DEFAULT_HOME = process.env.HOME || '/home/ubuntu';
-const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || '/opt/stacks/codex-mobile';
+const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || '/opt/stacks/agentdeck';
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
@@ -113,7 +113,7 @@ class CodexAccountRuntime extends EventEmitter {
     client.on('error', err => this.emit('error', err));
     await client.connect();
     const init = await client.request('initialize', {
-      clientInfo: { name:'agent-runtime', title:'Agent Runtime', version:'1.0.0' },
+      clientInfo: { name:'agentdeck-runtime', title:'Agent Runtime', version:'1.0.0' },
       capabilities: { experimentalApi:true, requestAttestation:false },
     }, 30_000);
     client.notify('initialized');
@@ -481,7 +481,7 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
 });
 
 await app.listen({ host:HOST, port:PORT });
-app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID }, 'agent-runtime listening');
+app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID }, 'agentdeck-runtime listening');
 if (process.env.SKIP_RUNTIME_BOOTSTRAP !== '1') {
   setTimeout(() => bootstrapRuntimeRecovery().catch(e => app.log.error({ err:e }, 'runtime bootstrap recovery failed')), 50);
 }
@@ -1013,7 +1013,7 @@ async function ensureCodexHomeSharedDirs(codexHome:string) {
   await mkdir(codexHome, { recursive:true });
   const resolvedHome = realpathSync(codexHome);
   const resolvedData = realpathSync(DATA_DIR);
-  if (resolvedData !== '/opt/data/codex-mobile' && !resolvedHome.startsWith(resolvedData + path.sep)) {
+  if (resolvedData !== '/opt/data/agentdeck' && !resolvedHome.startsWith(resolvedData + path.sep)) {
     app.log.warn({ codexHome, dataDir:DATA_DIR }, 'skipping shared codex dir repair outside test data dir');
     return;
   }
@@ -1193,8 +1193,8 @@ function portForAccount(accountId:string) {
   return CODEX_PORT_BASE + (hash.readUInt16BE(0) % 200);
 }
 
-function runtimeInstanceId(accountId:string) { return `codex-${safeUnitPart(accountId)}`; }
-function systemdUnitName(accountId:string) { return accountId === 'default' ? 'codex-app-server@default.service' : `codex-app-server-${safeUnitPart(accountId)}.service`; }
+function runtimeInstanceId(accountId:string) { return `agentdeck-${safeUnitPart(accountId)}`; }
+function systemdUnitName(accountId:string) { return accountId === 'default' ? 'agentdeck-app-server@default.service' : `agentdeck-app-server-${safeUnitPart(accountId)}.service`; }
 function safeUnitPart(value:string) { return value.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 64) || 'default'; }
 function sleep(ms:number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 

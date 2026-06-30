@@ -7,20 +7,20 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/stacks/codex-mobile
+WorkingDirectory=/opt/stacks/agentdeck
 Environment=HOME=/home/ubuntu
-Environment=DATA_DIR=/opt/data/codex-mobile
+Environment=DATA_DIR=/opt/data/agentdeck
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852
 Environment=CODEX_APP_SERVER_PORT_BASE=4620
-EnvironmentFile=/opt/data/codex-mobile/runtime.env
-ExecStart=/usr/bin/node /opt/stacks/codex-mobile/server/dist/agent-runtime.js
+EnvironmentFile=/opt/data/agentdeck/runtime.env
+ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/agentdeck-runtime.js
 Restart=always
 RestartSec=3
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/data/codex-mobile /opt/stacks/codex-mobile /home/ubuntu /tmp /run
+ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /home/ubuntu /tmp /run
 
 [Install]
 WantedBy=multi-user.target

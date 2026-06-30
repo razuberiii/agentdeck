@@ -27,21 +27,21 @@ Agent Deck is a phone-friendly web app for using local agent CLIs from a browser
 - Node.js 20 or newer.
 - SQLite available on the host.
 - OpenAI Codex CLI installed as `codex`.
-- A writable runtime data directory. The default is `/opt/data/codex-mobile`.
+- A writable runtime data directory. The default is `/opt/data/agentdeck`.
 
 ## Configuration
 
 The app reads configuration from environment variables. The current systemd deployment also loads:
 
 ```text
-/opt/data/codex-mobile/.env
+/opt/data/agentdeck/.env
 ```
 
 Common settings:
 
 - `ADMIN_PASSWORD` - initial admin password, required before the first login.
 - `COOKIE_SECRET` - stable secret used to sign cookies.
-- `DATA_DIR` - runtime data directory. Defaults to `/opt/data/codex-mobile`.
+- `DATA_DIR` - runtime data directory. Defaults to `/opt/data/agentdeck`.
 - `CODEX_HOME` - initial Codex home. Defaults to `/home/ubuntu/.codex`.
 - `HOST` - bind address. Defaults to `127.0.0.1`.
 - `PORT` - bind port. Defaults to `3842`.
@@ -76,25 +76,27 @@ npm start
 
 ## Deployment
 
-This repository is deployed as a systemd service on the current host:
+This repository is deployed as three systemd services on the current host:
 
 ```bash
-sudo systemctl restart codex-mobile.service
-sudo systemctl status codex-mobile.service
+sudo systemctl restart agentdeck-app-server@default.service
+sudo systemctl restart agentdeck-runtime.service
+sudo systemctl restart agentdeck-web.service
+sudo systemctl status agentdeck-app-server@default.service agentdeck-runtime.service agentdeck-web.service
 ```
 
 After changing frontend or server code, rebuild and restart:
 
 ```bash
 npm run build
-sudo systemctl restart codex-mobile.service
+sudo systemctl restart agentdeck-runtime.service agentdeck-web.service
 ```
 
 ## Runtime Data
 
 Runtime state lives outside the repository so the app can be updated without moving user data:
 
-- SQLite database: `/opt/data/codex-mobile/codex-mobile.sqlite3`
-- Codex profiles: `/opt/data/codex-mobile/profiles/`
-- Shared Codex sessions: `/opt/data/codex-mobile/shared/sessions`
-- Attachments: `/opt/data/codex-mobile/attachments/`
+- SQLite database: `/opt/data/agentdeck/agentdeck.sqlite3`
+- Codex profiles: `/opt/data/agentdeck/profiles/`
+- Shared Codex sessions: `/opt/data/agentdeck/shared/sessions`
+- Attachments: `/opt/data/agentdeck/attachments/`
