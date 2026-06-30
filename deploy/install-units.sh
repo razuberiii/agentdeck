@@ -12,7 +12,7 @@ before=$(findmnt -T /etc -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION -n || true)
 echo "before: $before"
 
 remounted=0
-if findmnt -T /etc -n -o OPTIONS | grep -qw ro; then
+if findmnt -T /etc -n -o OPTIONS | tr ',' '\n' | grep -qx ro; then
   sudo mount -o remount,bind,rw /etc || sudo mount -o remount,rw /etc
   remounted=1
 fi
