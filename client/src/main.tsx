@@ -2,9 +2,10 @@ import React, { createContext, useContext, useEffect, useMemo, useRef, useState 
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
-type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultModel?:string; codex:any; capabilities:Capabilities; activeProfile?:any };
+type ProviderStatus = { id:'codex'|'antigravity'; displayName:string; ok:boolean; installed:boolean; version?:string|null; error?:string|null; installHint?:string };
+type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:'codex'|'antigravity'; codex:any; antigravity?:ProviderStatus; providers?:ProviderStatus[]; capabilities:Capabilities; activeProfile?:any };
 type Capabilities = { imageInput:boolean; imageOutput:boolean; attachmentTypes:string[]; maxAttachmentBytes:number };
-type Session = { id:string; codex_thread_id:string; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number };
+type Session = { id:string; codex_thread_id:string; provider_id?:'codex'|'antigravity'; providerId?:'codex'|'antigravity'; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number; last_sequence?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
 type ModelOption = { id:string; model:string; actualModel?:string; displayName:string; description?:string; hidden?:boolean; isDefault?:boolean; inputModalities?:string[]; upgrade?:string|null };
 type Attachment = { id:string; name:string; type:string; size:number; url:string; previewUrl?:string; uploading?:boolean; error?:string };
@@ -12,7 +13,8 @@ type DisplayEvent = { key:string; role:'user'|'assistant'|'system'|'command'|'fi
 type Toast = { id:string; kind:'success'|'error'|'info'; text:string };
 type ApprovalRequest = { requestId:string; method:string; params:any };
 
-const DEFAULT_WORKSPACE = '/opt/projects/default-workspace';
+const FALLBACK_WORKSPACE = '/opt/stacks/codex-mobile';
+const APP_NAME = 'Agent Deck';
 const CHUNK_SIZE = 24 * 1024;
 const PUBLIC_UPLOAD_TARGET_BYTES = 650 * 1024;
 const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
@@ -28,7 +30,8 @@ async function api(url:string, opts:any = {}) {
   return r.json();
 }
 function haptic(){ navigator.vibrate?.(10); }
-function statusLabel(s?:string){ return ({idle:'空闲',running:'执行中',active:'执行中',interrupted:'已停止',notLoaded:'可继续'} as any)[s||''] || s || '空闲'; }
+function statusLabel(s?:string){ return ({idle:'空闲',running:'执行中',completed:'已完成',active:'空闲',interrupted:'已中断',unknown:'未知',notLoaded:'可继续'} as any)[s||''] || s || '空闲'; }
+function connectionLabel(s?:string){ return ({connected:'已连接',reconnecting:'重连中',offline:'离线',recovering:'恢复中',unavailable:'不可用'} as any)[s||''] || s || '未知'; }
 function formatTime(ms?:number){ if(!ms) return '未知时间'; return new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(ms)); }
 function formatSize(bytes:number){ if(bytes<1024) return `${bytes} B`; if(bytes<1024*1024) return `${(bytes/1024).toFixed(1)} KB`; return `${(bytes/1024/1024).toFixed(2)} MB`; }
 function projectName(path:string){ return path.split('/').filter(Boolean).pop() || path; }
@@ -36,6 +39,8 @@ function shortError(e:any){ try { const parsed = JSON.parse(String(e.message)); 
 function isMobileInput(){ return matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent); }
 function modeLabel(mode?:string){ if(mode==='read-only')return 'Read Only'; if(mode==='workspace-write')return 'Workspace Write'; return 'YOLO'; }
 function profileLabel(profile:any){ return profile?.login?.email || profile?.name || 'Codex Account'; }
+function providerLabel(id?:string){ return id==='antigravity' ? 'Antigravity' : 'Codex'; }
+function sessionProvider(session:Session){ return session.provider_id || session.providerId || 'codex'; }
 
 function ToastProvider({children}:{children:React.ReactNode}){
   const [toasts,setToasts]=useState<Toast[]>([]);
@@ -54,7 +59,7 @@ function App(){
   const [view,setView]=useState(location.hash || '#/');
   useEffect(()=>{const f=()=>setView(location.hash||'#/'); addEventListener('hashchange',f); return()=>removeEventListener('hashchange',f)},[]);
   useEffect(()=>{api('/api/status').then(s=>setAuthed(s.authed)).catch(()=>setAuthed(false)).finally(()=>setChecked(true))},[]);
-  if(!checked) return <main className="boot">Codex Mobile</main>;
+  if(!checked) return <main className="boot">{APP_NAME}</main>;
   if(!authed) return <Login onLogin={()=>setAuthed(true)}/>;
   const m=view.match(/^#\/s\/([^/]+)/);
   return m ? <SessionView id={m[1]}/> : <Home/>;
@@ -63,7 +68,7 @@ function App(){
 function Login({onLogin}:{onLogin:()=>void}){
   const toast=useToast(); const [password,setPassword]=useState(''); const [busy,setBusy]=useState(false);
   async function submit(e:any){ e.preventDefault(); setBusy(true); try{ await api('/api/login',{method:'POST',body:JSON.stringify({username:'admin',password})}); haptic(); onLogin(); } catch { toast('error','登录失败'); } finally { setBusy(false); } }
-  return <main className="login"><form onSubmit={submit} className="loginPanel"><div className="mark">CM</div><h1>Codex Mobile</h1><input autoFocus type="password" placeholder="管理员密码" value={password} onChange={e=>setPassword(e.target.value)}/><button className="btn primary" disabled={busy}>{busy?'登录中':'登录'}</button></form></main>;
+  return <main className="login"><form onSubmit={submit} className="loginPanel"><div className="mark">AD</div><h1>{APP_NAME}</h1><input autoFocus type="password" placeholder="管理员密码" value={password} onChange={e=>setPassword(e.target.value)}/><button className="btn primary" disabled={busy}>{busy?'登录中':'登录'}</button></form></main>;
 }
 
 function Home(){
@@ -76,24 +81,27 @@ function Home(){
   async function refresh(scanProjects=false){ setLoading(true); setError(''); try{ const [st,ss,ps]=await Promise.all([api('/api/status'),api('/api/sessions'+(archived?'?archived=1':'')),scanProjects?api('/api/projects?refresh=1'):Promise.resolve(null)]); setStatus(st); setSessions(ss.sessions); if(ps) setProjects(ps.projects); } catch(e:any){ setError(shortError(e)); toast('error','刷新失败'); } finally { setLoading(false); } }
   async function loadProjects(force=true){ setProjectsLoading(true); try{ const ps=await api('/api/projects'+(force?'?refresh=1':'')); setProjects(ps.projects); } catch(e:any){ toast('error','项目扫描失败：'+shortError(e)); } finally{ setProjectsLoading(false); } }
   async function openProjectPicker(){ setPicker(true); await loadProjects(true); }
-  async function newSession(projectDir:string,title?:string){ setBusy(projectDir); try{ const s=await api('/api/sessions',{method:'POST',body:JSON.stringify({projectDir,title:title||projectName(projectDir),mode:status?.defaultMode})}); haptic(); location.hash='#/s/'+s.id; } catch(e:any){ toast('error','创建失败：'+shortError(e)); } finally{ setBusy(''); } }
-  async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota')); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
-  async function showSettings(){ setSettingsOpen(true); try{ setSettings(await api('/api/settings')); } catch(e:any){ toast('error','设置读取失败：'+shortError(e)); } }
-  const filtered=sessions.filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
+  const defaultWorkspace = status?.defaultWorkspace || status?.roots?.[0] || FALLBACK_WORKSPACE;
+  async function newSession(projectDir:string,title?:string){ setBusy(projectDir); try{ const s=await api('/api/sessions',{method:'POST',body:JSON.stringify({projectDir,title:title||projectName(projectDir),mode:status?.defaultMode,providerId:status?.activeProvider||'codex'})}); haptic(); location.hash='#/s/'+s.id; } catch(e:any){ toast('error','创建失败：'+shortError(e)); } finally{ setBusy(''); } }
+  async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
+  async function showSettings(){ try{ setSettings(await api('/api/settings')); setSettingsOpen(true); } catch(e:any){ toast('error','设置读取失败：'+shortError(e)); } }
+  const activeProvider=status?.activeProvider || 'codex';
+  const activeProviderStatus = activeProvider === 'antigravity' ? status?.antigravity : status?.codex;
+  const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell">
     <header className="homeTop">
-      <div><strong>Codex Mobile</strong><span>{online?'网络在线':'网络离线'} · {status?.mode || 'Full Access'} · {profileLabel(status?.activeProfile)}</span></div>
+      <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(status?.activeProvider)} · {status?.mode || 'Full Access'} · {profileLabel(status?.activeProfile)}</span></div>
       <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={showSettings}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" onClick={()=>refresh(true)}>↻</button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="statusStrip">
       <div><span>服务器</span><b>{error?'异常':'在线'}</b></div>
-      <div><span>Codex</span><b>{status?.codex?.ok ? status.codex.version : '不可用'}</b></div>
+      <div><span>{providerLabel(activeProvider)}</span><b>{activeProviderStatus?.ok ? activeProviderStatus.version : (activeProviderStatus?.error || '不可用')}</b></div>
       <div><span>模式</span><b>{modeLabel(status?.defaultMode)}</b></div>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
     <section className="quickStart">
-      <button className="taskButton" disabled={!!busy} onClick={()=>newSession(DEFAULT_WORKSPACE,'Default Workspace')}><span>新建任务</span><b>{busy===DEFAULT_WORKSPACE?'创建中':'默认工作区'}</b></button>
+      <button className="taskButton" disabled={!!busy} onClick={()=>newSession(defaultWorkspace,'Default Workspace')}><span>新建任务</span><b>{busy===defaultWorkspace?'创建中':'默认工作区'}</b></button>
       <button className="taskButton secondary" onClick={openProjectPicker}><span>选择项目</span><b>{projectsLoading?'扫描中':projects.length ? `${projects.length} 个可用` : '点击扫描'}</b></button>
     </section>
     <section className="sessionTools">
@@ -114,7 +122,7 @@ function Home(){
 function SessionRow({session,onArchive}:{session:Session;onArchive:()=>void}){
   return <article className="sessionRow">
     <button className="sessionMain" onClick={()=>location.hash='#/s/'+session.id}>
-      <b>{session.title}</b><span>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
+      <b>{session.title}</b><span><i className="providerBadge">{providerLabel(sessionProvider(session))}</i>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
     </button>
     <button className="thinBtn" onClick={onArchive}>{session.archived?'恢复':'归档'}</button>
   </article>;
@@ -129,18 +137,22 @@ function SessionView({id}:{id:string}){
   const [session,setSession]=useState<Session|null>(null); const [events,setEvents]=useState<DisplayEvent[]>([]); const [live,setLive]=useState<any[]>([]);
   const [loading,setLoading]=useState(true);
   const [text,setText]=useState(''); const [attachments,setAttachments]=useState<Attachment[]>([]); const [status,setStatus]=useState<Status|null>(null);
-  const [busy,setBusy]=useState(''); const [online,setOnline]=useState(navigator.onLine); const [connected,setConnected]=useState(false); const [diff,setDiff]=useState(''); const [menu,setMenu]=useState(false); const [modelOpen,setModelOpen]=useState(false); const [models,setModels]=useState<any>(null); const [confirmDelete,setConfirmDelete]=useState(false); const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [viewer,setViewer]=useState<Attachment|null>(null); const [showBottom,setShowBottom]=useState(false); const [drag,setDrag]=useState(false); const [approvals,setApprovals]=useState<ApprovalRequest[]>([]);
+  const [busy,setBusy]=useState(''); const [online,setOnline]=useState(navigator.onLine); const [browserConnection,setBrowserConnection]=useState<'connected'|'reconnecting'|'offline'>(navigator.onLine?'reconnecting':'offline'); const [runtimeConnection,setRuntimeConnection]=useState<'connected'|'recovering'|'unavailable'>('recovering'); const [turnStatus,setTurnStatus]=useState<'idle'|'running'|'completed'|'interrupted'|'unknown'>('unknown'); const [diff,setDiff]=useState(''); const [menu,setMenu]=useState(false); const [modelOpen,setModelOpen]=useState(false); const [models,setModels]=useState<any>(null); const [modelsProvider,setModelsProvider]=useState<string>(''); const [confirmDelete,setConfirmDelete]=useState(false); const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [viewer,setViewer]=useState<Attachment|null>(null); const [showBottom,setShowBottom]=useState(false); const [drag,setDrag]=useState(false); const [approvals,setApprovals]=useState<ApprovalRequest[]>([]);
   const [menuPage,setMenuPage]=useState<'main'|'mode'|'manage'>('main');
-  const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const mountedRef=useRef(false); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true);
-  useEffect(()=>{ mountedRef.current=true; setLoading(true); setEvents([]); setLive([]); setApprovals([]); setText(localStorage.getItem(draftKey(id)) || ''); setAttachments([]); load(); connect(); const on=()=>setOnline(navigator.onLine); const poll=window.setInterval(()=>{ if(mountedRef.current && wsRef.current?.readyState!==WebSocket.OPEN) load(true); },5000); addEventListener('online',on); addEventListener('offline',on); return()=>{ mountedRef.current=false; window.clearInterval(poll); removeEventListener('online',on); removeEventListener('offline',on); if(reconnectRef.current) clearTimeout(reconnectRef.current); wsRef.current?.close(); }; },[id]);
-  useEffect(()=>{ setModels(null); api('/api/models').then(setModels).catch(()=>{}); },[id]);
+  const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const mountedRef=useRef(false); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true); const clientAppliedSequenceRef=useRef(0); const snapshotCoveredSequenceRef=useRef(0); const seenRuntimeEventsRef=useRef<Set<string>>(new Set());
+  useEffect(()=>{ mountedRef.current=true; clientAppliedSequenceRef.current=Number(localStorage.getItem(sequenceKey(id)) || 0); snapshotCoveredSequenceRef.current=0; seenRuntimeEventsRef.current=new Set(); setLoading(true); setEvents([]); setLive([]); setApprovals([]); setRuntimeConnection('recovering'); setTurnStatus('unknown'); setText(localStorage.getItem(draftKey(id)) || ''); setAttachments(loadDraftAttachments(id)); load(); connect(); const on=()=>{ const isOnline=navigator.onLine; setOnline(isOnline); setBrowserConnection(isOnline?(wsRef.current?.readyState===WebSocket.OPEN?'connected':'reconnecting'):'offline'); }; addEventListener('online',on); addEventListener('offline',on); return()=>{ mountedRef.current=false; removeEventListener('online',on); removeEventListener('offline',on); if(reconnectRef.current) clearTimeout(reconnectRef.current); wsRef.current?.close(); }; },[id]);
+  useEffect(()=>{ if(!session) return; const provider=sessionProvider(session); setModels(null); setModelsProvider(provider); api('/api/models?provider='+encodeURIComponent(provider)).then(setModels).catch(()=>{}); },[id,session?.provider_id,session?.providerId]);
   useEffect(()=>{ if(nearBottomRef.current) requestAnimationFrame(()=>feedRef.current?.scrollTo({top:feedRef.current.scrollHeight})); },[events,live]);
   useEffect(()=>{ const el=textareaRef.current; if(!el)return; el.style.height='auto'; el.style.height=Math.min(el.scrollHeight, 180)+'px'; },[text]);
   useEffect(()=>{ if(text.trim()) localStorage.setItem(draftKey(id), text); else localStorage.removeItem(draftKey(id)); },[id,text]);
-  async function load(resetLive=false){ try{ const [d,st]=await Promise.all([api('/api/sessions/'+id), api('/api/status')]); setSession(d.session); setEvents(threadEvents(d.thread)); setStatus(st); if(resetLive) setLive([]); } catch(e:any){ toast('error','读取会话失败：'+shortError(e)); } finally { setLoading(false); } }
-  function connect(){ if(!mountedRef.current) return; const proto=location.protocol==='https:'?'wss':'ws'; const ws=new WebSocket(`${proto}://${location.host}/ws`); wsRef.current=ws; ws.onopen=()=>{ setConnected(true); ws.send(JSON.stringify({type:'join',sessionId:id})); load(true); }; ws.onmessage=e=>{ const msg=JSON.parse(e.data); if(msg.type==='joined') return; if(msg.type==='approval'){ setApprovals(v=>v.some(a=>a.requestId===String(msg.requestId))?v:[...v,{requestId:String(msg.requestId),method:String(msg.method),params:msg.params}]); haptic(); toast('info','Codex 请求授权'); return; } if(msg.type==='sessionTitle') setSession(s=>s?{...s,title:msg.title}:s); if(msg.type==='codex'&&msg.method==='turn/started') setSession(s=>s?{...s,status:'running'}:s); if(msg.type==='codex'&&msg.method==='turn/completed') setSession(s=>s?{...s,status:'idle'}:s); if(msg.type==='error') toast('error','请求失败：'+msg.error); setLive(v=>[...v,msg]); }; ws.onclose=()=>{ if(wsRef.current===ws) wsRef.current=null; setConnected(false); if(mountedRef.current) reconnectRef.current=window.setTimeout(connect,1500); }; }
+  useEffect(()=>{ saveDraftAttachments(id, attachments); },[id,attachments]);
+  async function load(resetLive=false){ try{ const [d,st]=await Promise.all([api('/api/sessions/'+id), api('/api/status')]); setSession(d.session); setEvents(threadEvents(d.thread)); setStatus(st); const covered=Number(d.snapshot?.coveredSequence || 0); snapshotCoveredSequenceRef.current=covered; if(covered>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=covered; localStorage.setItem(sequenceKey(id), String(covered)); } setTurnStatus(normalizeTurnStatus(d.session?.status)); if(d.snapshot?.generation) setRuntimeConnection(d.snapshot.error?'recovering':'connected'); if(resetLive) setLive(v=>v.filter(m=>Number(m.runtimeSequence||0)>covered)); return clientAppliedSequenceRef.current; } catch(e:any){ toast('error','读取会话失败：'+shortError(e)); return clientAppliedSequenceRef.current; } finally { setLoading(false); } }
+  function connect(){ if(!mountedRef.current) return; const proto=location.protocol==='https:'?'wss':'ws'; const ws=new WebSocket(`${proto}://${location.host}/ws`); wsRef.current=ws; setBrowserConnection(navigator.onLine?'reconnecting':'offline'); ws.onopen=async()=>{ setBrowserConnection('connected'); const after=await load(true); if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'join',sessionId:id,lastSequence:after,clientAppliedSequence:after,snapshotCoveredSequence:snapshotCoveredSequenceRef.current})); }; ws.onmessage=e=>applySocketMessage(JSON.parse(e.data)); ws.onclose=()=>{ if(wsRef.current===ws) wsRef.current=null; setBrowserConnection(navigator.onLine?'reconnecting':'offline'); if(mountedRef.current) reconnectRef.current=window.setTimeout(connect,1500); }; }
+  function applySocketMessage(msg:any){ if(!acceptRuntimeEvent(msg)) return; if(msg.type==='joined'){ if(msg.runtimeConnection) setRuntimeConnection(msg.runtimeConnection==='connected'?'connected':'recovering'); return; } if(msg.type==='runtimeConnection'){ setRuntimeConnection(msg.status==='connected'?'connected':msg.status==='unavailable'?'unavailable':'recovering'); markRuntimeApplied(msg); return; } if(msg.type==='thread_snapshot'){ if(msg.thread){ setEvents(threadEvents(msg.thread)); const covered=Number(msg.snapshot?.coveredSequence || msg.runtimeSequence || 0); snapshotCoveredSequenceRef.current=Math.max(snapshotCoveredSequenceRef.current, covered); setLive(v=>v.filter(x=>Number(x.runtimeSequence||0)>covered)); if(covered>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=covered; localStorage.setItem(sequenceKey(id), String(covered)); } } if(msg.status) setTurnStatus(normalizeTurnStatus(msg.status)); markRuntimeApplied(msg); return; } if(msg.type==='approval'){ setApprovals(v=>v.some(a=>a.requestId===String(msg.requestId))?v:[...v,{requestId:String(msg.requestId),method:String(msg.method),params:msg.params}]); haptic(); toast('info','Codex 请求授权'); return; } if(msg.type==='sessionTitle') setSession(s=>s?{...s,title:msg.title}:s); if(msg.type==='codex'&&msg.method==='turn/started'){ setSession(s=>s?{...s,status:'running'}:s); setTurnStatus('running'); } if(msg.type==='codex'&&msg.method==='turn/completed'){ const interrupted=turnFailed(msg.params?.turn); setSession(s=>s?{...s,status:interrupted?'interrupted':'idle'}:s); setTurnStatus(interrupted?'interrupted':'completed'); } if(msg.type==='codex'&&(msg.method==='turn/failed'||msg.method==='turn/interrupted')){ setSession(s=>s?{...s,status:'interrupted'}:s); setTurnStatus('interrupted'); } if(msg.type==='error') toast('error','请求失败：'+msg.error); setLive(v=>[...v,msg]); markRuntimeApplied(msg); }
+  function acceptRuntimeEvent(msg:any){ const seq=Number(msg.runtimeSequence||0); if(!seq) return true; if(seq<=snapshotCoveredSequenceRef.current && msg.type!=='thread_snapshot') return false; const generation=String(msg.runtimeGeneration||'legacy'); const key=`${generation}:${seq}:${msg.type||''}:${msg.method||msg.status||''}`; if(seenRuntimeEventsRef.current.has(key)) return false; seenRuntimeEventsRef.current.add(key); return true; }
+  function markRuntimeApplied(msg:any){ const seq=Number(msg.runtimeSequence||0); if(seq>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=seq; localStorage.setItem(sequenceKey(id), String(seq)); } }
   function onScroll(){ const el=feedRef.current; if(!el)return; nearBottomRef.current=el.scrollHeight-el.scrollTop-el.clientHeight<120; setShowBottom(!nearBottomRef.current); }
-  async function send(){ const message=text.replace(/\r\n/g,'\n'); if(!message.trim()&&!attachments.length) return; if(attachments.some(a=>a.uploading||a.error)){ toast('error','图片仍在处理或上传失败'); return; } const ws=wsRef.current; if(!ws||ws.readyState!==WebSocket.OPEN){ toast('error','连接中，请稍后重试'); return; } setBusy('send'); try{ sendMessage(ws,id,{text:message,attachments}); haptic(); setText(''); localStorage.removeItem(draftKey(id)); setAttachments([]); toast('info','已发送'); } finally{ setBusy(''); } }
+  async function send(){ const message=text.replace(/\r\n/g,'\n'); if(!message.trim()&&!attachments.length) return; if(attachments.some(a=>a.uploading||a.error)){ toast('error','图片仍在处理或上传失败'); return; } const ws=wsRef.current; if(!ws||ws.readyState!==WebSocket.OPEN){ toast('error','连接中，请稍后重试'); return; } setBusy('send'); try{ sendMessage(ws,id,{text:message,attachments}); haptic(); setText(''); localStorage.removeItem(draftKey(id)); localStorage.removeItem(draftAttachmentsKey(id)); setAttachments([]); toast('info','已发送'); } finally{ setBusy(''); } }
   async function stop(){ setBusy('stop'); try{ wsRef.current?.send(JSON.stringify({type:'stop',sessionId:id})); haptic(); toast('info','已请求停止生成'); setLive(v=>[...v,{type:'system',text:'已请求停止生成'}]); } finally{ setBusy(''); } }
   async function uploadFiles(files:FileList|File[]){ if(!status?.capabilities?.imageInput){ toast('error','当前服务端未启用图片输入'); return; } for(const original of Array.from(files)){ let file=original; try{ file=await prepareImageForUpload(original,Math.min(status.capabilities.maxAttachmentBytes,PUBLIC_UPLOAD_TARGET_BYTES)); }catch(e:any){ toast('error',`${original.name} ${shortError(e)}`); continue; } if(!status.capabilities.attachmentTypes.includes(normalizeImageType(file.type))){ toast('error',`${file.name} 类型不支持`); continue; } const previewUrl=URL.createObjectURL(file); const local:Attachment={id:crypto.randomUUID(),name:file.name,type:normalizeImageType(file.type),size:file.size,url:'',previewUrl,uploading:true}; setAttachments(v=>[...v,local]); try{ const data=await readFileBase64(file); const saved=await api(`/api/sessions/${id}/attachments`,{method:'POST',body:JSON.stringify({name:file.name,type:normalizeImageType(file.type),data})}); setAttachments(v=>v.map(a=>a.id===local.id?{...saved,previewUrl}:a)); haptic(); if(file!==original) toast('info','图片已压缩后上传'); } catch(e:any){ setAttachments(v=>v.map(a=>a.id===local.id?{...a,uploading:false,error:shortError(e)}:a)); toast('error','图片上传失败：'+shortError(e)); } } }
   async function rename(){ const title=prompt('会话名称',session?.title||''); if(!title) return; setBusy('rename'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({title})}); setSession(s=>s?{...s,title}:s); haptic(); toast('success','已改名'); } catch(e:any){ toast('error','改名失败：'+shortError(e)); } finally{ setBusy(''); } }
@@ -148,18 +160,20 @@ function SessionView({id}:{id:string}){
   async function fork(){ setBusy('fork'); try{ const s=await api('/api/sessions/'+id+'/fork',{method:'POST'}); haptic(); toast('success','Fork 成功，已进入新会话'); location.hash='#/s/'+s.id; } catch(e:any){ toast('error','Fork 失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function del(){ setBusy('delete'); try{ await api('/api/sessions/'+id,{method:'DELETE'}); haptic(); toast('success','已删除'); location.hash='#/'; } catch(e:any){ toast('error','删除失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function showDiff(){ setBusy('diff'); try{ setDiff((await api('/api/sessions/'+id+'/diff')).diff || 'No diff'); } catch(e:any){ toast('error','Diff 读取失败：'+shortError(e)); } finally{ setBusy(''); } }
-  async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota')); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
+  async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(session ? sessionProvider(session) : 'codex'))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
   function toggleMenu(){ setMenu(v=>{ const next=!v; if(next) setMenuPage('main'); return next; }); }
   function closeMenu(){ setMenu(false); setMenuPage('main'); }
   async function setSessionMode(mode:string){ setBusy('mode'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({mode})}); setSession(s=>s?{...s,permission_mode:mode}:s); closeMenu(); haptic(); toast('success','已切换为 '+modeLabel(mode)); } catch(e:any){ toast('error','模式切换失败：'+shortError(e)); } finally{ setBusy(''); } }
-  async function openModelPicker(){ setMenu(false); setModelOpen(true); if(!models) try{ setModels(await api('/api/models')); } catch(e:any){ toast('error','模型列表读取失败：'+shortError(e)); } }
+  async function openModelPicker(){ const provider=session ? sessionProvider(session) : 'codex'; setMenu(false); setModelOpen(true); if(!models || modelsProvider!==provider) try{ setModels(null); setModelsProvider(provider); setModels(await api('/api/models?provider='+encodeURIComponent(provider))); } catch(e:any){ toast('error','模型列表读取失败：'+shortError(e)); } }
   async function setSessionModel(model:string){ setBusy('model'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({model})}); setSession(s=>s?{...s,model}:s); setModelOpen(false); haptic(); toast('success','已切换模型'); } catch(e:any){ toast('error','模型切换失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function answerApproval(req:ApprovalRequest, decision:'accept'|'decline'){ setBusy('approval:'+req.requestId); try{ await api('/api/approvals/'+encodeURIComponent(req.requestId),{method:'POST',body:JSON.stringify({decision,method:req.method})}); setApprovals(v=>v.filter(a=>a.requestId!==req.requestId)); haptic(); toast(decision==='accept'?'success':'info', decision==='accept'?'已允许':'已拒绝'); } catch(e:any){ toast('error','授权回复失败：'+shortError(e)); } finally{ setBusy(''); } }
-  const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=liveStatus(live,session?.status); const activeModel=session?.model || status?.defaultModel || catalogCurrent(models);
+  const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=turnStatus==='unknown'?liveStatus(live,session?.status):turnStatus; const activeModel=session?.model || (modelsProvider===(session ? sessionProvider(session) : '') ? catalogCurrent(models) : '') || status?.defaultModel;
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
-    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · {online?(connected?'online':'reconnecting'):'offline'}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
+    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · 浏览器 {connectionLabel(browserConnection)} · Runtime {connectionLabel(runtimeConnection)}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
     {!online&&<InlineNotice tone="error" text="网络离线，发送会在连接恢复后可用。"/>}
-    {online&&!connected&&<InlineNotice tone="info" text="正在重新连接会话。"/>}
+    {online&&browserConnection!=='connected'&&<InlineNotice tone="info" text="浏览器正在重新连接会话。"/>}
+    {runtimeConnection==='recovering'&&<InlineNotice tone="info" text="Runtime 正在恢复，会话恢复后可继续发送。"/>}
+    {runtimeConnection==='unavailable'&&<InlineNotice tone="error" text="Runtime 暂不可用，稍后会自动恢复。"/>}
     {menu&&<><button className="menuScrim" aria-label="关闭菜单" onClick={closeMenu}/><nav className="moreMenu">
       {menuPage==='main'&&<><button disabled={!!busy} onClick={openModelPicker}><b>模型</b><span>{modelLabel(activeModel)}</span></button><button disabled={!!busy} onClick={()=>setMenuPage('mode')}><b>权限模式</b><span>{modeLabel(session?.permission_mode)}</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); showDiff(); }}><b>Diff</b><span>查看当前改动</span></button><button disabled={!!busy} onClick={()=>setMenuPage('manage')}><b>会话管理</b><span>改名、Fork、归档</span></button></>}
       {menuPage==='mode'&&<><button className="menuBack" onClick={()=>setMenuPage('main')}>‹ 权限模式</button><button disabled={!!busy} className={session?.permission_mode==='yolo'?'active':''} onClick={()=>setSessionMode('yolo')}><b>YOLO</b><span>自动允许写入和命令</span></button><button disabled={!!busy} className={session?.permission_mode==='workspace-write'?'active':''} onClick={()=>setSessionMode('workspace-write')}><b>Workspace</b><span>写工作区前确认</span></button><button disabled={!!busy} className={session?.permission_mode==='read-only'?'active':''} onClick={()=>setSessionMode('read-only')}><b>Read Only</b><span>只读模式</span></button></>}
@@ -255,12 +269,48 @@ function liveEvents(items:any[]):DisplayEvent[]{
   if(started && !completedTurn && !deltas.size) out.push({key:'running',role:'system',text:'正在执行'});
   return out;
 }
-function liveStatus(items:any[], fallback?:string){ let s=fallback||'idle'; for(const m of items){ if(m.type==='codex'&&m.method==='turn/started') s='running'; if(m.type==='codex'&&m.method==='turn/completed') s='idle'; if(m.type==='system'&&m.text?.includes('停止')) s='interrupted'; } return s; }
+function liveStatus(items:any[], fallback?:string){
+  let s=fallback||'idle';
+  for(const m of items){
+    if(m.type==='codex'&&isRunningSignal(m)) s='running';
+    if(m.type==='codex'&&isTerminalSignal(m)) s='idle';
+    if(m.type==='system'&&m.text?.includes('停止')) s='interrupted';
+  }
+  return s;
+}
+function normalizeTurnStatus(value:any):'idle'|'running'|'completed'|'interrupted'|'unknown'{
+  const s=String(value||'');
+  if(s==='running'||s==='active') return 'running';
+  if(s==='completed') return 'completed';
+  if(s==='interrupted'||s==='failed') return 'interrupted';
+  if(s==='idle'||s==='notLoaded') return 'idle';
+  return 'unknown';
+}
+function isRunningSignal(m:any){
+  if(m.method==='turn/started'||m.method==='item/agentMessage/delta') return true;
+  const status=String(m.params?.item?.status||'');
+  return m.method==='item/started'||status==='inProgress';
+}
+function isTerminalSignal(m:any){
+  if(m.method==='turn/completed'||m.method==='turn/failed'||m.method==='turn/interrupted') return true;
+  const item=m.params?.item;
+  return m.method==='item/completed'&&item?.type==='agentMessage'&&item?.phase==='final_answer'&&String(item.text||'').trim();
+}
+function turnFailed(turn:any){ const status=String(turn?.status||''); return status==='failed'||status==='interrupted'; }
 function visibleEvents(items:DisplayEvent[]){
   const seenSystem = new Set<string>();
+  let lastUserText = '';
   return items.filter(e=>{
     if(e.role==='file'||e.role==='command') return false;
     if((e.role==='user'||e.role==='assistant'||e.role==='image') && !e.text.trim() && !(e.attachments?.length) && !(e.images?.length) && !(e.files?.length)) return false;
+    if(e.role==='user'){
+      const text = e.text.trim();
+      const sameAttachments = !(e.attachments?.length);
+      if(text && sameAttachments && text===lastUserText) return false;
+      lastUserText = text;
+    } else if(e.role!=='system') {
+      lastUserText = '';
+    }
     if(e.role==='system'){
       if(!e.text.trim()) return false;
       if(seenSystem.has(e.text)) return false;
@@ -327,11 +377,11 @@ function approvalInfo(req:ApprovalRequest){
 }
 function compactJson(value:any){ try { return JSON.stringify(value).slice(0, 180); } catch { return String(value).slice(0, 180); } }
 function CopyButton({text,onDone}:{text:string;onDone:(ok:boolean)=>void}){ const [ok,setOk]=useState(false); return <button className={`copyBtn ${ok?'ok':''}`} aria-label="复制" onClick={async()=>{ try{ await navigator.clipboard.writeText(text); setOk(true); onDone(true); setTimeout(()=>setOk(false),1200); } catch{ onDone(false); } }}>{ok?'已复制':'复制'}</button>; }
-function Markdown({text}:{text:string}){ const blocks=parseMarkdown(text); return <div className="md">{blocks.map((b,i)=>{ if(b.type==='code') return <CodeBlock key={i} code={b.text} lang={b.lang}/>; if(b.type==='quote') return <blockquote key={i}>{b.text}</blockquote>; if(b.type==='table') return <TableBlock key={i} rows={b.rows}/>; if(b.type==='list') return <ul key={i}>{b.items.map((x,j)=><li key={j}>{x}</li>)}</ul>; if(b.type==='heading') return <h3 key={i}>{b.text}</h3>; return <p key={i}>{renderInlineImages(b.text)}</p>; })}</div>; }
-function parseMarkdown(text:string){ const lines=text.split('\n'); const blocks:any[]=[]; for(let i=0;i<lines.length;i++){ const line=lines[i]; if(line.startsWith('```')){ const lang=line.slice(3).trim(); const code:string[]=[]; i++; while(i<lines.length&&!lines[i].startsWith('```')) code.push(lines[i++]); blocks.push({type:'code',lang,text:code.join('\n')}); } else if(/^\s*[-*]\s+/.test(line)){ const items=[line.replace(/^\s*[-*]\s+/,'')]; while(i+1<lines.length&&/^\s*[-*]\s+/.test(lines[i+1])) items.push(lines[++i].replace(/^\s*[-*]\s+/,'')); blocks.push({type:'list',items}); } else if(line.includes('|')&&i+1<lines.length&&/^\s*\|?[-:| ]+\|?\s*$/.test(lines[i+1])){ const rows=[line,lines[++i]]; while(i+1<lines.length&&lines[i+1].includes('|')) rows.push(lines[++i]); blocks.push({type:'table',rows}); } else if(line.startsWith('>')) blocks.push({type:'quote',text:line.replace(/^>\s?/,'')}); else if(/^#{1,4}\s+/.test(line)) blocks.push({type:'heading',text:line.replace(/^#{1,4}\s+/,'')}); else if(line.trim()) blocks.push({type:'p',text:line}); else blocks.push({type:'p',text:' '}); } return blocks; }
+function Markdown({text}:{text:string}){ const blocks=parseMarkdown(text); return <div className="md">{blocks.map((b,i)=>{ if(b.type==='code') return <CodeBlock key={i} code={b.text} lang={b.lang}/>; if(b.type==='quote') return <blockquote key={i}>{renderInlineMarkdown(b.text)}</blockquote>; if(b.type==='table') return <TableBlock key={i} rows={b.rows}/>; if(b.type==='list') return <ul key={i}>{b.items.map((x:string,j:number)=><li key={j}>{renderInlineMarkdown(x)}</li>)}</ul>; if(b.type==='heading') return <h3 key={i}>{renderInlineMarkdown(b.text)}</h3>; return <p key={i}>{renderInlineMarkdown(b.text)}</p>; })}</div>; }
+function parseMarkdown(text:string){ const lines=text.split('\n'); const blocks:any[]=[]; const listRe=/^\s*(?:[-*]|\d+[.)])\s+/; for(let i=0;i<lines.length;i++){ const line=lines[i]; if(line.startsWith('```')){ const lang=line.slice(3).trim(); const code:string[]=[]; i++; while(i<lines.length&&!lines[i].startsWith('```')) code.push(lines[i++]); blocks.push({type:'code',lang,text:code.join('\n')}); } else if(listRe.test(line)){ const items=[line.replace(listRe,'')]; while(i+1<lines.length&&listRe.test(lines[i+1])) items.push(lines[++i].replace(listRe,'')); blocks.push({type:'list',items}); } else if(line.includes('|')&&i+1<lines.length&&/^\s*\|?[-:| ]+\|?\s*$/.test(lines[i+1])){ const rows=[line,lines[++i]]; while(i+1<lines.length&&lines[i+1].includes('|')) rows.push(lines[++i]); blocks.push({type:'table',rows}); } else if(line.startsWith('>')) blocks.push({type:'quote',text:line.replace(/^>\s?/, '')}); else if(/^#{1,4}\s+/.test(line)) blocks.push({type:'heading',text:line.replace(/^#{1,4}\s+/, '')}); else if(line.trim()) blocks.push({type:'p',text:line}); } return blocks; }
 function CodeBlock({code,lang}:{code:string;lang:string}){ const toast=useToast(); return <div className="codeBlock"><div><span>{lang||'code'}</span><CopyButton text={code} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制代码':'复制失败')}/></div><pre><code>{code}</code></pre></div>; }
 function TableBlock({rows}:{rows:string[]}){ const parsed=rows.filter((_,i)=>i!==1).map(r=>r.split('|').map(c=>c.trim()).filter(Boolean)); return <div className="tableWrap"><table><tbody>{parsed.map((r,i)=><tr key={i}>{r.map((c,j)=>i?<td key={j}>{c}</td>:<th key={j}>{c}</th>)}</tr>)}</tbody></table></div>; }
-function renderInlineImages(line:string){ const parts=line.split(/(!?\[[^\]]*\]\([^)]+\))/g); return parts.map((p,i)=>{ const img=p.match(/!\[([^\]]*)\]\(([^)]+)\)/); if(img) return <img className="inlineImage" key={i} alt={img[1]} src={img[2]}/>; const link=p.match(/(?<!!)\[([^\]]+)\]\(([^)]+)\)/); if(link) return <a key={i} href={link[2]} target="_blank" rel="noreferrer" download={isDownloadUrl(link[2])?fileNameFromUrl(link[2]):undefined}>{link[1]}</a>; return <React.Fragment key={i}>{p}</React.Fragment>; }); }
+function renderInlineMarkdown(line:string){ const parts=line.split(/(`[^`]+`|\*\*[^*]+\*\*|!\[[^\]]*\]\([^)]+\)|(?<!!)\[[^\]]+\]\([^)]+\))/g); return parts.map((p,i)=>{ const img=p.match(/^!\[([^\]]*)\]\(([^)]+)\)$/); if(img) return <img className="inlineImage" key={i} alt={img[1]} src={img[2]}/>; const link=p.match(/^\[([^\]]+)\]\(([^)]+)\)$/); if(link) return <a key={i} href={link[2]} target="_blank" rel="noreferrer" download={isDownloadUrl(link[2])?fileNameFromUrl(link[2]):undefined}>{link[1]}</a>; if(/^`[^`]+`$/.test(p)) return <code key={i}>{p.slice(1,-1)}</code>; if(/^\*\*[^*]+\*\*$/.test(p)) return <strong key={i}>{p.slice(2,-2)}</strong>; return <React.Fragment key={i}>{p}</React.Fragment>; }); }
 function extractMarkdownImages(text:string):Attachment[]{ return [...text.matchAll(/!\[([^\]]*)\]\((https?:\/\/[^)]+|\/[^)]+)\)/g)].map((m,i)=>({id:m[2]+i,name:m[1]||'image',type:'image',size:0,url:m[2]})); }
 function extractFileLinks(text:string):Attachment[]{
   const links = new Map<string,string>();
@@ -351,14 +401,17 @@ function QuotaSheet({quota,onRefresh,onClose}:{quota:any;onRefresh:()=>void;onCl
   const account=quota?.account?.account || quota?.account;
   const limit=quota?.rateLimits?.rateLimitsByLimitId?.codex || quota?.rateLimits?.rateLimits;
   const email = findDeepEmail(account);
+  const isAntigravity = quota?.providerId === 'antigravity';
   return <Sheet onClose={onClose} title="额度" subtitle={quota?.checkedAt?new Date(quota.checkedAt).toLocaleString():'读取中'} actions={<button onClick={onRefresh}>刷新</button>}>
     <div className="quotaGrid">
       <div className="quotaAccount"><b>账号</b><span>{email || account?.type || '未返回账号'}{account?.planType?` · ${account.planType}`:''}</span></div>
+      {quota?.rateLimits?.usageText&&<div className="quotaAccount usageText"><b>Antigravity Usage</b><pre>{quota.rateLimits.usageText}</pre></div>}
       {limit ? <>
         <QuotaBar title="5 小时额度" limitWindow={limit.primary}/>
         <QuotaBar title="周额度" limitWindow={limit.secondary}/>
         <div className="quotaAccount"><b>Credits</b><span>{limit.credits?.unlimited?'不限':limit.credits?.balance?`余额 ${limit.credits.balance}`:limit.credits?.hasCredits?'可用':'0'}</span></div>
-      </> : <div><b>额度</b><span>没有返回额度数据</span></div>}
+      </> : !isAntigravity && <div><b>额度</b><span>没有返回额度数据</span></div>}
+      {isAntigravity&&!quota?.rateLimits?.usageText&&<div className="quotaAccount"><b>Antigravity Usage</b><span>未读取到 /usage 输出</span></div>}
     </div>
     {(quota?.errors?.account||quota?.errors?.rateLimits)&&<pre className="errorText">{[quota?.errors?.account,quota?.errors?.rateLimits].filter(Boolean).join('\n')}</pre>}
   </Sheet>;
@@ -375,10 +428,13 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   const [localData,setLocalData]=useState<any>(data);
   const [models,setModels]=useState<any>(null);
   const [loginJob,setLoginJob]=useState<any>(null);
+  const [agLoginJob,setAgLoginJob]=useState<any>(null);
+  const [agCode,setAgCode]=useState('');
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
-  const [page,setPage]=useState<'main'|'mode'|'model'|'account'>('main');
+  const [page,setPage]=useState<'main'|'agent'|'mode'|'model'|'account'>('main');
+  const activeProvider = localData?.settings?.activeProvider || 'codex';
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
-  useEffect(()=>{ api('/api/models').then(setModels).catch(()=>{}); },[]);
+  useEffect(()=>{ if(page!=='model') return; setModels(null); api('/api/models?provider='+encodeURIComponent(activeProvider)).then(setModels).catch((e:any)=>setModels({models:[], error:shortError(e)})); },[page,activeProvider]);
   async function syncSettings(){ const next=await onChanged(); if(next) setLocalData((current:any)=>mergeSettingsData(current, next)); }
   function markActiveProfile(id:string){
     setLocalData((d:any)=>{
@@ -387,26 +443,43 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
     });
   }
   useEffect(()=>{ if(!loginJob?.id || loginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/profile-login/'+loginJob.id); setLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录未完成'); } }catch{} },1500); return()=>window.clearInterval(timer); },[loginJob?.id,loginJob?.status]);
+  useEffect(()=>{ if(!agLoginJob?.id || agLoginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/antigravity-login/'+agLoginJob.id); setAgLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录失败'); } }catch{} },1500); return()=>window.clearInterval(timer); },[agLoginJob?.id,agLoginJob?.status]);
+  async function setActiveProvider(provider:string){ setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),activeProvider:provider}})); try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); haptic(); toast('success','Agent 已切换'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function setDefaultMode(mode:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultMode:mode})}); haptic(); toast('success','已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
-  async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model}})); haptic(); toast('success','模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
+  async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model,provider:activeProvider})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model,defaultModels:{...(d?.settings?.defaultModels||{}),[activeProvider]:model}}})); haptic(); toast('success','模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
   async function switchProfile(id:string){ try{ await api(`/api/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id); haptic(); toast('success','切换成功'); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } finally { await syncSettings(); } }
   async function deviceLogin(id:string, isNew=false){ try{ const r=await api(`/api/profiles/${id}/login/device`,{method:'POST',body:JSON.stringify({newProfile:isNew})}); setLoginJob(r.job); toast('info','登录流程已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function loginNewProfile(){ try{ const r=await api('/api/profiles',{method:'POST',body:JSON.stringify({name:'Codex Account'})}); await syncSettings(); await deviceLogin(r.profile.id, true); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
+  async function loginAntigravity(){ try{ const r=await api('/api/antigravity/profiles/login',{method:'POST'}); setAgLoginJob(r.job); setAgCode(''); toast('info','Antigravity 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
+  async function submitAntigravityCode(){ if(!agLoginJob?.id || !agCode.trim()) return; try{ const r=await api('/api/antigravity-login/'+agLoginJob.id+'/input',{method:'POST',body:JSON.stringify({code:agCode.trim()})}); setAgLoginJob((job:any)=>({...job,...(r.job||{}), codeSubmitted:true})); setAgCode(''); toast('info','授权码已提交，正在确认登录'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
+  async function switchAntigravityProfile(id:string){ try{ await api(`/api/antigravity/profiles/${id}/switch`,{method:'POST'}); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function removeAntigravityProfile(profile:any){ try{ await api(`/api/antigravity/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); await syncSettings(); } catch(e:any){ toast('error','删除失败：'+shortError(e)); } }
   async function removeProfile(profile:any){ try{ await api(`/api/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteProfile(null); await syncSettings(); } catch(e:any){ toast('error','删除失败：'+shortError(e)); } }
-  const currentModel = localData?.settings?.defaultModel || catalogCurrent(models);
+  const currentModel = localData?.settings?.defaultModels ? (localData.settings.defaultModels[activeProvider] || catalogCurrent(models)) : (localData?.settings?.defaultModel || catalogCurrent(models));
   const activeProfile = (localData?.profiles||[]).find((p:any)=>p.active) || localData?.activeProfile;
-  const title = page==='main' ? '设置' : page==='mode' ? '沙盒' : page==='model' ? '模型' : 'Codex 账户';
-  const subtitle = page==='main' ? '会话行为和账户' : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? modelLabel(currentModel) : profileLabel(activeProfile);
+  const activeAntigravityProfile = (localData?.antigravityProfiles||[]).find((p:any)=>p.active) || localData?.activeAntigravityProfile;
+  const codexProfiles = (localData?.profiles?.length ? localData.profiles : (localData?.activeProfile ? [localData.activeProfile] : []));
+  const codexProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='codex');
+  const antigravityProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='antigravity') || localData?.antigravity;
+  const activeProviderStatus = activeProvider==='antigravity' ? antigravityProviderStatus : codexProviderStatus;
+  const title = page==='main' ? '设置' : page==='agent' ? 'Agent' : page==='mode' ? '沙盒' : page==='model' ? '模型' : `${providerLabel(activeProvider)} 账户`;
+  const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? providerLabel(activeProvider) : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProvider==='codex'?modelLabel(currentModel):(activeProviderStatus?.ok?'Antigravity 模型':'Antigravity 未安装')) : (activeProvider==='codex'?profileLabel(activeProfile):(activeProviderStatus?.ok?antigravityProfileLabel(activeAntigravityProfile):'Antigravity 未安装'));
   return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button onClick={()=>setPage('main')}>返回</button>:undefined}>
     <div className="settingsGrid">
       {page==='main'&&<div className="settingsNav">
+        <button onClick={()=>setPage('agent')}><span><b>Agent</b><small>{providerLabel(activeProvider)}{activeProvider==='antigravity'&&!activeProviderStatus?.ok?' · 未安装':''}</small></span><i>›</i></button>
         <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
-        <button onClick={()=>setPage('model')}><span><b>模型</b><small>{modelLabel(currentModel)}</small></span><i>›</i></button>
-        <button onClick={()=>setPage('account')}><span><b>Codex 账户</b><small>{profileLabel(activeProfile)}</small></span><i>›</i></button>
+        <button onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.ok ? modelLabel(currentModel) : `${providerLabel(activeProvider)} 未安装`}</small></span><i>›</i></button>
+        <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{activeProvider==='codex'?profileLabel(activeProfile):(activeProviderStatus?.ok?antigravityProfileLabel(activeAntigravityProfile):'Antigravity 未安装')}</small></span><i>›</i></button>
       </div>}
+      {page==='agent'&&<section><b>Agent</b><div className="providerChoices">
+        <button className={activeProvider==='codex'?'active':''} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{codexProviderStatus?.ok ? codexProviderStatus.version : (codexProviderStatus?.error || 'Codex CLI 不可用')}</small></span><i/></button>
+        <button className={activeProvider==='antigravity'?'active':''} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{antigravityProviderStatus?.ok ? antigravityProviderStatus.version : (antigravityProviderStatus?.error || '未安装')}</small></span><i/></button>
+      </div>{activeProvider==='antigravity'&&!activeProviderStatus?.ok&&<InlineNotice tone="info" text={activeProviderStatus?.installHint || '需要先安装官方 CLI 后才能登录和创建 Antigravity 会话。'}/>}</section>}
       {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
-      {page==='model'&&<section><b>模型</b><ModelPicker models={models?.models||[]} value={currentModel} onPick={setDefaultModel}/></section>}
-      {page==='account'&&<><section><b>账户</b><div className="profileList">{(localData?.profiles||[]).map((p:any)=><ProfileRow key={p.id} profile={p} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
+      {page==='model'&&<section><b>模型</b>{models?.error&&<InlineNotice tone="info" text={models.error}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`} onPick={setDefaultModel}/></section>}
+      {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
+      {page==='account'&&activeProvider==='antigravity'&&<section><b>账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={removeAntigravityProfile}/>)}</div><button disabled={!activeProviderStatus?.ok || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Antigravity 未安装</b><span>安装后才能登录 Google 账户。</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode}/>}</section>}
     </div>
     {deleteProfile&&<ConfirmDialog title="删除账户？" detail={`删除 ${profileLabel(deleteProfile)} 的本地登录配置。当前账户不能删除。`} confirm="删除" onCancel={()=>setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
   </Sheet>;
@@ -426,8 +499,20 @@ function ProfileRow({profile,onSwitch,onLogin,onDelete}:{profile:any;onSwitch:(i
     <div><strong>{profileLabel(profile)}</strong><span className="profileBadges">{active&&<i>当前</i>}<i>{loggedIn?'已登录':'未登录'}</i>{profile.login?.email&&<em>{profile.login.email}</em>}</span></div>
     {!active&&loggedIn&&<button onClick={()=>onSwitch(profile.id)}>切换</button>}
     {!loggedIn&&<button onClick={()=>onLogin(profile.id)}>登录</button>}
-    <button className="dangerText" onClick={()=>onDelete(profile)} disabled={active}>删除</button>
+    <button className="dangerText" onClick={()=>onDelete(profile)} disabled={active&&loggedIn}>删除</button>
   </div>;
+}
+function AntigravityProfileRow({profile,onSwitch,onDelete}:{profile:any;onSwitch:(id:string)=>void;onDelete:(p:any)=>void}){
+  const loggedIn = !!profile.login?.ok;
+  const active = !!profile.active;
+  return <div className="profileRow">
+    <div><strong>{antigravityProfileLabel(profile)}</strong><span className="profileBadges">{active&&<i>当前</i>}<i>{loggedIn?'已登录':'未登录'}</i>{profile.login?.email&&<em>{profile.login.email}</em>}</span></div>
+    {!active&&loggedIn&&<button onClick={()=>onSwitch(profile.id)}>切换</button>}
+    <button className="dangerText" onClick={()=>onDelete(profile)}>删除</button>
+  </div>;
+}
+function antigravityProfileLabel(profile:any){
+  return profile?.login?.email || (profile?.name && profile.name !== 'Google Account' ? profile.name : 'Antigravity Account');
 }
 function LoginJobPanel({job}:{job:any}){
   const toast=useToast();
@@ -444,6 +529,22 @@ function LoginJobPanel({job}:{job:any}){
     <span>{job.status==='running'?'在网页完成认证后会自动完成':job.status==='done'?'登录完成':'登录失败，未完成的新账户会自动清理'}</span>
   </section>;
 }
+function AntigravityLoginPanel({job,code,onCode,onSubmit}:{job:any;code:string;onCode:(v:string)=>void;onSubmit:()=>void}){
+  const toast=useToast();
+  const text=stripAnsi(job.output?.join('\n') || '');
+  const url=job.loginUrl || stripAnsi(job.output?.join('\n') || '').replace(/\s+/g,'').match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?.*?state=[A-Za-z0-9_-]+/)?.[0]?.replace(/[),.]+$/,'') || '';
+  const submitted = !!job.codeSubmitted && job.status === 'running';
+  return <section><b>Antigravity 登录</b>
+    {url?<a className="loginLink" href={url} target="_blank" rel="noreferrer">打开 Google 登录</a>:<div className="loginLink pending">正在读取登录链接</div>}
+    {url&&<button onClick={async()=>{try{await navigator.clipboard.writeText(url);toast('success','链接已复制')}catch{toast('error','复制失败')}}}>复制链接</button>}
+    <div className="loginCodeCard ready">
+      <span>授权码</span>
+      <input value={code} onChange={e=>onCode(e.target.value)} placeholder="粘贴 Google 返回的 authorization code"/>
+      <button disabled={!code.trim() || job.status!=='running'} onClick={onSubmit}>{submitted?'正在确认':job.status==='running'?'提交授权码':'已结束'}</button>
+      <small>{job.status==='running'?(submitted?'已提交授权码，正在等待 Antigravity 确认登录':'完成 Google 登录后，把页面上的授权码粘贴到这里。'):job.status==='done'?'登录完成':'登录失败，未完成账户会自动清理'}</small>
+    </div>
+  </section>;
+}
 function stripAnsi(text:string){ return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g,''); }
 function extractDeviceCode(text:string){
   const cleaned=text.replace(/[^A-Za-z0-9-]+/g,' ');
@@ -456,9 +557,9 @@ function modelOptionLabel(model:ModelOption){
   const name = model.displayName || model.model;
   return name === model.model ? name : `${name} (${model.model})`;
 }
-function ModelPicker({models,value,onPick}:{models:ModelOption[];value:string;onPick:(model:string)=>void}){
+function ModelPicker({models,value,onPick,emptyText='正在读取模型列表'}:{models:ModelOption[];value:string;onPick:(model:string)=>void;emptyText?:string}){
   return <div className="modelChoices">
-    {!models.length&&<div className="modelLoading">正在读取 Codex 模型列表</div>}
+    {!models.length&&<div className="modelLoading">{emptyText}</div>}
     {models.map(m=><button key={m.id||m.model} className={`modelChoice ${value===m.model?'active':''}`} onClick={()=>onPick(m.model)}><span><b>{modelOptionLabel(m)}</b>{m.description&&<small>{m.description}</small>}</span><i/></button>)}
   </div>;
 }
@@ -502,6 +603,20 @@ function LoadingRows({count=4}:{count?:number}){ return <div className="loadingR
 function ErrorState({title,detail,action,onAction}:{title:string;detail:string;action:string;onAction:()=>void}){ return <div className="errorState"><b>{title}</b><span>{detail}</span><button onClick={onAction}>{action}</button></div>; }
 function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <div className={`notice ${tone}`}>{text}</div>; }
 function draftKey(id:string){ return `codex-mobile:draft:${id}`; }
+function draftAttachmentsKey(id:string){ return `codex-mobile:draftAttachments:${id}`; }
+function sequenceKey(id:string){ return `codex-mobile:lastSequence:${id}`; }
+function loadDraftAttachments(id:string):Attachment[]{
+  try {
+    const items = JSON.parse(localStorage.getItem(draftAttachmentsKey(id)) || '[]');
+    if (!Array.isArray(items)) return [];
+    return items.filter((a:any)=>a?.id&&a?.url).map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||'image'), size:Number(a.size||0), url:String(a.url) }));
+  } catch { return []; }
+}
+function saveDraftAttachments(id:string, attachments:Attachment[]){
+  const saved = attachments.filter(a=>a.id&&a.url&&!a.uploading&&!a.error).map(a=>({ id:a.id, name:a.name, type:a.type, size:a.size, url:a.url }));
+  if (saved.length) localStorage.setItem(draftAttachmentsKey(id), JSON.stringify(saved));
+  else localStorage.removeItem(draftAttachmentsKey(id));
+}
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {

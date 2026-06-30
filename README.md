@@ -1,6 +1,6 @@
-# Codex Mobile
+# Agent Deck
 
-Codex Mobile is a phone-friendly web app for using the local Codex CLI from a browser. It runs a Fastify server in front of `codex app-server`, serves a React PWA, and keeps Codex sessions, uploads, generated images, and downloadable artifacts easy to reach from mobile.
+Agent Deck is a phone-friendly web app for using local agent CLIs from a browser. It runs a Fastify server in front of `codex app-server` and supported agent providers, serves a React PWA, and keeps sessions, uploads, generated images, and downloadable artifacts easy to reach from mobile.
 
 ## What It Does
 

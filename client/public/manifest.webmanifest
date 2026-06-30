@@ -1,6 +1,6 @@
 {
-  "name": "Codex Mobile",
-  "short_name": "Codex",
+  "name": "Agent Deck",
+  "short_name": "Agent Deck",
   "id": "/?app=codex-mobile-v21",
   "start_url": "/?v=21",
   "scope": "/",
