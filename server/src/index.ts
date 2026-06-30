@@ -372,7 +372,8 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
 app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const requestId = req.id;
   const startedAt = Date.now();
-  const row = await findSession(req.params.id);
+  let row = await findSession(req.params.id);
+  if (!row && USE_AGENT_RUNTIME) row = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [String(req.params.id)]).catch(()=>null);
   if (row && normalizeProvider(row.provider_id) === 'antigravity') {
     if (!pathAllowed(String(row.project_dir))) return reply.code(403).send({error:'workspace not allowed'});
     const thread = await antigravityThread(row);
