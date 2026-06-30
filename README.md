@@ -1,6 +1,6 @@
 # Agent Deck
 
-Agent Deck 是一个面向手机浏览器的本地 Agent 控制台。它把 Codex CLI、会话状态、工作区选择、附件上传、图片预览和文件产物下载整合成一个可安装的 PWA，让你可以从手机上打开、继续和管理本机上的 Codex 会话。
+Agent Deck 是一个面向手机浏览器的本地 Agent 控制台。它把 Codex CLI、Google Antigravity、会话状态、工作区选择、附件上传、图片预览和文件产物下载整合成一个可安装的 PWA，让你可以从手机上打开、继续和管理本机上的 Agent 会话。
 
 当前项目由三部分组成：
 
@@ -12,12 +12,26 @@ Agent Deck 是一个面向手机浏览器的本地 Agent 控制台。它把 Code
 
 - 在移动端创建、继续、停止 Codex 会话。
 - 扫描允许访问的工作区目录，并在指定项目中启动会话。
-- 支持多 Codex profile 切换，以及 Antigravity profile 的登录和切换。
+- 支持多 Codex profile 切换，以及 Google Antigravity profile 的登录和切换。
+- 支持创建 Antigravity 会话并调用 Google 官方 CLI 执行一次性任务。
 - 支持文本、图片和附件输入，生成图片和产物文件可以在会话中预览或下载。
 - 会话可重命名、归档、取消归档、删除，并可查看项目 diff。
 - WebSocket 重连后可以按事件序号恢复输出，避免刷新或断线丢失正在运行的 turn。
 - 运行时状态写入 SQLite，项目代码更新时不移动用户数据。
 - 提供 PWA manifest、service worker 和图标，适合添加到手机桌面使用。
+
+## Antigravity 支持状态
+
+项目内已经接入 Google Antigravity，当前属于能用但仍有已知限制的状态：
+
+- 可以在设置里选择 `Antigravity`，登录 Google 账户，切换 Antigravity profile，并为新会话选择 Antigravity 模型。
+- Antigravity 会话会记录在本地 SQLite 中，用户消息和最终回复可以在移动端会话页中查看。
+- 当前发送消息时调用的是 Google 官方 CLI 的一次性命令形态，也就是类似 `agy --print <prompt>` 的非交互执行。
+- 不能像 Codex 一样使用 TUI 或 ACP 长连接协议，因为 Google Antigravity 目前没有提供可用的 ACP 接口。
+- 因为只能走一次性调用，所以它没有完整的 Codex runtime 能力：不能恢复真实上游交互线程，不能像 Codex 那样持续订阅结构化事件，图片附件也暂未接入 Antigravity。
+- 停止生成会终止当前 CLI 子进程，但会话上下文主要由 Agent Deck 本地记录，不等同于 Google CLI 原生 TUI 的完整上下文体验。
+
+简而言之：Codex 是当前的一等支持路径；Antigravity 是可用的补充 provider，适合从手机上发起单轮或短任务，但不要把它当成 Google 官方 TUI 的远程镜像。
 
 ## 目录结构
 
@@ -163,6 +177,7 @@ deploy/rollback.sh
 
 - SQLite 数据库：`/opt/data/agentdeck/agentdeck.sqlite3`
 - Codex profiles：`/opt/data/agentdeck/profiles/`
+- Antigravity profiles：`/opt/data/agentdeck/antigravity-profiles/`
 - 共享 Codex 会话：`/opt/data/agentdeck/shared/sessions`
 - 上传附件：`/opt/data/agentdeck/attachments/`
 - systemd 环境文件：`/opt/data/agentdeck/*.env`
