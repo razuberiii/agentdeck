@@ -5,18 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/opt/stacks/agentdeck
-Environment=HOME=/home/ubuntu
-EnvironmentFile=/opt/data/agentdeck/agentdeck-app-server-%i.env
+User=agentdeck
+Group=agentdeck
+WorkingDirectory=/opt/agentdeck
+Environment=HOME=/var/lib/agentdeck/home
+EnvironmentFile=/etc/agentdeck/agentdeck-app-server-%i.env
 ExecStart=/usr/local/bin/codex app-server --listen ${CODEX_APP_SERVER_LISTEN} -c approval_policy=\"never\" -c sandbox_mode=\"danger-full-access\"
 Restart=always
 RestartSec=2
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /home/ubuntu /tmp /run
+ReadWritePaths=/var/lib/agentdeck /opt/agentdeck /tmp /run
 
 [Install]
 WantedBy=multi-user.target

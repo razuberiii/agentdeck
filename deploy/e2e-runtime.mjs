@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const runtime = process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852';
-const cwd = process.env.E2E_CWD || '/opt/stacks/agentdeck';
+const cwd = process.env.E2E_CWD || process.cwd();
 
 function request(method, path, body) {
   const url = new URL(path, runtime);

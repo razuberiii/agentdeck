@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=${ROOT:-/opt/stacks/agentdeck}
-DATA_DIR=${DATA_DIR:-/opt/data/agentdeck}
+ROOT=${ROOT:-/opt/agentdeck}
+DATA_DIR=${DATA_DIR:-/var/lib/agentdeck}
+ENV_DIR=${ENV_DIR:-/etc/agentdeck}
 LOG=${LOG:-$ROOT/.tools/production-cutover-result.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
 exec >>"$LOG" 2>&1
@@ -27,8 +28,8 @@ else
   LOG="$ROOT/.tools/install-units.log" "$ROOT/deploy/install-units.sh"
 fi
 
-sudo sed -i 's/^CODEX_APP_SERVER_PORT_BASE=.*/CODEX_APP_SERVER_PORT_BASE=4620/' "$DATA_DIR/runtime.env"
-sudo sed -i 's#^CODEX_APP_SERVER_LISTEN=.*#CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668#' "$DATA_DIR/agentdeck-app-server-default.env"
+sudo sed -i 's/^CODEX_APP_SERVER_PORT_BASE=.*/CODEX_APP_SERVER_PORT_BASE=4620/' "$ENV_DIR/runtime.env"
+sudo sed -i 's#^CODEX_APP_SERVER_LISTEN=.*#CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668#' "$ENV_DIR/agentdeck-app-server-default.env"
 
 echo "stopping legacy service"
 sudo systemctl stop agentdeck.service || true

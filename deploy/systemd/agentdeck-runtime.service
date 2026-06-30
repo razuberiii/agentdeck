@@ -5,22 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/opt/stacks/agentdeck
-Environment=HOME=/home/ubuntu
-Environment=DATA_DIR=/opt/data/agentdeck
+User=agentdeck
+Group=agentdeck
+WorkingDirectory=/opt/agentdeck
+Environment=HOME=/var/lib/agentdeck/home
+Environment=DATA_DIR=/var/lib/agentdeck
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852
 Environment=CODEX_APP_SERVER_PORT_BASE=4620
-EnvironmentFile=/opt/data/agentdeck/runtime.env
-ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/agentdeck-runtime.js
+EnvironmentFile=/etc/agentdeck/runtime.env
+ExecStart=/usr/bin/node /opt/agentdeck/server/dist/agentdeck-runtime.js
 Restart=always
 RestartSec=3
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /home/ubuntu /tmp /run
+ReadWritePaths=/var/lib/agentdeck /opt/agentdeck /tmp /run
 
 [Install]
 WantedBy=multi-user.target

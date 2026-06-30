@@ -7,6 +7,7 @@ import staticPlugin from '@fastify/static';
 import argon2 from 'argon2';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
@@ -20,8 +21,10 @@ import { RuntimeClient } from './runtime-client.js';
 import { AntigravityProvider, type AgentProviderId } from './providers.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 const execFileAsync = promisify(execFile);
-const DATA_DIR = process.env.DATA_DIR || '/opt/data/agentdeck';
-const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || '/home/ubuntu/.codex';
+const DEFAULT_HOME = process.env.HOME || os.homedir();
+const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
+const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.codex');
+const ANTIGRAVITY_BIN = process.env.ANTIGRAVITY_BIN || 'agy';
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const ANTIGRAVITY_PROFILES_DIR = path.join(DATA_DIR, 'antigravity-profiles');
 const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
@@ -38,10 +41,10 @@ const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
 const artifactScanStarts = new Map<string, number>();
 const COOKIE_NAME = 'agentdeck_session';
 const CSRF_COOKIE = 'agentdeck_csrf';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://codex.rubusoo.com,http://codex.rubusoo.com,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3842,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
 const db = new Db(path.join(DATA_DIR, 'agentdeck.sqlite3'));
 const runtimeDb = new Db(process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime.sqlite3'));
-const codex = new CodexBridge('/home/ubuntu', DEFAULT_CODEX_HOME);
+const codex = new CodexBridge(DEFAULT_HOME, DEFAULT_CODEX_HOME);
 const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
 const antigravity = new AntigravityProvider();
@@ -60,8 +63,8 @@ const loginJobs = new Map<string, LoginJob>();
 type AntigravityLoginJob = LoginJob & { providerId:'antigravity'; authCodePrompt?:boolean; codeSubmitted?:boolean };
 const antigravityLoginJobs = new Map<string, AntigravityLoginJob>();
 const antigravityLoginChildren = new Map<string, any>();
-const roots = await existingRoots((process.env.ALLOWED_WORKSPACES || '/opt/stacks,/opt/projects,/home/ubuntu,/opt/data,/etc/nginx,/etc/systemd/system').split(',').map(s=>s.trim()).filter(Boolean));
-const DEFAULT_WORKSPACE_DIR = roots.find(r => r === '/opt/stacks/agentdeck' || r.endsWith('/agentdeck')) || roots[0];
+const roots = await existingRoots((process.env.ALLOWED_WORKSPACES || `${process.cwd()},/opt/projects`).split(',').map(s=>s.trim()).filter(Boolean));
+const DEFAULT_WORKSPACE_DIR = roots.find(r => r === process.cwd() || r.endsWith('/agentdeck')) || roots[0];
 const PROJECTS_CACHE_MS = Number(process.env.PROJECTS_CACHE_MS || 30_000);
 const CODEX_STATUS_CACHE_MS = Number(process.env.CODEX_STATUS_CACHE_MS || 60_000);
 let projectsCache: { expiresAt:number; promise?:Promise<any[]>; value?:any[] } = { expiresAt: 0 };
@@ -209,7 +212,7 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
   const jobId = crypto.randomBytes(12).toString('base64url');
   const job: LoginJob = { id:jobId, profileId:String(profile.id), output:[], status:'running', code:null, startedAt:Date.now(), newProfile:req.body?.newProfile === true };
   loginJobs.set(jobId, job);
-  const child = spawn('codex', ['login','--device-auth'], { env:{...process.env, HOME:'/home/ubuntu', CODEX_HOME:String(profile.codex_home)}, stdio:['ignore','pipe','pipe'] });
+  const child = spawn('codex', ['login','--device-auth'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:String(profile.codex_home)}, stdio:['ignore','pipe','pipe'] });
   const push = (s:string) => {
     for (const line of s.split(/\r?\n/).filter(Boolean)) job.output.push(line.replace(/(token|secret|password)[^\n]*/ig, '$1=[redacted]'));
     job.output = job.output.slice(-80);
@@ -251,7 +254,7 @@ app.post('/api/antigravity/profiles/login', { preHandler: ensureAuth }, async ()
   const jobId = crypto.randomBytes(12).toString('base64url');
   const job: AntigravityLoginJob = { id:jobId, providerId:'antigravity', profileId:id, output:[], status:'running', code:null, startedAt:Date.now(), newProfile:true };
   antigravityLoginJobs.set(jobId, job);
-  const child = pty.spawn('/home/ubuntu/.local/bin/agy', [], {
+  const child = pty.spawn(ANTIGRAVITY_BIN, [], {
     name: 'xterm-256color',
     cols: 96,
     rows: 32,
@@ -742,7 +745,7 @@ async function activateProfile(id:string) {
 async function syncDefaultCodexAppServerEnv(codexHome:string) {
   const file = path.join(DATA_DIR, 'agentdeck-app-server-default.env');
   const body = [
-    'HOME=/home/ubuntu',
+    `HOME=${DEFAULT_HOME}`,
     `CODEX_HOME=${codexHome}`,
     `CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:${Number(process.env.CODEX_APP_SERVER_DEFAULT_PORT || 4668)}`,
     '',
@@ -851,7 +854,7 @@ function antigravityUsage(homeDir:string): Promise<string|null> {
     let output = '';
     let sent = false;
     let done = false;
-    const child = pty.spawn('/home/ubuntu/.local/bin/agy', [], {
+    const child = pty.spawn(ANTIGRAVITY_BIN, [], {
       name: 'xterm-256color',
       cols: 100,
       rows: 36,
@@ -1070,7 +1073,7 @@ function collectUsage(value:any, out:any[]) {
   if (value.tokenUsage && typeof value.tokenUsage === 'object') out.push(value.tokenUsage);
   for (const v of Array.isArray(value) ? value : Object.values(value)) collectUsage(v, out);
 }
-async function codexStatus(){ try { const codexHome = codex.getCodexHome(); const {stdout}=await execFileAsync('codex',['--version'], { env:{...process.env, HOME:'/home/ubuntu', CODEX_HOME:codexHome} }); return { ok:true, version:stdout.trim(), appServer:true, sessionsPath:path.join(codexHome,'sessions') }; } catch(e:any) { return { ok:false, error:e.message }; } }
+async function codexStatus(){ try { const codexHome = codex.getCodexHome(); const {stdout}=await execFileAsync('codex',['--version'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:codexHome} }); return { ok:true, version:stdout.trim(), appServer:true, sessionsPath:path.join(codexHome,'sessions') }; } catch(e:any) { return { ok:false, error:e.message }; } }
 function codexProviderStatus(status:any) {
   return {
     id: 'codex',
@@ -1453,7 +1456,7 @@ async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId
     if (sessionMode(row) === 'yolo') args.push('--dangerously-skip-permissions');
     args.push('--print', prompt);
     const homeDir = String(profile.home_dir);
-    const child = spawn('/home/ubuntu/.local/bin/agy', args, {
+    const child = spawn(ANTIGRAVITY_BIN, args, {
       cwd:String(row.project_dir),
       env:{ ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
       stdio:['ignore','pipe','pipe'],

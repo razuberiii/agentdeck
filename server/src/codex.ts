@@ -1,6 +1,8 @@
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline from 'node:readline';
 import { EventEmitter } from 'node:events';
+import os from 'node:os';
+import path from 'node:path';
 
 type Pending = { resolve: (v:any)=>void; reject:(e:any)=>void; timer: NodeJS.Timeout };
 export class CodexBridge extends EventEmitter {
@@ -8,7 +10,7 @@ export class CodexBridge extends EventEmitter {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private ready: Promise<void> | null = null;
-  constructor(private home = '/home/ubuntu', private codexHome = '/home/ubuntu/.codex') { super(); }
+  constructor(private home = process.env.HOME || os.homedir(), private codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || os.homedir(), '.codex')) { super(); }
   getCodexHome() { return this.codexHome; }
   async switchCodexHome(codexHome: string) {
     if (this.codexHome === codexHome) return;

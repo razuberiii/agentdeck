@@ -14,7 +14,7 @@ type RuntimeConnection = 'unknown'|'checking'|'recovering'|'connected'|'unavaila
 type Toast = { id:string; kind:'success'|'error'|'info'; text:string };
 type ApprovalRequest = { requestId:string; method:string; params:any };
 
-const FALLBACK_WORKSPACE = '/opt/stacks/agentdeck';
+const FALLBACK_WORKSPACE = '/opt/agentdeck';
 const APP_NAME = 'Agent Deck';
 const CHUNK_SIZE = 24 * 1024;
 const PUBLIC_UPLOAD_TARGET_BYTES = 650 * 1024;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=${ROOT:-/opt/stacks/agentdeck}
+ROOT=${ROOT:-/opt/agentdeck}
 LOG=${LOG:-$ROOT/.tools/production-cutover-result.log}
 mkdir -p "$ROOT/.tools"
 exec >>"$LOG" 2>&1

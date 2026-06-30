@@ -37,7 +37,7 @@ export interface AgentProvider {
 export class AntigravityProvider implements AgentProvider {
   id: AgentProviderId = 'antigravity';
   displayName = 'Antigravity';
-  private candidates = ['/home/ubuntu/.local/bin/agy', 'agy', 'antigravity', 'google-antigravity', 'gemini'];
+  private candidates = [process.env.ANTIGRAVITY_BIN, 'agy', 'antigravity', 'google-antigravity', 'gemini'].filter(Boolean) as string[];
 
   async getVersion() {
     const found = await this.detectCommand();

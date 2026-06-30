@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BACKUP_DIR=/opt/data/agentdeck/backups
+DATA_DIR=${DATA_DIR:-/var/lib/agentdeck}
+CODEX_HOME=${CODEX_HOME:-${HOME:-/var/lib/agentdeck/home}/.codex}
+BACKUP_DIR=${BACKUP_DIR:-$DATA_DIR/backups}
 STAMP=$(date -u +%Y%m%d)
 TMP=$(mktemp -d)
 mkdir -p "$BACKUP_DIR"
-if [ -d /home/ubuntu/.codex/sessions ]; then
-  tar -C /home/ubuntu/.codex -czf "$TMP/codex-sessions.tar.gz" sessions
+if [ -d "$CODEX_HOME/sessions" ]; then
+  tar -C "$CODEX_HOME" -czf "$TMP/codex-sessions.tar.gz" sessions
 else
   tar -czf "$TMP/codex-sessions.tar.gz" --files-from /dev/null
 fi
-if [ -f /opt/data/agentdeck/agentdeck.sqlite3 ]; then
-  sqlite3 /opt/data/agentdeck/agentdeck.sqlite3 ".backup '$TMP/agentdeck.sqlite3'"
+if [ -f "$DATA_DIR/agentdeck.sqlite3" ]; then
+  sqlite3 "$DATA_DIR/agentdeck.sqlite3" ".backup '$TMP/agentdeck.sqlite3'"
+fi
+if [ -f "$DATA_DIR/agentdeck-runtime.sqlite3" ]; then
+  sqlite3 "$DATA_DIR/agentdeck-runtime.sqlite3" ".backup '$TMP/agentdeck-runtime.sqlite3'"
 fi
 tar -C "$TMP" -czf "$BACKUP_DIR/agentdeck-$STAMP.tar.gz" .
 rm -rf "$TMP"

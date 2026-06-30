@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
@@ -13,7 +14,8 @@ import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
 
 const execFileAsync = promisify(execFile);
-const DATA_DIR = process.env.RUNTIME_DATA_DIR || process.env.DATA_DIR || '/opt/data/agentdeck';
+const DEFAULT_HOME = process.env.HOME || os.homedir();
+const DATA_DIR = process.env.RUNTIME_DATA_DIR || process.env.DATA_DIR || '/var/lib/agentdeck';
 const DB_FILE = process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime.sqlite3');
 const HOST = process.env.RUNTIME_HOST || '127.0.0.1';
 const PORT = Number(process.env.RUNTIME_PORT || 3852);
@@ -21,9 +23,10 @@ const RUNTIME_TOKEN = process.env.RUNTIME_TOKEN || '';
 const CODEX_PORT_BASE = Number(process.env.CODEX_APP_SERVER_PORT_BASE || 4520);
 const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAULT_PORT || 4668);
 const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || '/home/ubuntu/.codex';
-const DEFAULT_HOME = process.env.HOME || '/home/ubuntu';
-const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || '/opt/stacks/agentdeck';
+const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.codex');
+const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || process.cwd();
+const APP_SERVER_USER = process.env.CODEX_APP_SERVER_USER || 'agentdeck';
+const APP_SERVER_GROUP = process.env.CODEX_APP_SERVER_GROUP || APP_SERVER_USER;
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
@@ -161,8 +164,8 @@ class CodexAccountRuntime extends EventEmitter {
     } else {
     const args = [
       '--unit', unit,
-      '--uid', 'ubuntu',
-      '--gid', 'ubuntu',
+      '--uid', APP_SERVER_USER,
+      '--gid', APP_SERVER_GROUP,
       '--property', `WorkingDirectory=${DEFAULT_WORKDIR}`,
       '--property', 'Restart=always',
       '--property', 'RestartSec=2',
@@ -1048,12 +1051,8 @@ function isTerminalEvent(eventType:string) {
 
 async function ensureCodexHomeSharedDirs(codexHome:string) {
   await mkdir(codexHome, { recursive:true });
-  const resolvedHome = realpathSync(codexHome);
-  const resolvedData = realpathSync(DATA_DIR);
-  if (resolvedData !== '/opt/data/agentdeck' && !resolvedHome.startsWith(resolvedData + path.sep)) {
-    app.log.warn({ codexHome, dataDir:DATA_DIR }, 'skipping shared codex dir repair outside test data dir');
-    return;
-  }
+  realpathSync(codexHome);
+  realpathSync(DATA_DIR);
   await mkdir(SHARED_SESSIONS_DIR, { recursive:true });
   await mkdir(SHARED_GENERATED_IMAGES_DIR, { recursive:true });
   await ensureSharedDirLink(codexHome, 'sessions', SHARED_SESSIONS_DIR);
