@@ -116,7 +116,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
     const status = await antigravity.status();
     const activeProfile:any = await getActiveAntigravityProfile();
     const login = activeProfile?.home_dir ? await antigravityLoginStatus(String(activeProfile.home_dir)) : { ok:false, email:null };
-    const usageText = status.ok && login.ok ? await antigravityUsage(String(activeProfile.home_dir)).catch((e:any)=>e?.message || String(e)) : null;
+    const usageText = status.ok && login.ok ? await antigravityUsage(String(activeProfile.home_dir)).catch(()=>null) : null;
     const email = login.email || activeProfile?.name || null;
     return {
       providerId: 'antigravity',
@@ -125,7 +125,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
       provider: status,
       errors: {
         account: status.ok && !email ? '请先登录 Antigravity Google 账户' : (status.ok ? null : status.error),
-        rateLimits: status.ok && login.ok ? null : (status.ok ? 'Antigravity 额度需要登录后通过 CLI 内置 /usage 读取' : status.error),
+        rateLimits: status.ok && login.ok && !usageText ? 'Google Antigravity CLI 当前没有暴露稳定的可机读额度；交互式 /usage 在当前远程 PTY 下未返回可解析内容。' : (status.ok && login.ok ? null : (status.ok ? 'Antigravity 额度需要登录后通过 CLI 内置 /usage 读取' : status.error)),
       },
       checkedAt: Date.now(),
     };
@@ -834,7 +834,7 @@ async function antigravityLoginStatus(homeDir:string) {
 async function antigravityProfileName(homeDir:string) {
   return await scanEmail(path.join(homeDir, '.gemini')).catch(()=>null) || 'Antigravity Account';
 }
-function antigravityUsage(homeDir:string): Promise<string> {
+function antigravityUsage(homeDir:string): Promise<string|null> {
   return new Promise((resolve) => {
     let output = '';
     let sent = false;
@@ -851,15 +851,15 @@ function antigravityUsage(homeDir:string): Promise<string> {
       done = true;
       clearTimeout(timer);
       try { child.kill(); } catch {}
-      const text = cleanAgentOutput(output).split(/\r?\n/).map(s=>s.trim()).filter(Boolean).slice(-80).join('\n');
-      resolve(text || 'Antigravity 未返回 usage 输出');
+      const text = cleanAgentOutput(output).split(/\r?\n/).map(s=>s.trim()).filter(Boolean).filter(s=>!isTerminalControlNoise(s)).slice(-80).join('\n');
+      resolve(isUsefulAntigravityUsage(text) ? text : null);
     };
     const timer = setTimeout(finish, 8000);
     child.onData((d:string) => {
       output += d;
       if (!sent && /send a message|Type|Welcome|Antigravity/i.test(stripAnsi(output))) {
         sent = true;
-        setTimeout(() => child.write('/usage\r'), 200);
+        setTimeout(() => child.write('/usage\r'), 500);
       }
     });
     child.onExit(() => finish());
@@ -958,6 +958,8 @@ function cleanAgentOutput(text:string) {
   }
   return cleaned;
 }
+function isTerminalControlNoise(line:string){ return !/[A-Za-z0-9\u4e00-\u9fff]/.test(line) || /^[?;=<>0-9\s()[\]{}|/\\._:-]+$/.test(line); }
+function isUsefulAntigravityUsage(text:string){ return /usage|quota|limit|额度|剩余|remaining|tokens?|requests?|reset/i.test(text) && text.length > 20; }
 function redactLine(line:string){ return line.replace(/(token|secret|password|refresh_token|access_token)[^\n]*/ig, '$1=[redacted]'); }
 function shellQuote(value:string) { return `'${value.replaceAll("'", "'\\''")}'`; }
 function normalizeMode(value:any) { const v = String(value || ''); return ['yolo','workspace-write','read-only'].includes(v) ? v : null; }
@@ -1243,7 +1245,27 @@ async function listIndexedThreads(archived:boolean){
   return [...byId.values()].sort((a:any,b:any)=>Number(b.updated_at || 0)-Number(a.updated_at || 0));
 }
 function projectNameFromPath(p:string){ return p.split(path.sep).filter(Boolean).pop() || p; }
-async function joinAndResume(id:string, ws:any, lastSequence = 0){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if(!clients.has(threadId)) clients.set(threadId,new Set()); clients.get(threadId)!.add(ws); if (row && normalizeProvider(row.provider_id) === 'antigravity') { ws.send(JSON.stringify({type:'joined', sessionId:threadId})); return; } if (USE_AGENT_RUNTIME) { await replayRuntimeEventsToWs(threadId, ws, lastSequence); ensureRuntimePushSubscription(threadId); ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:runtimeSubscriptions.get(threadId)?.connected?'connected':'recovering'})); return; } if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{}); ws.send(JSON.stringify({type:'joined', sessionId:threadId})); }
+async function joinAndResume(id:string, ws:any, lastSequence = 0){
+  const row = await findSession(id);
+  const threadId = String(row?.codex_thread_id || id);
+  if(!clients.has(threadId)) clients.set(threadId,new Set());
+  clients.get(threadId)!.add(ws);
+  if (row && normalizeProvider(row.provider_id) === 'antigravity') {
+    ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:'connected'}));
+    return;
+  }
+  if (USE_AGENT_RUNTIME) {
+    await replayRuntimeEventsToWs(threadId, ws, lastSequence);
+    const latestSequence = Number(row?.last_sequence || 0);
+    const shouldSubscribe = activeCodexSessions.has(threadId) || String(row?.status || '') === 'running' || Number(lastSequence || 0) < latestSequence;
+    if (shouldSubscribe) ensureRuntimePushSubscription(threadId);
+    const subscription = runtimeSubscriptions.get(threadId);
+    ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:subscription ? (subscription.connected?'connected':'recovering') : 'connected'}));
+    return;
+  }
+  if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{});
+  ws.send(JSON.stringify({type:'joined', sessionId:threadId}));
+}
 function broadcast(id:string, msg:any){ for(const ws of clients.get(id) || []) if(ws.readyState === 1) { ws.send(JSON.stringify(msg)); runtimeDiagnostics.broadcasts++; } }
 function ensureRuntimePushSubscription(threadId:string) {
   const existing = runtimeSubscriptions.get(threadId);
