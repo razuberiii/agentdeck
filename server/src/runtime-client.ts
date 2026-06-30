@@ -2,6 +2,10 @@ import http from 'node:http';
 
 export class RuntimeClient {
   constructor(private baseUrl = process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852') {}
+  private authHeaders() {
+    const token = process.env.RUNTIME_TOKEN || process.env.AGENT_RUNTIME_TOKEN || '';
+    return token ? { authorization:`Bearer ${token}` } : {};
+  }
 
   health() { return this.request('GET', '/healthz'); }
   diagnostics() { return this.request('GET', '/diagnostics'); }
@@ -20,7 +24,7 @@ export class RuntimeClient {
   stopTurn(id:string) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/stop`); }
   subscribe(id:string, after:number, onEvent:(event:any)=>void, onStatus?:(status:'connected'|'closed'|'error', error?:any)=>void) {
     const url = new URL(`/sessions/${encodeURIComponent(id)}/subscribe?after=${encodeURIComponent(String(after))}`, this.baseUrl);
-    const req = http.request(url, { method:'GET', headers:{ accept:'text/event-stream' } });
+    const req = http.request(url, { method:'GET', headers:{ accept:'text/event-stream', ...this.authHeaders() } });
     let buffer = '';
     req.on('response', res => {
       if ((res.statusCode || 500) >= 400) {
@@ -57,7 +61,7 @@ export class RuntimeClient {
     return new Promise<any>((resolve, reject) => {
       const req = http.request(url, {
         method,
-        headers: payload ? { 'content-type':'application/json', 'content-length':String(payload.length) } : {},
+        headers: payload ? { 'content-type':'application/json', 'content-length':String(payload.length), ...this.authHeaders() } : this.authHeaders(),
         timeout: 120_000,
       }, res => {
         const chunks:Buffer[] = [];

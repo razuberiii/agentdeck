@@ -17,6 +17,7 @@ const DATA_DIR = process.env.RUNTIME_DATA_DIR || process.env.DATA_DIR || '/opt/d
 const DB_FILE = process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime.sqlite3');
 const HOST = process.env.RUNTIME_HOST || '127.0.0.1';
 const PORT = Number(process.env.RUNTIME_PORT || 3852);
+const RUNTIME_TOKEN = process.env.RUNTIME_TOKEN || '';
 const CODEX_PORT_BASE = Number(process.env.CODEX_APP_SERVER_PORT_BASE || 4520);
 const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAULT_PORT || 4668);
 const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -27,6 +28,12 @@ const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
+function isLoopbackHost(host:string) {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
+if (!isLoopbackHost(HOST) && !RUNTIME_TOKEN) {
+  throw new Error('RUNTIME_TOKEN is required when RUNTIME_HOST is not loopback');
+}
 
 type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
 type RuntimeSession = {
@@ -217,6 +224,11 @@ const RUNTIME_GENERATION = INSTANCE_ID;
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 eventLoopDelay.enable();
 const app = Fastify({ logger:{ redact:['req.headers.authorization','token','secret','password'] }, bodyLimit:25 * 1024 * 1024 });
+app.addHook('preHandler', async (req, reply) => {
+  if (!RUNTIME_TOKEN) return;
+  const authorization = String(req.headers.authorization || '');
+  if (authorization !== `Bearer ${RUNTIME_TOKEN}`) return reply.code(401).send({ error:'unauthorized' });
+});
 
 app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now() }));
 app.get('/diagnostics', async () => ({
@@ -936,6 +948,8 @@ async function appendEventUnlocked(sessionId:string, eventType:string, payload:a
   const sequence = await nextSequence(sessionId);
   const now = Date.now();
   const event = { session_id:sessionId, threadId:sessionId, generation:RUNTIME_GENERATION, sequence, event_type:eventType, payload_json:JSON.stringify(payload), created_at:now };
+  if (isTerminalEvent(eventType)) await flushDeltaEvents(sessionId);
+  if (isCriticalEvent(eventType)) await persistEvent(event, eventKey);
   let pushed = 0;
   for (const raw of subscriptions.get(sessionId) || []) {
     diagnostics.runtimePendingPushCount++;
@@ -948,7 +962,7 @@ async function appendEventUnlocked(sessionId:string, eventType:string, payload:a
   if (isDeltaEvent(eventType) || eventType === 'turn/completed' || eventType === 'item/completed') {
     app.log.info({ localSessionId:sessionId, operation:'runtime SSE push', eventType, runtimePendingPushCount:diagnostics.runtimePendingPushCount, activeSseSubscriberCount:subscriptions.get(sessionId)?.size || 0, durationMs:Date.now() - startedAt }, 'runtime event pushed');
   }
-  persistEvent(event, eventKey).catch(e => app.log.error({ err:e, sessionId, eventType }, 'event persist failed'));
+  if (!isCriticalEvent(eventType)) persistEvent(event, eventKey).catch(e => app.log.error({ err:e, sessionId, eventType }, 'event persist failed'));
   return event;
 }
 
@@ -1007,6 +1021,29 @@ async function insertEvents(batch:{ event:any; eventKey:string|null }[]) {
 
 function isDeltaEvent(eventType:string) {
   return eventType === 'item/agentMessage/delta' || eventType === 'item/commandExecution/outputDelta';
+}
+
+function isCriticalEvent(eventType:string) {
+  return eventType === 'user'
+    || eventType === 'turn/start'
+    || eventType === 'turn/started'
+    || eventType === 'turn/completed'
+    || eventType === 'turn/failed'
+    || eventType === 'turn/interrupted'
+    || eventType === 'thread/status/changed'
+    || eventType === 'thread_snapshot'
+    || eventType === 'runtime/disconnect'
+    || eventType === 'runtime/recovering'
+    || eventType === 'thread_recovered_with_new_upstream'
+    || eventType === 'output_gap'
+    || eventType === 'item/completed';
+}
+
+function isTerminalEvent(eventType:string) {
+  return eventType === 'turn/completed'
+    || eventType === 'turn/failed'
+    || eventType === 'turn/interrupted'
+    || eventType === 'item/completed';
 }
 
 async function ensureCodexHomeSharedDirs(codexHome:string) {
