@@ -528,11 +528,16 @@ async function ensureAccount(id:string, codexHome:string) {
 }
 
 async function bootstrapRuntimeRecovery() {
-  const accounts = await db.all('SELECT * FROM accounts ORDER BY updated_at DESC');
-  if (!accounts.length) {
-    await runtimeForAccount('default').catch(e => app.log.warn({ err:e }, 'default account bootstrap failed'));
-    return;
-  }
+  const rows = await db.all(
+    `SELECT DISTINCT accounts.*
+     FROM accounts
+     LEFT JOIN sessions ON sessions.account_id=accounts.id
+     WHERE accounts.id='default'
+        OR sessions.status IN ('running','active')
+        OR sessions.active_turn_id IS NOT NULL
+     ORDER BY accounts.updated_at DESC`
+  );
+  const accounts = rows.length ? rows : [await ensureAccount('default', DEFAULT_CODEX_HOME)];
   for (const row of accounts) {
     const account = row as Account;
     runtimeForAccount(account.id).catch(e => app.log.warn({ err:e, accountId:account.id }, 'account bootstrap failed'));
