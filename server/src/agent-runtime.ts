@@ -31,10 +31,12 @@ const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
 type RuntimeSession = {
   id:string;
+  codex_thread_id:string | null;
   account_id:string | null;
   provider:string;
   upstream_thread_id:string | null;
   upstream_generation:string | null;
+  upstream_status:string | null;
   active_turn_id:string | null;
   status:string;
   project_dir:string;
@@ -66,8 +68,16 @@ class CodexAccountRuntime extends EventEmitter {
   }
 
   async request(method:string, params?:any, timeoutMs = 120_000) {
-    await this.ensureConnected();
-    return this.client!.request(method, params, timeoutMs);
+    const startedAt = Date.now();
+    diagnostics.activeRuntimeRpcCount++;
+    try {
+      await this.ensureConnected();
+      const result = await this.client!.request(method, params, timeoutMs);
+      app.log.info({ operation:`runtime ${method}`, durationMs:Date.now() - startedAt, activeRuntimeRpcCount:diagnostics.activeRuntimeRpcCount }, 'runtime rpc completed');
+      return result;
+    } finally {
+      diagnostics.activeRuntimeRpcCount = Math.max(0, diagnostics.activeRuntimeRpcCount - 1);
+    }
   }
 
   async restartAppServer() {
@@ -183,6 +193,10 @@ const eventAppendChains = new Map<string, Promise<any>>();
 const sequenceCache = new Map<string, number>();
 const deltaPersistQueues = new Map<string, any[]>();
 const deltaPersistTimers = new Map<string, NodeJS.Timeout>();
+const resumeInFlight = new Map<string, Promise<{ threadId:string; recovered:boolean }>>();
+const reconcileInFlight = new Map<string, Promise<void>>();
+const lastReconcileAt = new Map<string, number>();
+const threadSessionCache = new Map<string, RuntimeSession>();
 const diagnostics = {
   startedAt: Date.now(),
   sseConnections: 0,
@@ -194,6 +208,9 @@ const diagnostics = {
   sqliteBatches: 0,
   sqliteRows: 0,
   sqliteMs: 0,
+  activeRuntimeRpcCount: 0,
+  sseReconnectCount: 0,
+  runtimePendingPushCount: 0,
 };
 const STALE_RUNNING_MS = Number(process.env.STALE_RUNNING_MS || 30 * 60 * 1000);
 const RUNTIME_GENERATION = INSTANCE_ID;
@@ -206,6 +223,11 @@ app.get('/diagnostics', async () => ({
   ...diagnostics,
   activeSseSubscribers:[...subscriptions.entries()].map(([sessionId,set]) => ({ sessionId, count:set.size })),
   activeSseSubscriberTotal:[...subscriptions.values()].reduce((sum,set)=>sum+set.size,0),
+  activeRuntimeRpcCount:diagnostics.activeRuntimeRpcCount,
+  activeSseSubscriberCount:[...subscriptions.values()].reduce((sum,set)=>sum+set.size,0),
+  sseReconnectCount:diagnostics.sseReconnectCount,
+  resumeInFlightCount:resumeInFlight.size,
+  runtimePendingPushCount:diagnostics.runtimePendingPushCount,
   runtimeCount:runtimes.size,
   eventLoopDelayMs:{
     mean:Number.isFinite(eventLoopDelay.mean) ? eventLoopDelay.mean / 1e6 : 0,
@@ -216,9 +238,12 @@ app.get('/diagnostics', async () => ({
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
 
 app.get('/sessions', async (req:any) => {
+  const requestId = req.id;
+  const startedAt = Date.now();
   const archived = String(req.query?.archived || '') === '1' ? 1 : 0;
-  await reconcileStaleRunningSessions();
+  const sqliteStartedAt = Date.now();
   const sessions = await db.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived]);
+  app.log.info({ requestId, operation:'GET /sessions', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'runtime sessions listed from sqlite');
   return { sessions };
 });
 
@@ -318,13 +343,24 @@ app.post('/codex/sessions/resume', async (req:any, reply) => {
 });
 
 app.get('/sessions/:id', async (req:any, reply) => {
-  await reconcileStaleRunningSessions(String(req.params.id));
+  const requestId = req.id;
+  const startedAt = Date.now();
+  const sqliteStartedAt = Date.now();
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
-  const read = await readAuthoritativeThread(session).catch((e:any) => ({ error:e?.message || String(e), thread:threadFromSession(session) }));
-  if (read.thread && !read.error) await reconcileThread(session, read.thread, 'api_thread_read', false).catch(()=>{});
+  const thread = await threadFromSnapshot(session);
+  const sqliteDurationMs = Date.now() - sqliteStartedAt;
   const fresh = await getSession(String(session.id)) || session;
-  return { session:fresh, thread:read.thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:Number(fresh.last_sequence || 0), error:read.error || null } };
+  scheduleThreadReconcile(fresh, 'api_background_thread_read');
+  app.log.info({
+    requestId,
+    localSessionId:fresh.id,
+    upstreamThreadId:fresh.upstream_thread_id || fresh.id,
+    operation:'GET /sessions/:id',
+    sqliteDurationMs,
+    totalDurationMs:Date.now() - startedAt,
+  }, 'runtime session snapshot returned');
+  return { session:fresh, thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:Number(fresh.last_sequence || 0), error:fresh.upstream_status === 'missing' ? 'upstream_missing' : null } };
 });
 
 app.patch('/sessions/:id', async (req:any, reply) => {
@@ -365,6 +401,7 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
   }
   reply.raw.on('close', () => {
     set.delete(reply.raw);
+    diagnostics.sseReconnectCount++;
     app.log.info({ sessionId, activeSubscribers:set.size }, 'runtime sse subscriber closed');
   });
 });
@@ -395,9 +432,29 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
     }, opts));
   } catch (e:any) {
     const message = e?.message || String(e);
+    if (isMissingUpstreamThreadError(message)) {
+      await markUpstreamMissing(session, threadId, message);
+      const rebuilt = await createReplacementThread(session, runtime, opts, cwd, threadId, message);
+      const retryInput = rebuilt.recovered ? [await recoveryContextInput(session), ...input] : input;
+      try {
+        turn = await runtime.request('turn/start', withModel({
+          threadId:rebuilt.threadId,
+          cwd,
+          approvalPolicy:opts.approvalPolicy,
+          sandboxPolicy:{ type:sandboxPolicyType(opts.sandboxMode) },
+          input:retryInput,
+        }, opts));
+      } catch (retryError:any) {
+        const retryMessage = retryError?.message || String(retryError);
+        await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'turn_start_failed', Date.now(), session.id]);
+        await appendEvent(session.id, 'turn/failed', { threadId:rebuilt.threadId, error:{ message:retryMessage }, source:'runtime' });
+        return reply.code(500).send({ error:retryMessage });
+      }
+    } else {
     await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'turn_start_failed', Date.now(), session.id]);
     await appendEvent(session.id, 'turn/failed', { threadId, error:{ message }, source:'runtime' });
     return reply.code(message.includes('thread not found') ? 409 : 500).send({ error:message });
+    }
   }
   if (turn?.turn?.id) await db.run('UPDATE sessions SET active_turn_id=?1, status=?2, updated_at=?3 WHERE id=?4', [String(turn.turn.id), 'running', Date.now(), session.id]);
   await appendEvent(session.id, 'turn/start', { result:turn, source:'runtime' });
@@ -425,7 +482,9 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
 
 await app.listen({ host:HOST, port:PORT });
 app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID }, 'agent-runtime listening');
-setTimeout(() => bootstrapRuntimeRecovery().catch(e => app.log.error({ err:e }, 'runtime bootstrap recovery failed')), 50);
+if (process.env.SKIP_RUNTIME_BOOTSTRAP !== '1') {
+  setTimeout(() => bootstrapRuntimeRecovery().catch(e => app.log.error({ err:e }, 'runtime bootstrap recovery failed')), 50);
+}
 setInterval(() => {
   db.run('UPDATE runtime_instances SET heartbeat_at=?1 WHERE instance_id=?2', [Date.now(), INSTANCE_ID]).catch(()=>{});
 }, 5000).unref();
@@ -442,6 +501,7 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE sessions ADD COLUMN provider TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN upstream_thread_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN upstream_generation TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN upstream_status TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN active_turn_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN interruption_reason TEXT').catch(()=>{});
@@ -452,6 +512,7 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE events ADD COLUMN event_key TEXT').catch(()=>{});
   await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_sequence ON events(session_id, sequence)');
   await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_key ON events(session_id, event_key)');
+  await db.run('CREATE INDEX IF NOT EXISTS idx_events_session_type_sequence ON events(session_id, event_type, sequence)');
   await db.run('CREATE INDEX IF NOT EXISTS idx_sessions_upstream_thread_id ON sessions(upstream_thread_id)');
 }
 
@@ -610,16 +671,40 @@ async function reconcileStaleRunningSessions(id?:string) {
 }
 
 async function sessionForThread(upstreamThreadId:string) {
-  return db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [upstreamThreadId]) as Promise<RuntimeSession | null>;
+  const cached = threadSessionCache.get(upstreamThreadId);
+  if (cached) return cached;
+  const row = await db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [upstreamThreadId]) as RuntimeSession | null;
+  if (row) {
+    threadSessionCache.set(String(row.id), row);
+    if (row.upstream_thread_id) threadSessionCache.set(String(row.upstream_thread_id), row);
+    if (row.codex_thread_id) threadSessionCache.set(String(row.codex_thread_id), row);
+  }
+  return row;
 }
 
 async function getSession(id:string) {
-  return db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [id]) as Promise<RuntimeSession | null>;
+  const row = await db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [id]) as RuntimeSession | null;
+  if (row) {
+    threadSessionCache.set(String(row.id), row);
+    if (row.upstream_thread_id) threadSessionCache.set(String(row.upstream_thread_id), row);
+    if (row.codex_thread_id) threadSessionCache.set(String(row.codex_thread_id), row);
+  }
+  return row;
 }
 
 async function ensureLiveThread(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string):Promise<{ threadId:string; recovered:boolean }> {
+  const key = String(session.upstream_thread_id || session.id);
+  const existing = resumeInFlight.get(key);
+  if (existing) return existing;
+  const task = ensureLiveThreadUnlocked(session, runtime, opts, cwd).finally(() => { resumeInFlight.delete(key); });
+  resumeInFlight.set(key, task);
+  return task;
+}
+
+async function ensureLiveThreadUnlocked(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string):Promise<{ threadId:string; recovered:boolean }> {
   const threadId = String(session.upstream_thread_id || session.id);
-  if (session.upstream_generation === RUNTIME_GENERATION) return { threadId, recovered:false };
+  if (session.upstream_status !== 'missing' && session.upstream_generation === RUNTIME_GENERATION) return { threadId, recovered:false };
+  if (session.upstream_status === 'missing') return createReplacementThread(session, runtime, opts, cwd, threadId, 'upstream previously marked missing');
   try {
     diagnostics.threadResumeCalls++;
     await runtime.request('thread/resume', withModel({
@@ -628,53 +713,62 @@ async function ensureLiveThread(session:RuntimeSession, runtime:CodexAccountRunt
       approvalPolicy:opts.approvalPolicy,
       sandbox:opts.sandboxMode,
     }, opts));
-    await db.run('UPDATE sessions SET upstream_generation=?1, updated_at=?2 WHERE id=?3 AND COALESCE(upstream_thread_id,id)=?4', [RUNTIME_GENERATION, Date.now(), session.id, threadId]);
+    await db.run('UPDATE sessions SET upstream_generation=?1, upstream_status=?2, updated_at=?3 WHERE id=?4 AND COALESCE(upstream_thread_id,id)=?5', [RUNTIME_GENERATION, 'attached', Date.now(), session.id, threadId]);
     return { threadId, recovered:false };
   } catch (e:any) {
     const message = e?.message || String(e);
     if (!isMissingUpstreamThreadError(message)) throw e;
-    const fresh = await getSession(session.id);
-    const currentThreadId = String(fresh?.upstream_thread_id || session.upstream_thread_id || session.id);
-    if (currentThreadId !== threadId) return { threadId:currentThreadId, recovered:false };
-    app.log.warn({
-      localSessionId:session.id,
-      oldUpstreamThreadId:threadId,
-      fallbackReason:message,
-    }, 'upstream thread missing; creating replacement');
-    diagnostics.threadStartCalls++;
-    const started = await runtime.request('thread/start', withModel({
-      cwd,
-      approvalPolicy:opts.approvalPolicy,
-      sandbox:opts.sandboxMode,
-    }, opts));
-    const nextThreadId = String(started?.thread?.id || '');
-    if (!nextThreadId) throw e;
-    const now = Date.now();
-    const updated = await db.get(
-      `UPDATE sessions
-       SET upstream_thread_id=?1, upstream_generation=?2, updated_at=?3
-       WHERE id=?4 AND COALESCE(upstream_thread_id,id)=?5
-       RETURNING upstream_thread_id`,
-      [nextThreadId, RUNTIME_GENERATION, now, session.id, threadId]
-    );
-    if (!updated) {
-      const latest = await getSession(session.id);
-      return { threadId:String(latest?.upstream_thread_id || threadId), recovered:false };
-    }
-    app.log.warn({
-      localSessionId:session.id,
-      oldUpstreamThreadId:threadId,
-      newUpstreamThreadId:nextThreadId,
-      fallbackReason:message,
-    }, 'upstream thread replacement persisted');
-    await appendEvent(session.id, 'thread_recovered_with_new_upstream', {
-      oldUpstreamThreadId:threadId,
-      newUpstreamThreadId:nextThreadId,
-      fallbackReason:message,
-      warning:'上游会话已重建，部分模型上下文可能丢失',
-    });
-    return { threadId:nextThreadId, recovered:true };
+    await markUpstreamMissing(session, threadId, message);
+    return createReplacementThread(session, runtime, opts, cwd, threadId, message);
   }
+}
+
+async function markUpstreamMissing(session:RuntimeSession, threadId:string, reason:string) {
+  await db.run('UPDATE sessions SET upstream_status=?1, interruption_reason=?2, updated_at=?3 WHERE id=?4 AND COALESCE(upstream_thread_id,id)=?5', ['missing', 'upstream_missing', Date.now(), session.id, threadId]);
+  app.log.warn({ localSessionId:session.id, oldUpstreamThreadId:threadId, fallbackReason:reason, upstreamStatus:'missing' }, 'upstream thread marked missing');
+}
+
+async function createReplacementThread(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string, oldThreadId:string, reason:string) {
+  const fresh = await getSession(session.id);
+  const currentThreadId = String(fresh?.upstream_thread_id || session.upstream_thread_id || session.id);
+  if (currentThreadId !== oldThreadId && fresh?.upstream_status !== 'missing') return { threadId:currentThreadId, recovered:false };
+  diagnostics.threadStartCalls++;
+  const started = await runtime.request('thread/start', withModel({
+    cwd,
+    approvalPolicy:opts.approvalPolicy,
+    sandbox:opts.sandboxMode,
+  }, opts));
+  const nextThreadId = String(started?.thread?.id || '');
+  if (!nextThreadId) throw new Error(`replacement thread/start did not return a thread id after ${reason}`);
+  const now = Date.now();
+  const updated = await db.get(
+    `UPDATE sessions
+     SET upstream_thread_id=?1, upstream_generation=?2, upstream_status=?3, updated_at=?4
+     WHERE id=?5 AND (COALESCE(upstream_thread_id,id)=?6 OR upstream_status='missing')
+     RETURNING upstream_thread_id`,
+    [nextThreadId, RUNTIME_GENERATION, 'rebuilt', now, session.id, oldThreadId]
+  );
+  if (!updated) {
+    const latest = await getSession(session.id);
+    return { threadId:String(latest?.upstream_thread_id || oldThreadId), recovered:false };
+  }
+  threadSessionCache.delete(oldThreadId);
+  threadSessionCache.set(nextThreadId, { ...(fresh || session), upstream_thread_id:nextThreadId, upstream_generation:RUNTIME_GENERATION, upstream_status:'rebuilt' } as RuntimeSession);
+  app.log.warn({
+    localSessionId:session.id,
+    oldUpstreamThreadId:oldThreadId,
+    newUpstreamThreadId:nextThreadId,
+    fallbackReason:reason,
+    upstreamStatus:'rebuilt',
+  }, 'upstream thread replacement persisted');
+  await appendEvent(session.id, 'thread_recovered_with_new_upstream', {
+    oldUpstreamThreadId:oldThreadId,
+    newUpstreamThreadId:nextThreadId,
+    fallbackReason:reason,
+    upstreamStatus:'rebuilt',
+    warning:'上游会话已重建，部分模型上下文可能丢失',
+  });
+  return { threadId:nextThreadId, recovered:true };
 }
 
 async function recoveryContextInput(session:RuntimeSession) {
@@ -752,6 +846,62 @@ function threadFromSession(session:RuntimeSession) {
   };
 }
 
+async function threadFromSnapshot(session:RuntimeSession) {
+  const rows = await eventsAfter(session.id, 0, false);
+  const items:any[] = [];
+  for (const event of rows) {
+    const eventType = String(event.event_type || '');
+    let payload:any = {};
+    try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
+    if (eventType === 'user') {
+      const input = Array.isArray(payload?.input) ? payload.input : [];
+      const content = input
+        .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
+        .map((item:any) => ({ type:'text', text:String(item.text || '').replace(RECOVERY_CONTEXT_MARKER, '').trim() }))
+        .filter((item:any) => item.text);
+      if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', content });
+      continue;
+    }
+    if (eventType === 'item/completed') {
+      const item = payload?.params?.item || payload?.item;
+      if (item && ['userMessage','agentMessage','plan','reasoning','commandExecution','fileChange','imageView','imageGeneration','artifact','dynamicToolCall'].includes(String(item.type))) items.push(item);
+      continue;
+    }
+    if (eventType === 'turn/failed' || eventType === 'turn/interrupted') {
+      const reason = payload?.reason || payload?.params?.reason || payload?.error?.message || payload?.params?.error?.message || '';
+      items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage', text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
+      continue;
+    }
+    if (eventType === 'thread_recovered_with_new_upstream') {
+      items.push({ id:`upstream-rebuilt-${event.sequence}`, type:'agentMessage', text:String(payload?.warning || '上游会话已重建，部分模型上下文可能丢失'), phase:'final_answer' });
+    }
+  }
+  return { ...threadFromSession(session), turns:items.length ? [{ id:`snapshot-${session.id}`, items }] : [] };
+}
+
+function scheduleThreadReconcile(session:RuntimeSession, source:string) {
+  if (session.upstream_status === 'missing') return;
+  const key = String(session.id);
+  const now = Date.now();
+  if ((lastReconcileAt.get(key) || 0) + 15_000 > now) return;
+  if (reconcileInFlight.has(key)) return;
+  lastReconcileAt.set(key, now);
+  const task = (async () => {
+    try {
+      const read = await readAuthoritativeThread(session);
+      if (read?.thread) await reconcileThread(session, read.thread, source, true);
+    } catch (e:any) {
+      const message = e?.message || String(e);
+      if (isMissingUpstreamThreadError(message)) {
+        await markUpstreamMissing(session, String(session.upstream_thread_id || session.id), message);
+        return;
+      }
+      app.log.warn({ localSessionId:session.id, upstreamThreadId:session.upstream_thread_id || session.id, error:message }, 'background thread reconcile failed');
+    }
+  })().finally(() => { reconcileInFlight.delete(key); });
+  reconcileInFlight.set(key, task);
+}
+
 async function appendEvent(sessionId:string, eventType:string, payload:any) {
   const previous = eventAppendChains.get(sessionId) || Promise.resolve();
   const next = previous.then(() => appendEventUnlocked(sessionId, eventType, payload), () => appendEventUnlocked(sessionId, eventType, payload));
@@ -760,6 +910,7 @@ async function appendEvent(sessionId:string, eventType:string, payload:any) {
 }
 
 async function appendEventUnlocked(sessionId:string, eventType:string, payload:any) {
+  const startedAt = Date.now();
   const eventKey = eventKeyFor(eventType, payload);
   if (eventKey) {
     const existing = await db.get('SELECT sequence FROM events WHERE session_id=?1 AND event_key=?2', [sessionId, eventKey]);
@@ -770,11 +921,16 @@ async function appendEventUnlocked(sessionId:string, eventType:string, payload:a
   const event = { session_id:sessionId, threadId:sessionId, generation:RUNTIME_GENERATION, sequence, event_type:eventType, payload_json:JSON.stringify(payload), created_at:now };
   let pushed = 0;
   for (const raw of subscriptions.get(sessionId) || []) {
+    diagnostics.runtimePendingPushCount++;
     raw.write('event: runtime\n');
     raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    diagnostics.runtimePendingPushCount = Math.max(0, diagnostics.runtimePendingPushCount - 1);
     pushed++;
   }
   if (isDeltaEvent(eventType)) diagnostics.deltasSsePushed += pushed;
+  if (isDeltaEvent(eventType) || eventType === 'turn/completed' || eventType === 'item/completed') {
+    app.log.info({ localSessionId:sessionId, operation:'runtime SSE push', eventType, runtimePendingPushCount:diagnostics.runtimePendingPushCount, activeSseSubscriberCount:subscriptions.get(sessionId)?.size || 0, durationMs:Date.now() - startedAt }, 'runtime event pushed');
+  }
   persistEvent(event, eventKey).catch(e => app.log.error({ err:e, sessionId, eventType }, 'event persist failed'));
   return event;
 }
@@ -838,6 +994,12 @@ function isDeltaEvent(eventType:string) {
 
 async function ensureCodexHomeSharedDirs(codexHome:string) {
   await mkdir(codexHome, { recursive:true });
+  const resolvedHome = realpathSync(codexHome);
+  const resolvedData = realpathSync(DATA_DIR);
+  if (resolvedData !== '/opt/data/codex-mobile' && !resolvedHome.startsWith(resolvedData + path.sep)) {
+    app.log.warn({ codexHome, dataDir:DATA_DIR }, 'skipping shared codex dir repair outside test data dir');
+    return;
+  }
   await mkdir(SHARED_SESSIONS_DIR, { recursive:true });
   await mkdir(SHARED_GENERATED_IMAGES_DIR, { recursive:true });
   await ensureSharedDirLink(codexHome, 'sessions', SHARED_SESSIONS_DIR);
@@ -891,16 +1053,13 @@ async function eventsAfter(sessionId:string, after:number, includeDeltas = false
          SELECT session_id,sequence,event_type,payload_json,created_at
        FROM events
        WHERE session_id=?1
-         AND event_type<>'thread/read'
-         AND (?2=1 OR event_type NOT IN ('item/agentMessage/delta','item/commandExecution/outputDelta'))
-         AND (?2=0 OR event_type<>'item/commandExecution/outputDelta')
-          AND event_type NOT LIKE 'turn/diff/%'
-          AND NOT (
-            event_type='item/completed'
-            AND COALESCE(json_extract(payload_json,'$.params.item.type'),'') NOT IN ('userMessage','agentMessage','imageView','imageGeneration')
-          )
+         AND (
+           (?2=1 AND event_type<>'thread/read' AND event_type NOT LIKE 'turn/diff/%')
+           OR
+           (?2=0 AND event_type IN ('user','item/completed','turn/failed','turn/interrupted','thread_recovered_with_new_upstream','runtime/disconnect','runtime/recovering','thread_snapshot'))
+         )
        ORDER BY sequence DESC
-       LIMIT 3000
+       LIMIT 250
      )
        ORDER BY sequence ASC`,
       [sessionId, includeDeltas ? 1 : 0]

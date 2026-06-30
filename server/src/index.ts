@@ -38,6 +38,7 @@ const COOKIE_NAME = 'codex_mobile_session';
 const CSRF_COOKIE = 'codex_mobile_csrf';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://codex.rubusoo.com,http://codex.rubusoo.com,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
 const db = new Db(path.join(DATA_DIR, 'codex-mobile.sqlite3'));
+const runtimeDb = new Db(process.env.RUNTIME_DB || path.join(DATA_DIR, 'agent-runtime.sqlite3'));
 const codex = new CodexBridge('/home/ubuntu', DEFAULT_CODEX_HOME);
 const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
@@ -369,6 +370,8 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   return sessionDto(thread, { title, status:'idle', archived:0, model, account_id: accountId, ...modeFields(mode) });
 });
 app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const requestId = req.id;
+  const startedAt = Date.now();
   const row = await findSession(req.params.id);
   if (row && normalizeProvider(row.provider_id) === 'antigravity') {
     if (!pathAllowed(String(row.project_dir))) return reply.code(403).send({error:'workspace not allowed'});
@@ -379,18 +382,22 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
   if (USE_AGENT_RUNTIME) {
     if (!row) return reply.code(404).send({error:'not found'});
     if (!pathAllowed(String(row.project_dir))) return reply.code(403).send({error:'workspace not allowed'});
-    const runtimeRead = await runtime.readSession(threadId).catch(()=>null);
-    const runtimeRow = runtimeRead?.session || row;
+    const sqliteStartedAt = Date.now();
+    const runtimeRow = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [threadId]).catch(()=>null) || row;
     if (runtimeRow?.status && runtimeRow.status !== row.status) {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [String(runtimeRow.status), Date.now(), threadId]).catch(()=>{});
     }
-    const thread = runtimeRead?.thread || await runtimeThreadFromEvents(threadId, runtimeRow);
+    const thread = await runtimeThreadFromEvents(threadId, runtimeRow);
     decorateThreadImages(thread, threadId, String(runtimeRow.project_dir || row.project_dir));
-    await injectGeneratedImages(thread, threadId);
-    await injectArtifacts(thread, threadId);
+    const [branch] = await Promise.all([
+      gitBranch(String(runtimeRow.project_dir || row.project_dir)).catch(()=>null),
+      injectGeneratedImages(thread, threadId).catch(()=>{}),
+      injectArtifacts(thread, threadId).catch(()=>{}),
+    ]);
     sanitizeThreadForMobile(thread);
-    const snapshot = runtimeRead?.snapshot || { coveredSequence:Number(runtimeRow?.last_sequence || 0), generation:null };
-    return { session: rowSessionDto(runtimeRow), thread, snapshot, branch: await gitBranch(String(runtimeRow.project_dir || row.project_dir)), interrupted: (runtimeRow?.status === 'interrupted') };
+    const snapshot = { coveredSequence:Number(runtimeRow?.last_sequence || 0), generation:String(runtimeRow?.upstream_generation || '') || null };
+    app.log.info({ requestId, localSessionId:threadId, upstreamThreadId:String(runtimeRow?.upstream_thread_id || threadId), operation:'GET /api/sessions/:id', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'web session snapshot returned');
+    return { session: rowSessionDto(runtimeRow), thread, snapshot, branch, interrupted: (runtimeRow?.status === 'interrupted') };
   }
   let read:any;
   try { read = await codex.readThread(threadId, true); }
@@ -1042,12 +1049,24 @@ function threadFromRow(row:any) {
   };
 }
 async function runtimeThreadFromEvents(threadId:string, row:any) {
-  const res = await runtime.events(threadId, 0, true).catch(()=>({ events:[] }));
+  const events = await runtimeDb.all(
+    `SELECT session_id,sequence,event_type,payload_json,created_at
+     FROM (
+       SELECT session_id,sequence,event_type,payload_json,created_at
+       FROM events
+       WHERE session_id=?1
+         AND event_type IN ('user','item/completed','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
+       ORDER BY sequence DESC
+       LIMIT 250
+     )
+     ORDER BY sequence ASC`,
+    [threadId]
+  ).catch(()=>[]);
   const items:any[] = [];
   const completedItemIds = new Set<string>();
   const deltaText = new Map<string, string>();
   const deltaOrder:string[] = [];
-  for (const event of res.events || []) {
+  for (const event of events as any[]) {
     const eventType = String(event.event_type || '');
     let payload:any = {};
     try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
@@ -1122,17 +1141,22 @@ async function antigravityThread(row:any) {
 }
 async function listIndexedThreads(archived:boolean){
   if (USE_AGENT_RUNTIME) {
+    const startedAt = Date.now();
     const byId = new Map<string, any>();
-    const runtimeSessions = await runtime.listSessions(archived).catch(()=>({ sessions:[] }));
-    for (const session of runtimeSessions.sessions || []) {
+    const runtimeStartedAt = Date.now();
+    const runtimeSessions = await runtimeDb.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived ? 1 : 0]).catch(()=>[]);
+    for (const session of runtimeSessions as any[]) {
       if (!pathAllowed(String(session.project_dir || session.workspace_path || ''))) continue;
       byId.set(String(session.codex_thread_id || session.id), rowSessionDto(session));
     }
+    const runtimeSqliteDurationMs = Date.now() - runtimeStartedAt;
+    const localStartedAt = Date.now();
     const rows = await db.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived ? 1 : 0]);
     for (const row of rows) {
       const id = String(row.codex_thread_id || row.id);
       if (!byId.has(id) && pathAllowed(String(row.project_dir))) byId.set(id, rowSessionDto(row));
     }
+    app.log.info({ operation:'GET /api/sessions', sqliteDurationMs:Date.now() - localStartedAt + runtimeSqliteDurationMs, totalDurationMs:Date.now() - startedAt }, 'web sessions listed from sqlite');
     return [...byId.values()].sort((a:any,b:any)=>Number(b.updated_at || 0)-Number(a.updated_at || 0));
   }
   const res = await codex.listThreads(archived, 500).catch(()=>({data:[]}));
@@ -1201,7 +1225,7 @@ async function ensureRuntimeCodexSession(row:any) {
     sandboxMode: row.sandbox_mode,
   });
 }
-async function sendTurn(id:string, text:string, attachments:any[] = []){ const row = await findSession(id); if(!row) throw new Error('session not found'); const threadId = String(row.codex_thread_id || row.id); if (normalizeProvider(row.provider_id) === 'antigravity') { await sendAntigravityTurn(row, text, attachments); return; } const input = await buildTurnInput(threadId, text, attachments); const title = autoTitle(text, String(row.project_dir), String(row.title || '')); const opts = modeOptions(sessionMode(row), await effectiveModel(row)); if (USE_AGENT_RUNTIME) { await ensureRuntimeCodexSession(row); ensureRuntimePushSubscription(threadId); if (title) { await runtime.setSessionTitle(threadId, title).catch(()=>{}); await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); broadcast(threadId,{type:'sessionTitle', title}); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); activeCodexSessions.add(threadId); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); artifactScanStarts.set(threadId, Date.now()); try { await runtime.startTurn(threadId, { input, text, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model }); } catch(e:any) { activeCodexSessions.delete(threadId); artifactScanStarts.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{}); broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message:e?.message||String(e)}}}); maybeExitAfterDrain(); throw e; } return; } await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null); if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); await codex.setName(threadId, title).catch(()=>{}); broadcast(threadId,{type:'sessionTitle', title}); } artifactScanStarts.set(threadId, Date.now()); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); activeCodexSessions.add(threadId); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); try { await codex.startTurn(threadId, input, String(row.project_dir), opts); } catch(e:any) { activeCodexSessions.delete(threadId); artifactScanStarts.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{}); maybeExitAfterDrain(); throw e; } }
+async function sendTurn(id:string, text:string, attachments:any[] = []){ const row = await findSession(id); if(!row) throw new Error('session not found'); const threadId = String(row.codex_thread_id || row.id); if (normalizeProvider(row.provider_id) === 'antigravity') { await sendAntigravityTurn(row, text, attachments); return; } const input = await buildTurnInput(threadId, text, attachments); const title = autoTitle(text, String(row.project_dir), String(row.title || '')); const opts = modeOptions(sessionMode(row), await effectiveModel(row)); if (USE_AGENT_RUNTIME) { ensureRuntimePushSubscription(threadId); if (title) { await runtime.setSessionTitle(threadId, title).catch(()=>{}); await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); broadcast(threadId,{type:'sessionTitle', title}); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); activeCodexSessions.add(threadId); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); artifactScanStarts.set(threadId, Date.now()); try { await runtime.startTurn(threadId, { input, text, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model }); } catch(e:any) { activeCodexSessions.delete(threadId); artifactScanStarts.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{}); broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message:e?.message||String(e)}}}); maybeExitAfterDrain(); throw e; } return; } await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null); if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); await codex.setName(threadId, title).catch(()=>{}); broadcast(threadId,{type:'sessionTitle', title}); } artifactScanStarts.set(threadId, Date.now()); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); activeCodexSessions.add(threadId); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); try { await codex.startTurn(threadId, input, String(row.project_dir), opts); } catch(e:any) { activeCodexSessions.delete(threadId); artifactScanStarts.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{}); maybeExitAfterDrain(); throw e; } }
 async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const child = activeAntigravityTurns.get(threadId); if (child) { try { child.kill('SIGTERM'); } catch {} activeAntigravityTurns.delete(threadId); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function sendAntigravityTurn(row:any, text:string, attachments:any[] = []) {
   const threadId = String(row.codex_thread_id || row.id);
