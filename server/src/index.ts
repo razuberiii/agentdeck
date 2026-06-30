@@ -49,9 +49,10 @@ const clients = new Map<string, Set<any>>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
-const runtimeSubscriptions = new Map<string, { close:()=>void; connected:boolean; connecting:boolean; generation?:string; lastSequence:number }>();
+type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
+const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
 const activeAntigravityTurns = new Map<string, any>();
-const chunkedMessages = new Map<string, { sessionId:string; chunks:string[]; size:number; createdAt:number }>();
+const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
 const runtimeDiagnostics = { subscribeStarts:0, subscribeReconnects:0, subscribeEvents:0, broadcasts:0, replayCalls:0 };
 type LoginJob = { id:string; profileId:string; output:string[]; status:'running'|'done'|'error'; code?:number|null; error?:string; startedAt:number; newProfile?:boolean; loginUrl?:string; deviceCode?:string };
@@ -100,7 +101,18 @@ app.addHook('preHandler', async (req, reply) => { if (['POST','PUT','PATCH','DEL
 function secureCookie() { return { httpOnly:true, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 function csrfCookie() { return { httpOnly:false, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 async function ensureAuth(req:any, reply:any) { const sid = req.cookies[COOKIE_NAME]; if (!sid) return reply.code(401).send({error:'unauthorized'}); try { const decoded = app.unsignCookie(sid); if (!decoded.valid) throw new Error('bad cookie'); } catch { return reply.code(401).send({error:'unauthorized'}); } }
-app.get('/api/status', async (req) => { await syncAntigravityProfilesFromDisk().catch(()=>{}); const raw = req.cookies[COOKIE_NAME] || ''; const authed = !!raw && !!app.unsignCookie(raw).valid; const settings = await appSettings(); const activeProfile = await getActiveProfile(); const activeAntigravityProfile = await getActiveAntigravityProfile(); const codexStatus = await cachedCodexStatus(); const antigravityStatus = await antigravity.status(); return { authed, serverTime: Date.now(), codex: codexStatus, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeAntigravityProfile, capabilities: { imageInput: true, imageOutput: true, attachmentTypes: Object.keys(IMAGE_TYPES), maxAttachmentBytes: MAX_ATTACHMENT_BYTES } }; });
+app.get('/api/status', async (req) => {
+  const raw = req.cookies[COOKIE_NAME] || '';
+  const authed = !!raw && !!app.unsignCookie(raw).valid;
+  if (!authed) return { authed:false, authenticated:false, serverTime:Date.now(), capabilities:{} };
+  await syncAntigravityProfilesFromDisk().catch(()=>{});
+  const settings = await appSettings();
+  const activeProfile = await getActiveProfile();
+  const activeAntigravityProfile = await getActiveAntigravityProfile();
+  const codexStatus = await cachedCodexStatus();
+  const antigravityStatus = await antigravity.status();
+  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeAntigravityProfile, capabilities: { imageInput: true, imageOutput: true, attachmentTypes: Object.keys(IMAGE_TYPES), maxAttachmentBytes: MAX_ATTACHMENT_BYTES } };
+});
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
     ...runtimeDiagnostics,
@@ -544,7 +556,7 @@ app.get('/icons/:file', async (req:any, reply) => {
   if (!/^[A-Za-z0-9_.-]+$/.test(file)) return reply.code(404).send({error:'not found'});
   return reply.sendFile(`icons/${file}`);
 });
-app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : []); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e.message})); } }); ws.on('close', () => { for (const set of clients.values()) set.delete(ws); }); });
+app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || '')); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e.message})); } }); ws.on('close', () => { for (const set of clients.values()) set.delete(ws); }); });
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
 codex.on('notification', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id);
@@ -1256,22 +1268,26 @@ async function joinAndResume(id:string, ws:any, lastSequence = 0){
   }
   if (USE_AGENT_RUNTIME) {
     await replayRuntimeEventsToWs(threadId, ws, lastSequence);
-    const latestSequence = Number(row?.last_sequence || 0);
-    const shouldSubscribe = activeCodexSessions.has(threadId) || String(row?.status || '') === 'running' || Number(lastSequence || 0) < latestSequence;
-    if (shouldSubscribe) ensureRuntimePushSubscription(threadId);
-    const subscription = runtimeSubscriptions.get(threadId);
-    ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:subscription ? (subscription.connected?'connected':'recovering') : 'connected'}));
+    const subscription = ensureRuntimePushSubscription(threadId);
+    app.log.info({ threadId, rowStatus:String(row?.status || ''), lastSequence:Number(lastSequence || 0), latestSequence:Number(row?.last_sequence || 0), runtimeConnection:runtimeConnectionStatus(subscription) }, 'codex session joined with runtime subscription');
+    ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:runtimeConnectionStatus(subscription)}));
     return;
   }
   if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{});
   ws.send(JSON.stringify({type:'joined', sessionId:threadId}));
 }
 function broadcast(id:string, msg:any){ for(const ws of clients.get(id) || []) if(ws.readyState === 1) { ws.send(JSON.stringify(msg)); runtimeDiagnostics.broadcasts++; } }
+function runtimeConnectionStatus(state?:RuntimeSubscriptionState):RuntimeSubscriptionState['lastStatus'] {
+  if (!state) return 'unknown';
+  if (state.connected) return 'connected';
+  if (state.connecting) return state.lastStatus === 'unavailable' ? 'unavailable' : 'checking';
+  return state.lastStatus || 'recovering';
+}
 function ensureRuntimePushSubscription(threadId:string) {
   const existing = runtimeSubscriptions.get(threadId);
-  if (existing?.connected || existing?.connecting) return;
+  if (existing?.connected || existing?.connecting) return existing;
   existing?.close?.();
-  const state = { close:()=>{}, connected:false, connecting:true, lastSequence:Number(existing?.lastSequence || 0), generation:existing?.generation };
+  const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, lastSequence:Number(existing?.lastSequence || 0), generation:existing?.generation, lastError:existing?.lastError, lastStatus:'checking' };
   runtimeSubscriptions.set(threadId, state);
   runtimeDiagnostics.subscribeStarts++;
   app.log.info({ threadId, after:state.lastSequence }, 'runtime sse subscribe starting');
@@ -1285,17 +1301,21 @@ function ensureRuntimePushSubscription(threadId:string) {
     if (status === 'connected') {
       state.connecting = false;
       state.connected = true;
+      state.lastStatus = 'connected';
+      state.lastError = undefined;
       broadcast(threadId, { type:'runtimeConnection', status:'connected' });
       return;
     }
     state.connecting = false;
     state.connected = false;
+    state.lastError = error?.message || undefined;
+    state.lastStatus = status === 'error' ? 'unavailable' : 'recovering';
     if (status === 'closed' && runtimeSubscriptions.get(threadId) === state && !(clients.get(threadId)?.size || activeCodexSessions.has(threadId))) {
       runtimeSubscriptions.delete(threadId);
     }
     runtimeDiagnostics.subscribeReconnects++;
     app.log.warn({ threadId, status, error:error?.message || undefined }, 'runtime sse subscribe disconnected');
-    broadcast(threadId, { type:'runtimeConnection', status:'recovering', error:error?.message || undefined });
+    broadcast(threadId, { type:'runtimeConnection', status:state.lastStatus, error:error?.message || undefined });
     if (runtimeSubscriptions.get(threadId) === state) {
       setTimeout(() => {
         if (clients.get(threadId)?.size || activeCodexSessions.has(threadId)) ensureRuntimePushSubscription(threadId);
@@ -1303,6 +1323,7 @@ function ensureRuntimePushSubscription(threadId:string) {
     }
   });
   state.close = close;
+  return state;
 }
 async function ensureRuntimeCodexSession(row:any) {
   const threadId = String(row.codex_thread_id || row.id);
@@ -1320,7 +1341,77 @@ async function ensureRuntimeCodexSession(row:any) {
     sandboxMode: row.sandbox_mode,
   });
 }
-async function sendTurn(id:string, text:string, attachments:any[] = []){ const row = await findSession(id); if(!row) throw new Error('session not found'); const threadId = String(row.codex_thread_id || row.id); if (normalizeProvider(row.provider_id) === 'antigravity') { await sendAntigravityTurn(row, text, attachments); return; } const input = await buildTurnInput(threadId, text, attachments); const title = autoTitle(text, String(row.project_dir), String(row.title || '')); const opts = modeOptions(sessionMode(row), await effectiveModel(row)); if (USE_AGENT_RUNTIME) { ensureRuntimePushSubscription(threadId); if (title) { await runtime.setSessionTitle(threadId, title).catch(()=>{}); await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); broadcast(threadId,{type:'sessionTitle', title}); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); activeCodexSessions.add(threadId); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); artifactScanStarts.set(threadId, Date.now()); try { await runtime.startTurn(threadId, { input, text, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model }); } catch(e:any) { activeCodexSessions.delete(threadId); artifactScanStarts.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{}); broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message:e?.message||String(e)}}}); maybeExitAfterDrain(); throw e; } return; } await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null); if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]); await codex.setName(threadId, title).catch(()=>{}); broadcast(threadId,{type:'sessionTitle', title}); } artifactScanStarts.set(threadId, Date.now()); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]); activeCodexSessions.add(threadId); broadcast(threadId,{type:'user', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))}); try { await codex.startTurn(threadId, input, String(row.project_dir), opts); } catch(e:any) { activeCodexSessions.delete(threadId); artifactScanStarts.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{}); maybeExitAfterDrain(); throw e; } }
+async function sendTurn(id:string, text:string, attachments:any[] = [], clientMessageId = ''){
+  const row = await findSession(id);
+  if(!row) throw new Error('session not found');
+  const threadId = String(row.codex_thread_id || row.id);
+  const ack = (status:string, error?:string) => {
+    if (clientMessageId) broadcast(threadId, { type:'messageStatus', clientMessageId, status, error });
+  };
+  ack('received');
+  if (normalizeProvider(row.provider_id) === 'antigravity') {
+    await sendAntigravityTurn(row, text, attachments);
+    ack('accepted');
+    return;
+  }
+  const input = await buildTurnInput(threadId, text, attachments);
+  const title = autoTitle(text, String(row.project_dir), String(row.title || ''));
+  const opts = modeOptions(sessionMode(row), await effectiveModel(row));
+  const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+  if (USE_AGENT_RUNTIME) {
+    const subscription = ensureRuntimePushSubscription(threadId);
+    broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
+    if (title) {
+      await runtime.setSessionTitle(threadId, title).catch(()=>{});
+      await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]);
+      broadcast(threadId,{type:'sessionTitle', title});
+    }
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['submitting',Date.now(),threadId]).catch(async () => {
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]);
+    });
+    activeCodexSessions.add(threadId);
+    broadcast(threadId, userMessage);
+    ack('persisted');
+    artifactScanStarts.set(threadId, Date.now());
+    try {
+      await runtime.startTurn(threadId, { input, text, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model });
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]).catch(()=>{});
+      ack('accepted');
+    } catch(e:any) {
+      const message = e?.message || String(e);
+      activeCodexSessions.delete(threadId);
+      artifactScanStarts.delete(threadId);
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+      ack('failed', message);
+      broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
+      maybeExitAfterDrain();
+      throw e;
+    }
+    return;
+  }
+  await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null);
+  if (title) {
+    await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]);
+    await codex.setName(threadId, title).catch(()=>{});
+    broadcast(threadId,{type:'sessionTitle', title});
+  }
+  artifactScanStarts.set(threadId, Date.now());
+  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]);
+  activeCodexSessions.add(threadId);
+  broadcast(threadId, userMessage);
+  ack('persisted');
+  try {
+    await codex.startTurn(threadId, input, String(row.project_dir), opts);
+    ack('accepted');
+  } catch(e:any) {
+    activeCodexSessions.delete(threadId);
+    artifactScanStarts.delete(threadId);
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+    ack('failed', e?.message || String(e));
+    maybeExitAfterDrain();
+    throw e;
+  }
+}
 async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const child = activeAntigravityTurns.get(threadId); if (child) { try { child.kill('SIGTERM'); } catch {} activeAntigravityTurns.delete(threadId); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function sendAntigravityTurn(row:any, text:string, attachments:any[] = []) {
   const threadId = String(row.codex_thread_id || row.id);
@@ -1454,7 +1545,12 @@ async function runtimeEventMessages(threadId:string, event:any) {
     return out;
   }
   if (eventType === 'thread/read') return out;
-  if (eventType === 'turn/start') return out;
+  if (eventType === 'turn/start') {
+    const turn = payload?.result?.turn || payload?.turn || null;
+    if (turn?.id) activeTurns.set(threadId, String(turn.id));
+    out.push({ type:'codex', method:'turn/started', params:{ turn }, ...base });
+    return out;
+  }
   if (eventType.includes('/')) {
     const msg = payload?.method ? payload : { method:eventType, params:payload?.params || payload };
     if (shouldBroadcastCodexNotification(msg)) out.push({ type:'codex', method:msg.method, params:msg.params, ...base });
@@ -1481,7 +1577,9 @@ async function runtimeEventMessages(threadId:string, event:any) {
     }
     if (msg.method === 'thread/status/changed') {
       const rawStatus = rawStatusName(msg.params?.status);
-      const nextStatus = rawStatus === 'active' && activeTurns.has(threadId) ? 'running' : statusName(rawStatus);
+      const row = rawStatus === 'active' ? await findSession(threadId).catch(()=>null) : null;
+      const hasActiveTurn = activeTurns.has(threadId) || !!row?.active_turn_id || String(row?.status || '') === 'running' || String(row?.status || '') === 'submitting';
+      const nextStatus = rawStatus === 'active' && hasActiveTurn ? 'running' : statusName(rawStatus);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]).catch(()=>{});
     }
   }
@@ -1514,9 +1612,9 @@ function latestAgentItemIdFromThread(thread:any){
 
 function cleanTitle(value:any, cwd:string){ const raw = String(value || '').split(/\r?\n/)[0].trim(); return (raw ? raw.slice(0, 120) : path.basename(cwd)); }
 function autoTitle(text:string, cwd:string, current:string){ const base = path.basename(cwd); const generic = new Set([base, 'Default Workspace', 'default-workspace', 'Session']); if (!generic.has(current.trim())) return null; const raw = text.split(/\r?\n/).map(s=>s.trim()).find(Boolean) || ''; const cleaned = raw.replace(/\s+/g, ' ').replace(/^#+\s*/, '').trim(); if (!cleaned) return null; return cleaned.slice(0, 42); }
-function startChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const sessionId = String(msg.sessionId || ''); if (!id || !sessionId) throw new Error('bad chunked message'); chunkedMessages.set(id, { sessionId, chunks: [], size: 0, createdAt: Date.now() }); cleanupChunkedMessages(); }
+function startChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const sessionId = String(msg.sessionId || ''); if (!id || !sessionId) throw new Error('bad chunked message'); chunkedMessages.set(id, { sessionId, clientMessageId:String(msg.clientMessageId || id), chunks: [], size: 0, createdAt: Date.now() }); cleanupChunkedMessages(); }
 function appendChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); const chunk = String(msg.chunk || ''); state.size += Buffer.byteLength(chunk); if (state.size > 25 * 1024 * 1024) { chunkedMessages.delete(id); throw new Error('message too large'); } state.chunks.push(chunk); }
-async function finishChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); chunkedMessages.delete(id); const payload = JSON.parse(state.chunks.join('')); await sendTurn(state.sessionId, String(payload.text || ''), Array.isArray(payload.attachments) ? payload.attachments : []); }
+async function finishChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); chunkedMessages.delete(id); const payload = JSON.parse(state.chunks.join('')); await sendTurn(state.sessionId, String(payload.text || ''), Array.isArray(payload.attachments) ? payload.attachments : [], state.clientMessageId); }
 function cleanupChunkedMessages(){ const cutoff = Date.now() - 10 * 60 * 1000; for (const [id, state] of chunkedMessages) if (state.createdAt < cutoff) chunkedMessages.delete(id); }
 function cleanupPendingApprovals(){ const cutoff = Date.now() - 10 * 60 * 1000; for (const [id, state] of pendingApprovals) if (state.createdAt < cutoff) pendingApprovals.delete(id); }
 function statusName(status:any){ if (!status) return 'idle'; const value = rawStatusName(status); return value === 'active' ? 'idle' : value; }
