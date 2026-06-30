@@ -2,6 +2,7 @@ node_modules/
 server/dist/
 server/public/
 test-artifacts/
+.tools/
 
 .env
 *.log
