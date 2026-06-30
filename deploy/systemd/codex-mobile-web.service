@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent Deck web gateway
+After=network-online.target agent-runtime.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/stacks/codex-mobile
+Environment=HOME=/home/ubuntu
+Environment=USE_AGENT_RUNTIME=1
+Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
+EnvironmentFile=/opt/data/codex-mobile/web.env
+ExecStart=/usr/bin/node /opt/stacks/codex-mobile/server/dist/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/data/codex-mobile /opt/stacks/codex-mobile /home/ubuntu /tmp
+
+[Install]
+WantedBy=multi-user.target

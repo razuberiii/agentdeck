@@ -1,0 +1,26 @@
+[Unit]
+Description=Agent Deck persistent agent runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/stacks/codex-mobile
+Environment=HOME=/home/ubuntu
+Environment=DATA_DIR=/opt/data/codex-mobile
+Environment=RUNTIME_HOST=127.0.0.1
+Environment=RUNTIME_PORT=3852
+Environment=CODEX_APP_SERVER_PORT_BASE=4620
+EnvironmentFile=/opt/data/codex-mobile/runtime.env
+ExecStart=/usr/bin/node /opt/stacks/codex-mobile/server/dist/agent-runtime.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/data/codex-mobile /opt/stacks/codex-mobile /home/ubuntu /tmp /run
+
+[Install]
+WantedBy=multi-user.target

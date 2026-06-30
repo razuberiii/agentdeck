@@ -1,0 +1,1019 @@
+import 'dotenv/config';
+import Fastify from 'fastify';
+import crypto from 'node:crypto';
+import http from 'node:http';
+import path from 'node:path';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { EventEmitter } from 'node:events';
+import { realpathSync } from 'node:fs';
+import { cp, lstat, mkdir, readlink, rm, symlink } from 'node:fs/promises';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { Db } from './db.js';
+import { WsJsonRpcClient } from './ws-json-rpc.js';
+
+const execFileAsync = promisify(execFile);
+const DATA_DIR = process.env.RUNTIME_DATA_DIR || process.env.DATA_DIR || '/opt/data/codex-mobile';
+const DB_FILE = process.env.RUNTIME_DB || path.join(DATA_DIR, 'agent-runtime.sqlite3');
+const HOST = process.env.RUNTIME_HOST || '127.0.0.1';
+const PORT = Number(process.env.RUNTIME_PORT || 3852);
+const CODEX_PORT_BASE = Number(process.env.CODEX_APP_SERVER_PORT_BASE || 4520);
+const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAULT_PORT || 4668);
+const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || '/home/ubuntu/.codex';
+const DEFAULT_HOME = process.env.HOME || '/home/ubuntu';
+const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || '/opt/stacks/codex-mobile';
+const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
+const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
+const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
+const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
+
+type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
+type RuntimeSession = {
+  id:string;
+  account_id:string | null;
+  provider:string;
+  upstream_thread_id:string | null;
+  upstream_generation:string | null;
+  active_turn_id:string | null;
+  status:string;
+  project_dir:string;
+  title:string;
+  permission_mode:string;
+  approval_policy:string;
+  sandbox_mode:string;
+  model:string | null;
+  created_at:number;
+  updated_at:number;
+  last_sequence:number;
+  interruption_reason:string | null;
+};
+
+class CodexAccountRuntime extends EventEmitter {
+  private client: WsJsonRpcClient | null = null;
+  private connecting: Promise<void> | null = null;
+  private appServerStarting: Promise<void> | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private initialized = false;
+
+  constructor(private account:Account, private port:number, private db:Db) { super(); }
+
+  async ensureConnected() {
+    await this.ensureAppServer();
+    if (this.client?.isConnected() && this.initialized) return;
+    if (!this.connecting) this.connecting = this.connect().finally(() => { this.connecting = null; });
+    return this.connecting;
+  }
+
+  async request(method:string, params?:any, timeoutMs = 120_000) {
+    await this.ensureConnected();
+    return this.client!.request(method, params, timeoutMs);
+  }
+
+  async restartAppServer() {
+    this.client?.close();
+    this.client = null;
+    this.initialized = false;
+    await execFileAsync('sudo', ['systemctl', 'restart', systemdUnitName(this.account.id)], { maxBuffer:1024 * 1024 });
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 15_000) {
+      if (await readyz(this.port)) {
+        await this.connect();
+        return;
+      }
+      await sleep(250);
+    }
+    throw new Error(`codex app-server did not become ready after restart on ${this.port}`);
+  }
+
+  respond(id:number|string, result:any) {
+    this.client?.respond(id, result);
+  }
+
+  private async connect() {
+    const client = new WsJsonRpcClient('127.0.0.1', this.port);
+    client.on('notification', msg => this.emit('notification', msg));
+    client.on('request', msg => this.emit('request', msg));
+    client.on('close', () => {
+      this.initialized = false;
+      if (this.client === client) this.client = null;
+      this.emit('disconnect', { accountId:this.account.id, at:Date.now() });
+      this.scheduleReconnect();
+    });
+    client.on('error', err => this.emit('error', err));
+    await client.connect();
+    const init = await client.request('initialize', {
+      clientInfo: { name:'agent-runtime', title:'Agent Runtime', version:'1.0.0' },
+      capabilities: { experimentalApi:true, requestAttestation:false },
+    }, 30_000);
+    client.notify('initialized');
+    this.client = client;
+    this.initialized = true;
+    await this.db.run('UPDATE runtime_instances SET pid=?1, heartbeat_at=?2 WHERE instance_id=?3', [await pidForPort(this.port), Date.now(), runtimeInstanceId(this.account.id)]);
+    this.emit('connect', { accountId:this.account.id, init, at:Date.now() });
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.ensureConnected();
+        this.emit('reconnect', { accountId:this.account.id, at:Date.now() });
+      } catch (e) {
+        this.emit('error', e);
+        this.scheduleReconnect();
+      }
+    }, 1500);
+  }
+
+  private async ensureAppServer() {
+    await ensureCodexHomeSharedDirs(this.account.codex_home);
+    if (await readyz(this.port)) return;
+    if (this.appServerStarting) return this.appServerStarting;
+    this.appServerStarting = this.startAppServer().finally(() => { this.appServerStarting = null; });
+    return this.appServerStarting;
+  }
+
+  private async startAppServer() {
+    const unit = systemdUnitName(this.account.id);
+    const listen = `ws://127.0.0.1:${this.port}`;
+    app.log.warn({ accountId:this.account.id, unit, listen }, 'codex app-server not ready; starting');
+    if (this.account.id === 'default') {
+      await execFileAsync('sudo', ['systemctl', 'start', unit], { maxBuffer:1024 * 1024 });
+    } else {
+    const args = [
+      '--unit', unit,
+      '--uid', 'ubuntu',
+      '--gid', 'ubuntu',
+      '--property', `WorkingDirectory=${DEFAULT_WORKDIR}`,
+      '--property', 'Restart=always',
+      '--property', 'RestartSec=2',
+      '--setenv', `HOME=${DEFAULT_HOME}`,
+      '--setenv', `CODEX_HOME=${this.account.codex_home}`,
+      '--collect',
+      'codex', 'app-server', '--listen', listen,
+      '-c', 'approval_policy="never"',
+      '-c', 'sandbox_mode="danger-full-access"',
+    ];
+    await execFileAsync('sudo', ['systemd-run', ...args], { maxBuffer:1024 * 1024 });
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 10_000) {
+      if (await readyz(this.port)) {
+        await this.db.run(
+          'INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at',
+          [runtimeInstanceId(this.account.id), await pidForPort(this.port), Date.now()]
+        );
+        return;
+      }
+      await sleep(250);
+    }
+    throw new Error(`codex app-server did not become ready on ${listen}`);
+  }
+}
+
+const db = new Db(DB_FILE);
+await db.init();
+await initRuntimeSchema();
+
+const subscriptions = new Map<string, Set<any>>();
+const runtimes = new Map<string, CodexAccountRuntime>();
+const eventAppendChains = new Map<string, Promise<any>>();
+const sequenceCache = new Map<string, number>();
+const deltaPersistQueues = new Map<string, any[]>();
+const deltaPersistTimers = new Map<string, NodeJS.Timeout>();
+const diagnostics = {
+  startedAt: Date.now(),
+  sseConnections: 0,
+  sseReconnects: 0,
+  threadResumeCalls: 0,
+  threadStartCalls: 0,
+  deltasReceived: 0,
+  deltasSsePushed: 0,
+  sqliteBatches: 0,
+  sqliteRows: 0,
+  sqliteMs: 0,
+};
+const STALE_RUNNING_MS = Number(process.env.STALE_RUNNING_MS || 30 * 60 * 1000);
+const RUNTIME_GENERATION = INSTANCE_ID;
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
+const app = Fastify({ logger:{ redact:['req.headers.authorization','token','secret','password'] }, bodyLimit:25 * 1024 * 1024 });
+
+app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now() }));
+app.get('/diagnostics', async () => ({
+  ...diagnostics,
+  activeSseSubscribers:[...subscriptions.entries()].map(([sessionId,set]) => ({ sessionId, count:set.size })),
+  activeSseSubscriberTotal:[...subscriptions.values()].reduce((sum,set)=>sum+set.size,0),
+  runtimeCount:runtimes.size,
+  eventLoopDelayMs:{
+    mean:Number.isFinite(eventLoopDelay.mean) ? eventLoopDelay.mean / 1e6 : 0,
+    max:eventLoopDelay.max / 1e6,
+    p99:eventLoopDelay.percentile(99) / 1e6,
+  },
+}));
+app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
+
+app.get('/sessions', async (req:any) => {
+  const archived = String(req.query?.archived || '') === '1' ? 1 : 0;
+  await reconcileStaleRunningSessions();
+  const sessions = await db.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived]);
+  return { sessions };
+});
+
+app.post('/codex/accounts/default', async () => {
+  const account = await ensureAccount('default', DEFAULT_CODEX_HOME);
+  await (await runtimeForAccount(account.id)).ensureConnected();
+  return { account, port:portForAccount(account.id), runtimeInstanceId:runtimeInstanceId(account.id) };
+});
+
+app.post('/codex/accounts/default/restart', async (req:any) => {
+  const codexHome = String(req.body?.codexHome || DEFAULT_CODEX_HOME);
+  const account = await ensureAccount('default', codexHome);
+  const runtime = await runtimeForAccount(account.id);
+  await runtime.restartAppServer();
+  const read = await runtime.request('account/read', { refreshToken:false }).catch((e:any) => ({ error:e?.message || String(e) }));
+  return { account, port:portForAccount(account.id), runtimeInstanceId:runtimeInstanceId(account.id), read };
+});
+
+app.get('/codex/account', async (req:any) => {
+  const account = await ensureAccount(String(req.query?.accountId || 'default'), String(req.query?.codexHome || DEFAULT_CODEX_HOME));
+  const runtime = await runtimeForAccount(account.id);
+  return runtime.request('account/read', { refreshToken:false });
+});
+
+app.get('/codex/rate-limits', async (req:any) => {
+  const account = await ensureAccount(String(req.query?.accountId || 'default'), String(req.query?.codexHome || DEFAULT_CODEX_HOME));
+  const runtime = await runtimeForAccount(account.id);
+  return runtime.request('account/rateLimits/read');
+});
+
+app.get('/codex/models', async (req:any) => {
+  const account = await ensureAccount(String(req.query?.accountId || 'default'), String(req.query?.codexHome || DEFAULT_CODEX_HOME));
+  const runtime = await runtimeForAccount(account.id);
+  const includeHidden = String(req.query?.hidden || '') === '1';
+  const [models, config] = await Promise.allSettled([
+    runtime.request('model/list', { includeHidden, limit:200 }),
+    runtime.request('config/read', { cwd:String(req.query?.cwd || DEFAULT_WORKDIR), includeLayers:false }),
+  ]);
+  return {
+    models: models.status === 'fulfilled' ? models.value : { data:[] },
+    config: config.status === 'fulfilled' ? config.value : null,
+    errors: {
+      models: models.status === 'rejected' ? models.reason?.message || String(models.reason) : null,
+      config: config.status === 'rejected' ? config.reason?.message || String(config.reason) : null,
+    },
+  };
+});
+
+app.post('/codex/sessions', async (req:any) => {
+  const body = req.body || {};
+  const account = await ensureAccount(String(body.accountId || 'default'), String(body.codexHome || DEFAULT_CODEX_HOME));
+  const runtime = await runtimeForAccount(account.id);
+  const opts = turnOptions(body);
+  const started = await runtime.request('thread/start', withModel({ cwd:String(body.cwd || DEFAULT_WORKDIR), approvalPolicy:opts.approvalPolicy, sandbox:opts.sandboxMode }, opts));
+  const thread = started.thread;
+  const now = Date.now();
+  const title = cleanTitle(body.title || thread.name || thread.preview, thread.cwd);
+  await db.run(
+    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason)
+     VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'codex',?9,?7,?2,?1,'codex',?1,NULL,0,NULL)
+     ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at`,
+    [thread.id, thread.cwd, title, opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, account.id]
+  );
+  await appendEvent(String(thread.id), 'thread/start', { thread, source:'runtime' });
+  if (title) await runtime.request('thread/name/set', { threadId:thread.id, name:title }).catch(()=>{});
+  return { session: await getSession(String(thread.id)), thread };
+});
+
+app.post('/codex/sessions/resume', async (req:any, reply) => {
+  const body = req.body || {};
+  const threadId = String(body.threadId || '').trim();
+  if (!threadId) return reply.code(400).send({ error:'threadId required' });
+  const account = await ensureAccount(String(body.accountId || 'default'), String(body.codexHome || DEFAULT_CODEX_HOME));
+  const runtime = await runtimeForAccount(account.id);
+  const opts = turnOptions(body);
+  let read:any;
+  try {
+    read = await runtime.request('thread/resume', withModel({
+      threadId,
+      cwd:String(body.cwd || DEFAULT_WORKDIR),
+      approvalPolicy:opts.approvalPolicy,
+      sandbox:opts.sandboxMode,
+    }, opts));
+  } catch (e:any) {
+    return reply.code(409).send({ error:`旧会话无法迁移到 runtime：${e?.message || e}` });
+  }
+  const thread = read.thread;
+  const now = Date.now();
+  await db.run(
+    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason)
+     VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?9,'codex',?10,?8,?2,?1,'codex',?1,NULL,0,NULL)
+     ON CONFLICT(id) DO UPDATE SET project_dir=excluded.project_dir,title=excluded.title,status=excluded.status,account_id=excluded.account_id,updated_at=excluded.updated_at`,
+    [threadId, thread.cwd || body.cwd || DEFAULT_WORKDIR, cleanTitle(body.title || thread.name || thread.preview, thread.cwd || body.cwd || DEFAULT_WORKDIR), statusName(thread.status), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, account.id]
+  );
+  await appendEvent(threadId, 'thread/read', { source:'legacy_resume', thread });
+  return { session: await getSession(threadId), thread };
+});
+
+app.get('/sessions/:id', async (req:any, reply) => {
+  await reconcileStaleRunningSessions(String(req.params.id));
+  const session = await getSession(String(req.params.id));
+  if (!session) return reply.code(404).send({ error:'not found' });
+  const read = await readAuthoritativeThread(session).catch((e:any) => ({ error:e?.message || String(e), thread:threadFromSession(session) }));
+  if (read.thread && !read.error) await reconcileThread(session, read.thread, 'api_thread_read', false).catch(()=>{});
+  const fresh = await getSession(String(session.id)) || session;
+  return { session:fresh, thread:read.thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:Number(fresh.last_sequence || 0), error:read.error || null } };
+});
+
+app.patch('/sessions/:id', async (req:any, reply) => {
+  const session = await getSession(String(req.params.id));
+  if (!session) return reply.code(404).send({ error:'not found' });
+  const title = cleanTitle(req.body?.title, session.project_dir);
+  if (!title) return reply.code(400).send({ error:'title required' });
+  const account = await getAccount(String(session.account_id || 'default'));
+  if (!account) return reply.code(409).send({ error:'account not found' });
+  const runtime = await runtimeForAccount(account.id);
+  const threadId = String(session.upstream_thread_id || session.id);
+  await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE id=?3 OR upstream_thread_id=?3 OR codex_thread_id=?3', [title, Date.now(), session.id]);
+  await runtime.request('thread/name/set', { threadId, name:title }).catch(()=>{});
+  return { ok:true, session: await getSession(session.id) };
+});
+
+app.get('/sessions/:id/events', async (req:any) => {
+  const after = Number(req.query?.after || 0);
+  return { events: await eventsAfter(String(req.params.id), after, String(req.query?.includeDeltas || '') === '1') };
+});
+
+app.get('/sessions/:id/subscribe', async (req:any, reply) => {
+  const sessionId = String(req.params.id);
+  const after = Number(req.query?.after || 0);
+  reply.raw.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  });
+  const set = subscriptions.get(sessionId) || new Set();
+  subscriptions.set(sessionId, set);
+  set.add(reply.raw);
+  diagnostics.sseConnections++;
+  app.log.info({ sessionId, after, activeSubscribers:set.size }, 'runtime sse subscriber connected');
+  for (const event of await eventsAfter(sessionId, after)) {
+    reply.raw.write(`event: runtime\n`);
+    reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+  }
+  reply.raw.on('close', () => {
+    set.delete(reply.raw);
+    app.log.info({ sessionId, activeSubscribers:set.size }, 'runtime sse subscriber closed');
+  });
+});
+
+app.post('/sessions/:id/turns', async (req:any, reply) => {
+  const session = await getSession(String(req.params.id));
+  if (!session) return reply.code(404).send({ error:'not found' });
+  const account = await getAccount(String(session.account_id || 'default'));
+  if (!account) return reply.code(409).send({ error:'account not found' });
+  const runtime = await runtimeForAccount(account.id);
+  const body = req.body || {};
+  const opts = turnOptions({ ...session, ...body });
+  const input = Array.isArray(body.input) ? body.input : [{ type:'text', text:String(body.text || ''), text_elements:[] }];
+  const cwd = String(body.cwd || session.project_dir);
+  const live = await ensureLiveThread(session, runtime, opts, cwd);
+  const threadId = live.threadId;
+  const codexInput = live.recovered ? [await recoveryContextInput(session), ...input] : input;
+  await appendEvent(session.id, 'user', { input });
+  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3', ['running', Date.now(), session.id]);
+  let turn:any;
+  try {
+    turn = await runtime.request('turn/start', withModel({
+      threadId,
+      cwd,
+      approvalPolicy:opts.approvalPolicy,
+      sandboxPolicy:{ type:sandboxPolicyType(opts.sandboxMode) },
+      input:codexInput,
+    }, opts));
+  } catch (e:any) {
+    const message = e?.message || String(e);
+    await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'turn_start_failed', Date.now(), session.id]);
+    await appendEvent(session.id, 'turn/failed', { threadId, error:{ message }, source:'runtime' });
+    return reply.code(message.includes('thread not found') ? 409 : 500).send({ error:message });
+  }
+  if (turn?.turn?.id) await db.run('UPDATE sessions SET active_turn_id=?1, status=?2, updated_at=?3 WHERE id=?4', [String(turn.turn.id), 'running', Date.now(), session.id]);
+  await appendEvent(session.id, 'turn/start', { result:turn, source:'runtime' });
+  return { turn };
+});
+
+app.post('/sessions/:id/stop', async (req:any, reply) => {
+  const session = await getSession(String(req.params.id));
+  if (!session) return reply.code(404).send({ error:'not found' });
+  if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
+  const account = await getAccount(String(session.account_id || 'default'));
+  if (!account) return reply.code(409).send({ error:'account not found' });
+  const runtime = await runtimeForAccount(account.id);
+  const turnId = session.active_turn_id;
+  let warning:string|null = null;
+  try {
+    await runtime.request('turn/interrupt', { threadId:session.upstream_thread_id || session.id, turnId }, 10_000);
+  } catch (e:any) {
+    warning = e?.message || String(e);
+  }
+  await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'manual_stop', Date.now(), session.id]);
+  await appendEvent(session.id, 'turn/interrupted', { reason:'manual_stop', turnId, warning });
+  return { ok:true, interrupted:!warning, warning };
+});
+
+await app.listen({ host:HOST, port:PORT });
+app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID }, 'agent-runtime listening');
+setTimeout(() => bootstrapRuntimeRecovery().catch(e => app.log.error({ err:e }, 'runtime bootstrap recovery failed')), 50);
+setInterval(() => {
+  db.run('UPDATE runtime_instances SET heartbeat_at=?1 WHERE instance_id=?2', [Date.now(), INSTANCE_ID]).catch(()=>{});
+}, 5000).unref();
+
+async function initRuntimeSchema() {
+  await db.run('CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, codex_home TEXT, runtime_instance_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+  await db.run('CREATE TABLE IF NOT EXISTS runtime_instances (instance_id TEXT PRIMARY KEY, pid INTEGER, started_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL)');
+  await db.run('INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at', [INSTANCE_ID, process.pid, Date.now()]);
+  await db.run('ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT \'codex\'').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN model_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN workspace_path TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN provider_session_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN provider TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN upstream_thread_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN upstream_generation TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN active_turn_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN interruption_reason TEXT').catch(()=>{});
+  await db.run('ALTER TABLE events ADD COLUMN sequence INTEGER').catch(()=>{});
+  await db.run('ALTER TABLE events ADD COLUMN event_type TEXT').catch(()=>{});
+  await db.run('ALTER TABLE events ADD COLUMN payload_json TEXT').catch(()=>{});
+  await db.run('ALTER TABLE events ADD COLUMN created_at INTEGER').catch(()=>{});
+  await db.run('ALTER TABLE events ADD COLUMN event_key TEXT').catch(()=>{});
+  await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_sequence ON events(session_id, sequence)');
+  await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_key ON events(session_id, event_key)');
+  await db.run('CREATE INDEX IF NOT EXISTS idx_sessions_upstream_thread_id ON sessions(upstream_thread_id)');
+}
+
+async function ensureAccount(id:string, codexHome:string) {
+  const now = Date.now();
+  await db.run(
+    `INSERT INTO accounts (id,provider,codex_home,runtime_instance_id,created_at,updated_at)
+     VALUES (?1,'codex',?2,?3,?4,?4)
+     ON CONFLICT(id) DO UPDATE SET codex_home=excluded.codex_home, runtime_instance_id=excluded.runtime_instance_id, updated_at=excluded.updated_at`,
+    [id, codexHome, runtimeInstanceId(id), now]
+  );
+  return getAccount(id) as Promise<Account>;
+}
+
+async function bootstrapRuntimeRecovery() {
+  const accounts = await db.all('SELECT * FROM accounts ORDER BY updated_at DESC');
+  if (!accounts.length) {
+    await runtimeForAccount('default').catch(e => app.log.warn({ err:e }, 'default account bootstrap failed'));
+    return;
+  }
+  for (const row of accounts) {
+    const account = row as Account;
+    runtimeForAccount(account.id).catch(e => app.log.warn({ err:e, accountId:account.id }, 'account bootstrap failed'));
+  }
+}
+
+async function getAccount(id:string) {
+  return db.get('SELECT * FROM accounts WHERE id=?1', [id]) as Promise<Account | null>;
+}
+
+async function runtimeForAccount(accountId:string) {
+  const account = await getAccount(accountId) || await ensureAccount(accountId, DEFAULT_CODEX_HOME);
+  let runtime = runtimes.get(account.id);
+  if (!runtime) {
+    runtime = new CodexAccountRuntime(account, portForAccount(account.id), db);
+    runtime.on('notification', (msg:any) => handleCodexNotification(account, msg).catch(e => app.log.error({ err:e }, 'notification handling failed')));
+    runtime.on('request', (msg:any) => runtime!.respond(msg.id, approvalResponse(String(msg.method || ''))));
+    runtime.on('connect', () => setTimeout(() => recoverAccount(account).catch(e => app.log.error({ err:e }, 'initial recovery failed')), 50));
+    runtime.on('disconnect', () => markAccountDisconnect(account).catch(()=>{}));
+    runtime.on('reconnect', () => recoverAccount(account).catch(e => app.log.error({ err:e }, 'recovery failed')));
+    runtime.on('error', e => app.log.warn({ err:e }, 'codex account runtime error'));
+    runtimes.set(account.id, runtime);
+  }
+  await runtime.ensureConnected();
+  return runtime;
+}
+
+async function handleCodexNotification(account:Account, msg:any) {
+  const upstreamThreadId = String(msg.params?.threadId || msg.params?.thread?.id || '');
+  if (!upstreamThreadId) return;
+  const session = await sessionForThread(upstreamThreadId);
+  if (!session) return;
+  if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) diagnostics.deltasReceived++;
+  appendEvent(session.id, msg.method, msg).catch(e => app.log.error({ err:e }, 'event append failed'));
+  if (msg.method === 'turn/started' && msg.params?.turn?.id) {
+    await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,updated_at=?3 WHERE id=?4', [String(msg.params.turn.id), 'running', Date.now(), session.id]);
+  }
+  if (msg.method === 'thread/status/changed') {
+    const rawStatus = rawStatusName(msg.params?.status);
+    const nextStatus = rawStatus === 'active' && session.active_turn_id ? 'running' : statusName(rawStatus);
+    const nextActiveTurnId = nextStatus === 'running' ? session.active_turn_id : null;
+    await db.run('UPDATE sessions SET status=?1,active_turn_id=?2,updated_at=?3 WHERE id=?4', [nextStatus, nextActiveTurnId, Date.now(), session.id]);
+  }
+  if (msg.method === 'turn/completed') {
+    const nextStatus = turnTerminalStatus(msg.params?.turn);
+    await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,interruption_reason=?2,updated_at=?3 WHERE id=?4', [nextStatus, nextStatus === 'interrupted' ? 'turn_failed_or_interrupted' : null, Date.now(), session.id]);
+  }
+  if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
+    await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,updated_at=?2 WHERE id=?3', ['idle', Date.now(), session.id]);
+  }
+}
+
+async function markAccountDisconnect(account:Account) {
+  const rows = await db.all("SELECT id FROM sessions WHERE account_id=?1 AND provider='codex' AND status='running'", [account.id]);
+  for (const row of rows) await appendEvent(String(row.id), 'runtime/disconnect', { accountId:account.id, at:Date.now() });
+}
+
+async function recoverAccount(account:Account) {
+  const runtime = await runtimeForAccount(account.id);
+  await reconcileStaleRunningSessions();
+  const rows = await db.all("SELECT * FROM sessions WHERE account_id=?1 AND provider='codex' AND (active_turn_id IS NOT NULL OR status NOT IN ('idle','completed','interrupted','archived'))", [account.id]);
+  for (const row of rows) {
+    const session = row as RuntimeSession;
+    const gapStart = Date.now();
+    let read:any;
+    try {
+      const opts = turnOptions(session);
+      diagnostics.threadResumeCalls++;
+      read = await runtime.request('thread/resume', withModel({
+        threadId:session.upstream_thread_id || session.id,
+        cwd:session.project_dir,
+        approvalPolicy:opts.approvalPolicy,
+        sandbox:opts.sandboxMode,
+      }, opts));
+    } catch (e:any) {
+      await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'runtime_reconnect_failed', Date.now(), session.id]);
+      await appendEvent(session.id, 'turn/interrupted', { threadId:session.upstream_thread_id || session.id, turnId:session.active_turn_id || null, reason:`runtime reconnect failed: ${e?.message || e}` });
+      continue;
+    }
+    await appendEvent(session.id, 'runtime/recovering', { accountId:account.id, at:gapStart });
+    await reconcileThread(session, read.thread, 'reconnect_thread_read', true);
+  }
+}
+
+async function reconcileThread(session:RuntimeSession, thread:any, source:string, publishSnapshot = false) {
+  const turns = thread?.turns || [];
+  const lastTurn = turns[turns.length - 1];
+  const hasFinalAnswer = lastTurnHasFinalAnswer(lastTurn);
+  const status = reconciledThreadStatus(thread, lastTurn, hasFinalAnswer);
+  const activeTurnId = !hasFinalAnswer && lastTurn?.status === 'inProgress' && lastTurn?.id ? String(lastTurn.id) : null;
+  const finalStatus = status === 'active' ? 'running' : status;
+  await db.run('UPDATE sessions SET status=?1, active_turn_id=?2, interruption_reason=?3, updated_at=?4 WHERE id=?5', [finalStatus, activeTurnId, finalStatus === 'interrupted' ? source : null, Date.now(), session.id]);
+  await appendEvent(session.id, publishSnapshot ? 'thread_snapshot' : 'thread/read', { source, thread, status:finalStatus, activeTurnId });
+}
+
+function lastTurnHasFinalAnswer(turn:any) {
+  return (turn?.items || []).some((item:any) => isFinalAnswerItem(item));
+}
+
+function reconciledThreadStatus(thread:any, lastTurn:any, hasFinalAnswer:boolean) {
+  if (!lastTurn) return statusName(thread?.status);
+  if (hasFinalAnswer) return statusName(thread?.status) === 'running' ? 'idle' : statusName(thread?.status);
+  const turnStatus = String(lastTurn.status || '');
+  if (turnStatus === 'inProgress') return 'running';
+  return 'interrupted';
+}
+
+function turnTerminalStatus(turn:any) {
+  const status = String(turn?.status || '');
+  return status === 'failed' || status === 'interrupted' ? 'interrupted' : 'idle';
+}
+
+async function reconcileStaleRunningSessions(id?:string) {
+  const cutoff = Date.now() - STALE_RUNNING_MS;
+  const rows = await db.all(
+    id
+      ? "SELECT * FROM sessions WHERE (id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1) AND provider='codex' AND (active_turn_id IS NOT NULL OR status IN ('running','active'))"
+      : "SELECT * FROM sessions WHERE provider='codex' AND (active_turn_id IS NOT NULL OR status IN ('running','active'))",
+    id ? [id] : []
+  );
+  for (const row of rows) {
+    const final = await db.get(
+      "SELECT sequence FROM events WHERE session_id=?1 AND event_type='item/completed' AND payload_json LIKE '%\"phase\":\"final_answer\"%' ORDER BY sequence DESC LIMIT 1",
+      [String(row.id)]
+    );
+    if (final) {
+      await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, updated_at=?2 WHERE id=?3', ['idle', Date.now(), row.id]);
+      continue;
+    }
+    const last = await db.get('SELECT MAX(created_at) AS ts FROM events WHERE session_id=?1', [String(row.id)]);
+    const lastEventAt = Number(last?.ts || row.updated_at || 0);
+    if (lastEventAt > cutoff) continue;
+    await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'stale_running_timeout', Date.now(), row.id]);
+    await appendEvent(String(row.id), 'turn/interrupted', { threadId:row.upstream_thread_id || row.id, turnId:row.active_turn_id || null, reason:'stale_running_timeout' }).catch(()=>{});
+  }
+}
+
+async function sessionForThread(upstreamThreadId:string) {
+  return db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [upstreamThreadId]) as Promise<RuntimeSession | null>;
+}
+
+async function getSession(id:string) {
+  return db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [id]) as Promise<RuntimeSession | null>;
+}
+
+async function ensureLiveThread(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string):Promise<{ threadId:string; recovered:boolean }> {
+  const threadId = String(session.upstream_thread_id || session.id);
+  if (session.upstream_generation === RUNTIME_GENERATION) return { threadId, recovered:false };
+  try {
+    diagnostics.threadResumeCalls++;
+    await runtime.request('thread/resume', withModel({
+      threadId,
+      cwd,
+      approvalPolicy:opts.approvalPolicy,
+      sandbox:opts.sandboxMode,
+    }, opts));
+    await db.run('UPDATE sessions SET upstream_generation=?1, updated_at=?2 WHERE id=?3 AND COALESCE(upstream_thread_id,id)=?4', [RUNTIME_GENERATION, Date.now(), session.id, threadId]);
+    return { threadId, recovered:false };
+  } catch (e:any) {
+    const message = e?.message || String(e);
+    if (!isMissingUpstreamThreadError(message)) throw e;
+    const fresh = await getSession(session.id);
+    const currentThreadId = String(fresh?.upstream_thread_id || session.upstream_thread_id || session.id);
+    if (currentThreadId !== threadId) return { threadId:currentThreadId, recovered:false };
+    app.log.warn({
+      localSessionId:session.id,
+      oldUpstreamThreadId:threadId,
+      fallbackReason:message,
+    }, 'upstream thread missing; creating replacement');
+    diagnostics.threadStartCalls++;
+    const started = await runtime.request('thread/start', withModel({
+      cwd,
+      approvalPolicy:opts.approvalPolicy,
+      sandbox:opts.sandboxMode,
+    }, opts));
+    const nextThreadId = String(started?.thread?.id || '');
+    if (!nextThreadId) throw e;
+    const now = Date.now();
+    const updated = await db.get(
+      `UPDATE sessions
+       SET upstream_thread_id=?1, upstream_generation=?2, updated_at=?3
+       WHERE id=?4 AND COALESCE(upstream_thread_id,id)=?5
+       RETURNING upstream_thread_id`,
+      [nextThreadId, RUNTIME_GENERATION, now, session.id, threadId]
+    );
+    if (!updated) {
+      const latest = await getSession(session.id);
+      return { threadId:String(latest?.upstream_thread_id || threadId), recovered:false };
+    }
+    app.log.warn({
+      localSessionId:session.id,
+      oldUpstreamThreadId:threadId,
+      newUpstreamThreadId:nextThreadId,
+      fallbackReason:message,
+    }, 'upstream thread replacement persisted');
+    await appendEvent(session.id, 'thread_recovered_with_new_upstream', {
+      oldUpstreamThreadId:threadId,
+      newUpstreamThreadId:nextThreadId,
+      fallbackReason:message,
+      warning:'上游会话已重建，部分模型上下文可能丢失',
+    });
+    return { threadId:nextThreadId, recovered:true };
+  }
+}
+
+async function recoveryContextInput(session:RuntimeSession) {
+  const recent = await recentConversationSummary(session.id, 12);
+  return {
+    type:'text',
+    text:[
+      RECOVERY_CONTEXT_MARKER,
+      'The upstream Codex thread was recreated because its rollout was unavailable.',
+      'Continue the same local mobile session using this recovery context. Do not repeat this context verbatim to the user.',
+      `Project path: ${session.project_dir}`,
+      `Local session title: ${session.title}`,
+      recent ? `Recent visible conversation:\n${recent}` : 'No prior visible conversation could be reconstructed from runtime events.',
+    ].join('\n\n'),
+    text_elements:[],
+  };
+}
+
+async function recentConversationSummary(sessionId:string, limit:number) {
+  const rows = await db.all(
+    `SELECT event_type,payload_json FROM events
+     WHERE session_id=?1
+       AND event_type IN ('user','item/completed')
+     ORDER BY sequence DESC
+     LIMIT ?2`,
+    [sessionId, limit * 3]
+  );
+  const lines:string[] = [];
+  for (const row of rows.reverse()) {
+    let payload:any = {};
+    try { payload = JSON.parse(String(row.payload_json || '{}')); } catch {}
+    if (row.event_type === 'user') {
+      const text = (payload.input || []).filter((x:any)=>x?.type === 'text').map((x:any)=>String(x.text || '')).join('\n').trim();
+      if (text) lines.push(`User: ${text.slice(0, 1200)}`);
+    }
+    const item = payload?.params?.item;
+    if (row.event_type === 'item/completed' && item?.type === 'agentMessage' && item?.phase === 'final_answer') {
+      const text = String(item.text || '').trim();
+      if (text) lines.push(`Assistant: ${text.slice(0, 1600)}`);
+    }
+  }
+  return lines.slice(-limit).join('\n\n');
+}
+
+async function readAuthoritativeThread(session:RuntimeSession) {
+  const account = await getAccount(String(session.account_id || 'default'));
+  if (!account) throw new Error('account not found');
+  const runtime = await runtimeForAccount(account.id);
+  const threadId = String(session.upstream_thread_id || session.id);
+  try {
+    return await runtime.request('thread/read', { threadId, includeTurns:true }, 30_000);
+  } catch {
+    const opts = turnOptions(session);
+    await runtime.request('thread/resume', withModel({
+      threadId,
+      cwd:session.project_dir,
+      approvalPolicy:opts.approvalPolicy,
+      sandbox:opts.sandboxMode,
+    }, opts), 30_000);
+    return runtime.request('thread/read', { threadId, includeTurns:true }, 30_000);
+  }
+}
+
+function threadFromSession(session:RuntimeSession) {
+  return {
+    id: session.upstream_thread_id || session.id,
+    name: session.title,
+    preview: session.title,
+    cwd: session.project_dir,
+    status: { type: session.status || 'idle' },
+    createdAt: Math.floor(Number(session.created_at || Date.now()) / 1000),
+    updatedAt: Math.floor(Number(session.updated_at || Date.now()) / 1000),
+    turns: [],
+    path: null,
+  };
+}
+
+async function appendEvent(sessionId:string, eventType:string, payload:any) {
+  const previous = eventAppendChains.get(sessionId) || Promise.resolve();
+  const next = previous.then(() => appendEventUnlocked(sessionId, eventType, payload), () => appendEventUnlocked(sessionId, eventType, payload));
+  eventAppendChains.set(sessionId, next.catch(()=>undefined));
+  return next;
+}
+
+async function appendEventUnlocked(sessionId:string, eventType:string, payload:any) {
+  const eventKey = eventKeyFor(eventType, payload);
+  if (eventKey) {
+    const existing = await db.get('SELECT sequence FROM events WHERE session_id=?1 AND event_key=?2', [sessionId, eventKey]);
+    if (existing) return { session_id:sessionId, sequence:Number(existing.sequence || 0), event_type:eventType, payload_json:JSON.stringify(payload), created_at:Date.now(), duplicate:true };
+  }
+  const sequence = await nextSequence(sessionId);
+  const now = Date.now();
+  const event = { session_id:sessionId, threadId:sessionId, generation:RUNTIME_GENERATION, sequence, event_type:eventType, payload_json:JSON.stringify(payload), created_at:now };
+  let pushed = 0;
+  for (const raw of subscriptions.get(sessionId) || []) {
+    raw.write('event: runtime\n');
+    raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    pushed++;
+  }
+  if (isDeltaEvent(eventType)) diagnostics.deltasSsePushed += pushed;
+  persistEvent(event, eventKey).catch(e => app.log.error({ err:e, sessionId, eventType }, 'event persist failed'));
+  return event;
+}
+
+async function nextSequence(sessionId:string) {
+  const cached = sequenceCache.get(sessionId);
+  if (cached !== undefined) {
+    const next = cached + 1;
+    sequenceCache.set(sessionId, next);
+    return next;
+  }
+  const row = await db.get('SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE session_id=?1', [sessionId]);
+  const next = Number(row?.seq || 0) + 1;
+  sequenceCache.set(sessionId, next);
+  return next;
+}
+
+async function persistEvent(event:any, eventKey:string|null) {
+  if (isDeltaEvent(event.event_type)) {
+    const queue = deltaPersistQueues.get(event.session_id) || [];
+    queue.push({ event, eventKey });
+    deltaPersistQueues.set(event.session_id, queue);
+    if (!deltaPersistTimers.has(event.session_id)) {
+      const timer = setTimeout(() => flushDeltaEvents(event.session_id).catch(e => app.log.error({ err:e }, 'delta flush failed')), 50);
+      (timer as any).unref?.();
+      deltaPersistTimers.set(event.session_id, timer);
+    }
+    return;
+  }
+  await insertEvents([{ event, eventKey }]);
+}
+
+async function flushDeltaEvents(sessionId:string) {
+  const timer = deltaPersistTimers.get(sessionId);
+  if (timer) clearTimeout(timer);
+  deltaPersistTimers.delete(sessionId);
+  const batch = deltaPersistQueues.get(sessionId) || [];
+  deltaPersistQueues.delete(sessionId);
+  if (batch.length) await insertEvents(batch);
+}
+
+async function insertEvents(batch:{ event:any; eventKey:string|null }[]) {
+  const startedAt = Date.now();
+  const statements:string[] = ['BEGIN'];
+  for (const { event, eventKey } of batch) {
+    statements.push(`INSERT OR IGNORE INTO events (session_id,ts,kind,payload,sequence,event_type,payload_json,created_at,event_key) VALUES (${q(event.session_id)},${Number(event.created_at)},${q(event.event_type)},${q(event.payload_json)},${Number(event.sequence)},${q(event.event_type)},${q(event.payload_json)},${Number(event.created_at)},${q(eventKey)})`);
+    statements.push(`UPDATE sessions SET last_sequence=${Number(event.sequence)}, updated_at=${Number(event.created_at)} WHERE (id=${q(event.session_id)} OR codex_thread_id=${q(event.session_id)}) AND COALESCE(last_sequence,0)<${Number(event.sequence)}`);
+  }
+  statements.push('COMMIT');
+  await db.run(statements.join(';\n'));
+  const elapsed = Date.now() - startedAt;
+  diagnostics.sqliteBatches++;
+  diagnostics.sqliteRows += batch.length;
+  diagnostics.sqliteMs += elapsed;
+  if (elapsed > 100 || batch.length > 100) app.log.warn({ sessionId:batch[0]?.event?.session_id, batchSize:batch.length, elapsedMs:elapsed }, 'runtime sqlite event batch slow');
+}
+
+function isDeltaEvent(eventType:string) {
+  return eventType === 'item/agentMessage/delta' || eventType === 'item/commandExecution/outputDelta';
+}
+
+async function ensureCodexHomeSharedDirs(codexHome:string) {
+  await mkdir(codexHome, { recursive:true });
+  await mkdir(SHARED_SESSIONS_DIR, { recursive:true });
+  await mkdir(SHARED_GENERATED_IMAGES_DIR, { recursive:true });
+  await ensureSharedDirLink(codexHome, 'sessions', SHARED_SESSIONS_DIR);
+  await ensureSharedDirLink(codexHome, 'generated_images', SHARED_GENERATED_IMAGES_DIR);
+}
+
+async function ensureSharedDirLink(codexHome:string, name:string, sharedDir:string) {
+  const localDir = path.join(codexHome, name);
+  const existing = await lstat(localDir).catch(()=>null);
+  if (existing?.isSymbolicLink()) {
+    let target = '';
+    try { target = realpathSync(localDir); } catch {}
+    if (target === realpathSync(sharedDir)) return;
+    const linkTarget = await readlink(localDir).catch(()=>'');
+    app.log.warn({ codexHome, name, linkTarget, expected:sharedDir }, 'repairing codex shared directory symlink');
+    await rm(localDir, { force:true });
+  } else if (existing?.isDirectory()) {
+    if (realpathSync(localDir) === realpathSync(sharedDir)) return;
+    await cp(localDir, sharedDir, { recursive:true, force:false, errorOnExist:false }).catch(()=>{});
+    await rm(localDir, { recursive:true, force:true });
+  } else if (existing) {
+    await rm(localDir, { force:true });
+  }
+  await symlink(sharedDir, localDir, 'dir');
+}
+
+function q(value:any) {
+  if (value === null || value === undefined) return 'null';
+  if (typeof value === 'number') return String(value);
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+function eventKeyFor(eventType:string, payload:any) {
+  if (eventType === 'item/commandExecution/outputDelta' || eventType === 'item/agentMessage/delta') return null;
+  const item = payload?.params?.item || payload?.item;
+  const threadId = payload?.params?.threadId || payload?.threadId || payload?.thread?.id || '';
+  const turnId = payload?.params?.turnId || payload?.params?.turn?.id || payload?.turn?.id || '';
+  if (eventType === 'turn/interrupted') return `${eventType}:${threadId}:${turnId || payload?.turnId || ''}`;
+  if (item?.id) return `${eventType}:${threadId}:${turnId}:${item.id}:${item.type || ''}`;
+  if (eventType === 'turn/started' || eventType === 'turn/completed' || eventType === 'turn/failed') return `${eventType}:${threadId}:${turnId}`;
+  if (eventType === 'thread/status/changed') return null;
+  if (eventType === 'thread/read' || eventType === 'output_gap') return null;
+  return null;
+}
+
+async function eventsAfter(sessionId:string, after:number, includeDeltas = false) {
+  const decorate = (rows:any[]) => rows.map(row => ({ ...row, threadId:sessionId, generation:RUNTIME_GENERATION }));
+  if (after <= 0) {
+    return decorate(await db.all(
+      `SELECT session_id,sequence,event_type,payload_json,created_at
+       FROM (
+         SELECT session_id,sequence,event_type,payload_json,created_at
+       FROM events
+       WHERE session_id=?1
+         AND event_type<>'thread/read'
+         AND (?2=1 OR event_type NOT IN ('item/agentMessage/delta','item/commandExecution/outputDelta'))
+         AND (?2=0 OR event_type<>'item/commandExecution/outputDelta')
+          AND event_type NOT LIKE 'turn/diff/%'
+          AND NOT (
+            event_type='item/completed'
+            AND COALESCE(json_extract(payload_json,'$.params.item.type'),'') NOT IN ('userMessage','agentMessage','imageView','imageGeneration')
+          )
+       ORDER BY sequence DESC
+       LIMIT 3000
+     )
+       ORDER BY sequence ASC`,
+      [sessionId, includeDeltas ? 1 : 0]
+    ));
+  }
+  return decorate(await db.all(
+    `SELECT session_id,sequence,event_type,payload_json,created_at
+     FROM events
+     WHERE session_id=?1
+       AND COALESCE(sequence,0)>?2
+       AND event_type<>'thread/read'
+     ORDER BY sequence ASC
+     LIMIT 1000`,
+    [sessionId, after]
+  ));
+}
+
+function turnOptions(body:any) {
+  const permissionMode = normalizeMode(body.permission_mode || body.permissionMode || body.mode) || 'yolo';
+  const fields = modeFields(permissionMode);
+  return {
+    permissionMode,
+    approvalPolicy:String(body.approvalPolicy || body.approval_policy || fields.approval_policy),
+    sandboxMode:String(body.sandboxMode || body.sandbox_mode || fields.sandbox_mode),
+    model:cleanModel(body.model),
+  };
+}
+
+function withModel<T extends Record<string, any>>(params:T, opts:{ model?:string | null }) {
+  if (opts.model) (params as any).model = opts.model;
+  return params;
+}
+
+function modeFields(mode:string) {
+  if (mode === 'read-only') return { approval_policy:'on-request', sandbox_mode:'read-only' };
+  if (mode === 'workspace-write') return { approval_policy:'on-request', sandbox_mode:'workspace-write' };
+  return { approval_policy:'never', sandbox_mode:'danger-full-access' };
+}
+
+function normalizeMode(value:any) {
+  const v = String(value || '');
+  return ['read-only','workspace-write','yolo'].includes(v) ? v : null;
+}
+
+function sandboxPolicyType(mode:string) {
+  if (mode === 'read-only') return 'readOnly';
+  if (mode === 'workspace-write') return 'workspaceWrite';
+  return 'dangerFullAccess';
+}
+
+function statusName(status:any) {
+  if (!status) return 'idle';
+  const value = rawStatusName(status);
+  return value === 'active' ? 'idle' : value;
+}
+
+function rawStatusName(status:any) {
+  if (!status) return 'idle';
+  return typeof status === 'string' ? status : status.type || 'idle';
+}
+
+function isMissingUpstreamThreadError(message:string) {
+  return /no rollout found|thread not found|invalid thread id/i.test(message);
+}
+
+function isFinalAnswerItem(item:any) {
+  return item?.type === 'agentMessage' && item?.phase === 'final_answer' && String(item?.text || '').trim();
+}
+
+function approvalResponse(method:string) {
+  if (method.includes('permissions')) return { permissions:{ network:null, fileSystem:null }, scope:'session' };
+  if (method.includes('fileChange')) return { decision:'accept' };
+  return { decision:'accept' };
+}
+
+function cleanModel(value:any) {
+  const v = String(value || '').trim();
+  return /^[A-Za-z0-9_.:/@+\-() ]{1,120}$/.test(v) ? v : null;
+}
+
+function cleanTitle(value:any, cwd:string) {
+  const raw = String(value || '').split(/\r?\n/)[0].trim();
+  return (raw || path.basename(cwd)).slice(0, 120);
+}
+
+function portForAccount(accountId:string) {
+  if (accountId === 'default') return DEFAULT_CODEX_APP_SERVER_PORT;
+  const hash = crypto.createHash('sha256').update(accountId).digest();
+  return CODEX_PORT_BASE + (hash.readUInt16BE(0) % 200);
+}
+
+function runtimeInstanceId(accountId:string) { return `codex-${safeUnitPart(accountId)}`; }
+function systemdUnitName(accountId:string) { return accountId === 'default' ? 'codex-app-server@default.service' : `codex-app-server-${safeUnitPart(accountId)}.service`; }
+function safeUnitPart(value:string) { return value.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 64) || 'default'; }
+function sleep(ms:number) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function readyz(port:number) {
+  return new Promise<boolean>(resolve => {
+    const req = http.get({ hostname:'127.0.0.1', port, path:'/readyz', timeout:1000 }, res => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
+}
+
+async function pidForPort(port:number) {
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-af', `codex app-server --listen ws://127.0.0.1:${port}`]);
+    const line = stdout.trim().split(/\r?\n/)[0] || '';
+    return Number(line.split(/\s+/)[0]) || null;
+  } catch {
+    return null;
+  }
+}

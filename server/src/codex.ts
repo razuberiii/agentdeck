@@ -38,7 +38,7 @@ export class CodexBridge extends EventEmitter {
     });
     const rl = readline.createInterface({ input: proc.stdout });
     rl.on('line', line => this.handleLine(line));
-    await this.request('initialize', { clientInfo: { name:'codex-mobile', title:'Codex Mobile', version:'1.0.0' }, capabilities: { experimentalApi: true, requestAttestation: false } });
+    await this.request('initialize', { clientInfo: { name:'agent-deck', title:'Agent Deck', version:'1.0.0' }, capabilities: { experimentalApi: true, requestAttestation: false } });
     this.notify('initialized');
   }
   private handleLine(line: string) {
