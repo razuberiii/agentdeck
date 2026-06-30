@@ -869,7 +869,7 @@ async function threadFromSnapshot(session:RuntimeSession) {
     }
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
-      if (item && ['userMessage','agentMessage','plan','reasoning','commandExecution','fileChange','imageView','imageGeneration','artifact','dynamicToolCall'].includes(String(item.type))) items.push(item);
+      if (item && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) items.push(compactSnapshotItem(item));
       continue;
     }
     if (eventType === 'turn/failed' || eventType === 'turn/interrupted') {
@@ -882,6 +882,16 @@ async function threadFromSnapshot(session:RuntimeSession) {
     }
   }
   return { ...threadFromSession(session), turns:items.length ? [{ id:`snapshot-${session.id}`, items }] : [] };
+}
+
+function compactSnapshotItem(item:any) {
+  if (!item || typeof item !== 'object') return item;
+  const next = { ...item };
+  if (typeof next.text === 'string' && next.text.length > 80_000) next.text = `${next.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]`;
+  if (Array.isArray(next.content)) {
+    next.content = next.content.map((part:any) => typeof part?.text === 'string' && part.text.length > 80_000 ? { ...part, text:`${part.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]` } : part);
+  }
+  return next;
 }
 
 function scheduleThreadReconcile(session:RuntimeSession, source:string) {
@@ -1055,17 +1065,42 @@ async function eventsAfter(sessionId:string, after:number, includeDeltas = false
     return decorate(await db.all(
       `SELECT session_id,sequence,event_type,payload_json,created_at
        FROM (
-         SELECT session_id,sequence,event_type,payload_json,created_at
-       FROM events
-       WHERE session_id=?1
-         AND (
-           (?2=1 AND event_type<>'thread/read' AND event_type NOT LIKE 'turn/diff/%')
-           OR
-           (?2=0 AND event_type IN ('user','item/completed','turn/failed','turn/interrupted','thread_recovered_with_new_upstream','runtime/disconnect','runtime/recovering','thread_snapshot'))
+         SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+           SELECT session_id,sequence,event_type,payload_json,created_at
+           FROM events
+           WHERE session_id=?1
+             AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream','runtime/disconnect','runtime/recovering','thread_snapshot')
+           ORDER BY sequence DESC
+           LIMIT 80
          )
-       ORDER BY sequence DESC
-       LIMIT 250
-     )
+         UNION ALL
+         SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+           SELECT session_id,sequence,event_type,payload_json,created_at
+           FROM events
+           WHERE session_id=?1
+             AND event_type='item/completed'
+             AND length(payload_json)<300000
+             AND (
+               payload_json LIKE '%"type":"agentMessage"%'
+               OR payload_json LIKE '%"type":"userMessage"%'
+               OR payload_json LIKE '%"type":"imageView"%'
+               OR payload_json LIKE '%"type":"imageGeneration"%'
+               OR payload_json LIKE '%"type":"artifact"%'
+             )
+           ORDER BY sequence DESC
+           LIMIT 80
+         )
+         UNION ALL
+         SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+           SELECT session_id,sequence,event_type,payload_json,created_at
+           FROM events
+           WHERE ?2=1
+             AND session_id=?1
+             AND event_type IN ('item/agentMessage/delta','turn/completed','turn/started')
+           ORDER BY sequence DESC
+           LIMIT 80
+         )
+       )
        ORDER BY sequence ASC`,
       [sessionId, includeDeltas ? 1 : 0]
     ));

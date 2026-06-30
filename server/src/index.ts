@@ -1053,14 +1053,33 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
   const events = await runtimeDb.all(
     `SELECT session_id,sequence,event_type,payload_json,created_at
      FROM (
-       SELECT session_id,sequence,event_type,payload_json,created_at
-       FROM events
-       WHERE session_id=?1
-         AND event_type IN ('user','item/completed','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
-       ORDER BY sequence DESC
-       LIMIT 250
-     )
-     ORDER BY sequence ASC`,
+       SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+         SELECT session_id,sequence,event_type,payload_json,created_at
+         FROM events
+         WHERE session_id=?1
+           AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
+         ORDER BY sequence DESC
+         LIMIT 80
+       )
+       UNION ALL
+       SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+         SELECT session_id,sequence,event_type,payload_json,created_at
+         FROM events
+         WHERE session_id=?1
+           AND event_type='item/completed'
+           AND length(payload_json)<300000
+           AND (
+             payload_json LIKE '%"type":"agentMessage"%'
+             OR payload_json LIKE '%"type":"userMessage"%'
+             OR payload_json LIKE '%"type":"imageView"%'
+             OR payload_json LIKE '%"type":"imageGeneration"%'
+             OR payload_json LIKE '%"type":"artifact"%'
+           )
+         ORDER BY sequence DESC
+         LIMIT 80
+       )
+      )
+      ORDER BY sequence ASC`,
     [threadId]
   ).catch(()=>[]);
   const items:any[] = [];
@@ -1083,7 +1102,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
       if (item?.id) completedItemIds.add(String(item.id));
-      if (item?.id && ['userMessage','agentMessage','reasoning','plan','commandExecution','fileChange','imageView','imageGeneration','artifact','dynamicToolCall'].includes(String(item.type))) items.push(item);
+      if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) items.push(compactSnapshotItem(item));
       continue;
     }
     if (eventType === 'item/agentMessage/delta') {
@@ -1115,6 +1134,16 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
     turns:items.length ? [{ id:`turn-${threadId}`, items }] : [],
     path:null,
   };
+}
+
+function compactSnapshotItem(item:any) {
+  if (!item || typeof item !== 'object') return item;
+  const next = { ...item };
+  if (typeof next.text === 'string' && next.text.length > 80_000) next.text = `${next.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]`;
+  if (Array.isArray(next.content)) {
+    next.content = next.content.map((part:any) => typeof part?.text === 'string' && part.text.length > 80_000 ? { ...part, text:`${part.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]` } : part);
+  }
+  return next;
 }
 function rowSessionDto(row:any) {
   const fields = modeFields(sessionMode(row));
