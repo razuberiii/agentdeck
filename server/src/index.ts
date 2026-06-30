@@ -47,7 +47,7 @@ const clients = new Map<string, Set<any>>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
-const runtimeSubscriptions = new Map<string, { close:()=>void; connected:boolean; generation?:string; lastSequence:number }>();
+const runtimeSubscriptions = new Map<string, { close:()=>void; connected:boolean; connecting:boolean; generation?:string; lastSequence:number }>();
 const activeAntigravityTurns = new Map<string, any>();
 const chunkedMessages = new Map<string, { sessionId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
@@ -1180,9 +1180,9 @@ async function joinAndResume(id:string, ws:any, lastSequence = 0){ const row = a
 function broadcast(id:string, msg:any){ for(const ws of clients.get(id) || []) if(ws.readyState === 1) { ws.send(JSON.stringify(msg)); runtimeDiagnostics.broadcasts++; } }
 function ensureRuntimePushSubscription(threadId:string) {
   const existing = runtimeSubscriptions.get(threadId);
-  if (existing?.connected) return;
+  if (existing?.connected || existing?.connecting) return;
   existing?.close?.();
-  const state = { close:()=>{}, connected:false, lastSequence:Number(existing?.lastSequence || 0), generation:existing?.generation };
+  const state = { close:()=>{}, connected:false, connecting:true, lastSequence:Number(existing?.lastSequence || 0), generation:existing?.generation };
   runtimeSubscriptions.set(threadId, state);
   runtimeDiagnostics.subscribeStarts++;
   app.log.info({ threadId, after:state.lastSequence }, 'runtime sse subscribe starting');
@@ -1194,11 +1194,16 @@ function ensureRuntimePushSubscription(threadId:string) {
     for (const msg of messages) broadcast(threadId, msg);
   }, (status, error) => {
     if (status === 'connected') {
+      state.connecting = false;
       state.connected = true;
       broadcast(threadId, { type:'runtimeConnection', status:'connected' });
       return;
     }
+    state.connecting = false;
     state.connected = false;
+    if (status === 'closed' && runtimeSubscriptions.get(threadId) === state && !(clients.get(threadId)?.size || activeCodexSessions.has(threadId))) {
+      runtimeSubscriptions.delete(threadId);
+    }
     runtimeDiagnostics.subscribeReconnects++;
     app.log.warn({ threadId, status, error:error?.message || undefined }, 'runtime sse subscribe disconnected');
     broadcast(threadId, { type:'runtimeConnection', status:'recovering', error:error?.message || undefined });
