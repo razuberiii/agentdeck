@@ -77,14 +77,13 @@ type RuntimeSession = {
 class CodexAccountRuntime extends EventEmitter {
   private client: WsJsonRpcClient | null = null;
   private connecting: Promise<void> | null = null;
-  private appServerStarting: Promise<void> | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private initialized = false;
 
   constructor(private account:Account, private port:number, private db:Db) { super(); }
 
   async ensureConnected() {
-    await this.ensureAppServer();
+    await ensureCodexAppServer(this.account, this.port, this.db);
     if (this.client?.isConnected() && this.initialized) return;
     if (!this.connecting) this.connecting = this.connect().finally(() => { this.connecting = null; });
     return this.connecting;
@@ -160,53 +159,6 @@ class CodexAccountRuntime extends EventEmitter {
     }, 1500);
   }
 
-  private async ensureAppServer() {
-    await ensureCodexHomeSharedDirs(this.account.codex_home);
-    if (await readyz(this.port)) return;
-    if (this.appServerStarting) return this.appServerStarting;
-    this.appServerStarting = this.startAppServer().finally(() => { this.appServerStarting = null; });
-    return this.appServerStarting;
-  }
-
-  private async startAppServer() {
-    const unit = systemdUnitName(this.account.id);
-    const listen = `ws://127.0.0.1:${this.port}`;
-    app.log.warn({ accountId:this.account.id, unit, listen }, 'codex app-server not ready; starting');
-    if (this.account.id === 'default') {
-      await mapAppServerStartError(execFileAsync('sudo', ['systemctl', 'start', unit], { maxBuffer:1024 * 1024 }));
-    } else {
-      await validateAppServerRunUser(APP_SERVER_USER, APP_SERVER_GROUP);
-      const args = [
-        '--unit', unit,
-        '--uid', APP_SERVER_USER,
-        '--gid', APP_SERVER_GROUP,
-        '--property', `WorkingDirectory=${DEFAULT_WORKDIR}`,
-        '--property', 'Restart=on-failure',
-        '--property', 'RestartSec=5',
-        '--property', 'StartLimitIntervalSec=60',
-        '--property', 'StartLimitBurst=3',
-        '--setenv', `HOME=${DEFAULT_HOME}`,
-        '--setenv', `CODEX_HOME=${this.account.codex_home}`,
-        '--collect',
-        'codex', 'app-server', '--listen', listen,
-        '-c', 'approval_policy="never"',
-        '-c', 'sandbox_mode="danger-full-access"',
-      ];
-      await mapAppServerStartError(execFileAsync('sudo', ['systemd-run', ...args], { maxBuffer:1024 * 1024 }));
-    }
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < 10_000) {
-      if (await readyz(this.port)) {
-        await this.db.run(
-          'INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at',
-          [runtimeInstanceId(this.account.id), await pidForPort(this.port), Date.now()]
-        );
-        return;
-      }
-      await sleep(250);
-    }
-    throw new Error(`codex app-server did not become ready on ${listen}`);
-  }
 }
 
 const db = new Db(DB_FILE);
@@ -332,6 +284,8 @@ const geminiManager = new GeminiRuntimeManager();
 
 const subscriptions = new Map<string, Set<any>>();
 const runtimes = new Map<string, CodexAccountRuntime>();
+const runtimeForAccountInFlight = new Map<string, Promise<CodexAccountRuntime>>();
+const codexAppServerEnsureInFlight = new Map<string, Promise<void>>();
 const eventAppendChains = new Map<string, Promise<any>>();
 const sequenceCache = new Map<string, number>();
 const deltaPersistQueues = new Map<string, any[]>();
@@ -838,6 +792,14 @@ async function getAccount(id:string) {
 }
 
 async function runtimeForAccount(accountId:string) {
+  const pending = runtimeForAccountInFlight.get(accountId);
+  if (pending) return pending;
+  const promise = runtimeForAccountOnce(accountId).finally(() => runtimeForAccountInFlight.delete(accountId));
+  runtimeForAccountInFlight.set(accountId, promise);
+  return promise;
+}
+
+async function runtimeForAccountOnce(accountId:string) {
   const account = await getAccount(accountId) || await ensureAccount(accountId, DEFAULT_CODEX_HOME);
   let runtime = runtimes.get(account.id);
   if (!runtime) {
@@ -1545,6 +1507,109 @@ function redactRuntimeError(message:string) {
   return String(message || 'Gemini request failed')
     .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]')
     .replace(/(access_token|refresh_token|id_token|client_secret|authorization code)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
+}
+
+async function ensureCodexAppServer(account:Account, port:number, db:Db) {
+  const key = account.id;
+  const pending = codexAppServerEnsureInFlight.get(key);
+  if (pending) return pending;
+  const promise = ensureCodexAppServerOnce(account, port, db).finally(() => codexAppServerEnsureInFlight.delete(key));
+  codexAppServerEnsureInFlight.set(key, promise);
+  return promise;
+}
+
+async function ensureCodexAppServerOnce(account:Account, port:number, db:Db) {
+  await ensureCodexHomeSharedDirs(account.codex_home);
+  const unit = systemdUnitName(account.id);
+  const listen = `ws://127.0.0.1:${port}`;
+  if (await readyz(port)) {
+    await recordRuntimeInstance(db, account.id, port);
+    return;
+  }
+
+  const state = await systemdUnitState(unit);
+  if (state.activeState === 'activating') {
+    app.log.info({ accountId:account.id, unit, listen }, 'codex app-server activating; waiting');
+    await waitForAppServerReady(account.id, port, db, 15_000);
+    return;
+  }
+
+  if (state.activeState === 'active') {
+    app.log.warn({ accountId:account.id, unit, listen, subState:state.subState }, 'codex app-server active but not ready; waiting');
+    await waitForAppServerReady(account.id, port, db, 10_000);
+    return;
+  }
+
+  app.log.warn({ accountId:account.id, unit, listen, activeState:state.activeState, fragmentPath:state.fragmentPath }, 'codex app-server not ready; starting');
+  if (account.id === 'default' || isPersistentSystemdFragment(state.fragmentPath)) {
+    await mapAppServerStartError(execFileAsync('sudo', ['systemctl', 'start', unit], { maxBuffer:1024 * 1024 }));
+  } else {
+    await validateAppServerRunUser(APP_SERVER_USER, APP_SERVER_GROUP);
+    await mapAppServerStartError(execFileAsync('sudo', ['systemd-run', ...codexSystemdRunArgs(account, unit, listen)], { maxBuffer:1024 * 1024 }));
+  }
+  await waitForAppServerReady(account.id, port, db, 10_000);
+}
+
+function codexSystemdRunArgs(account:Account, unit:string, listen:string) {
+  return [
+    '--unit', unit,
+    '--uid', APP_SERVER_USER,
+    '--gid', APP_SERVER_GROUP,
+    '--property', `WorkingDirectory=${DEFAULT_WORKDIR}`,
+    '--property', 'Restart=on-failure',
+    '--property', 'RestartSec=5',
+    '--property', 'StartLimitIntervalSec=60',
+    '--property', 'StartLimitBurst=3',
+    '--setenv', `HOME=${DEFAULT_HOME}`,
+    '--setenv', `CODEX_HOME=${account.codex_home}`,
+    '--collect',
+    'codex', 'app-server', '--listen', listen,
+    '-c', 'approval_policy="never"',
+    '-c', 'sandbox_mode="danger-full-access"',
+  ];
+}
+
+async function waitForAppServerReady(accountId:string, port:number, db:Db, timeoutMs:number) {
+  const listen = `ws://127.0.0.1:${port}`;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await readyz(port)) {
+      await recordRuntimeInstance(db, accountId, port);
+      return;
+    }
+    await sleep(250);
+  }
+  throw new Error(`codex app-server did not become ready on ${listen}`);
+}
+
+async function recordRuntimeInstance(db:Db, accountId:string, port:number) {
+  await db.run(
+    'INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at',
+    [runtimeInstanceId(accountId), await pidForPort(port), Date.now()]
+  );
+}
+
+function isPersistentSystemdFragment(fragmentPath:string | null) {
+  return !!fragmentPath && !fragmentPath.startsWith('/run/systemd/transient/');
+}
+
+async function systemdUnitState(unit:string) {
+  try {
+    const { stdout } = await execFileAsync('systemctl', ['show', unit, '-p', 'LoadState', '-p', 'ActiveState', '-p', 'SubState', '-p', 'FragmentPath', '--no-pager'], { maxBuffer:128 * 1024 });
+    const values:Record<string,string> = {};
+    for (const line of stdout.split(/\r?\n/)) {
+      const idx = line.indexOf('=');
+      if (idx > 0) values[line.slice(0, idx)] = line.slice(idx + 1);
+    }
+    return {
+      loadState:values.LoadState || 'not-found',
+      activeState:values.ActiveState || 'inactive',
+      subState:values.SubState || '',
+      fragmentPath:values.FragmentPath || null,
+    };
+  } catch {
+    return { loadState:'not-found', activeState:'inactive', subState:'', fragmentPath:null };
+  }
 }
 
 class StructuredRuntimeError extends Error {

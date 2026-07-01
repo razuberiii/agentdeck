@@ -40,3 +40,26 @@ test('install-units validates configured service user and group before installin
   assert.match(installUnits, /getent passwd "\$RUN_USER"/);
   assert.match(installUnits, /getent group "\$RUN_GROUP"/);
 });
+
+test('Codex app-server lifecycle uses a profile single-flight ensure entrypoint', () => {
+  assert.match(runtimeSource, /async function ensureCodexAppServer\(account:Account, port:number, db:Db\)/);
+  assert.match(runtimeSource, /const codexAppServerEnsureInFlight = new Map<string, Promise<void>>\(\)/);
+  assert.match(runtimeSource, /codexAppServerEnsureInFlight\.get\(key\)/);
+  assert.match(runtimeSource, /ensureCodexAppServerOnce\(account, port, db\)\.finally/);
+  assert.match(runtimeSource, /await ensureCodexAppServer\(this\.account, this\.port, this\.db\)/);
+});
+
+test('runtimeForAccount creation is also single-flight per account', () => {
+  assert.match(runtimeSource, /const runtimeForAccountInFlight = new Map<string, Promise<CodexAccountRuntime>>\(\)/);
+  assert.match(runtimeSource, /runtimeForAccountInFlight\.get\(accountId\)/);
+  assert.match(runtimeSource, /runtimeForAccountOnce\(accountId\)\.finally/);
+});
+
+test('Codex app-server ensure reuses healthy or persistent units before transient systemd-run', () => {
+  assert.match(runtimeSource, /if \(await readyz\(port\)\) \{/);
+  assert.match(runtimeSource, /state\.activeState === 'activating'/);
+  assert.match(runtimeSource, /isPersistentSystemdFragment\(state\.fragmentPath\)/);
+  assert.match(runtimeSource, /\['systemctl', 'start', unit\]/);
+  assert.match(runtimeSource, /'systemd-run', \.\.\.codexSystemdRunArgs/);
+  assert.doesNotMatch(runtimeSource, /Date\.now\(\).*systemd-run/);
+});
