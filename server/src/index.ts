@@ -1523,7 +1523,8 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [])
   const threadId = String(row.codex_thread_id || row.id);
   const message = String(text || '').trim();
   if (!message && !attachments.length) throw new Error('empty message');
-  if (attachments.length) throw new Error('Antigravity 暂未接入图片附件');
+  const attachmentText = attachments.length ? await attachmentPromptText(threadId, attachments) : '';
+  const prompt = [message, attachmentText].filter(Boolean).join('\n\n');
   const profile:any = await getActiveAntigravityProfile();
   if (!profile?.home_dir) throw new Error('请先登录 Antigravity');
   const login = await antigravityLoginStatus(String(profile.home_dir));
@@ -1531,16 +1532,16 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [])
   const now = Date.now();
   const userId = crypto.randomUUID();
   const title = autoTitle(message, String(row.project_dir), String(row.title || ''));
-  await db.run('INSERT INTO agent_messages (id,session_id,role,text,created_at) VALUES (?1,?2,?3,?4,?5)', [userId, threadId, 'user', message, now]);
+  await db.run('INSERT INTO agent_messages (id,session_id,role,text,created_at) VALUES (?1,?2,?3,?4,?5)', [userId, threadId, 'user', prompt, now]);
   if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[title, now, threadId]); broadcast(threadId,{type:'sessionTitle', title}); }
   await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['running', now, threadId]);
-  broadcast(threadId,{type:'user', text:message, attachments:[]});
+  broadcast(threadId,{type:'user', text:message, attachments:attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))});
   broadcast(threadId,{type:'codex', method:'turn/started', params:{}});
   const assistantId = crypto.randomUUID();
   const model = cleanAgentModel(row.model);
   broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:`${assistantId}-progress`, type:'plan', text:`Antigravity 已接收请求，正在用 ${model || '默认模型'} 分析。` } }});
   try {
-    const output = await runAntigravityPrint(profile, row, message, threadId, assistantId);
+    const output = await runAntigravityPrint(profile, row, prompt, threadId, assistantId);
     await db.run('INSERT INTO agent_messages (id,session_id,role,text,created_at) VALUES (?1,?2,?3,?4,?5)', [assistantId, threadId, 'assistant', output, Date.now()]);
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
     broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:assistantId, type:'agentMessage', text:output, phase:'final_answer' } }});
@@ -1550,6 +1551,14 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [])
     broadcast(threadId,{type:'codex', method:'turn/completed', params:{}});
     throw e;
   }
+}
+async function attachmentPromptText(threadId:string, attachments:any[]) {
+  const lines = ['Attachments are available as local files:'];
+  for (const a of attachments) {
+    const meta = await readAttachmentMeta(threadId, String(a.id));
+    lines.push(`- ${meta.name} | ${meta.type || meta.mime} | ${meta.size} bytes | ${meta.path}`);
+  }
+  return lines.join('\n');
 }
 async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId:string, itemId:string) {
   return new Promise<string>((resolve, reject) => {
