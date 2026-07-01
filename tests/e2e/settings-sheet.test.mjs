@@ -71,9 +71,9 @@ test('settings sheet opens, navigates providers, and does not black screen', asy
     await page.getByRole('button', { name:'返回', exact:true }).click();
     await page.getByRole('button', { name:'当前账户' }).click();
     await page.locator('.profileRow button.dangerText').first().click();
-    await page.getByText('删除账户？').waitFor({ timeout:3000 });
+    await page.getByText('删除 Codex 账户？').waitFor({ timeout:3000 });
     await page.getByRole('button', { name:'取消' }).click();
-    await assert.equal(await page.getByText('删除账户？').count(), 0);
+    await assert.equal(await page.getByText('删除 Codex 账户？').count(), 0);
     await assertNotBlack(page);
 
     assert.deepEqual(errors, []);
