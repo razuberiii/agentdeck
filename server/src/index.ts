@@ -22,6 +22,7 @@ import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
 import { AntigravityProvider, GeminiProvider, type AgentProviderId } from './providers.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
+import { providerCapabilitiesFor } from './provider-adapter.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -1210,6 +1211,11 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
   const antigravityEmail = findEmailInText(String(antigravityProfile?.login?.email || antigravityProfile?.name || '')) || undefined;
   const antigravityAuth = antigravityProfile?.id ? 'unknown' : 'unauthenticated';
   const antigravityCanCreate = !!antigravityCli?.ok && !!antigravityProfile?.id && !!antigravityProfile?.login?.ok;
+  const adapterCapabilities = {
+    codex: providerCapabilitiesFor('codex'),
+    gemini: providerCapabilitiesFor('gemini'),
+    antigravity: providerCapabilitiesFor('antigravity'),
+  };
   return {
     codex: providerStatus({
       provider:'codex',
@@ -1225,7 +1231,7 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       canQueryQuota: true,
       canListModels: !!codexCli?.ok,
       canSelectModel: !!codexCli?.ok,
-      capabilities: attachmentCapabilities(null).providers?.codex || {},
+      capabilities: adapterCapabilities.codex,
       reasonCode: codexCli?.ok ? (codexAuth === 'authenticated' ? null : 'codex_not_logged_in') : 'codex_unavailable',
       message: codexCli?.ok ? (codexAuth === 'authenticated' ? null : '请先登录 Codex') : (codexCli?.error || 'Codex CLI 不可用'),
       checkedAt,
@@ -1245,7 +1251,7 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       canQueryQuota: false,
       canListModels: !!geminiCli?.ok,
       canSelectModel: !!geminiCli?.ok,
-      capabilities: attachmentCapabilities(null).providers?.gemini || {},
+      capabilities: adapterCapabilities.gemini,
       reasonCode: geminiReason,
       message: geminiMessage,
       checkedAt,
@@ -1265,7 +1271,7 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       canQueryQuota: false,
       canListModels: !!antigravityCli?.ok && !!antigravityProfile?.id,
       canSelectModel: false,
-      capabilities: attachmentCapabilities(null).providers?.antigravity || {},
+      capabilities: adapterCapabilities.antigravity,
       reasonCode: !antigravityCli?.ok ? 'antigravity_unavailable' : antigravityProfile?.id ? 'antigravity_auth_unknown' : 'antigravity_not_logged_in',
       message: !antigravityCli?.ok ? (antigravityCli?.error || 'Antigravity CLI 不可用') : antigravityProfile?.id ? 'Antigravity 登录状态无法可靠探测' : '请先添加 Antigravity 账户',
       checkedAt,
