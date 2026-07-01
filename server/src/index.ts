@@ -56,6 +56,7 @@ const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
 const antigravity = new AntigravityProvider();
 const geminiProvider = new GeminiProvider();
 const clients = new Map<string, Set<any>>();
+let websocketConnectionGeneration = 0;
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
@@ -793,7 +794,9 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     if (!row) return reply.code(404).send({error:'not found'});
     if (!pathAllowed(String(row.project_dir))) return reply.code(403).send({error:'workspace not allowed'});
     const sqliteStartedAt = Date.now();
-    const runtimeRow = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [threadId]).catch(()=>null) || row;
+    const runtimeRowRaw:any = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [threadId]).catch(()=>null) || row;
+    const inferredStatus = await inferredRuntimeStatus(threadId, String(runtimeRowRaw?.status || row.status || 'idle')).catch(()=>String(runtimeRowRaw?.status || row.status || 'idle'));
+    const runtimeRow:any = { ...runtimeRowRaw, status:inferredStatus };
     if (runtimeRow?.status && runtimeRow.status !== row.status) {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [String(runtimeRow.status), Date.now(), threadId]).catch(()=>{});
     }
@@ -806,7 +809,7 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     ]);
     sanitizeThreadForMobile(thread);
     const snapshot = { coveredSequence:Number(runtimeRow?.last_sequence || 0), generation:String(runtimeRow?.upstream_generation || '') || null };
-    app.log.info({ requestId, localSessionId:threadId, upstreamThreadId:String(runtimeRow?.upstream_thread_id || threadId), operation:'GET /api/sessions/:id', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'web session snapshot returned');
+    app.log.info({ requestId, localSessionId:threadId, upstreamThreadId:String(runtimeRow?.upstream_thread_id || threadId), status:runtimeRow.status, latestSequence:Number(runtimeRow?.last_sequence || 0), operation:'GET /api/sessions/:id', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'web session snapshot returned');
     return { session: rowSessionDto(runtimeRow), thread, snapshot, branch, interrupted: (runtimeRow?.status === 'interrupted') };
   }
   let read:any;
@@ -958,7 +961,7 @@ app.get('/icons/:file', async (req:any, reply) => {
   if (!/^[A-Za-z0-9_.-]+$/.test(file)) return reply.code(404).send({error:'not found'});
   return reply.sendFile(`icons/${file}`);
 });
-app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || '')); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e.message})); } }); ws.on('close', () => { for (const set of clients.values()) set.delete(ws); }); });
+app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; ws.agentdeckGeneration = ++websocketConnectionGeneration; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); app.log.info({ connectionGeneration:ws.agentdeckGeneration }, 'websocket connected'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || '')); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e.message})); } }); ws.on('close', () => { for (const [sessionId,set] of clients.entries()) { if (set.delete(ws)) app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers'); } }); });
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
 codex.on('notification', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id);
@@ -2657,26 +2660,48 @@ async function joinAndResume(id:string, ws:any, lastSequence = 0){
   const threadId = String(row?.codex_thread_id || id);
   if(!clients.has(threadId)) clients.set(threadId,new Set());
   clients.get(threadId)!.add(ws);
+  app.log.info({ sessionId:id, threadId, connectionGeneration:ws.agentdeckGeneration || null, subscriberCount:clients.get(threadId)?.size || 0, replayFrom:Number(lastSequence || 0) }, 'websocket joined session');
   if (row && normalizeProvider(row.provider_id) === 'antigravity') {
     ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:'connected'}));
     return;
   }
   if (USE_AGENT_RUNTIME) {
+    const subscription = ensureSessionSubscription(id, threadId);
     await replayRuntimeEventsToWs(threadId, ws, lastSequence);
-    const subscription = ensureRuntimePushSubscription(threadId);
-    app.log.info({ threadId, rowStatus:String(row?.status || ''), lastSequence:Number(lastSequence || 0), latestSequence:Number(row?.last_sequence || 0), runtimeConnection:runtimeConnectionStatus(subscription) }, 'codex session joined with runtime subscription');
+    const latest = await runtimeLatestSequence(threadId).catch(()=>Number(row?.last_sequence || 0));
+    app.log.info({ sessionId:id, threadId, rowStatus:String(row?.status || ''), lastSequence:Number(lastSequence || 0), latestSequence:latest, subscriberCount:clients.get(threadId)?.size || 0, connectionGeneration:ws.agentdeckGeneration || null, runtimeConnection:runtimeConnectionStatus(subscription) }, 'codex session joined with runtime subscription');
     ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:runtimeConnectionStatus(subscription)}));
     return;
   }
   if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{});
   ws.send(JSON.stringify({type:'joined', sessionId:threadId}));
 }
-function broadcast(id:string, msg:any){ for(const ws of clients.get(id) || []) if(ws.readyState === 1) { ws.send(JSON.stringify(msg)); runtimeDiagnostics.broadcasts++; } }
+function broadcast(id:string, msg:any){
+  const set = clients.get(id);
+  if (!set?.size) {
+    app.log.warn({ sessionId:id, threadId:id, eventType:msg?.method || msg?.type || 'unknown', subscriberCount:0, sequence:msg?.runtimeSequence || null, pushResult:'no_subscriber' }, 'runtime push has no websocket subscriber');
+    return;
+  }
+  for(const ws of set) {
+    if(ws.readyState === 1) {
+      ws.send(JSON.stringify(msg));
+      runtimeDiagnostics.broadcasts++;
+      app.log.debug({ sessionId:id, threadId:id, eventType:msg?.method || msg?.type || 'unknown', sequence:msg?.runtimeSequence || null, connectionGeneration:ws.agentdeckGeneration || null, pushResult:'sent' }, 'websocket event pushed');
+    } else {
+      app.log.warn({ sessionId:id, threadId:id, eventType:msg?.method || msg?.type || 'unknown', sequence:msg?.runtimeSequence || null, connectionGeneration:ws.agentdeckGeneration || null, readyState:ws.readyState, pushResult:'socket_closed' }, 'runtime push found closed websocket');
+    }
+  }
+}
 function runtimeConnectionStatus(state?:RuntimeSubscriptionState):RuntimeSubscriptionState['lastStatus'] {
   if (!state) return 'unknown';
   if (state.connected) return 'connected';
   if (state.connecting) return state.lastStatus === 'unavailable' ? 'unavailable' : 'checking';
   return state.lastStatus || 'recovering';
+}
+function ensureSessionSubscription(sessionId:string, threadId:string) {
+  const state = ensureRuntimePushSubscription(threadId);
+  app.log.info({ sessionId, threadId, subscriberCount:clients.get(threadId)?.size || 0, lastSequence:state.lastSequence, runtimeConnection:runtimeConnectionStatus(state) }, 'session subscription ensured');
+  return state;
 }
 function ensureRuntimePushSubscription(threadId:string) {
   const existing = runtimeSubscriptions.get(threadId);
@@ -2685,12 +2710,13 @@ function ensureRuntimePushSubscription(threadId:string) {
   const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, lastSequence:Number(existing?.lastSequence || 0), generation:existing?.generation, lastError:existing?.lastError, lastStatus:'checking' };
   runtimeSubscriptions.set(threadId, state);
   runtimeDiagnostics.subscribeStarts++;
-  app.log.info({ threadId, after:state.lastSequence }, 'runtime sse subscribe starting');
+  app.log.info({ sessionId:threadId, threadId, after:state.lastSequence }, 'runtime sse subscribe starting');
   const close = runtime.subscribe(threadId, state.lastSequence, async (event:any) => {
     state.generation = String(event.generation || '');
     state.lastSequence = Math.max(state.lastSequence, Number(event.sequence || 0));
     runtimeDiagnostics.subscribeEvents++;
     const messages = await runtimeEventMessages(threadId, event);
+    if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'unmapped_runtime_event' }, 'runtime event ignored');
     for (const msg of messages) broadcast(threadId, msg);
   }, (status, error) => {
     if (status === 'connected') {
@@ -2698,6 +2724,7 @@ function ensureRuntimePushSubscription(threadId:string) {
       state.connected = true;
       state.lastStatus = 'connected';
       state.lastError = undefined;
+      app.log.info({ sessionId:threadId, threadId, subscriberCount:clients.get(threadId)?.size || 0 }, 'runtime subscription restored');
       broadcast(threadId, { type:'runtimeConnection', status:'connected' });
       return;
     }
@@ -2709,11 +2736,11 @@ function ensureRuntimePushSubscription(threadId:string) {
       runtimeSubscriptions.delete(threadId);
     }
     runtimeDiagnostics.subscribeReconnects++;
-    app.log.warn({ threadId, status, error:error?.message || undefined }, 'runtime sse subscribe disconnected');
+    app.log.warn({ sessionId:threadId, threadId, status, error:error?.message || undefined, subscriberCount:clients.get(threadId)?.size || 0 }, 'runtime sse subscribe disconnected');
     broadcast(threadId, { type:'runtimeConnection', status:state.lastStatus, error:error?.message || undefined });
     if (runtimeSubscriptions.get(threadId) === state) {
       setTimeout(() => {
-        if (clients.get(threadId)?.size || activeCodexSessions.has(threadId)) ensureRuntimePushSubscription(threadId);
+        if (clients.get(threadId)?.size || activeCodexSessions.has(threadId)) ensureSessionSubscription(threadId, threadId);
       }, 1000).unref?.();
     }
   });
@@ -2754,7 +2781,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     if (!dto?.id || dto.status !== 'authenticated' || !dto.login?.ok) throw new Error('请先登录 Gemini');
     const input = await buildTurnInput(threadId, text, attachments);
     const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
-    const subscription = ensureRuntimePushSubscription(threadId);
+    const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['submitting',Date.now(),threadId]).catch(()=>{});
     broadcast(threadId, userMessage);
@@ -2778,7 +2805,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
   const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
   if (USE_AGENT_RUNTIME) {
-    const subscription = ensureRuntimePushSubscription(threadId);
+    const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
     if (title) {
       await runtime.setSessionTitle(threadId, title).catch(()=>{});
@@ -2918,11 +2945,53 @@ async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId
 async function replayRuntimeEventsToWs(threadId:string, ws:any, after:number) {
   if (!USE_AGENT_RUNTIME || ws.readyState !== 1) return;
   runtimeDiagnostics.replayCalls++;
-  const res = await runtime.events(threadId, after).catch(()=>({events:[]}));
+  const replayFrom = Number(after || 0);
+  let replayTo = replayFrom;
+  let replayMessages = 0;
+  const res = await runtime.events(threadId, replayFrom).catch((e:any)=>{
+    app.log.error({ sessionId:threadId, threadId, replayFrom, error:e?.message || String(e) }, 'runtime replay query failed');
+    return {events:[]};
+  });
   for (const event of res.events || []) {
+    replayTo = Math.max(replayTo, Number(event.sequence || 0));
     const messages = await runtimeEventMessages(threadId, event);
-    for (const msg of messages) if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+    if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'unmapped_replay_event' }, 'runtime replay event ignored');
+    for (const msg of messages) {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify(msg));
+        replayMessages++;
+      } else {
+        app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', connectionGeneration:ws.agentdeckGeneration || null, pushResult:'socket_closed' }, 'runtime replay found closed websocket');
+      }
+    }
   }
+  app.log.info({ sessionId:threadId, threadId, connectionGeneration:ws.agentdeckGeneration || null, replayFrom, replayTo, replayEvents:(res.events || []).length, replayMessages }, 'runtime replay completed');
+}
+async function runtimeLatestSequence(threadId:string) {
+  const row = await runtimeDb.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1', [threadId]);
+  return Number(row?.sequence || 0);
+}
+async function inferredRuntimeStatus(threadId:string, fallback:string) {
+  const row = await runtimeDb.get(
+    `SELECT event_type,payload_json,sequence
+     FROM events
+     WHERE session_id=?1
+       AND (event_type IN ('turn/completed','turn/failed','turn/interrupted')
+         OR (event_type='item/completed' AND payload_json LIKE '%"phase":"final_answer"%'))
+     ORDER BY sequence DESC
+     LIMIT 1`,
+    [threadId]
+  );
+  if (!row) return fallback;
+  const eventType = String(row.event_type || '');
+  let payload:any = {};
+  try { payload = JSON.parse(String(row.payload_json || '{}')); } catch {}
+  const method = String(payload?.method || eventType);
+  if (method === 'turn/failed' || method === 'turn/interrupted') return 'interrupted';
+  if (method === 'turn/completed') return turnFailed(payload?.params?.turn || payload?.turn) ? 'interrupted' : 'idle';
+  const item = payload?.params?.item || payload?.item;
+  if (eventType === 'item/completed' && item?.type === 'agentMessage' && item?.phase === 'final_answer' && String(item.text || '').trim()) return 'idle';
+  return fallback;
 }
 async function runtimeEventMessages(threadId:string, event:any) {
   const eventType = String(event.event_type || '');
