@@ -69,6 +69,8 @@ const runtimeDiagnostics = { subscribeStarts:0, subscribeReconnects:0, subscribe
 type LoginJob = { id:string; profileId:string; output:string[]; status:'running'|'done'|'error'; code?:number|null; error?:string; startedAt:number; newProfile?:boolean; loginUrl?:string; deviceCode?:string };
 const loginJobs = new Map<string, LoginJob>();
 const loginChildren = new Map<string, any>();
+type ProviderLoginAttemptStatus = 'starting'|'waiting_authorization'|'waiting_code'|'verifying'|'failed'|'cancelled'|'done';
+type ProviderLoginAttempt = { id:string; provider:AgentProviderId; profileId:string|null; tempHome:string|null; methodId:string|null; status:ProviderLoginAttemptStatus; error:string|null; metadata:Record<string, any>; createdAt:number; updatedAt:number };
 type AntigravityLoginJob = LoginJob & { providerId:'antigravity'; authCodePrompt?:boolean; codeSubmitted?:boolean };
 const antigravityLoginJobs = new Map<string, AntigravityLoginJob>();
 const antigravityLoginChildren = new Map<string, any>();
@@ -136,6 +138,7 @@ await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
+await db.run('CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, profile_id TEXT, temp_home TEXT, method_id TEXT, status TEXT NOT NULL, error TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run("ALTER TABLE codex_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE antigravity_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE gemini_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'configured'").catch(()=>{});
@@ -338,12 +341,10 @@ app.get('/api/models', { preHandler: ensureAuth }, async (req:any) => modelCatal
 app.get('/api/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listProfiles(), pendingProfiles: await listPendingProfiles(), activeProfile: await getActiveProfile() }));
 app.post('/api/profiles', { preHandler: ensureAuth }, async (req:any) => {
   const name = cleanProfileName(String(req.body?.name || 'Codex Account'));
-  const id = crypto.randomBytes(8).toString('hex');
-  const codexHome = path.join(PROFILES_DIR, id, '.codex');
-  await mkdir(codexHome, { recursive:true });
-  await ensureSharedCodexDirs(codexHome);
-  await db.run("INSERT INTO codex_profiles (id,name,codex_home,active,status,created_at,updated_at) VALUES (?1,?2,?3,0,'draft',?4,?4)", [id, name, codexHome, Date.now()]);
-  return { profile: await getProfile(id) };
+  const attempt = await createProviderLoginAttempt('codex', { displayName:name });
+  await mkdir(String(attempt.tempHome), { recursive:true });
+  await ensureSharedCodexDirs(String(attempt.tempHome));
+  return { loginAttempt: attempt, profile: providerLoginAttemptDto(attempt) };
 });
 app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any) => {
   const profile = await getProfile(String(req.params.id));
@@ -364,7 +365,16 @@ app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any)
 });
 app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getProfile(String(req.params.id));
-  if (!profile) return reply.code(404).send({error:'profile not found'});
+  if (!profile) {
+    const attempt = await getProviderLoginAttempt(String(req.params.id));
+    if (attempt?.provider === 'codex') {
+      await cancelCodexLoginForProfile(String(attempt.id));
+      await updateProviderLoginAttempt(String(attempt.id), { status:'cancelled', error:'登录已取消' });
+      if (attempt.tempHome) await deleteProfileDir(String(attempt.tempHome)).catch(()=>{});
+      return { ok:true, cancelled:true };
+    }
+    return reply.code(404).send({error:'profile not found'});
+  }
   const running = await db.get("SELECT id FROM sessions WHERE provider_id='codex' AND account_id=?1 AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]);
   if (running) return reply.code(409).send({error:'该账户仍有正在运行的任务，请停止任务后再删除。'});
   await cancelCodexLoginForProfile(String(profile.id));
@@ -434,6 +444,9 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({error:'methodId required'});
   await db.run("UPDATE gemini_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND status IN ('bootstrap','draft','failed','needs_login','configured')", [Date.now(), String(profile.id)]).catch(()=>{});
+  let attempt = await getProviderLoginAttempt(String(profile.id));
+  if (!attempt || attempt.provider !== 'gemini') attempt = await createProviderLoginAttempt('gemini', { id:String(profile.id), profileId:String(profile.id), tempHome:String(profile.home_dir), methodId, displayName:String(profile.name || 'Gemini Login') });
+  await updateProviderLoginAttempt(String(attempt!.id), { status:'starting', methodId, profileId:String(profile.id) }).catch(()=>{});
   invalidateUnifiedProviderStatuses();
   const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'preparing', startedAt:Date.now() };
   geminiLoginJobs.set(job.id, job);
@@ -448,7 +461,15 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
 });
 app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getGeminiProfile(String(req.params.id));
-  if (!profile) return reply.code(404).send({error:'profile not found'});
+  if (!profile) {
+    const attempt = await getProviderLoginAttempt(String(req.params.id));
+    if (attempt?.provider === 'gemini') {
+      await updateProviderLoginAttempt(String(attempt.id), { status:'cancelled', error:'登录已取消' });
+      if (attempt.tempHome) await deleteGeminiProfileDir(String(attempt.tempHome)).catch(()=>{});
+      return { ok:true, cancelled:true };
+    }
+    return reply.code(404).send({error:'profile not found'});
+  }
   const running = await db.get("SELECT id FROM sessions WHERE provider_id='gemini' AND (current_upstream_account_id=?1 OR (current_upstream_account_id IS NULL AND account_id=?1)) AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)])
     || await runtimeDb.get("SELECT id FROM sessions WHERE (provider_id='gemini' OR provider='gemini') AND (current_upstream_account_id=?1 OR (current_upstream_account_id IS NULL AND account_id=?1)) AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]).catch(()=>null);
   if (running) return reply.code(409).send({error:'该账户仍有正在运行的任务，请停止任务后再删除。'});
@@ -522,13 +543,19 @@ app.post('/api/gemini-login/:jobId/cancel', { preHandler: ensureAuth }, async (r
   return { job };
 });
 app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (req:any) => {
-  const profile = await getProfile(String(req.params.id));
-  if (!profile) throw new Error('profile not found');
-  await db.run("UPDATE codex_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND COALESCE(status,'draft') IN ('draft','failed')", [Date.now(), String(profile.id)]).catch(()=>{});
+  let profile = await getProfile(String(req.params.id));
+  let attempt = await getProviderLoginAttempt(String(req.params.id));
+  if (!profile && !attempt) throw new Error('profile not found');
+  if (!attempt && profile && ['draft','authenticating','verifying','failed'].includes(String(profile.status || ''))) {
+    attempt = await createProviderLoginAttempt('codex', { id:String(profile.id), tempHome:String(profile.codex_home), displayName:String(profile.name || 'Codex Account') });
+  }
+  const codexHome = String(attempt?.tempHome || profile?.codex_home || DEFAULT_CODEX_HOME);
+  if (profile) await db.run("UPDATE codex_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND COALESCE(status,'draft') IN ('draft','failed')", [Date.now(), String(profile.id)]).catch(()=>{});
+  if (attempt) await updateProviderLoginAttempt(String(attempt.id), { status:'waiting_authorization' });
   const jobId = crypto.randomBytes(12).toString('base64url');
-  const job: LoginJob = { id:jobId, profileId:String(profile.id), output:[], status:'running', code:null, startedAt:Date.now(), newProfile:req.body?.newProfile === true };
+  const job: LoginJob = { id:jobId, profileId:String(attempt?.id || profile!.id), output:[], status:'running', code:null, startedAt:Date.now(), newProfile:req.body?.newProfile === true || !!attempt };
   loginJobs.set(jobId, job);
-  const child = spawn('codex', ['login','--device-auth'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:String(profile.codex_home)}, stdio:['ignore','pipe','pipe'] });
+  const child = spawn('codex', ['login','--device-auth'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:codexHome}, stdio:['ignore','pipe','pipe'] });
   loginChildren.set(jobId, child);
   const push = (s:string) => {
     for (const line of s.split(/\r?\n/).filter(Boolean)) job.output.push(line.replace(/(token|secret|password)[^\n]*/ig, '$1=[redacted]'));
@@ -536,6 +563,7 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
     const parsed = parseDeviceLogin(job.output.join('\n'));
     if (parsed.loginUrl) job.loginUrl = parsed.loginUrl;
     if (parsed.deviceCode) job.deviceCode = parsed.deviceCode;
+    if (attempt && (parsed.loginUrl || parsed.deviceCode)) updateProviderLoginAttempt(String(attempt.id), { status:'waiting_authorization' }).catch(()=>{});
   };
   child.stdout.on('data', d=>push(d.toString()));
   child.stderr.on('data', d=>push(d.toString()));
@@ -543,14 +571,19 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
     loginChildren.delete(jobId);
     job.code = code;
     job.status = code === 0 ? 'done' : 'error';
+    if (attempt && code === 0) await updateProviderLoginAttempt(String(attempt.id), { status:'verifying' }).catch(()=>{});
     if (code !== 0) (job as any).error = `codex login exited ${code}`;
-    if (code !== 0 && job.newProfile) await db.run("UPDATE codex_profiles SET status='failed', active=0, updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]).catch(()=>{});
+    if (code !== 0 && job.newProfile && profile) await db.run("UPDATE codex_profiles SET status='failed', active=0, updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]).catch(()=>{});
+    if (code !== 0 && attempt) await updateProviderLoginAttempt(String(attempt.id), { status:'failed', error:`codex login exited ${code}` }).catch(()=>{});
     if (code === 0) {
-      await ensureSharedCodexDirs(String(profile.codex_home)).catch(()=>{});
-      await updateProfileEmailName(String(profile.id), String(profile.codex_home)).catch(()=>{});
-      await db.run("UPDATE codex_profiles SET status='authenticated', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]).catch(()=>{});
-      await activateProfile(String(profile.id)).catch(()=>{});
-      if (!USE_AGENT_RUNTIME) await codex.switchCodexHome(String(profile.codex_home)).catch(()=>{});
+      const finalProfile = attempt
+        ? await completeCodexLoginAttempt(String(attempt.id), codexHome)
+        : profile;
+      await ensureSharedCodexDirs(String(finalProfile.codex_home)).catch(()=>{});
+      await updateProfileEmailName(String(finalProfile.id), String(finalProfile.codex_home)).catch(()=>{});
+      await db.run("UPDATE codex_profiles SET status='authenticated', updated_at=?1 WHERE id=?2", [Date.now(), String(finalProfile.id)]).catch(()=>{});
+      await activateProfile(String(finalProfile.id)).catch(()=>{});
+      if (!USE_AGENT_RUNTIME) await codex.switchCodexHome(String(finalProfile.codex_home)).catch(()=>{});
       codexStatusCache = { expiresAt:0 };
     }
   });
@@ -1368,6 +1401,111 @@ async function appSettings() {
   };
 }
 async function setSetting(key:string, value:string) { await db.run('INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value', [key, value]); }
+async function createProviderLoginAttempt(provider:AgentProviderId, options:{ id?:string; profileId?:string|null; tempHome?:string|null; methodId?:string|null; displayName?:string } = {}) {
+  const id = options.id || crypto.randomBytes(8).toString('hex');
+  const tempHome = options.tempHome || (
+    provider === 'codex'
+      ? path.join(PROFILES_DIR, id, '.codex')
+      : provider === 'gemini'
+        ? geminiHomeForProfile(id)
+        : antigravityHomeForProfile(id)
+  );
+  const metadata = { displayName: options.displayName || `${provider} login` };
+  const now = Date.now();
+  await db.run(
+    `INSERT INTO provider_login_attempts (id,provider,profile_id,temp_home,method_id,status,error,metadata_json,created_at,updated_at)
+     VALUES (?1,?2,?3,?4,?5,'starting',NULL,?6,?7,?7)
+     ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, profile_id=excluded.profile_id, temp_home=excluded.temp_home, method_id=excluded.method_id, status=excluded.status, error=NULL, metadata_json=excluded.metadata_json, updated_at=excluded.updated_at`,
+    [id, provider, options.profileId || null, tempHome, options.methodId || null, JSON.stringify(metadata), now]
+  );
+  return getProviderLoginAttempt(id) as Promise<ProviderLoginAttempt>;
+}
+async function getProviderLoginAttempt(id:string) {
+  const row = await db.get('SELECT id,provider,profile_id,temp_home,method_id,status,error,metadata_json,created_at,updated_at FROM provider_login_attempts WHERE id=?1', [id]).catch(()=>null);
+  if (!row) return null;
+  let metadata:Record<string, any> = {};
+  try { metadata = JSON.parse(String(row.metadata_json || '{}')); } catch { metadata = {}; }
+  return {
+    id:String(row.id),
+    provider:normalizeProvider(row.provider) || 'codex',
+    profileId:row.profile_id ? String(row.profile_id) : null,
+    tempHome:row.temp_home ? String(row.temp_home) : null,
+    methodId:row.method_id ? String(row.method_id) : null,
+    status:normalizeProviderLoginAttemptStatus(row.status),
+    error:row.error ? String(row.error) : null,
+    metadata,
+    createdAt:Number(row.created_at || 0),
+    updatedAt:Number(row.updated_at || 0),
+  };
+}
+async function updateProviderLoginAttempt(id:string, values:{ status?:ProviderLoginAttemptStatus; error?:string|null; profileId?:string|null; methodId?:string|null; metadata?:Record<string, any> }) {
+  const attempt = await getProviderLoginAttempt(id);
+  if (!attempt) return null;
+  const nextMetadata = values.metadata ? { ...(attempt.metadata || {}), ...values.metadata } : attempt.metadata || {};
+  await db.run(
+    `UPDATE provider_login_attempts
+     SET status=COALESCE(?1,status), error=?2, profile_id=COALESCE(?3,profile_id), method_id=COALESCE(?4,method_id), metadata_json=?5, updated_at=?6
+     WHERE id=?7`,
+    [values.status || null, values.error === undefined ? attempt.error || null : values.error, values.profileId || null, values.methodId || null, JSON.stringify(nextMetadata), Date.now(), id]
+  );
+  return getProviderLoginAttempt(id);
+}
+function normalizeProviderLoginAttemptStatus(value:any): ProviderLoginAttemptStatus {
+  const status = String(value || '');
+  return ['starting','waiting_authorization','waiting_code','verifying','failed','cancelled','done'].includes(status) ? status as ProviderLoginAttemptStatus : 'starting';
+}
+function providerLoginAttemptDto(attempt:ProviderLoginAttempt) {
+  const state = attempt.status === 'waiting_authorization' || attempt.status === 'waiting_code' || attempt.status === 'starting' ? 'authenticating' : attempt.status === 'done' ? 'authenticated' : attempt.status === 'cancelled' ? 'failed' : attempt.status;
+  return {
+    id:attempt.id,
+    provider:attempt.provider,
+    name:String(attempt.metadata?.displayName || `${providerLabelForAttempt(attempt.provider)} Login`),
+    active:0,
+    status:state,
+    state,
+    isLoginAttempt:true,
+    tempHome:attempt.tempHome,
+    error:attempt.error || undefined,
+    login:{ ok:false, text:'Login attempt' },
+    created_at:attempt.createdAt,
+    updated_at:attempt.updatedAt,
+  };
+}
+function providerLabelForAttempt(provider:AgentProviderId) {
+  return provider === 'gemini' ? 'Gemini' : provider === 'antigravity' ? 'Antigravity' : 'Codex';
+}
+async function listProviderLoginAttempts(provider:AgentProviderId) {
+  const rows = await db.all("SELECT id FROM provider_login_attempts WHERE provider=?1 AND status IN ('starting','waiting_authorization','waiting_code','verifying','failed','cancelled') ORDER BY updated_at DESC", [provider]).catch(()=>[]);
+  const attempts = await Promise.all(rows.map((row:any) => getProviderLoginAttempt(String(row.id))));
+  return attempts.filter(Boolean).map((attempt:any) => providerLoginAttemptDto(attempt));
+}
+async function completeCodexLoginAttempt(attemptId:string, codexHome:string) {
+  const attempt = await getProviderLoginAttempt(attemptId);
+  if (!attempt) throw new Error('login attempt not found');
+  await updateProviderLoginAttempt(attemptId, { status:'verifying' });
+  const email = await readProfileEmail(codexHome).catch(()=>null);
+  const existing = email ? await findCodexProfileByEmail(email) : null;
+  const now = Date.now();
+  const id = existing?.id ? String(existing.id) : attemptId;
+  if (existing?.id) {
+    await db.run("UPDATE codex_profiles SET name=?1,codex_home=?2,status='authenticated',updated_at=?3 WHERE id=?4", [email || existing.name || 'Codex Account', codexHome, now, id]);
+  } else {
+    await db.run("INSERT INTO codex_profiles (id,name,codex_home,active,status,created_at,updated_at) VALUES (?1,?2,?3,0,'authenticated',?4,?4)", [id, email || 'Codex Account', codexHome, now]);
+  }
+  await updateProviderLoginAttempt(attemptId, { status:'done', error:null, profileId:id, metadata:{ email:email || null } });
+  return getProfile(id) as Promise<any>;
+}
+async function findCodexProfileByEmail(email:string) {
+  const normalized = email.trim().toLowerCase();
+  const byName = await db.get('SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE lower(name)=?1 LIMIT 1', [normalized]).catch(()=>null);
+  if (byName) return byName;
+  const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated'").catch(()=>[]);
+  for (const row of rows as any[]) {
+    const found = await readProfileEmail(String(row.codex_home)).catch(()=>null);
+    if (found && found.trim().toLowerCase() === normalized) return row;
+  }
+  return null;
+}
 async function listProfiles() {
   const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY active DESC, updated_at DESC");
   return Promise.all(rows.map(async (p:any)=>{
@@ -1376,8 +1514,10 @@ async function listProfiles() {
   }));
 }
 async function listPendingProfiles() {
+  const attempts = await listProviderLoginAttempts('codex');
   const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated') IN ('draft','authenticating','verifying','failed') ORDER BY updated_at DESC");
-  return rows.map((p:any) => ({ ...p, provider:'codex', name:profileDisplayName(p.name), state:String(p.status || 'draft'), active:false, login:{ ok:false, text:'Not logged in' } }));
+  const legacy = rows.map((p:any) => ({ ...p, provider:'codex', name:profileDisplayName(p.name), state:String(p.status || 'draft'), active:false, isLoginAttempt:false, login:{ ok:false, text:'Not logged in' } }));
+  return [...attempts, ...legacy.filter((row:any) => !attempts.some((attempt:any) => attempt.id === row.id))];
 }
 async function getProfile(id:string) { return db.get('SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE id=?1', [id]); }
 async function getActiveProfile() {
@@ -1411,6 +1551,7 @@ async function cancelCodexLoginForProfile(profileId:string) {
     }
     job.status = 'error';
     job.error = '登录已取消';
+    updateProviderLoginAttempt(profileId, { status:'cancelled', error:'登录已取消' }).catch(()=>{});
   }
 }
 async function syncDefaultCodexAppServerEnv(codexHome:string) {
@@ -1440,8 +1581,10 @@ async function listGeminiProfiles() {
   return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
 }
 async function listGeminiPendingProfiles() {
+  const attempts = await listProviderLoginAttempts('gemini');
   const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','authenticating','verifying','failed','needs_login','configured') ORDER BY updated_at DESC");
-  return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
+  const legacy = await Promise.all(rows.map((p:any) => geminiProfileDto(p)));
+  return [...attempts, ...legacy.filter((row:any) => !attempts.some((attempt:any) => attempt.id === row.id))];
 }
 async function getGeminiProfile(id:string) {
   return db.get('SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE id=?1', [id]);
@@ -1887,10 +2030,21 @@ function setGeminiJobStatus(job:GeminiLoginJob, status:GeminiLoginJob['status'],
   const previous = job.status;
   job.status = status;
   if (error) job.error = error;
+  const attemptStatus = geminiJobStatusToAttemptStatus(status);
+  if (attemptStatus) updateProviderLoginAttempt(job.profileId, { status:attemptStatus, error:error || (status === 'failed' || status === 'error' ? job.error || 'Gemini 登录失败' : null), methodId:job.methodId }).catch(()=>{});
   const profileStatus = status === 'done' ? 'authenticated' : status === 'verifying' ? 'verifying' : status === 'failed' || status === 'error' || status === 'fallback' ? 'failed' : status === 'cancelled' ? 'failed' : status === 'waiting_user' || status === 'preparing' ? 'authenticating' : null;
   if (profileStatus) db.run("UPDATE gemini_profiles SET status=?1, active=CASE WHEN ?1='authenticated' THEN active ELSE 0 END, updated_at=?2 WHERE id=?3", [profileStatus, Date.now(), job.profileId]).catch(()=>{});
   if (profileStatus) invalidateUnifiedProviderStatuses();
   if (previous !== status) app.log.info({ jobId:job.id, profileId:job.profileId, from:previous, to:status, ptyAlive:!!geminiLoginWorkers.get(job.id), elapsedMs:Date.now() - job.startedAt }, 'gemini login job state changed');
+}
+function geminiJobStatusToAttemptStatus(status:GeminiLoginJob['status']): ProviderLoginAttemptStatus | null {
+  if (status === 'preparing') return 'starting';
+  if (status === 'waiting_user' || status === 'fallback') return 'waiting_authorization';
+  if (status === 'verifying') return 'verifying';
+  if (status === 'done') return 'done';
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'failed' || status === 'error') return 'failed';
+  return null;
 }
 function clearGeminiLoginJobChallenge(job:GeminiLoginJob) {
   job.loginUrl = undefined;
