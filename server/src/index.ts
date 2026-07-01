@@ -117,6 +117,9 @@ await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
+await db.run("ALTER TABLE gemini_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'configured'").catch(()=>{});
+await db.run("UPDATE gemini_profiles SET status='bootstrap' WHERE id='default' AND auth_type IS NULL AND status='configured'").catch(()=>{});
+await db.run("UPDATE gemini_profiles SET status='bootstrap', active=0 WHERE auth_type IS NULL AND name='Gemini Account' AND status='configured'").catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS agent_messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('UPDATE sessions SET status=?1 WHERE status=?2', ['interrupted', 'running']).catch(()=>{});
 await ensureProfiles();
@@ -303,13 +306,20 @@ app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, repl
 app.get('/api/gemini/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listGeminiProfiles(), activeGeminiProfile: await getActiveGeminiProfile() }));
 app.post('/api/gemini/profiles', { preHandler: ensureAuth }, async (req:any) => {
   const name = cleanProfileName(String(req.body?.name || 'Gemini Account'));
+  const reusable = await getReusableGeminiBootstrapProfile();
+  if (reusable?.id) {
+    await db.run("UPDATE gemini_profiles SET name=?1, active=0, status='bootstrap', updated_at=?2 WHERE id=?3", [name, Date.now(), String(reusable.id)]);
+    await mkdir(String(reusable.home_dir), { recursive:true, mode:0o700 });
+    await chmod(String(reusable.home_dir), 0o700).catch(()=>{});
+    return { profile: await getGeminiProfileDto(String(reusable.id), { includeHidden:true }) };
+  }
   const id = crypto.randomBytes(8).toString('hex');
   const homeDir = geminiHomeForProfile(id);
   await mkdir(homeDir, { recursive:true, mode:0o700 });
   await chmod(path.dirname(homeDir), 0o700).catch(()=>{});
   await chmod(homeDir, 0o700).catch(()=>{});
-  await db.run('INSERT INTO gemini_profiles (id,name,home_dir,auth_type,active,created_at,updated_at) VALUES (?1,?2,?3,NULL,0,?4,?4)', [id, name, homeDir, Date.now()]);
-  return { profile: await getGeminiProfileDto(id) };
+  await db.run("INSERT INTO gemini_profiles (id,name,home_dir,auth_type,active,status,created_at,updated_at) VALUES (?1,?2,?3,NULL,0,'bootstrap',?4,?4)", [id, name, homeDir, Date.now()]);
+  return { profile: await getGeminiProfileDto(id, { includeHidden:true }) };
 });
 app.post('/api/gemini/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getGeminiProfile(String(req.params.id));
@@ -333,7 +343,8 @@ app.post('/api/gemini/profiles/:id/logout', { preHandler: ensureAuth }, async (r
   if (running) return reply.code(409).send({error:'该 Gemini 账户仍有正在运行的会话，不能退出登录'});
   await runtime.logoutGeminiProfile(String(profile.id)).catch((e:any)=>{ throw new Error(safeGeminiError(e)); });
   await removeGeminiProfileSecret(String(profile.home_dir), 'GEMINI_API_KEY').catch(()=>{});
-  await db.run('UPDATE gemini_profiles SET auth_type=NULL, updated_at=?1 WHERE id=?2', [Date.now(), String(profile.id)]);
+  await db.run("UPDATE gemini_profiles SET auth_type=NULL, active=0, status='configured', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
+  await ensureGeminiActiveProfile();
   return { ok:true, profile: await getGeminiProfileDto(String(profile.id)) };
 });
 app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -342,6 +353,7 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
   if (geminiLoginProfiles.has(String(profile.id))) return reply.code(409).send({error:'该 Gemini Profile 已有登录任务在运行'});
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({error:'methodId required'});
+  await db.run("UPDATE gemini_profiles SET status='configured', updated_at=?1 WHERE id=?2 AND status='bootstrap'", [Date.now(), String(profile.id)]).catch(()=>{});
   const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'starting', startedAt:Date.now() };
   geminiLoginJobs.set(job.id, job);
   geminiLoginProfiles.set(String(profile.id), job.id);
@@ -356,12 +368,21 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
 app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getGeminiProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
-  if (Number(profile.active || 0)) return reply.code(409).send({error:'不能删除当前正在使用的 Gemini 账户，请先切换到其他账户'});
+  const running = await db.get("SELECT id FROM sessions WHERE provider_id='gemini' AND account_id=?1 AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]);
+  if (running) return reply.code(409).send({error:'该 Gemini 账户仍有正在运行的会话，不能删除'});
+  if (geminiLoginProfiles.has(String(profile.id))) return reply.code(409).send({error:'该 Gemini 账户正在登录，取消或完成登录后再删除'});
+  const state = geminiProfileState(profile);
+  if (Number(profile.active || 0) && state === 'authenticated') return reply.code(409).send({error:'不能删除当前已登录的 Gemini 账户，请先切换到其他账户'});
   const refs = await geminiSessionReferenceCount(String(profile.id));
-  if (refs > 0) return reply.code(409).send({error:'该 Gemini 账户仍被历史会话引用，不能删除', references:refs});
+  if (refs > 0) {
+    await db.run("UPDATE gemini_profiles SET active=0, status='disabled', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
+    await ensureGeminiActiveProfile();
+    return { ok:true, hidden:true, references:refs };
+  }
   await db.run('DELETE FROM gemini_profiles WHERE id=?1', [String(profile.id)]);
   await deleteGeminiProfileDir(String(profile.home_dir)).catch(()=>{});
-  return { ok:true };
+  await ensureGeminiActiveProfile();
+  return { ok:true, deleted:true };
 });
 app.get('/api/gemini-login/:jobId', { preHandler: ensureAuth }, async (req:any, reply) => {
   const job = geminiLoginJobs.get(String(req.params.jobId));
@@ -547,8 +568,8 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     const status = await cachedGeminiStatus();
     if (!status.ok) return reply.code(409).send({error:status.error || 'Gemini CLI 不可用'});
     const activeProfile:any = await getActiveGeminiProfile();
-    if (!activeProfile?.id) return reply.code(409).send({error:'请先添加并登录 Gemini 账户'});
-    if (!activeProfile.login?.ok) return reply.code(409).send({error:'当前 Gemini 账户未登录，请前往账户页登录'});
+    if (!activeProfile?.id || activeProfile.status !== 'authenticated') return reply.code(409).send({error:'请先登录 Gemini'});
+    if (!activeProfile.login?.ok) return reply.code(409).send({error:'当前 Gemini 账户需要重新登录'});
     const id = crypto.randomUUID();
     const model = cleanAgentModel(req.body?.model) || cleanAgentModel(settings.defaultModels?.gemini) || null;
     const opts = modeOptions(mode, model || undefined);
@@ -930,27 +951,18 @@ async function ensureGeminiProfiles() {
     await mkdir(defaultHome, { recursive:true, mode:0o700 });
     await chmod(defaultHome, 0o700).catch(()=>{});
     const existing = await getGeminiProfile('default');
-    const anyActive = await db.get('SELECT id FROM gemini_profiles WHERE active=1 LIMIT 1');
-    const anyProfile = await db.get('SELECT id FROM gemini_profiles LIMIT 1');
     const login = await geminiLoginStatus(defaultHome, existing?.auth_type ? String(existing.auth_type) : null).catch(()=>({ ok:false, email:null, text:'Not logged in', authType:null }));
     const name = login.email || existing?.name || 'Gemini Account';
-    const active = anyActive ? Number(existing?.active || 0) : (!anyProfile ? 1 : 0);
+    const state = login.ok ? 'authenticated' : (existing?.status || 'bootstrap');
+    const active = login.ok ? Number(existing?.active || 0) : 0;
     await db.run(
-      `INSERT INTO gemini_profiles (id,name,home_dir,auth_type,active,created_at,updated_at)
-       VALUES ('default',?1,?2,?3,?4,?5,?5)
-       ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, auth_type=COALESCE(gemini_profiles.auth_type, excluded.auth_type), active=CASE WHEN gemini_profiles.active=1 THEN 1 ELSE excluded.active END, updated_at=excluded.updated_at`,
-      [name, defaultHome, login.authType || existing?.auth_type || null, active, Date.now()]
+      `INSERT INTO gemini_profiles (id,name,home_dir,auth_type,active,status,created_at,updated_at)
+       VALUES ('default',?1,?2,?3,?4,?5,?6,?6)
+       ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, auth_type=COALESCE(gemini_profiles.auth_type, excluded.auth_type), active=excluded.active, status=CASE WHEN gemini_profiles.status='disabled' THEN 'disabled' ELSE excluded.status END, updated_at=excluded.updated_at`,
+      [name, defaultHome, login.authType || existing?.auth_type || null, active, state, Date.now()]
     );
   }
-  const single = await db.get('SELECT COUNT(*) count FROM gemini_profiles');
-  const activeCount = await db.get('SELECT COUNT(*) count FROM gemini_profiles WHERE active=1');
-  if (Number(single?.count || 0) === 1 && Number(activeCount?.count || 0) === 0) {
-    await db.run('UPDATE gemini_profiles SET active=1, updated_at=?1 WHERE id=(SELECT id FROM gemini_profiles LIMIT 1)', [Date.now()]);
-  }
-  if (Number(activeCount?.count || 0) > 1) {
-    const active = await db.get('SELECT id FROM gemini_profiles WHERE active=1 ORDER BY updated_at DESC LIMIT 1');
-    if (active?.id) await activateGeminiProfile(String(active.id));
-  }
+  await ensureGeminiActiveProfile();
   await db.run("UPDATE sessions SET account_id='default' WHERE provider_id='gemini' AND (account_id IS NULL OR account_id='')").catch(()=>{});
   await runtimeDb.run("UPDATE sessions SET account_id='default' WHERE (provider_id='gemini' OR provider='gemini') AND (account_id IS NULL OR account_id='')").catch(()=>{});
 }
@@ -1052,18 +1064,21 @@ function geminiHomeForProfile(id:string) {
   return path.join(GEMINI_PROFILES_DIR, id, 'home');
 }
 async function listGeminiProfiles() {
-  const rows = await db.all('SELECT id,name,home_dir,auth_type,active,created_at,updated_at FROM gemini_profiles ORDER BY active DESC, updated_at DESC');
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'configured') NOT IN ('bootstrap','disabled') ORDER BY active DESC, updated_at DESC");
   return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
 }
 async function getGeminiProfile(id:string) {
-  return db.get('SELECT id,name,home_dir,auth_type,active,created_at,updated_at FROM gemini_profiles WHERE id=?1', [id]);
+  return db.get('SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE id=?1', [id]);
 }
-async function getGeminiProfileDto(id:string) {
+async function getGeminiProfileDto(id:string, options:{ includeHidden?:boolean } = {}) {
   const row = await getGeminiProfile(id);
-  return row ? geminiProfileDto(row) : null;
+  if (!row) return null;
+  const state = geminiProfileState(row);
+  if (!options.includeHidden && (state === 'bootstrap' || state === 'disabled')) return null;
+  return geminiProfileDto(row);
 }
 async function getActiveGeminiProfile() {
-  const row = await db.get('SELECT id,name,home_dir,auth_type,active,created_at,updated_at FROM gemini_profiles WHERE active=1 ORDER BY updated_at DESC LIMIT 1');
+  const row = await db.get("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
   return row ? geminiProfileDto(row) : null;
 }
 async function activateGeminiProfile(id:string) {
@@ -1073,20 +1088,45 @@ async function activateGeminiProfile(id:string) {
 async function geminiProfileDto(row:any) {
   const login = await geminiLoginStatus(String(row.home_dir), String(row.auth_type || '') || null);
   const name = login.email || (String(row.name || '').trim() && row.name !== 'Gemini Account' ? row.name : 'Gemini Account');
+  const state = geminiProfileState(row, login);
   return {
     id:String(row.id),
     name,
-    active:Number(row.active || 0),
+    active: state === 'authenticated' ? Number(row.active || 0) : 0,
+    status: state,
     authType: row.auth_type || login.authType || null,
     login,
     created_at:Number(row.created_at || 0),
     updated_at:Number(row.updated_at || 0),
   };
 }
+function geminiProfileState(row:any, login?:any):'bootstrap'|'configured'|'authenticated'|'disabled' {
+  const explicit = String(row?.status || '').trim();
+  if (explicit === 'disabled') return 'disabled';
+  if (login?.ok || explicit === 'authenticated') return 'authenticated';
+  if (explicit === 'bootstrap') return 'bootstrap';
+  return row?.auth_type ? 'configured' : 'configured';
+}
+async function getReusableGeminiBootstrapProfile() {
+  const visible = await db.get("SELECT id FROM gemini_profiles WHERE COALESCE(status,'configured') NOT IN ('bootstrap','disabled') LIMIT 1");
+  if (visible?.id) return null;
+  return db.get("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'bootstrap')='bootstrap' ORDER BY CASE WHEN id='default' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1");
+}
+async function ensureGeminiActiveProfile() {
+  const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' LIMIT 1");
+  if (active?.id) {
+    await db.run("UPDATE gemini_profiles SET active=0 WHERE active=1 AND id<>?1", [String(active.id)]).catch(()=>{});
+    return;
+  }
+  await db.run('UPDATE gemini_profiles SET active=0').catch(()=>{});
+  const next = await db.get("SELECT id FROM gemini_profiles WHERE COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (next?.id) await db.run('UPDATE gemini_profiles SET active=1, updated_at=?1 WHERE id=?2', [Date.now(), String(next.id)]).catch(()=>{});
+}
 async function refreshGeminiProfileName(id:string, homeDir:string, authType:string|null) {
   const login = await geminiLoginStatus(homeDir, authType);
   if (login.email || login.authType) {
-    await db.run('UPDATE gemini_profiles SET name=COALESCE(?1,name), auth_type=COALESCE(?2,auth_type), updated_at=?3 WHERE id=?4', [login.email || null, login.authType || null, Date.now(), id]);
+    await db.run("UPDATE gemini_profiles SET name=COALESCE(?1,name), auth_type=COALESCE(?2,auth_type), status=CASE WHEN ?5=1 THEN 'authenticated' ELSE status END, updated_at=?3 WHERE id=?4", [login.email || null, login.authType || null, Date.now(), id, login.ok ? 1 : 0]);
+    if (login.ok) await activateGeminiProfile(id);
   }
 }
 async function geminiLoginStatus(homeDir:string, authType:string|null = null) {
@@ -1147,11 +1187,13 @@ async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
     const apiKey = String(body.apiKey || '').trim();
     if (!/^[A-Za-z0-9_.-]{20,}$/.test(apiKey)) throw new Error('Gemini API Key 格式不正确');
     await writeGeminiProfileSecret(String(profile.home_dir), { GEMINI_API_KEY: apiKey });
-    await db.run("UPDATE gemini_profiles SET auth_type='api_key', updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+    await db.run("UPDATE gemini_profiles SET auth_type='api_key', status='configured', updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
     await runtime.restartGeminiProfile(job.profileId).catch(()=>null);
     const status = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
     if (status?.error) throw new Error(String(status.error));
     await refreshGeminiProfileName(job.profileId, String(profile.home_dir), 'api_key').catch(()=>{});
+    await db.run("UPDATE gemini_profiles SET status='authenticated', active=1, updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+    await db.run('UPDATE gemini_profiles SET active=0 WHERE id<>?1', [job.profileId]).catch(()=>{});
     job.status = 'done';
     return;
   }
@@ -1181,6 +1223,8 @@ async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
   if (verified?.error) throw new Error(String(verified.error));
   if (Array.isArray(verified?.authMethods) && verified.authMethods.length) throw new Error('Gemini 登录未完成，请重新检测或改用 API Key/Vertex');
   await refreshGeminiProfileName(job.profileId, String(profile.home_dir), null).catch(()=>{});
+  await db.run("UPDATE gemini_profiles SET status='authenticated', active=1, updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+  await db.run('UPDATE gemini_profiles SET active=0 WHERE id<>?1', [job.profileId]).catch(()=>{});
   job.status = 'done';
 }
 async function writeGeminiProfileSecret(homeDir:string, values:Record<string,string>) {
@@ -1875,6 +1919,10 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     return;
   }
   if (normalizeProvider(row.provider_id) === 'gemini') {
+    const profile:any = row.account_id ? await getGeminiProfile(String(row.account_id)).catch(()=>null) : null;
+    if (!profile || geminiProfileState(profile) === 'disabled') throw new Error('该 Gemini 账户已移除，请重新登录后创建新会话');
+    const dto = await geminiProfileDto(profile);
+    if (dto.status !== 'authenticated' || !dto.login?.ok) throw new Error('请先登录 Gemini');
     const input = await buildTurnInput(threadId, text, attachments);
     const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
     const subscription = ensureRuntimePushSubscription(threadId);
