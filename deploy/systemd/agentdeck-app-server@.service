@@ -2,21 +2,23 @@
 Description=Agent Deck Codex app-server instance %i
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=agentdeck
-Group=agentdeck
-WorkingDirectory=/opt/agentdeck
-Environment=HOME=/var/lib/agentdeck/home
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/stacks/agentdeck
+Environment=HOME=/home/ubuntu
 EnvironmentFile=/etc/agentdeck/agentdeck-app-server-%i.env
 ExecStart=/usr/local/bin/codex app-server --listen ${CODEX_APP_SERVER_LISTEN} -c approval_policy=\"never\" -c sandbox_mode=\"danger-full-access\"
-Restart=always
-RestartSec=2
+Restart=on-failure
+RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/agentdeck /opt/agentdeck /tmp /run
+ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /tmp /run
 
 [Install]
 WantedBy=multi-user.target

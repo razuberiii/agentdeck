@@ -2,25 +2,27 @@
 Description=Agent Deck persistent agent runtime
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=agentdeck
-Group=agentdeck
-WorkingDirectory=/opt/agentdeck
-Environment=HOME=/var/lib/agentdeck/home
-Environment=DATA_DIR=/var/lib/agentdeck
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/stacks/agentdeck
+Environment=HOME=/home/ubuntu
+Environment=DATA_DIR=/opt/data/agentdeck
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852
 Environment=CODEX_APP_SERVER_PORT_BASE=4620
 EnvironmentFile=/etc/agentdeck/runtime.env
-ExecStart=/usr/bin/node /opt/agentdeck/server/dist/agentdeck-runtime.js
-Restart=always
-RestartSec=3
+ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/agentdeck-runtime.js
+Restart=on-failure
+RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/agentdeck /opt/agentdeck /tmp /run
+ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /tmp /run
 
 [Install]
 WantedBy=multi-user.target

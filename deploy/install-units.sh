@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT=${ROOT:-/opt/agentdeck}
 DATA_DIR=${DATA_DIR:-/var/lib/agentdeck}
 ENV_DIR=${ENV_DIR:-/etc/agentdeck}
+RUN_USER=${AGENTDECK_RUN_USER:-ubuntu}
+RUN_GROUP=${AGENTDECK_RUN_GROUP:-$RUN_USER}
+AGENTDECK_HOME=${AGENTDECK_HOME:-/home/$RUN_USER}
 LOG=${LOG:-$ROOT/.tools/install-units.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
 sudo mkdir -p "$ENV_DIR"
@@ -12,6 +15,15 @@ exec >>"$LOG" 2>&1
 echo "== install-units $(date -Is) =="
 before=$(findmnt -T /etc -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION -n || true)
 echo "before: $before"
+
+if ! getent passwd "$RUN_USER" >/dev/null; then
+  echo "ERROR: configured service user does not exist: $RUN_USER" >&2
+  exit 1
+fi
+if ! getent group "$RUN_GROUP" >/dev/null; then
+  echo "ERROR: configured service group does not exist: $RUN_GROUP" >&2
+  exit 1
+fi
 
 remounted=0
 if findmnt -T /etc -n -o OPTIONS | tr ',' '\n' | grep -qx ro; then
@@ -45,8 +57,8 @@ fi
 
 if [ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
   {
-    echo "HOME=${AGENTDECK_HOME:-/var/lib/agentdeck/home}"
-    echo "CODEX_HOME=${CODEX_HOME:-${AGENTDECK_HOME:-/var/lib/agentdeck/home}/.codex}"
+    echo "HOME=${AGENTDECK_HOME}"
+    echo "CODEX_HOME=${CODEX_HOME:-$DATA_DIR/profiles/default/.codex}"
     echo "CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668"
   } | sudo tee "$ENV_DIR/agentdeck-app-server-default.env" >/dev/null
   sudo chmod 0600 "$ENV_DIR/agentdeck-app-server-default.env"

@@ -26,7 +26,7 @@ const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAUL
 const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.codex');
 const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || process.cwd();
-const APP_SERVER_USER = process.env.CODEX_APP_SERVER_USER || 'agentdeck';
+const APP_SERVER_USER = process.env.CODEX_APP_SERVER_USER || 'ubuntu';
 const APP_SERVER_GROUP = process.env.CODEX_APP_SERVER_GROUP || APP_SERVER_USER;
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
@@ -40,6 +40,13 @@ if (!isLoopbackHost(HOST) && !RUNTIME_TOKEN) {
 }
 
 type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
+type StructuredRuntimeErrorBody = {
+  code:string;
+  layer:string;
+  message:string;
+  safeDetail:string;
+  requestId?:string;
+};
 type RuntimeSession = {
   id:string;
   codex_thread_id:string | null;
@@ -166,23 +173,26 @@ class CodexAccountRuntime extends EventEmitter {
     const listen = `ws://127.0.0.1:${this.port}`;
     app.log.warn({ accountId:this.account.id, unit, listen }, 'codex app-server not ready; starting');
     if (this.account.id === 'default') {
-      await execFileAsync('sudo', ['systemctl', 'start', unit], { maxBuffer:1024 * 1024 });
+      await mapAppServerStartError(execFileAsync('sudo', ['systemctl', 'start', unit], { maxBuffer:1024 * 1024 }));
     } else {
-    const args = [
-      '--unit', unit,
-      '--uid', APP_SERVER_USER,
-      '--gid', APP_SERVER_GROUP,
-      '--property', `WorkingDirectory=${DEFAULT_WORKDIR}`,
-      '--property', 'Restart=always',
-      '--property', 'RestartSec=2',
-      '--setenv', `HOME=${DEFAULT_HOME}`,
-      '--setenv', `CODEX_HOME=${this.account.codex_home}`,
-      '--collect',
-      'codex', 'app-server', '--listen', listen,
-      '-c', 'approval_policy="never"',
-      '-c', 'sandbox_mode="danger-full-access"',
-    ];
-    await execFileAsync('sudo', ['systemd-run', ...args], { maxBuffer:1024 * 1024 });
+      await validateAppServerRunUser(APP_SERVER_USER, APP_SERVER_GROUP);
+      const args = [
+        '--unit', unit,
+        '--uid', APP_SERVER_USER,
+        '--gid', APP_SERVER_GROUP,
+        '--property', `WorkingDirectory=${DEFAULT_WORKDIR}`,
+        '--property', 'Restart=on-failure',
+        '--property', 'RestartSec=5',
+        '--property', 'StartLimitIntervalSec=60',
+        '--property', 'StartLimitBurst=3',
+        '--setenv', `HOME=${DEFAULT_HOME}`,
+        '--setenv', `CODEX_HOME=${this.account.codex_home}`,
+        '--collect',
+        'codex', 'app-server', '--listen', listen,
+        '-c', 'approval_policy="never"',
+        '-c', 'sandbox_mode="danger-full-access"',
+      ];
+      await mapAppServerStartError(execFileAsync('sudo', ['systemd-run', ...args], { maxBuffer:1024 * 1024 }));
     }
     const startedAt = Date.now();
     while (Date.now() - startedAt < 10_000) {
@@ -350,6 +360,21 @@ const RUNTIME_GENERATION = INSTANCE_ID;
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 eventLoopDelay.enable();
 const app = Fastify({ logger:{ redact:['req.headers.authorization','token','secret','password'] }, bodyLimit:25 * 1024 * 1024 });
+app.setErrorHandler((err:any, req, reply) => {
+  if (err instanceof StructuredRuntimeError) {
+    const body = { ...err.body, requestId:String(req.id || '') };
+    req.log.warn({ requestId:body.requestId, code:body.code, layer:body.layer, safeDetail:body.safeDetail }, err.message);
+    return reply.code(err.statusCode).send(body);
+  }
+  req.log.error({ requestId:req.id, err }, 'runtime request failed');
+  return reply.code(500).send({
+    code:'runtime_internal_error',
+    layer:'runtime',
+    message:'Runtime 请求失败',
+    safeDetail:'Runtime 处理请求时发生未知错误',
+    requestId:String(req.id || ''),
+  });
+});
 app.addHook('preHandler', async (req, reply) => {
   if (!RUNTIME_TOKEN) return;
   const authorization = String(req.headers.authorization || '');
@@ -1520,6 +1545,50 @@ function redactRuntimeError(message:string) {
   return String(message || 'Gemini request failed')
     .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]')
     .replace(/(access_token|refresh_token|id_token|client_secret|authorization code)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
+}
+
+class StructuredRuntimeError extends Error {
+  constructor(public statusCode:number, public body:StructuredRuntimeErrorBody) {
+    super(body.message);
+  }
+}
+
+function codexAppServerInvalidRunUserError(): StructuredRuntimeError {
+  return new StructuredRuntimeError(500, {
+    code:'codex_app_server_invalid_run_user',
+    layer:'codex_app_server_manager',
+    message:'Codex 后台服务运行用户配置无效',
+    safeDetail:'配置的服务运行用户不存在或无法解析',
+  });
+}
+
+async function validateAppServerRunUser(user:string, group:string) {
+  const [userOk, groupOk] = await Promise.all([
+    commandSucceeds('getent', ['passwd', user]),
+    commandSucceeds('getent', ['group', group]),
+  ]);
+  if (!userOk || !groupOk) throw codexAppServerInvalidRunUserError();
+}
+
+async function mapAppServerStartError<T>(promise:Promise<T>): Promise<T> {
+  try {
+    return await promise;
+  } catch (e:any) {
+    const text = `${e?.message || ''}\n${e?.stdout || ''}\n${e?.stderr || ''}`;
+    if (/217\/USER|Failed to determine user credentials|No such process|user credentials/i.test(text)) {
+      throw codexAppServerInvalidRunUserError();
+    }
+    throw e;
+  }
+}
+
+async function commandSucceeds(command:string, args:string[]) {
+  try {
+    await execFileAsync(command, args, { maxBuffer:64 * 1024 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function mimeFromPath(filePath:string) {
