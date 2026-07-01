@@ -59,7 +59,7 @@ function accountSubtitle(provider:string, codexProfile:any, geminiProfile:any, a
   if(provider==='gemini') return providerStatus?.ok ? (geminiProfile?.login?.ok ? geminiProfileLabel(geminiProfile) : '尚未添加 Gemini 账户') : 'Gemini 未安装';
   return providerStatus?.ok ? antigravityProfileLabel(antigravityProfile) : 'Antigravity 未安装';
 }
-function authTypeLabel(type:string){ const v=String(type||''); if(v==='api_key') return 'API Key'; if(v==='oauth') return 'Google'; if(v==='vertex') return 'Vertex'; return v; }
+function authTypeLabel(type:string){ const v=String(type||''); if(v==='api_key') return 'API Key'; if(v==='oauth'||v==='oauth-personal') return 'Google'; if(v==='vertex') return 'Vertex'; return v; }
 function sessionProvider(session:Session){ return session.provider_id || session.providerId || 'codex'; }
 
 function ToastProvider({children}:{children:React.ReactNode}){
@@ -489,7 +489,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   }
   useEffect(()=>{ if(!loginJob?.id || loginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/profile-login/'+loginJob.id); setLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录未完成'); } }catch{} },1500); return()=>window.clearInterval(timer); },[loginJob?.id,loginJob?.status]);
   useEffect(()=>{ if(!agLoginJob?.id || agLoginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/antigravity-login/'+agLoginJob.id); setAgLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录失败'); } }catch{} },1500); return()=>window.clearInterval(timer); },[agLoginJob?.id,agLoginJob?.status]);
-  useEffect(()=>{ if(!geminiLoginJob?.id || !['starting','waiting_user','verifying'].includes(geminiLoginJob.status)) return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id); setGeminiLoginJob(r.job); if(!['starting','waiting_user','verifying'].includes(r.job.status)){ window.clearInterval(timer); await syncSettings(); if(r.job.status==='done') setPage('account'); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录失败'); } }catch{} },1500); return()=>window.clearInterval(timer); },[geminiLoginJob?.id,geminiLoginJob?.status]);
+  useEffect(()=>{ if(!geminiLoginJob?.id || !['preparing','waiting_user','verifying'].includes(geminiLoginJob.status)) return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id); setGeminiLoginJob(r.job); if(!['preparing','waiting_user','verifying'].includes(r.job.status)){ window.clearInterval(timer); await syncSettings(); if(r.job.status==='done') setPage('account'); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录失败'); } }catch{} },1500); return()=>window.clearInterval(timer); },[geminiLoginJob?.id,geminiLoginJob?.status]);
   async function setActiveProvider(provider:string){ setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),activeProvider:provider}})); try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); haptic(); toast('success','Agent 已切换'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function setDefaultMode(mode:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultMode:mode})}); haptic(); toast('success','已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
   async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model,provider:activeProvider})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model,defaultModels:{...(d?.settings?.defaultModels||{}),[activeProvider]:model}}})); haptic(); toast('success','模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
@@ -547,7 +547,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
         <button className={activeProvider==='codex'?'active':''} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{codexProviderStatus?.ok ? codexProviderStatus.version : (codexProviderStatus?.error || 'Codex CLI 不可用')}</small></span><i/></button>
         <button className={activeProvider==='gemini'?'active':''} onClick={()=>setActiveProvider('gemini')}><span><b>Gemini</b><small>{geminiProviderStatus?.ok ? `${geminiProviderStatus.version}${geminiProviderStatus?.runtime?.authenticated?' · 已登录':' · 未登录'}` : (geminiProviderStatus?.error || '未安装')}</small></span><i/></button>
         <button className={activeProvider==='antigravity'?'active':''} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{antigravityProviderStatus?.ok ? antigravityProviderStatus.version : (antigravityProviderStatus?.error || '未安装')}</small></span><i/></button>
-      </div>{activeProvider==='gemini'&&<InlineNotice tone={activeGeminiProfile?.login?.ok?'info':'error'} text={activeGeminiProfile?.login?.ok?'Gemini 已登录。':geminiLoginJob&&['starting','waiting_user','verifying'].includes(geminiLoginJob.status)?'Gemini 登录尚未完成':'尚未添加 Gemini 账户'}/>} {activeProvider==='antigravity'&&!activeProviderStatus?.ok&&<InlineNotice tone="info" text={activeProviderStatus?.installHint || '需要先安装官方 CLI 后才能登录和创建 Antigravity 会话。'}/>}</section>}
+      </div>{activeProvider==='gemini'&&<InlineNotice tone={activeGeminiProfile?.login?.ok?'info':'error'} text={activeGeminiProfile?.login?.ok?'Gemini 已登录。':geminiLoginJob&&['preparing','waiting_user','verifying'].includes(geminiLoginJob.status)?'Gemini 登录尚未完成':'尚未添加 Gemini 账户'}/>} {activeProvider==='antigravity'&&!activeProviderStatus?.ok&&<InlineNotice tone="info" text={activeProviderStatus?.installHint || '需要先安装官方 CLI 后才能登录和创建 Antigravity 会话。'}/>}</section>}
       {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
       {page==='model'&&<section><b>模型</b>{models?.error&&<InlineNotice tone="info" text={models.error}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`} onPick={setDefaultModel}/></section>}
       {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={profileLabel(p)} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
@@ -657,11 +657,11 @@ function GeminiMethodList({methods,onPick}:{methods:LoginMethodView[];onPick:(m:
   </section>;
 }
 function GeminiGoogleLogin({profile,job,code,onCode,onStart,onSubmitCode,onCancel,onRefresh}:{profile:any;job:any;code:string;onCode:(v:string)=>void;onStart:()=>void;onSubmitCode:()=>void;onCancel:()=>void;onRefresh:()=>any|Promise<any>}){
-  const running=job&&['starting','waiting_user','verifying'].includes(job.status);
-  return <section className="loginForm"><b>Google 登录</b><span className="formHelp">{geminiProfileLabel(profile)} · 使用 Google 账号和订阅额度</span><button disabled={running} onClick={onStart}>{running?'登录进行中':'继续'}</button>{job&&<GeminiLoginJobPanel job={job} code={code} onCode={onCode} onSubmitCode={onSubmitCode} onCancel={onCancel} onRefresh={onRefresh}/>}</section>;
+  const running=job&&['preparing','waiting_user','verifying'].includes(job.status);
+  return <section className="loginForm"><b>Google 登录</b><span className="formHelp">{geminiProfileLabel(profile)} · 使用 Google 账号和订阅额度</span><button disabled={running} onClick={onStart}>{running?(job.loginUrl?'等待授权码':'正在准备授权链接'):'继续'}</button>{job&&<GeminiLoginJobPanel job={job} code={code} onCode={onCode} onSubmitCode={onSubmitCode} onCancel={onCancel} onRefresh={onRefresh}/>}</section>;
 }
 function GeminiApiKeyLogin({apiKey,onApiKey,job,onSubmit}:{apiKey:string;onApiKey:(v:string)=>void;job:any;onSubmit:()=>void}){
-  const running=job&&['starting','waiting_user','verifying'].includes(job.status);
+  const running=job&&['preparing','waiting_user','verifying'].includes(job.status);
   return <section className="loginForm"><b>Gemini API Key</b><input type="password" value={apiKey} onChange={e=>onApiKey(e.target.value)} placeholder="Gemini API Key" autoComplete="off"/><span className="formHelp">API Key 只写入当前 Gemini Profile 的私有配置，不会回显。</span><button disabled={!apiKey.trim()||running} onClick={onSubmit}>{running?'正在验证':'使用 API Key 登录'}</button>{job&&<GeminiLoginJobPanel job={job}/>}</section>;
 }
 function GeminiVertexLogin(){
@@ -669,17 +669,17 @@ function GeminiVertexLogin(){
 }
 function GeminiLoginJobPanel({job,code='',onCode,onSubmitCode,onCancel,onRefresh}:{job:any;code?:string;onCode?:(v:string)=>void;onSubmitCode?:()=>void;onCancel?:()=>void;onRefresh?:()=>any|Promise<any>}){
   const toast=useToast();
-  const running=['starting','waiting_user','verifying'].includes(job.status);
-  const statusText=job.status==='starting'?'正在准备 Google 登录':job.status==='verifying'?'正在验证登录':job.status==='waiting_user'?(job.loginUrl?'等待你在 Google 完成授权':'正在准备 Google 登录'):job.status==='done'?'登录完成':job.status==='cancelled'?'已取消':job.status==='fallback'?'需要 SSH 完成登录':'登录失败';
+  const running=['preparing','waiting_user','verifying'].includes(job.status);
+  const statusText=job.status==='preparing'?'正在准备授权链接':job.status==='verifying'?'正在验证':job.status==='waiting_user'?'等待打开 Google 并输入授权码':job.status==='done'?'登录成功':job.status==='cancelled'?'已取消':job.status==='fallback'?'登录失败，可使用 SSH 兜底':'登录失败';
   return <section><b>Gemini 登录</b>
     <span>{statusText}</span>
-    {job.loginUrl&&<a className="loginLink" href={job.loginUrl} target="_blank" rel="noreferrer">打开 Google 登录页面</a>}
+    {job.loginUrl&&<a className="loginLink" href={job.loginUrl} target="_blank" rel="noreferrer">打开 Google 登录</a>}
     {job.loginUrl&&<button onClick={async()=>{try{await navigator.clipboard.writeText(job.loginUrl);toast('success','链接已复制')}catch{toast('error','复制失败')}}}>复制链接</button>}
     {job.requiresCodeInput&&<div className="loginCodeCard ready">
       <span>Authorization code</span>
       <input value={code} onChange={e=>onCode?.(e.target.value)} placeholder="粘贴 Google 返回的 authorization code" autoComplete="off"/>
-      <button disabled={!code.trim()||!running||job.codeSubmitted} onClick={onSubmitCode}>{job.codeSubmitted?'正在确认':'提交授权码'}</button>
-      <small>{job.codeSubmitted?'已提交授权码，正在等待 Gemini CLI 确认登录':'Google 授权完成后，把页面显示的 code 粘贴到这里。'}</small>
+      <button disabled={!code.trim()||!running||job.codeSubmitted} onClick={onSubmitCode}>{job.codeSubmitted?'正在验证':'完成登录'}</button>
+      <small>{job.codeSubmitted?'已提交授权码，正在验证登录':'Google 授权完成后，把页面显示的 code 粘贴到这里。若账号选择页没有出现，请用无痕窗口打开链接。'}</small>
     </div>}
     {job.deviceCode&&<div className="loginCodeCard ready"><span>认证码</span><div className="loginCodeLine"><strong>{job.deviceCode}</strong></div></div>}
     {job.fallbackCommand&&job.status==='fallback'&&<div className="loginCodeCard ready"><span>SSH 命令</span><code className="loginCommand">{job.fallbackCommand}</code><button onClick={async()=>{try{await navigator.clipboard.writeText(job.fallbackCommand);toast('success','命令已复制')}catch{toast('error','复制失败')}}}>复制命令</button>{onRefresh&&<button onClick={()=>onRefresh()}>重新检测登录</button>}</div>}

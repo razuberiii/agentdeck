@@ -73,7 +73,7 @@ type GeminiLoginJob = {
   id:string;
   profileId:string;
   methodId:string;
-  status:'starting'|'waiting_user'|'verifying'|'done'|'error'|'cancelled'|'fallback';
+  status:'preparing'|'waiting_user'|'verifying'|'done'|'error'|'cancelled'|'fallback';
   loginUrl?:string;
   deviceCode?:string;
   requiresCodeInput?:boolean;
@@ -87,6 +87,8 @@ const geminiLoginJobs = new Map<string, GeminiLoginJob>();
 const geminiLoginProfiles = new Map<string, string>();
 const geminiLoginWorkers = new Map<string, any>();
 const GEMINI_LOGIN_TIMEOUT_MS = Number(process.env.GEMINI_LOGIN_TIMEOUT_MS || 5 * 60 * 1000);
+const GEMINI_GOOGLE_AUTH_TYPE = 'oauth-personal';
+const GEMINI_USER_CODE_REDIRECT_URI = 'https://codeassist.google.com/authcode';
 const roots = await existingRoots((process.env.ALLOWED_WORKSPACES || `${process.cwd()},/opt/projects`).split(',').map(s=>s.trim()).filter(Boolean));
 const DEFAULT_WORKSPACE_DIR = roots.find(r => r === process.cwd() || r.endsWith('/agentdeck')) || roots[0];
 const PROJECTS_CACHE_MS = Number(process.env.PROJECTS_CACHE_MS || 30_000);
@@ -359,7 +361,7 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({error:'methodId required'});
   await db.run("UPDATE gemini_profiles SET status='configured', updated_at=?1 WHERE id=?2 AND status='bootstrap'", [Date.now(), String(profile.id)]).catch(()=>{});
-  const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'starting', startedAt:Date.now() };
+  const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'preparing', startedAt:Date.now() };
   geminiLoginJobs.set(job.id, job);
   geminiLoginProfiles.set(String(profile.id), job.id);
   runGeminiLoginJob(job, req.body || {}).catch((e:any) => {
@@ -398,13 +400,14 @@ app.post('/api/gemini-login/:jobId/input', { preHandler: ensureAuth }, async (re
   const job = geminiLoginJobs.get(String(req.params.jobId));
   if (!job) return reply.code(404).send({error:'not found'});
   const child = geminiLoginWorkers.get(job.id);
-  if (!child || !['starting','waiting_user'].includes(job.status)) return reply.code(409).send({error:'Gemini 登录进程未在等待授权码'});
+  if (!child || !['waiting_user','verifying'].includes(job.status)) return reply.code(409).send({error:'Gemini 登录进程未在等待授权码'});
   if (!job.requiresCodeInput) return reply.code(409).send({error:'当前 Gemini 登录流程未要求网页输入 code'});
+  if (job.codeSubmitted) return reply.code(409).send({error:'授权码已提交，正在验证'});
   const code = String(req.body?.code || '').trim();
   if (!/^[A-Za-z0-9_./~+=-]{4,4096}$/.test(code)) return reply.code(400).send({error:'bad code'});
-  child.write(code + '\r');
+  child.write(code + '\n');
   job.codeSubmitted = true;
-  job.status = 'waiting_user';
+  job.status = 'verifying';
   return { ok:true, job:{ ...job, codeSubmitted:true } };
 });
 app.post('/api/gemini-login/:jobId/cancel', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -1152,7 +1155,7 @@ async function geminiLoginStatus(homeDir:string, authType:string|null = null) {
   const secretFile = path.join(homeDir, 'agentdeck.env');
   const hasApiKey = await geminiSecretEnvHas(secretFile, 'GEMINI_API_KEY').catch(()=>false);
   const email = await scanGeminiEmail(homeDir).catch(()=>null);
-  const detectedAuthType = authType || (hasApiKey ? 'api_key' : (email ? 'oauth' : null));
+  const detectedAuthType = authType || (hasApiKey ? 'api_key' : (email ? GEMINI_GOOGLE_AUTH_TYPE : null));
   const ok = hasApiKey || !!email;
   return { ok, email, text: ok ? 'Logged in' : 'Not logged in', authType: detectedAuthType };
 }
@@ -1256,6 +1259,7 @@ async function runGeminiGoogleLoginWorker(job:GeminiLoginJob, homeDir:string) {
   let finalized = false;
   let timeout:NodeJS.Timeout|null = null;
   let completeResolve:(()=>void)|null = null;
+  let rawOutput = '';
   const complete = new Promise<void>(resolve => { completeResolve = resolve; });
   const finalize = async (fn:()=>Promise<void>|void) => {
     if (finalized) return;
@@ -1279,7 +1283,7 @@ async function runGeminiGoogleLoginWorker(job:GeminiLoginJob, homeDir:string) {
     job.error = `无法启动 Gemini Google 登录进程：${safeGeminiError(e)}。请通过 SSH 执行下面的完整命令完成登录，然后点击重新检测。`;
     return;
   }
-  job.status = 'starting';
+  job.status = 'preparing';
   timeout = setTimeout(() => {
     finalize(async () => {
       try { child?.kill(); } catch {}
@@ -1289,12 +1293,21 @@ async function runGeminiGoogleLoginWorker(job:GeminiLoginJob, homeDir:string) {
     }).catch(()=>{});
   }, GEMINI_LOGIN_TIMEOUT_MS);
   const handleOutput = (chunk:string) => {
+    rawOutput = (rawOutput + String(chunk || '')).slice(-12000);
     const sanitized = redactGeminiLoginOutput(chunk);
     for (const line of stripAnsi(sanitized).split(/\r?\n/).map(x=>x.trim()).filter(Boolean)) {
       job.output!.push(line);
     }
     job.output = job.output!.slice(-120);
-    const parsed = parseGeminiGoogleLogin(job.output.join('\n'));
+    const parsed = parseGeminiGoogleLogin(rawOutput);
+    if (parsed.invalidReason && job.status !== 'cancelled') {
+      finalize(async () => {
+        try { child?.kill(); } catch {}
+        job.status = 'error';
+        job.error = parsed.invalidReason;
+      }).catch(()=>{});
+      return;
+    }
     if (parsed.loginUrl) {
       job.loginUrl = parsed.loginUrl;
       job.status = 'waiting_user';
@@ -1317,7 +1330,7 @@ async function runGeminiGoogleLoginWorker(job:GeminiLoginJob, homeDir:string) {
     await finalize(async () => {
       if (job.status === 'cancelled' || job.status === 'error' || job.status === 'done') return;
       try {
-        const login = await geminiLoginStatus(homeDir, 'oauth').catch(()=>({ ok:false }));
+        const login = await geminiLoginStatus(homeDir, GEMINI_GOOGLE_AUTH_TYPE).catch(()=>({ ok:false }));
         if (exitCode === 0 && login.ok) {
           await finishGeminiGoogleLoginJob(job, homeDir);
         } else {
@@ -1334,7 +1347,7 @@ async function runGeminiGoogleLoginWorker(job:GeminiLoginJob, homeDir:string) {
 }
 async function finishGeminiGoogleLoginJob(job:GeminiLoginJob, homeDir:string) {
   job.status = 'verifying';
-  await db.run("UPDATE gemini_profiles SET auth_type='oauth', status='configured', updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+  await db.run("UPDATE gemini_profiles SET auth_type=?1, status='configured', updated_at=?2 WHERE id=?3", [GEMINI_GOOGLE_AUTH_TYPE, Date.now(), job.profileId]);
   await runtime.restartGeminiProfile(job.profileId).catch(()=>null);
   const initialized = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
   if (initialized?.error) throw new Error(String(initialized.error));
@@ -1348,8 +1361,9 @@ async function finishGeminiGoogleLoginJob(job:GeminiLoginJob, homeDir:string) {
     approvalPolicy: 'never',
     sandboxMode: 'read-only',
   }).catch((e:any) => { throw new Error(safeGeminiError(e)); });
-  await refreshGeminiProfileName(job.profileId, homeDir, 'oauth').catch(()=>{});
-  await db.run("UPDATE gemini_profiles SET auth_type='oauth', status='authenticated', active=1, updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+  const login = await geminiLoginStatus(homeDir, GEMINI_GOOGLE_AUTH_TYPE);
+  if (!login.ok || !login.email) throw new Error('Gemini ACP 验证通过，但未读取到 Google 登录邮箱');
+  await db.run("UPDATE gemini_profiles SET name=?1, auth_type=?2, status='authenticated', active=1, updated_at=?3 WHERE id=?4", [login.email, GEMINI_GOOGLE_AUTH_TYPE, Date.now(), job.profileId]);
   await db.run('UPDATE gemini_profiles SET active=0 WHERE id<>?1', [job.profileId]).catch(()=>{});
   job.status = 'done';
   delete job.error;
@@ -1359,8 +1373,14 @@ function geminiConfigDir(homeDir:string) {
 }
 function geminiCliEnv(homeDir:string, extra:Record<string,string> = {}) {
   const configDir = geminiConfigDir(homeDir);
+  const env:Record<string,string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (key === 'CI' || key === 'CONTINUOUS_INTEGRATION' || key.startsWith('CI_')) continue;
+    env[key] = value;
+  }
   return {
-    ...process.env,
+    ...env,
     HOME: homeDir,
     GEMINI_CONFIG_DIR: configDir,
     XDG_CONFIG_HOME: path.join(homeDir, '.config'),
@@ -1379,19 +1399,52 @@ async function ensureGeminiOAuthSettings(homeDir:string) {
   try { settings = JSON.parse(await readFile(settingsFile, 'utf8')); } catch { settings = {}; }
   settings.security = settings.security && typeof settings.security === 'object' ? settings.security : {};
   settings.security.auth = settings.security.auth && typeof settings.security.auth === 'object' ? settings.security.auth : {};
-  settings.security.auth.selectedType = 'oauth-personal';
+  settings.security.auth.selectedType = GEMINI_GOOGLE_AUTH_TYPE;
   await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n', { mode:0o600 });
   await chmod(settingsFile, 0o600).catch(()=>{});
 }
 function parseGeminiGoogleLogin(output:string) {
-  const text = stripAnsi(output).replace(/[^\S\r\n]+/g, ' ');
-  const compact = stripAnsi(output).replace(/\s+/g, '');
-  const loginUrl = compact.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?.*?(?:client_id=[^&\s]+|state=[A-Za-z0-9._-]+)/i)?.[0]?.replace(/[),.]+$/, '')
-    || text.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?[^\s)]+/i)?.[0]?.replace(/[),.]+$/, '');
+  const text = stripAnsi(output).replace(/\r/g, '').replace(/[^\S\n]+/g, ' ');
   const requiresCodeInput = /Enter the authorization code|authorization code|authcode|paste .*code/i.test(text);
+  const loginUrlResult = extractGeminiUserCodeLoginUrl(text, requiresCodeInput);
   const failureMatch = text.match(/(Error authenticating:[^\n]+|FatalAuthenticationError:[^\n]+|Manual authorization is required[^\n]+|authentication failed[^\n]*|invalid_grant[^\n]*)/i);
   const success = /authenticated successfully|authentication completed successfully|login successful/i.test(text);
-  return { loginUrl, requiresCodeInput, success, failure: failureMatch?.[1] ? redactLine(failureMatch[1]).slice(0, 500) : null };
+  return { loginUrl: loginUrlResult.loginUrl, invalidReason: loginUrlResult.invalidReason, requiresCodeInput, success, failure: failureMatch?.[1] ? redactLine(failureMatch[1]).slice(0, 500) : null };
+}
+function extractGeminiUserCodeLoginUrl(text:string, complete:boolean): { loginUrl?:string; invalidReason?:string } {
+  const marker = 'Please visit the following URL to authorize the application:';
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex < 0) return {};
+  let tail = text.slice(markerIndex + marker.length);
+  const promptIndex = tail.search(/Enter the authorization code/i);
+  if (promptIndex >= 0) tail = tail.slice(0, promptIndex);
+  const start = tail.indexOf('https://accounts.google.com/');
+  if (start < 0) return complete ? { invalidReason:'Gemini CLI 未输出完整 Google 授权 URL' } : {};
+  const compact = tail.slice(start).replace(/\s+/g, '');
+  const rawUrl = compact.match(/^https:\/\/accounts\.google\.com\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/)?.[0]?.replace(/[),.]+$/, '');
+  if (!rawUrl) return complete ? { invalidReason:'Gemini CLI 输出的 Google 授权 URL 无法解析' } : {};
+  return validateGeminiUserCodeLoginUrl(rawUrl, complete);
+}
+function validateGeminiUserCodeLoginUrl(rawUrl:string, complete:boolean): { loginUrl?:string; invalidReason?:string } {
+  let parsed:URL;
+  try { parsed = new URL(rawUrl); } catch { return complete ? { invalidReason:'Gemini CLI 输出的 Google 授权 URL 无效' } : {}; }
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'accounts.google.com') {
+    return { invalidReason:'Gemini CLI 输出的授权 URL 不是 Google OAuth 地址' };
+  }
+  if (!/^\/o\/oauth2\/v2\/auth\/?$/.test(parsed.pathname)) {
+    return { invalidReason:'Gemini CLI 输出的授权 URL 不是手工授权码流程' };
+  }
+  const required = ['client_id','redirect_uri','response_type','scope','state','code_challenge'];
+  const missing = required.filter(key => !parsed.searchParams.get(key));
+  if (missing.length) return complete ? { invalidReason:`Gemini CLI 输出的授权 URL 缺少参数：${missing.join(', ')}` } : {};
+  if (parsed.searchParams.get('redirect_uri') !== GEMINI_USER_CODE_REDIRECT_URI) {
+    return { invalidReason:'Gemini CLI 授权 URL redirect_uri 不是手工授权码地址' };
+  }
+  if (parsed.searchParams.get('response_type') !== 'code') {
+    return { invalidReason:'Gemini CLI 授权 URL response_type 不是 code' };
+  }
+  if (!parsed.searchParams.get('prompt')) parsed.searchParams.set('prompt', 'select_account');
+  return { loginUrl: parsed.toString() };
 }
 function redactGeminiLoginOutput(text:string) {
   return String(text || '')
