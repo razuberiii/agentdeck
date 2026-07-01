@@ -125,10 +125,18 @@ await db.run('ALTER TABLE sessions ADD COLUMN provider_metadata TEXT').catch(()=
 await db.run('ALTER TABLE sessions ADD COLUMN last_execution_account_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN current_upstream_account_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN account_snapshot_json TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN creator_profile_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN selected_profile_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN executing_profile_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN upstream_binding_profile_id TEXT').catch(()=>{});
 await runtimeDb.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
 await runtimeDb.run('ALTER TABLE sessions ADD COLUMN last_execution_account_id TEXT').catch(()=>{});
 await runtimeDb.run('ALTER TABLE sessions ADD COLUMN current_upstream_account_id TEXT').catch(()=>{});
 await runtimeDb.run('ALTER TABLE sessions ADD COLUMN account_snapshot_json TEXT').catch(()=>{});
+await runtimeDb.run('ALTER TABLE sessions ADD COLUMN creator_profile_id TEXT').catch(()=>{});
+await runtimeDb.run('ALTER TABLE sessions ADD COLUMN selected_profile_id TEXT').catch(()=>{});
+await runtimeDb.run('ALTER TABLE sessions ADD COLUMN executing_profile_id TEXT').catch(()=>{});
+await runtimeDb.run('ALTER TABLE sessions ADD COLUMN upstream_binding_profile_id TEXT').catch(()=>{});
 await db.run("UPDATE sessions SET provider_id='codex' WHERE provider_id IS NULL OR provider_id=''").catch(()=>{});
 await db.run('UPDATE sessions SET provider_session_id=codex_thread_id WHERE provider_session_id IS NULL AND codex_thread_id IS NOT NULL').catch(()=>{});
 await db.run('UPDATE sessions SET workspace_path=project_dir WHERE workspace_path IS NULL').catch(()=>{});
@@ -799,6 +807,7 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
       const created = await runtime.createCodexSession({
         accountId,
         codexHome: activeProfile.codex_home,
+        accountSnapshot: codexAccountSnapshot(activeProfile),
         cwd: projectDir,
         title,
         mode,
@@ -806,8 +815,9 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
         approvalPolicy: opts.approvalPolicy,
         sandboxMode: opts.sandboxMode,
       });
-      await upsertThread(created.thread, { title, archived: 0, status:'idle', model, account_id: accountId, ...modeFields(mode) });
-      return sessionDto(created.thread, { title, status:'idle', archived:0, model, account_id: accountId, ...modeFields(mode) });
+      const profileFields = codexSessionProfileFields(accountId, accountId, accountId);
+      await upsertThread(created.thread, { title, archived: 0, status:'idle', model, account_id: accountId, account_snapshot_json:JSON.stringify(codexAccountSnapshot(activeProfile)), ...profileFields, ...modeFields(mode) });
+      return sessionDto(created.thread, { title, status:'idle', archived:0, model, account_id: accountId, account_snapshot_json:JSON.stringify(codexAccountSnapshot(activeProfile)), ...profileFields, ...modeFields(mode) });
     } catch (e:any) {
       const body = structuredSessionCreateError('codex', e, 'web_session_api');
       return reply.code(body.statusCode).send(body.body);
@@ -815,9 +825,10 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   }
   const started = await codex.startThread(projectDir, opts);
   const thread = started.thread;
-  await upsertThread(thread, { title, archived: 0, status:'idle', model, account_id: accountId, ...modeFields(mode) });
+  const profileFields = codexSessionProfileFields(accountId, accountId, accountId);
+  await upsertThread(thread, { title, archived: 0, status:'idle', model, account_id: accountId, account_snapshot_json:JSON.stringify(codexAccountSnapshot(activeProfile)), ...profileFields, ...modeFields(mode) });
   await codex.setName(thread.id, title).catch(()=>{});
-  return sessionDto(thread, { title, status:'idle', archived:0, model, account_id: accountId, ...modeFields(mode) });
+  return sessionDto(thread, { title, status:'idle', archived:0, model, account_id: accountId, account_snapshot_json:JSON.stringify(codexAccountSnapshot(activeProfile)), ...profileFields, ...modeFields(mode) });
 });
 app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const requestId = req.id;
@@ -1552,6 +1563,66 @@ async function codexCreateSessionPreflight(activeProfile:any) {
     };
   }
   return { ok:true as const };
+}
+async function codexContinueSessionPreflight(activeProfile:any) {
+  const result = await codexCreateSessionPreflight(activeProfile);
+  if (result.ok) return { ok:true as const };
+  return {
+    ok:false,
+    statusCode:result.statusCode,
+    body:{
+      ...result.body,
+      code: result.body.code === 'codex_no_active_profile' ? 'codex_no_executing_profile' : result.body.code,
+      message: result.body.message || '当前 Codex 账户无法继续会话',
+      safeDetail: `canContinueSession=false: ${result.body.safeDetail || result.body.code}`,
+    },
+  };
+}
+function codexSessionProfileFields(creatorProfileId:any, executingProfileId:any, upstreamBindingProfileId:any) {
+  return {
+    creator_profile_id: creatorProfileId || null,
+    selected_profile_id: executingProfileId || null,
+    executing_profile_id: executingProfileId || null,
+    upstream_binding_profile_id: upstreamBindingProfileId || null,
+    last_execution_account_id: executingProfileId || null,
+    current_upstream_account_id: upstreamBindingProfileId || null,
+  };
+}
+function codexAccountSnapshot(profile:any) {
+  if (!profile) return null;
+  return {
+    provider:'codex',
+    id:String(profile.id || ''),
+    email:profile.email || profile.login?.email || null,
+    name:profile.name || profile.email || null,
+    status:profile.status || profile.state || 'authenticated',
+    codexHome:profile.codex_home || null,
+  };
+}
+function codexExecutionContext(profile:any) {
+  const accountId = String(profile?.id || '');
+  return {
+    selectedProfileId:accountId,
+    executingProfileId:accountId,
+    accountSnapshot:codexAccountSnapshot(profile),
+    runtime:{
+      appServerUnit:codexAppServerUnitName(accountId),
+      endpoint:codexAppServerEndpoint(accountId),
+      codexHome:String(profile?.codex_home || ''),
+    },
+  };
+}
+function codexAppServerEndpoint(profileId:string) {
+  return `ws://127.0.0.1:${codexAppServerPort(profileId)}`;
+}
+function codexAppServerPort(profileId:string) {
+  if (profileId === 'default') return Number(process.env.CODEX_APP_SERVER_DEFAULT_PORT || 4668);
+  const hash = crypto.createHash('sha256').update(profileId).digest();
+  return Number(process.env.CODEX_APP_SERVER_PORT_BASE || 4520) + (hash.readUInt16BE(0) % 200);
+}
+function codexAppServerUnitName(profileId:string) {
+  const safe = String(profileId || 'default').replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, 64) || 'default';
+  return profileId === 'default' ? 'agentdeck-app-server@default.service' : `agentdeck-app-server-${safe}.service`;
 }
 function structuredSessionCreateError(provider:AgentProviderId, e:any, layer:string) {
   const statusCode = e?.statusCode === 503 ? 503 : e?.statusCode === 409 ? 409 : 502;
@@ -2688,9 +2759,9 @@ async function findSession(id:string){
   if (normalizeProvider(row?.provider_id) === 'gemini' && runtimeRow) return runtimeRow;
   return row || runtimeRow;
 }
-async function upsertThread(thread:any, extra:any = {}) { if (!thread?.id || !pathAllowed(thread.cwd)) return; const existing:any = await findSession(String(thread.id)); const title = cleanTitle(extra.title || existing?.title || thread.name || thread.preview, thread.cwd); const now = Date.now(); const mode = normalizeMode(extra.permission_mode) || 'yolo'; const fields = { ...modeFields(mode), ...extra }; const model = cleanModel(fields.model); await db.run("INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'codex',?12,?8,?2,?1) ON CONFLICT(id) DO UPDATE SET codex_thread_id=excluded.codex_thread_id, project_dir=excluded.project_dir, title=excluded.title, status=excluded.status, archived=excluded.archived, provider_id=COALESCE(sessions.provider_id,'codex'), account_id=COALESCE(sessions.account_id,excluded.account_id), model_id=excluded.model_id, workspace_path=excluded.workspace_path, provider_session_id=excluded.provider_session_id, updated_at=excluded.updated_at", [thread.id, thread.cwd, title, extra.status || statusName(thread.status), fields.permission_mode, fields.approval_policy, fields.sandbox_mode, model || null, extra.archived ?? 0, (thread.createdAt || Math.floor(now/1000))*1000, (thread.updatedAt || Math.floor(now/1000))*1000, fields.account_id || null]); }
+async function upsertThread(thread:any, extra:any = {}) { if (!thread?.id || !pathAllowed(thread.cwd)) return; const existing:any = await findSession(String(thread.id)); const title = cleanTitle(extra.title || existing?.title || thread.name || thread.preview, thread.cwd); const now = Date.now(); const mode = normalizeMode(extra.permission_mode) || 'yolo'; const fields = { ...modeFields(mode), ...extra }; const model = cleanModel(fields.model); await db.run("INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'codex',?12,?8,?2,?1,?13,?14,?15,?16,?15,?16,?17) ON CONFLICT(id) DO UPDATE SET codex_thread_id=excluded.codex_thread_id, project_dir=excluded.project_dir, title=excluded.title, status=excluded.status, archived=excluded.archived, provider_id=COALESCE(sessions.provider_id,'codex'), account_id=COALESCE(sessions.account_id,excluded.account_id), model_id=excluded.model_id, workspace_path=excluded.workspace_path, provider_session_id=excluded.provider_session_id, creator_profile_id=COALESCE(sessions.creator_profile_id,excluded.creator_profile_id), selected_profile_id=COALESCE(excluded.selected_profile_id,sessions.selected_profile_id), executing_profile_id=COALESCE(excluded.executing_profile_id,sessions.executing_profile_id), upstream_binding_profile_id=COALESCE(excluded.upstream_binding_profile_id,sessions.upstream_binding_profile_id), last_execution_account_id=COALESCE(excluded.last_execution_account_id,sessions.last_execution_account_id), current_upstream_account_id=COALESCE(excluded.current_upstream_account_id,sessions.current_upstream_account_id), account_snapshot_json=COALESCE(excluded.account_snapshot_json,sessions.account_snapshot_json), updated_at=excluded.updated_at", [thread.id, thread.cwd, title, extra.status || statusName(thread.status), fields.permission_mode, fields.approval_policy, fields.sandbox_mode, model || null, extra.archived ?? 0, (thread.createdAt || Math.floor(now/1000))*1000, (thread.updatedAt || Math.floor(now/1000))*1000, fields.account_id || null, fields.creator_profile_id || fields.account_id || null, fields.selected_profile_id || fields.account_id || null, fields.executing_profile_id || fields.account_id || null, fields.upstream_binding_profile_id || fields.account_id || null, fields.account_snapshot_json || null]); }
 async function indexedSession(thread:any){ const row = await findSession(thread.id); return sessionDto(thread, row || undefined); }
-function sessionDto(thread:any, row:any = {}) { const fields = modeFields(sessionMode(row)); const providerId = normalizeProvider(row.provider_id) || 'codex'; const model = providerId === 'codex' ? cleanModel(row.model) : cleanAgentModel(row.model); const modelId = providerId === 'codex' ? cleanModel(row.model_id) || model : cleanAgentModel(row.model_id) || model; return { id: thread.id, codex_thread_id: thread.id, provider_id: providerId, providerId, provider_session_id: row.provider_session_id || thread.id, account_id: row.account_id || null, workspace_path: row.workspace_path || thread.cwd, project_dir: thread.cwd, title: cleanTitle(row.title || thread.name || thread.preview, thread.cwd), status: row.status || statusName(thread.status), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived: Number(row.archived || 0), created_at: (thread.createdAt || 0)*1000, updated_at: (thread.updatedAt || 0)*1000, last_sequence:Number(row.last_sequence || 0), path: thread.path || null }; }
+function sessionDto(thread:any, row:any = {}) { const fields = modeFields(sessionMode(row)); const providerId = normalizeProvider(row.provider_id) || 'codex'; const model = providerId === 'codex' ? cleanModel(row.model) : cleanAgentModel(row.model); const modelId = providerId === 'codex' ? cleanModel(row.model_id) || model : cleanAgentModel(row.model_id) || model; return { id: thread.id, codex_thread_id: thread.id, provider_id: providerId, providerId, provider_session_id: row.provider_session_id || thread.id, account_id: row.account_id || null, creatorProfileId:row.creator_profile_id || row.account_id || null, selectedProfileId:row.selected_profile_id || null, executingProfileId:row.executing_profile_id || row.last_execution_account_id || null, upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path: row.workspace_path || thread.cwd, project_dir: thread.cwd, title: cleanTitle(row.title || thread.name || thread.preview, thread.cwd), status: row.status || statusName(thread.status), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived: Number(row.archived || 0), created_at: (thread.createdAt || 0)*1000, updated_at: (thread.updatedAt || 0)*1000, last_sequence:Number(row.last_sequence || 0), canCreateSession:providerId === 'codex' ? true : undefined, canContinueSession:providerId === 'codex' ? !!(row.executing_profile_id || row.last_execution_account_id || row.account_id) : undefined, path: thread.path || null }; }
 function threadFromRow(row:any) {
   const now = Date.now();
   return {
@@ -2806,7 +2877,7 @@ function rowSessionDto(row:any) {
   const providerId = normalizeProvider(row.provider_id) || 'codex';
   const model = providerId === 'antigravity' || providerId === 'gemini' ? cleanAgentModel(row.model) : cleanModel(row.model);
   const modelId = providerId === 'antigravity' || providerId === 'gemini' ? cleanAgentModel(row.model_id) || model : cleanModel(row.model_id) || model;
-  return { id:String(row.codex_thread_id || row.id), codex_thread_id:String(row.codex_thread_id || row.id), provider_id:providerId, providerId, provider_session_id:String(row.provider_session_id || row.codex_thread_id || row.id), account_id:row.account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path:String(row.workspace_path || row.project_dir), project_dir:String(row.project_dir), title:String(row.title || projectNameFromPath(String(row.project_dir))), status:String(row.status || 'idle'), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived:Number(row.archived || 0), created_at:Number(row.created_at || 0), updated_at:Number(row.updated_at || 0), last_sequence:Number(row.last_sequence || 0), path:null };
+  return { id:String(row.codex_thread_id || row.id), codex_thread_id:String(row.codex_thread_id || row.id), provider_id:providerId, providerId, provider_session_id:String(row.provider_session_id || row.codex_thread_id || row.id), account_id:row.account_id || null, creatorProfileId:row.creator_profile_id || row.account_id || null, selectedProfileId:row.selected_profile_id || null, executingProfileId:row.executing_profile_id || row.last_execution_account_id || null, upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path:String(row.workspace_path || row.project_dir), project_dir:String(row.project_dir), title:String(row.title || projectNameFromPath(String(row.project_dir))), status:String(row.status || 'idle'), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived:Number(row.archived || 0), created_at:Number(row.created_at || 0), updated_at:Number(row.updated_at || 0), last_sequence:Number(row.last_sequence || 0), canCreateSession:providerId === 'codex' ? true : undefined, canContinueSession:providerId === 'codex' ? !!(row.executing_profile_id || row.last_execution_account_id || row.account_id) : undefined, path:null };
 }
 async function antigravityThread(row:any) {
   const messages = await db.all('SELECT * FROM agent_messages WHERE session_id=?1 ORDER BY created_at ASC', [String(row.id)]);
@@ -3019,6 +3090,14 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const input = await buildTurnInput(threadId, text, attachments);
   const title = autoTitle(text, String(row.project_dir), String(row.title || ''));
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
+  const activeProfile:any = await getActiveProfile();
+  const continuePreflight = await codexContinueSessionPreflight(activeProfile);
+  if (!continuePreflight.ok) {
+    ack('failed', continuePreflight.body.message);
+    throw Object.assign(new Error(continuePreflight.body.message), { statusCode:continuePreflight.statusCode, body:continuePreflight.body });
+  }
+  const execution = codexExecutionContext(activeProfile);
+  const executionSnapshotJson = JSON.stringify(execution.accountSnapshot || null);
   const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
   if (USE_AGENT_RUNTIME) {
     const subscription = ensureSessionSubscription(id, threadId);
@@ -3031,12 +3110,28 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['submitting',Date.now(),threadId]).catch(async () => {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]);
     });
+    await db.run(
+      'UPDATE sessions SET selected_profile_id=?1,executing_profile_id=?1,last_execution_account_id=?1,account_snapshot_json=?2,updated_at=?3 WHERE codex_thread_id=?4 OR id=?4',
+      [execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
+    ).catch(()=>{});
     activeCodexSessions.add(threadId);
     broadcast(threadId, userMessage);
     ack('persisted');
     artifactScanStarts.set(threadId, Date.now());
     try {
-      await runtime.startTurn(threadId, { input, text, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model });
+      app.log.info({
+        localSessionId:threadId,
+        creatorProfileId:row.creator_profile_id || row.account_id || null,
+        selectedProfileId:execution.selectedProfileId,
+        executingProfileId:execution.executingProfileId,
+        upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null,
+        providerSessionId:row.provider_session_id || row.upstream_thread_id || row.codex_thread_id || threadId,
+        appServerUnit:execution.runtime.appServerUnit,
+        endpoint:execution.runtime.endpoint,
+        codexHome:execution.runtime.codexHome,
+        account:execution.accountSnapshot,
+      }, 'codex sendTurn execution profile selected');
+      await runtime.startTurn(threadId, { input, text, accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]).catch(()=>{});
       ack('accepted');
     } catch(e:any) {
@@ -3058,7 +3153,10 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     broadcast(threadId,{type:'sessionTitle', title});
   }
   artifactScanStarts.set(threadId, Date.now());
-  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]);
+  await db.run(
+    'UPDATE sessions SET status=?1,selected_profile_id=?2,executing_profile_id=?2,last_execution_account_id=?2,account_snapshot_json=?3,updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',
+    ['running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
+  );
   activeCodexSessions.add(threadId);
   broadcast(threadId, userMessage);
   ack('persisted');

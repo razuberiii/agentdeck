@@ -65,6 +65,10 @@ type RuntimeSession = {
   model:string | null;
   provider_id?: string | null;
   provider_session_id?: string | null;
+  creator_profile_id?: string | null;
+  selected_profile_id?: string | null;
+  executing_profile_id?: string | null;
+  upstream_binding_profile_id?: string | null;
   last_execution_account_id?: string | null;
   current_upstream_account_id?: string | null;
   account_snapshot_json?: string | null;
@@ -446,10 +450,10 @@ app.post('/codex/sessions', async (req:any) => {
   const now = Date.now();
   const title = cleanTitle(body.title || thread.name || thread.preview, thread.cwd);
   await db.run(
-    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason)
-     VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'codex',?9,?7,?2,?1,'codex',?1,NULL,0,NULL)
+    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json)
+     VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'codex',?9,?7,?2,?1,'codex',?1,NULL,0,NULL,?9,?9,?9,?9,?9,?9,?10)
      ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at`,
-    [thread.id, thread.cwd, title, opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, account.id]
+    [thread.id, thread.cwd, title, opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, account.id, JSON.stringify(body.accountSnapshot || null)]
   );
   await appendEvent(String(thread.id), 'thread/start', { thread, source:'runtime' });
   if (title) await runtime.request('thread/name/set', { threadId:thread.id, name:title }).catch(()=>{});
@@ -542,7 +546,7 @@ app.patch('/sessions/:id', async (req:any, reply) => {
   if (!session) return reply.code(404).send({ error:'not found' });
   const title = cleanTitle(req.body?.title, session.project_dir);
   if (!title) return reply.code(400).send({ error:'title required' });
-  const account = await getAccount(String(session.account_id || 'default'));
+  const account = await getAccount(String(session.current_upstream_account_id || session.last_execution_account_id || session.executing_profile_id || session.account_id || ''));
   if (!account) return reply.code(409).send({ error:'account not found' });
   const runtime = await runtimeForAccount(account.id);
   const threadId = String(session.upstream_thread_id || session.id);
@@ -614,17 +618,50 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
       return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId) });
     }
   }
-  const account = await getAccount(String(session.account_id || 'default'));
-  if (!account) return reply.code(409).send({ error:'account not found' });
-  const runtime = await runtimeForAccount(account.id);
   const body = req.body || {};
+  const accountId = String(body.accountId || '').trim();
+  if (!accountId) return reply.code(409).send({ code:'codex_executing_profile_required', message:'Codex 继续会话需要明确的 executingProfileId', canContinueSession:false });
+  const previousAccountId = String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || '');
+  const accountSwitched = !!previousAccountId && previousAccountId !== accountId;
+  const account = await getOrEnsureCodexTurnAccount(accountId, body.codexHome);
+  if (!account) return reply.code(409).send({ code:'codex_executing_profile_not_found', message:'当前 Codex 账户无法执行会话', canContinueSession:false });
+  const runtime = await runtimeForAccount(account.id);
   const opts = turnOptions({ ...session, ...body });
   const input = Array.isArray(body.input) ? body.input : [{ type:'text', text:String(body.text || ''), text_elements:[] }];
   const cwd = String(body.cwd || session.project_dir);
-  const live = await ensureLiveThread(session, runtime, opts, cwd);
+  app.log.info({
+    localSessionId:session.id,
+    creatorProfileId:session.creator_profile_id || session.account_id || null,
+    selectedProfileId:body.executionContext?.selectedProfileId || accountId,
+    executingProfileId:accountId,
+    upstreamBindingProfileId:session.upstream_binding_profile_id || session.current_upstream_account_id || null,
+    providerSessionId:session.provider_session_id || session.upstream_thread_id || session.codex_thread_id || session.id,
+    appServerUnit:systemdUnitName(accountId),
+    endpoint:`ws://127.0.0.1:${portForAccount(accountId)}`,
+    codexHome:account.codex_home,
+    account:body.accountSnapshot || null,
+    accountSwitched,
+  }, 'codex runtime turn execution profile resolved');
+  const live = await ensureLiveThread(session, runtime, opts, cwd, accountSwitched);
   const threadId = live.threadId;
   const codexInput = live.recovered ? [await recoveryContextInput(session), ...input] : input;
-  await appendEvent(session.id, 'user', { input });
+  await db.run(
+    `UPDATE sessions
+     SET selected_profile_id=?1,executing_profile_id=?2,upstream_binding_profile_id=?2,last_execution_account_id=?2,current_upstream_account_id=?2,account_snapshot_json=COALESCE(?3,account_snapshot_json),updated_at=?4
+     WHERE id=?5`,
+    [body.executionContext?.selectedProfileId || accountId, accountId, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]
+  );
+  await appendEvent(session.id, 'user', {
+    input,
+    selectedProfileId:body.executionContext?.selectedProfileId || accountId,
+    executingProfileId:accountId,
+    upstreamBindingProfileId:accountId,
+    providerThreadId:threadId,
+    appServerUnit:systemdUnitName(accountId),
+    endpoint:`ws://127.0.0.1:${portForAccount(accountId)}`,
+    accountSnapshot:body.accountSnapshot || null,
+    accountSwitched,
+  });
   await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3', ['running', Date.now(), session.id]);
   let turn:any;
   try {
@@ -671,7 +708,7 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
   if (!session) return reply.code(404).send({ error:'not found' });
   if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || 'default'))).cancel(session.id);
   if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
-  const account = await getAccount(String(session.account_id || 'default'));
+  const account = await getAccount(String(session.current_upstream_account_id || session.last_execution_account_id || session.executing_profile_id || session.account_id || ''));
   if (!account) return reply.code(409).send({ error:'account not found' });
   const runtime = await runtimeForAccount(account.id);
   const turnId = session.active_turn_id;
@@ -718,6 +755,10 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE sessions ADD COLUMN last_execution_account_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN current_upstream_account_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN account_snapshot_json TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN creator_profile_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN selected_profile_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN executing_profile_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN upstream_binding_profile_id TEXT').catch(()=>{});
   await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN sequence INTEGER').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN event_type TEXT').catch(()=>{});
@@ -778,6 +819,14 @@ async function ensureAccount(id:string, codexHome:string) {
     [id, codexHome, runtimeInstanceId(id), now]
   );
   return getAccount(id) as Promise<Account>;
+}
+
+async function getOrEnsureCodexTurnAccount(id:string, codexHome:any) {
+  const existing = await getAccount(id);
+  const nextHome = typeof codexHome === 'string' && codexHome.trim() ? String(codexHome) : '';
+  if (existing && (!nextHome || existing.codex_home === nextHome)) return existing;
+  if (nextHome) return ensureAccount(id, nextHome);
+  return null;
 }
 
 async function bootstrapRuntimeRecovery() {
@@ -958,18 +1007,18 @@ async function getSession(id:string) {
   return row;
 }
 
-async function ensureLiveThread(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string):Promise<{ threadId:string; recovered:boolean }> {
-  const key = String(session.upstream_thread_id || session.id);
+async function ensureLiveThread(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string, forceResume = false):Promise<{ threadId:string; recovered:boolean }> {
+  const key = `${String(session.upstream_thread_id || session.id)}:${forceResume ? 'force' : 'normal'}`;
   const existing = resumeInFlight.get(key);
   if (existing) return existing;
-  const task = ensureLiveThreadUnlocked(session, runtime, opts, cwd).finally(() => { resumeInFlight.delete(key); });
+  const task = ensureLiveThreadUnlocked(session, runtime, opts, cwd, forceResume).finally(() => { resumeInFlight.delete(key); });
   resumeInFlight.set(key, task);
   return task;
 }
 
-async function ensureLiveThreadUnlocked(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string):Promise<{ threadId:string; recovered:boolean }> {
+async function ensureLiveThreadUnlocked(session:RuntimeSession, runtime:CodexAccountRuntime, opts:ReturnType<typeof turnOptions>, cwd:string, forceResume = false):Promise<{ threadId:string; recovered:boolean }> {
   const threadId = String(session.upstream_thread_id || session.id);
-  if (session.upstream_status !== 'missing' && session.upstream_generation === RUNTIME_GENERATION) return { threadId, recovered:false };
+  if (!forceResume && session.upstream_status !== 'missing' && session.upstream_generation === RUNTIME_GENERATION) return { threadId, recovered:false };
   if (session.upstream_status === 'missing') return createReplacementThread(session, runtime, opts, cwd, threadId, 'upstream previously marked missing');
   try {
     diagnostics.threadResumeCalls++;
@@ -1098,7 +1147,7 @@ async function recentConversationSummary(sessionId:string, limit:number) {
 }
 
 async function readAuthoritativeThread(session:RuntimeSession) {
-  const account = await getAccount(String(session.account_id || 'default'));
+  const account = await getAccount(String(session.current_upstream_account_id || session.last_execution_account_id || session.executing_profile_id || session.account_id || ''));
   if (!account) throw new Error('account not found');
   const runtime = await runtimeForAccount(account.id);
   const threadId = String(session.upstream_thread_id || session.id);

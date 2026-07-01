@@ -31,3 +31,28 @@ test('Codex session creation does not fall back to default account after preflig
   assert.match(createBlock, /accountId,/);
   assert.match(createBlock, /codexHome: activeProfile\.codex_home/);
 });
+
+test('Codex turns use the current active profile as the explicit execution profile', () => {
+  assert.match(webSource, /codexContinueSessionPreflight\(activeProfile\)/);
+  assert.match(webSource, /codexExecutionContext\(activeProfile\)/);
+  assert.match(webSource, /accountId:execution\.executingProfileId/);
+  assert.match(webSource, /codexHome:execution\.runtime\.codexHome/);
+  assert.match(webSource, /selectedProfileId:execution\.selectedProfileId/);
+  assert.match(webSource, /executingProfileId:execution\.executingProfileId/);
+  assert.match(webSource, /upstreamBindingProfileId/);
+});
+
+test('Codex runtime turn continuation rejects missing execution profile and records binding', () => {
+  const turnBlock = runtimeSource.slice(
+    runtimeSource.indexOf("const accountId = String(body.accountId || '').trim();"),
+    runtimeSource.indexOf("app.post('/sessions/:id/stop'")
+  );
+  assert.match(turnBlock, /codex_executing_profile_required/);
+  assert.doesNotMatch(turnBlock, /body\.accountId \|\| session\.current_upstream_account_id/);
+  assert.match(turnBlock, /getOrEnsureCodexTurnAccount\(accountId, body\.codexHome\)/);
+  assert.match(runtimeSource, /if \(nextHome\) return ensureAccount\(id, nextHome\)/);
+  assert.match(turnBlock, /accountSwitched/);
+  assert.match(turnBlock, /ensureLiveThread\(session, runtime, opts, cwd, accountSwitched\)/);
+  assert.match(turnBlock, /selected_profile_id=\?1,executing_profile_id=\?2,upstream_binding_profile_id=\?2/);
+  assert.match(turnBlock, /providerThreadId:threadId/);
+});
