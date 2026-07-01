@@ -180,6 +180,32 @@ app.get('/api/status', async (req) => {
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
   return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
+app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
+  const settings = await appSettings();
+  const codexStatus = cachedCodexStatusSnapshot();
+  const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
+  const antigravityStatus = cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value);
+  return {
+    authed:true,
+    authenticated:true,
+    serverTime:Date.now(),
+    codex:codexStatus,
+    gemini:geminiStatus,
+    antigravity:antigravityStatus,
+    providers:[codexProviderStatus(codexStatus), geminiStatus, antigravityStatus],
+    activeProvider:settings.activeProvider,
+    roots,
+    defaultWorkspace:DEFAULT_WORKSPACE_DIR,
+    mode:modeLabel(settings.defaultMode),
+    defaultMode:settings.defaultMode,
+    defaultModel:settings.defaultModel,
+    defaultModels:settings.defaultModels,
+    activeProfile:await activeCodexProfileSummary(),
+    activeGeminiProfile:await activeGeminiProfileSummary(),
+    activeAntigravityProfile:await activeAntigravityProfileSummary(),
+    capabilities:attachmentCapabilities(null),
+  };
+});
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
     ...runtimeDiagnostics,
@@ -238,6 +264,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
 });
 app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const force = req.query?.refresh === '1';
+  const light = req.query?.light === '1';
   const [
     settings,
     profiles,
@@ -262,10 +289,10 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     getActiveGeminiProfile(),
     listAntigravityProfiles(),
     getActiveAntigravityProfile(),
-    cachedCodexStatus(),
-    cachedAntigravityStatus(force),
-    cachedGeminiStatus(force),
-    USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
+    light ? Promise.resolve(cachedCodexStatusSnapshot()) : cachedCodexStatus(),
+    light ? Promise.resolve(cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value)) : cachedAntigravityStatus(force),
+    light ? Promise.resolve(cachedProviderStatusSnapshot('gemini', geminiStatusCache.value)) : cachedGeminiStatus(force),
+    light || !USE_AGENT_RUNTIME ? Promise.resolve({ error: light ? 'not refreshed' : 'persistent runtime disabled' }) : runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   return { settings, profiles, pendingProfiles, activeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] };
@@ -963,6 +990,13 @@ async function cachedGeminiStatus(force = false) {
     () => geminiProvider.status({ forceAcpHelp: force })
   );
 }
+function cachedCodexStatusSnapshot() {
+  return codexStatusCache.value || { ok:false, error:'Codex CLI 状态尚未刷新', appServer:true, sessionsPath:path.join(DEFAULT_CODEX_HOME, 'sessions') };
+}
+function cachedProviderStatusSnapshot(id:Exclude<AgentProviderId, 'codex'>, status:any) {
+  const displayName = id === 'gemini' ? 'Gemini' : 'Antigravity';
+  return status || { id, displayName, ok:false, installed:false, version:null, error:`${displayName} 状态尚未刷新` };
+}
 async function cachedProviderStatus(
   cache: { expiresAt:number; promise?:Promise<any>; value?:any },
   update: (cache:{ expiresAt:number; promise?:Promise<any>; value?:any }) => void,
@@ -988,6 +1022,57 @@ async function cachedProviderStatus(
   });
   update({ ...cache, promise });
   return promise;
+}
+async function activeCodexProfileSummary() {
+  const p = await db.get("SELECT id,name,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (!p) return null;
+  return {
+    id:String(p.id),
+    provider:'codex',
+    name:profileDisplayName(String(p.name || 'Codex Account')),
+    state:'authenticated',
+    status:String(p.status || 'authenticated'),
+    active:Number(p.active || 0),
+    login:{ ok:true, text:'Cached account summary' },
+    created_at:Number(p.created_at || 0),
+    updated_at:Number(p.updated_at || 0),
+  };
+}
+async function activeGeminiProfileSummary() {
+  const p = await db.get("SELECT id,name,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (!p) return null;
+  const name = String(p.name || '').trim() || 'Gemini Account';
+  return {
+    id:String(p.id),
+    provider:'gemini',
+    name,
+    state:String(p.status || 'authenticated'),
+    status:String(p.status || 'authenticated'),
+    authType:p.auth_type || null,
+    active:Number(p.active || 0),
+    login:{ ok:String(p.status || '') === 'authenticated', email:findEmailInText(name) || undefined, text:'Cached account summary' },
+    created_at:Number(p.created_at || 0),
+    updated_at:Number(p.updated_at || 0),
+  };
+}
+async function activeAntigravityProfileSummary() {
+  const p = await db.get("SELECT id,name,active,status,created_at,updated_at FROM antigravity_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (!p) return null;
+  const name = String(p.name || '').trim() || 'Antigravity Account';
+  return {
+    id:String(p.id),
+    provider:'antigravity',
+    name,
+    state:String(p.status || 'authenticated'),
+    status:String(p.status || 'authenticated'),
+    active:Number(p.active || 0),
+    login:{ ok:String(p.status || '') === 'authenticated', email:findEmailInText(name) || undefined, text:'Cached account summary' },
+    created_at:Number(p.created_at || 0),
+    updated_at:Number(p.updated_at || 0),
+  };
+}
+function findEmailInText(value:string) {
+  return value.match(/[^\s@]+@[^\s@]+\.[^\s@]+/)?.[0] || null;
 }
 async function ensureProfiles() {
   await mkdir(PROFILES_DIR, { recursive:true });

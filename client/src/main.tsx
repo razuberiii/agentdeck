@@ -4,7 +4,7 @@ import './styles.css';
 
 type ProviderId = 'codex'|'gemini'|'antigravity';
 type ProviderStatus = { id:ProviderId; displayName:string; ok:boolean; installed:boolean; version?:string|null; error?:string|null; installHint?:string; runtime?:any };
-type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; capabilities:Capabilities; activeProfile?:any; activeGeminiProfile?:any; activeAntigravityProfile?:any };
+type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultWorkspace?:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; capabilities:Capabilities; activeProfile?:any; activeGeminiProfile?:any; activeAntigravityProfile?:any };
 type Capabilities = { imageInput:boolean; imageOutput:boolean; fileInput?:boolean; attachmentTypes:string[]; maxAttachmentBytes:number; maxAttachmentsPerMessage?:number; maxTotalAttachmentBytes?:number; providers?:Record<string,any> };
 type Session = { id:string; codex_thread_id:string; provider_id?:ProviderId; providerId?:ProviderId; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number; last_sequence?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
@@ -94,28 +94,32 @@ function Login({onLogin}:{onLogin:()=>void}){
 function Home(){
   const toast=useToast();
   const [status,setStatus]=useState<Status|null>(null); const [projects,setProjects]=useState<Project[]>([]); const [sessions,setSessions]=useState<Session[]>([]);
-  const [archived,setArchived]=useState(false); const [query,setQuery]=useState(''); const [picker,setPicker]=useState(false); const [busy,setBusy]=useState(''); const [loading,setLoading]=useState(true); const [projectsLoading,setProjectsLoading]=useState(false); const [error,setError]=useState('');
-  const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [settingsOpen,setSettingsOpen]=useState(false); const [settings,setSettings]=useState<any>(null); const [online,setOnline]=useState(navigator.onLine);
+  const [archived,setArchived]=useState(false); const [query,setQuery]=useState(''); const [picker,setPicker]=useState(false); const [busy,setBusy]=useState(''); const [sessionsLoading,setSessionsLoading]=useState(true); const [appStateLoading,setAppStateLoading]=useState(true); const [statusRefreshing,setStatusRefreshing]=useState(false); const [projectsLoading,setProjectsLoading]=useState(false); const [error,setError]=useState('');
+  const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [settingsOpen,setSettingsOpen]=useState(false); const [settings,setSettings]=useState<any>(null); const [settingsLoading,setSettingsLoading]=useState(false); const [settingsError,setSettingsError]=useState(''); const [online,setOnline]=useState(navigator.onLine);
   useEffect(()=>{ refresh(); },[archived]);
   useEffect(()=>{ const on=()=>setOnline(navigator.onLine); addEventListener('online',on); addEventListener('offline',on); return()=>{removeEventListener('online',on); removeEventListener('offline',on)} },[]);
-  async function refresh(scanProjects=false){ setLoading(true); setError(''); try{ const [st,ss,ps]=await Promise.all([api('/api/status'),api('/api/sessions'+(archived?'?archived=1':'')),scanProjects?api('/api/projects?refresh=1'):Promise.resolve(null)]); setStatus(st); setSessions(ss.sessions); if(ps) setProjects(ps.projects); } catch(e:any){ setError(shortError(e)); toast('error','刷新失败'); } finally { setLoading(false); } }
+  async function refresh(scanProjects=false){ setError(''); const sessionsPromise=refreshSessions(); refreshAppState(); if(scanProjects){ refreshStatus(); loadProjects(true); } await sessionsPromise; }
+  async function refreshSessions(){ setSessionsLoading(true); try{ const ss=await api('/api/sessions'+(archived?'?archived=1':'')); setSessions(ss.sessions); } catch(e:any){ setError(shortError(e)); toast('error','会话读取失败'); } finally { setSessionsLoading(false); } }
+  async function refreshAppState(){ setAppStateLoading(true); try{ setStatus((await api('/api/app-state')) as Status); } catch(e:any){ setError(shortError(e)); } finally { setAppStateLoading(false); } }
+  async function refreshStatus(){ setStatusRefreshing(true); try{ setStatus((await api('/api/status')) as Status); } catch(e:any){ console.warn('status refresh failed', e); } finally { setStatusRefreshing(false); } }
   async function loadProjects(force=true){ setProjectsLoading(true); try{ const ps=await api('/api/projects'+(force?'?refresh=1':'')); setProjects(ps.projects); } catch(e:any){ toast('error','项目扫描失败：'+shortError(e)); } finally{ setProjectsLoading(false); } }
   async function openProjectPicker(){ setPicker(true); await loadProjects(true); }
   const defaultWorkspace = status?.defaultWorkspace || status?.roots?.[0] || FALLBACK_WORKSPACE;
   async function newSession(projectDir:string,title?:string){ setBusy(projectDir); try{ const s=await api('/api/sessions',{method:'POST',body:JSON.stringify({projectDir,title:title||projectName(projectDir),mode:status?.defaultMode,providerId:status?.activeProvider||'codex'})}); haptic(); location.hash='#/s/'+s.id; } catch(e:any){ toast('error','创建失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
-  async function showSettings(){ try{ setSettings(await api('/api/settings')); setSettingsOpen(true); } catch(e:any){ toast('error','设置读取失败：'+shortError(e)); } }
+  async function loadSettings(){ setSettingsLoading(true); setSettingsError(''); try{ setSettings(await api('/api/settings?light=1')); } catch(e:any){ const msg=shortError(e); setSettingsError(msg); toast('error','设置读取失败：'+msg); } finally { setSettingsLoading(false); } }
+  function showSettings(){ setSettingsOpen(true); loadSettings(); }
   const activeProvider=status?.activeProvider || 'codex';
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell">
     <header className="homeTop">
       <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(status?.activeProvider)} · {status?.mode || 'Full Access'} · {activeStatusProfileLabel(status)}</span></div>
-      <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={showSettings}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" onClick={()=>refresh(true)}>↻</button></div>
+      <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={showSettings}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}>↻</button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="statusStrip">
-      <div><span>服务器</span><b>{error?'异常':'在线'}</b></div>
+      <div><span>服务器</span><b>{error?'异常':statusRefreshing?'刷新中':'在线'}</b></div>
       <div><span>{providerLabel(activeProvider)}</span><b>{activeProviderStatus?.ok ? activeProviderStatus.version : (activeProviderStatus?.error || '不可用')}</b></div>
       <div><span>模式</span><b>{modeLabel(status?.defaultMode)}</b></div>
     </section>
@@ -128,14 +132,14 @@ function Home(){
       <div className="seg"><button className={!archived?'active':''} onClick={()=>setArchived(false)}>当前</button><button className={archived?'active':''} onClick={()=>setArchived(true)}>归档</button></div>
       <input className="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索会话、项目或状态"/>
     </section>
-    <section className="sessionList" aria-busy={loading}>
-      {loading&&<LoadingRows count={6}/>}
-      {!loading&&!filtered.length&&<EmptyState title={archived?'没有归档会话':'还没有最近会话'} detail={query?'换个关键词试试':'选择项目或新建任务开始'} />}
+    <section className="sessionList" aria-busy={sessionsLoading}>
+      {sessionsLoading&&<LoadingRows count={6}/>}
+      {!sessionsLoading&&!filtered.length&&<EmptyState title={archived?'没有归档会话':'还没有最近会话'} detail={query?'换个关键词试试':'选择项目或新建任务开始'} />}
       {filtered.map(s=><SessionRow key={s.id} session={s} onArchive={async()=>{ try{ await api(`/api/sessions/${s.id}/${s.archived?'unarchive':'archive'}`,{method:'POST'}); haptic(); toast('success',s.archived?'已恢复':'已归档'); refresh(); } catch(e:any){ toast('error','操作失败：'+shortError(e)); } }}/>)}
     </section>
     {picker&&<ProjectPicker projects={projects} busy={busy} loading={projectsLoading} onRefresh={()=>loadProjects(true)} onClose={()=>setPicker(false)} onPick={(p)=>newSession(p.path,p.name)}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
-    {settingsOpen&&<SettingsSheet data={settings} onChanged={async()=>{ await refresh(); const next=await api('/api/settings'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/>}
+    {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} onRetry={loadSettings} onChanged={async()=>{ refresh(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
   </main>;
 }
 
@@ -460,7 +464,21 @@ function findDeepEmail(value:any):string|null{
   if(typeof value==='object'){ for(const key of ['email','email_address','account_email','login']){ const found=findDeepEmail(value[key]); if(found) return found; } for(const x of Object.values(value)){ const found=findDeepEmail(x); if(found) return found; } }
   return null;
 }
-function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Promise<any>;onClose:()=>void}){
+type SettingsBoundaryProps = { children:React.ReactNode; onClose:()=>void; resetKey:string };
+type SettingsBoundaryState = { error:Error|null };
+class SettingsErrorBoundary extends React.Component<SettingsBoundaryProps, SettingsBoundaryState> {
+  state:SettingsBoundaryState = { error:null };
+  static getDerivedStateFromError(error:Error){ return { error }; }
+  componentDidCatch(error:Error, info:React.ErrorInfo){ console.error('SettingsSheet crashed', error, info.componentStack); }
+  componentDidUpdate(prev:SettingsBoundaryProps){ if(prev.resetKey!==this.props.resetKey && this.state.error) this.setState({error:null}); }
+  render(){
+    if(!this.state.error) return this.props.children;
+    return <Sheet onClose={this.props.onClose} title="设置出错" subtitle="设置面板遇到错误，应用其余部分仍可继续使用">
+      <ErrorState title="设置暂时不可用" detail={shortError(this.state.error)} action="关闭" onAction={this.props.onClose}/>
+    </Sheet>;
+  }
+}
+function SettingsSheet({data,loading,error,onRetry,onChanged,onClose}:{data:any;loading:boolean;error:string;onRetry:()=>void;onChanged:()=>any|Promise<any>;onClose:()=>void}){
   const toast=useToast();
   const [localData,setLocalData]=useState<any>(data);
   const [models,setModels]=useState<any>(null);
@@ -480,6 +498,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   const [agCode,setAgCode]=useState('');
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
   const [deleteGeminiProfile,setDeleteGeminiProfile]=useState<any>(null);
+  const [deleteAntigravityProfile,setDeleteAntigravityProfile]=useState<any>(null);
   const [page,setPage]=useState<'main'|'agent'|'mode'|'model'|'account'|'geminiMethods'|'geminiGoogle'|'geminiApiKey'|'geminiVertex'>('main');
   const activeProvider = localData?.settings?.activeProvider || 'codex';
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
@@ -544,7 +563,9 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? providerLabel(activeProvider) : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProvider==='codex'?modelLabel(currentModel):(activeProviderStatus?.ok?`${providerLabel(activeProvider)} 模型`:`${providerLabel(activeProvider)} 未安装`)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
   const goBack = () => setPage(page==='geminiMethods'?'account':(['geminiGoogle','geminiApiKey','geminiVertex'].includes(page)?'geminiMethods':'main') as any);
   return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button onClick={goBack}>返回</button>:undefined}>
-    <div className="settingsGrid">
+    {error&&<ErrorState title="设置读取失败" detail={error} action="重试" onAction={onRetry}/>}
+    {loading&&!localData&&<LoadingRows count={4}/>}
+    {localData&&<div className="settingsGrid">
       {page==='main'&&<div className="settingsNav">
         <button onClick={()=>setPage('agent')}><span><b>Agent</b><small>{providerLabel(activeProvider)}{activeProvider==='antigravity'&&!activeProviderStatus?.ok?' · 未安装':''}</small></span><i>›</i></button>
         <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
@@ -565,7 +586,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
       {page==='geminiApiKey'&&<GeminiApiKeyLogin apiKey={geminiApiKey} onApiKey={setGeminiApiKey} job={geminiLoginJob} onSubmit={()=>startGeminiLogin('api_key')}/>}
       {page==='geminiVertex'&&<GeminiVertexLogin/>}
       {page==='account'&&activeProvider==='antigravity'&&<section><b>账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={(p:any)=>{setAntigravityDeleteError('');setDeleteAntigravityProfile(p)}}/>)}{!(localData?.antigravityProfiles||[]).length&&<div className="empty"><b>尚未添加 Antigravity 账户</b><span>登录后才能创建 Antigravity 会话。</span></div>}</div><button disabled={!activeProviderStatus?.ok || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Antigravity 未安装</b><span>安装后才能登录 Google 账户。</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode} onCancel={cancelAntigravityLogin}/>}</section>}
-    </div>
+    </div>}
     {deleteProfile&&<ConfirmDialog title="删除账户？" detail={`删除 ${profileLabel(deleteProfile)} 的本地登录配置。有历史会话引用时会从账户列表隐藏，历史记录仍保留。`} confirm={profileDeleteBusy?'删除中':'删除'} busy={profileDeleteBusy} error={profileDeleteError} onCancel={()=>!profileDeleteBusy&&setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
     {deleteGeminiProfile&&<ConfirmDialog title="删除 Gemini 账户？" detail={`删除 ${geminiProfileLabel(deleteGeminiProfile)} 的本地登录配置。有历史会话引用时会从账户列表隐藏，历史记录仍保留。`} confirm={geminiDeleteBusy?'删除中':'删除'} busy={geminiDeleteBusy} error={geminiDeleteError} onCancel={()=>!geminiDeleteBusy&&setDeleteGeminiProfile(null)} onConfirm={()=>removeGeminiProfile(deleteGeminiProfile)}/>}
     {deleteAntigravityProfile&&<ConfirmDialog title="删除 Antigravity 账户？" detail={`删除 ${antigravityProfileLabel(deleteAntigravityProfile)} 的本地登录配置。有历史会话引用时会从账户列表隐藏，历史记录仍保留。`} confirm={antigravityDeleteBusy?'删除中':'删除'} busy={antigravityDeleteBusy} error={antigravityDeleteError} onCancel={()=>!antigravityDeleteBusy&&setDeleteAntigravityProfile(null)} onConfirm={()=>removeAntigravityProfile(deleteAntigravityProfile)}/>}
