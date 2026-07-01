@@ -17,6 +17,7 @@ export class RuntimeClient {
   geminiStatus() { return this.request('GET', '/gemini/status'); }
   geminiProfileStatus(profileId:string) { return this.request('GET', `/gemini/profiles/${encodeURIComponent(profileId)}/status`); }
   initializeGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/initialize`); }
+  forceInitializeGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/force-initialize`); }
   authenticateGeminiProfile(profileId:string, methodId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/authenticate`, { methodId }); }
   logoutGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/logout`); }
   restartGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/restart`); }

@@ -242,6 +242,28 @@ class GeminiRuntimeManager {
     return runtime.status();
   }
 
+  async forceReinitialize(profileId:string) {
+    const id = normalizeGeminiProfileId(profileId);
+    const previous = this.runtimes.get(id);
+    const previousPid = previous?.status()?.childPid || null;
+    const started = Date.now();
+    this.inFlight.delete(id);
+    if (previous) await previous.dispose('Gemini profile force reinitialize');
+    this.runtimes.delete(id);
+    const runtime = await this.get(id);
+    await runtime.ensureInitialized();
+    const status = runtime.status();
+    return {
+      ...status,
+      forceReinitialized:true,
+      oldInstance:!!previous,
+      oldChildPid:previousPid,
+      newChildPid:status.childPid || null,
+      disposeCompleted:true,
+      elapsedMs:Date.now() - started,
+    };
+  }
+
   async authenticate(profileId:string, methodId:string) {
     const runtime = await this.get(profileId);
     return runtime.authenticate(methodId);
@@ -355,6 +377,7 @@ app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sq
 app.get('/gemini/status', async (req:any) => geminiManager.status(String(req.query?.profileId || 'default')));
 app.get('/gemini/profiles/:id/status', async (req:any) => geminiManager.status(String(req.params.id)));
 app.post('/gemini/profiles/:id/initialize', async (req:any) => geminiManager.initialize(String(req.params.id)));
+app.post('/gemini/profiles/:id/force-initialize', async (req:any) => geminiManager.forceReinitialize(String(req.params.id)));
 app.post('/gemini/profiles/:id/authenticate', async (req:any, reply) => {
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({ error:'methodId required' });

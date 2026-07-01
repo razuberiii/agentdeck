@@ -79,6 +79,7 @@ export class GeminiAcpRuntime {
       agentInfo: this.initializeResponse?.agentInfo || null,
       profileId: this.options.profileId,
       profileDir: this.options.profileDir,
+      childPid: this.child?.pid || null,
       lastError: this.lastError,
     };
   }
@@ -138,6 +139,12 @@ export class GeminiAcpRuntime {
   }
 
   async dispose(reason = 'Gemini ACP disposed') {
+    const child = this.child;
+    const exited = child && !child.killed ? new Promise<void>(resolve => {
+      const done = () => resolve();
+      child.once('exit', done);
+      setTimeout(done, 1500).unref();
+    }) : Promise.resolve();
     for (const pending of this.permissions.values()) pending.resolve({ outcome:{ outcome:'cancelled' } });
     this.permissions.clear();
     for (const state of this.sessions.values()) {
@@ -151,9 +158,11 @@ export class GeminiAcpRuntime {
     this.connection = null;
     this.agent = null;
     this.initializeResponse = null;
+    this.connectPromise = null;
     if (this.child && !this.child.killed) this.child.kill();
     this.child = null;
     this.lastError = reason;
+    await exited;
   }
 
   async restart() {
