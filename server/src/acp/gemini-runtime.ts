@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, chmod } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -23,6 +23,9 @@ export type GeminiRuntimeOptions = {
   db: Db;
   dataDir: string;
   defaultCwd: string;
+  profileId: string;
+  profileDir: string;
+  profileEnv?: Record<string, string>;
   appendEvent(sessionId: string, eventType: string, payload: any): Promise<any>;
   updateSession(sessionId: string, values: Record<string, string | number | null>): Promise<void>;
   logger?: {
@@ -74,8 +77,8 @@ export class GeminiAcpRuntime {
       authMethods: this.initializeResponse?.authMethods || [],
       capabilities: this.initializeResponse?.agentCapabilities || null,
       agentInfo: this.initializeResponse?.agentInfo || null,
-      profileId: 'default',
-      profileDir: this.profileDir(),
+      profileId: this.options.profileId,
+      profileDir: this.options.profileDir,
       lastError: this.lastError,
     };
   }
@@ -94,7 +97,7 @@ export class GeminiAcpRuntime {
     const response = await this.agent!.request(methods.agent.session.new, {
       cwd: params.cwd,
       mcpServers: [],
-      _meta: { agentdeckSessionId: params.localSessionId, profileId: 'default' },
+      _meta: { agentdeckSessionId: params.localSessionId, profileId: this.options.profileId },
     });
     const state: GeminiSessionState = {
       localSessionId: params.localSessionId,
@@ -119,6 +122,38 @@ export class GeminiAcpRuntime {
       capabilities: this.initializeResponse?.agentCapabilities || null,
     });
     return state;
+  }
+
+  async authenticate(methodId: string) {
+    await this.ensureInitialized();
+    const response = await this.agent!.request(methods.agent.authenticate, { methodId });
+    return response || {};
+  }
+
+  async logout() {
+    await this.ensureInitialized();
+    const response = await this.agent!.request(methods.agent.logout, {});
+    await this.restart();
+    return response || {};
+  }
+
+  async restart() {
+    this.restarting = true;
+    try {
+      for (const pending of this.permissions.values()) pending.resolve({ outcome:{ outcome:'cancelled' } });
+      this.permissions.clear();
+      this.sessions.clear();
+      this.providerToLocal.clear();
+      this.connection?.close(new Error('Gemini ACP restarting'));
+      this.connection = null;
+      this.agent = null;
+      this.initializeResponse = null;
+      if (this.child && !this.child.killed) this.child.kill();
+      this.child = null;
+      await this.ensureInitialized();
+    } finally {
+      this.restarting = false;
+    }
   }
 
   async prompt(localSessionId: string, prompt: ContentBlock[]) {
@@ -204,16 +239,24 @@ export class GeminiAcpRuntime {
 
   private async connect() {
     await mkdir(this.profileDir(), { recursive:true, mode:0o700 });
+    await chmod(this.profileDir(), 0o700).catch(()=>{});
     const child = spawn(this.geminiBin(), this.geminiArgs(), {
       cwd: this.options.defaultCwd,
-      env: { ...process.env, HOME:this.profileDir(), GEMINI_CONFIG_DIR:this.profileDir() },
+      env: {
+        ...process.env,
+        HOME:this.profileDir(),
+        GEMINI_CONFIG_DIR:this.profileDir(),
+        XDG_CONFIG_HOME:path.join(this.profileDir(), '.config'),
+        XDG_CACHE_HOME:path.join(this.profileDir(), '.cache'),
+        ...(this.options.profileEnv || {}),
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', chunk => {
       const text = String(chunk).trim();
-      if (text) this.options.logger?.warn({ provider:'gemini', pid:child.pid, stderr:text.slice(0, 1000) }, 'gemini acp stderr');
+      if (text) this.options.logger?.warn({ provider:'gemini', profileId:this.options.profileId, pid:child.pid, stderr:redactSecretText(text).slice(0, 1000) }, 'gemini acp stderr');
     });
     child.on('exit', (code, signal) => {
       this.lastError = `Gemini ACP exited code=${code} signal=${signal}`;
@@ -229,6 +272,7 @@ export class GeminiAcpRuntime {
       }
       this.sessions.clear();
       this.providerToLocal.clear();
+      if (this.restarting) this.lastError = null;
     });
 
     const app = client({ name:'AgentDeck Runtime' })
@@ -252,7 +296,7 @@ export class GeminiAcpRuntime {
     });
     const initialized = this.initializeResponse!;
     this.lastError = null;
-    this.options.logger?.info({ provider:'gemini', pid:child.pid, agentInfo:initialized.agentInfo, capabilities:initialized.agentCapabilities, authRequired:!!initialized.authMethods?.length }, 'gemini acp initialized');
+    this.options.logger?.info({ provider:'gemini', profileId:this.options.profileId, pid:child.pid, agentInfo:initialized.agentInfo, capabilities:initialized.agentCapabilities, authRequired:!!initialized.authMethods?.length }, 'gemini acp initialized');
   }
 
   private async handleUpdate(notification: SessionNotification) {
@@ -330,8 +374,14 @@ export class GeminiAcpRuntime {
   }
 
   private profileDir() {
-    return process.env.GEMINI_PROFILE_ROOT || path.join(this.options.dataDir, 'gemini', 'profiles', 'default');
+    return this.options.profileDir;
   }
+}
+
+function redactSecretText(text:string) {
+  return String(text || '')
+    .replace(/(GEMINI_API_KEY|GOOGLE_API_KEY|API[_ -]?KEY)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]')
+    .replace(/(access_token|refresh_token|id_token|client_secret|authorization code)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
 }
 
 function textFromContent(content: any): string {

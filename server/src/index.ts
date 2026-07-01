@@ -29,6 +29,7 @@ const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.c
 const ANTIGRAVITY_BIN = process.env.ANTIGRAVITY_BIN || 'agy';
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const ANTIGRAVITY_PROFILES_DIR = path.join(DATA_DIR, 'antigravity-profiles');
+const GEMINI_PROFILES_DIR = path.join(DATA_DIR, 'gemini', 'profiles');
 const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
@@ -68,12 +69,29 @@ const loginJobs = new Map<string, LoginJob>();
 type AntigravityLoginJob = LoginJob & { providerId:'antigravity'; authCodePrompt?:boolean; codeSubmitted?:boolean };
 const antigravityLoginJobs = new Map<string, AntigravityLoginJob>();
 const antigravityLoginChildren = new Map<string, any>();
+type GeminiLoginJob = {
+  id:string;
+  profileId:string;
+  methodId:string;
+  status:'starting'|'waiting_user'|'verifying'|'done'|'error'|'cancelled';
+  loginUrl?:string;
+  deviceCode?:string;
+  requiresCodeInput?:boolean;
+  error?:string;
+  startedAt:number;
+};
+const geminiLoginJobs = new Map<string, GeminiLoginJob>();
+const geminiLoginProfiles = new Map<string, string>();
 const roots = await existingRoots((process.env.ALLOWED_WORKSPACES || `${process.cwd()},/opt/projects`).split(',').map(s=>s.trim()).filter(Boolean));
 const DEFAULT_WORKSPACE_DIR = roots.find(r => r === process.cwd() || r.endsWith('/agentdeck')) || roots[0];
 const PROJECTS_CACHE_MS = Number(process.env.PROJECTS_CACHE_MS || 30_000);
 const CODEX_STATUS_CACHE_MS = Number(process.env.CODEX_STATUS_CACHE_MS || 60_000);
+const PROVIDER_STATUS_OK_CACHE_MS = 5 * 60_000;
+const PROVIDER_STATUS_FAIL_CACHE_MS = 30_000;
 let projectsCache: { expiresAt:number; promise?:Promise<any[]>; value?:any[] } = { expiresAt: 0 };
 let codexStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
+let antigravityStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
+let geminiStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any>; value?:any } = { key:'', expiresAt: 0 };
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
@@ -98,9 +116,11 @@ await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND ar
 await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
+await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS agent_messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('UPDATE sessions SET status=?1 WHERE status=?2', ['interrupted', 'running']).catch(()=>{});
 await ensureProfiles();
+await ensureGeminiProfiles();
 await ensureAdmin();
 const app = Fastify({ bodyLimit: Number(process.env.BODY_LIMIT_BYTES || 25 * 1024 * 1024), logger: { redact: ['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','token','secret'] } });
 await app.register(cookie, { secret: process.env.COOKIE_SECRET || crypto.randomBytes(32).toString('hex') });
@@ -113,19 +133,38 @@ app.addHook('preHandler', async (req, reply) => { if (['POST','PUT','PATCH','DEL
 function secureCookie() { return { httpOnly:true, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 function csrfCookie() { return { httpOnly:false, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 async function ensureAuth(req:any, reply:any) { const sid = req.cookies[COOKIE_NAME]; if (!sid) return reply.code(401).send({error:'unauthorized'}); try { const decoded = app.unsignCookie(sid); if (!decoded.valid) throw new Error('bad cookie'); } catch { return reply.code(401).send({error:'unauthorized'}); } }
-app.get('/api/status', async (req) => {
+function isAuthenticated(req:any) {
   const raw = req.cookies[COOKIE_NAME] || '';
-  const authed = !!raw && !!app.unsignCookie(raw).valid;
+  return !!raw && !!app.unsignCookie(raw).valid;
+}
+app.get('/api/auth/status', async (req) => ({ authenticated: isAuthenticated(req) }));
+app.get('/api/status', async (req) => {
+  const startedAt = Date.now();
+  const authed = isAuthenticated(req);
   if (!authed) return { authed:false, authenticated:false, serverTime:Date.now(), capabilities:{} };
-  await syncAntigravityProfilesFromDisk().catch(()=>{});
-  const settings = await appSettings();
-  const activeProfile = await getActiveProfile();
-  const activeAntigravityProfile = await getActiveAntigravityProfile();
-  const codexStatus = await cachedCodexStatus();
-  const antigravityStatus = await antigravity.status();
-  const geminiStatus = await geminiProvider.status();
-  const geminiRuntime = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : { error:'persistent runtime disabled' };
-  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeAntigravityProfile, capabilities: attachmentCapabilities(geminiRuntime) };
+  const force = !!(req.query && typeof req.query === 'object' && (req.query as any).refresh === '1');
+  const [
+    settings,
+    activeProfile,
+    activeGeminiProfile,
+    activeAntigravityProfile,
+    codexStatus,
+    antigravityStatus,
+    geminiStatus,
+    geminiRuntime,
+  ] = await Promise.all([
+    appSettings(),
+    getActiveProfile(),
+    getActiveGeminiProfile(),
+    getActiveAntigravityProfile(),
+    cachedCodexStatus(),
+    cachedAntigravityStatus(force),
+    cachedGeminiStatus(force),
+    USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
+    syncAntigravityProfilesFromDisk().catch(()=>{}),
+  ]);
+  app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
+  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
@@ -139,7 +178,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const settings = await appSettings();
   const provider = normalizeProvider(req.query?.provider) || settings.activeProvider;
   if (provider === 'gemini') {
-    const status = await geminiProvider.status();
+    const status = await cachedGeminiStatus();
     const runtimeStatus = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : null;
     return {
       providerId: 'gemini',
@@ -154,7 +193,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
     };
   }
   if (provider === 'antigravity') {
-    const status = await antigravity.status();
+    const status = await cachedAntigravityStatus();
     const activeProfile:any = await getActiveAntigravityProfile();
     const login = activeProfile?.home_dir ? await antigravityLoginStatus(String(activeProfile.home_dir)) : { ok:false, email:null };
     const usageText = status.ok && login.ok ? await antigravityUsage(String(activeProfile.home_dir)).catch(()=>null) : null;
@@ -183,7 +222,36 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
     checkedAt: Date.now(),
   };
 });
-app.get('/api/settings', { preHandler: ensureAuth }, async () => { await syncAntigravityProfilesFromDisk().catch(()=>{}); const codexStatus = await cachedCodexStatus(); const antigravityStatus = await antigravity.status(); const geminiStatus = await geminiProvider.status(); const geminiRuntime = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : { error:'persistent runtime disabled' }; return { settings: await appSettings(), profiles: await listProfiles(), activeProfile: await getActiveProfile(), antigravityProfiles: await listAntigravityProfiles(), activeAntigravityProfile: await getActiveAntigravityProfile(), codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] }; });
+app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
+  const force = req.query?.refresh === '1';
+  const [
+    settings,
+    profiles,
+    activeProfile,
+    geminiProfiles,
+    activeGeminiProfile,
+    antigravityProfiles,
+    activeAntigravityProfile,
+    codexStatus,
+    antigravityStatus,
+    geminiStatus,
+    geminiRuntime,
+  ] = await Promise.all([
+    appSettings(),
+    listProfiles(),
+    getActiveProfile(),
+    listGeminiProfiles(),
+    getActiveGeminiProfile(),
+    listAntigravityProfiles(),
+    getActiveAntigravityProfile(),
+    cachedCodexStatus(),
+    cachedAntigravityStatus(force),
+    cachedGeminiStatus(force),
+    USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
+    syncAntigravityProfilesFromDisk().catch(()=>{}),
+  ]);
+  return { settings, profiles, activeProfile, geminiProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] };
+});
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
   if (provider) await setSetting('activeProvider', provider);
@@ -231,6 +299,87 @@ app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, repl
   await db.run('DELETE FROM codex_profiles WHERE id=?1', [String(profile.id)]);
   await deleteProfileDir(String(profile.codex_home)).catch(()=>{});
   return { ok:true };
+});
+app.get('/api/gemini/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listGeminiProfiles(), activeGeminiProfile: await getActiveGeminiProfile() }));
+app.post('/api/gemini/profiles', { preHandler: ensureAuth }, async (req:any) => {
+  const name = cleanProfileName(String(req.body?.name || 'Gemini Account'));
+  const id = crypto.randomBytes(8).toString('hex');
+  const homeDir = geminiHomeForProfile(id);
+  await mkdir(homeDir, { recursive:true, mode:0o700 });
+  await chmod(path.dirname(homeDir), 0o700).catch(()=>{});
+  await chmod(homeDir, 0o700).catch(()=>{});
+  await db.run('INSERT INTO gemini_profiles (id,name,home_dir,auth_type,active,created_at,updated_at) VALUES (?1,?2,?3,NULL,0,?4,?4)', [id, name, homeDir, Date.now()]);
+  return { profile: await getGeminiProfileDto(id) };
+});
+app.post('/api/gemini/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await getGeminiProfile(String(req.params.id));
+  if (!profile) return reply.code(404).send({error:'profile not found'});
+  const login = await geminiLoginStatus(String(profile.home_dir), String(profile.auth_type || '') || null);
+  if (!login.ok) return reply.code(409).send({error:'请先登录该 Gemini 账户'});
+  await activateGeminiProfile(String(profile.id));
+  return { ok:true, activeGeminiProfile: await getActiveGeminiProfile() };
+});
+app.post('/api/gemini/profiles/:id/refresh', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await getGeminiProfile(String(req.params.id));
+  if (!profile) return reply.code(404).send({error:'profile not found'});
+  const runtimeStatus = USE_AGENT_RUNTIME ? await runtime.initializeGeminiProfile(String(profile.id)).catch((e:any)=>({ error:safeGeminiError(e) })) : null;
+  await refreshGeminiProfileName(String(profile.id), String(profile.home_dir), String(profile.auth_type || '') || null).catch(()=>{});
+  return { profile: await getGeminiProfileDto(String(profile.id)), runtime: sanitizeGeminiRuntimeStatus(runtimeStatus) };
+});
+app.post('/api/gemini/profiles/:id/logout', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await getGeminiProfile(String(req.params.id));
+  if (!profile) return reply.code(404).send({error:'profile not found'});
+  const running = await db.get("SELECT id FROM sessions WHERE provider_id='gemini' AND account_id=?1 AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]);
+  if (running) return reply.code(409).send({error:'该 Gemini 账户仍有正在运行的会话，不能退出登录'});
+  await runtime.logoutGeminiProfile(String(profile.id)).catch((e:any)=>{ throw new Error(safeGeminiError(e)); });
+  await removeGeminiProfileSecret(String(profile.home_dir), 'GEMINI_API_KEY').catch(()=>{});
+  await db.run('UPDATE gemini_profiles SET auth_type=NULL, updated_at=?1 WHERE id=?2', [Date.now(), String(profile.id)]);
+  return { ok:true, profile: await getGeminiProfileDto(String(profile.id)) };
+});
+app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await getGeminiProfile(String(req.params.id));
+  if (!profile) return reply.code(404).send({error:'profile not found'});
+  if (geminiLoginProfiles.has(String(profile.id))) return reply.code(409).send({error:'该 Gemini Profile 已有登录任务在运行'});
+  const methodId = String(req.body?.methodId || '').trim();
+  if (!methodId) return reply.code(400).send({error:'methodId required'});
+  const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'starting', startedAt:Date.now() };
+  geminiLoginJobs.set(job.id, job);
+  geminiLoginProfiles.set(String(profile.id), job.id);
+  runGeminiLoginJob(job, req.body || {}).catch((e:any) => {
+    job.status = 'error';
+    job.error = safeGeminiError(e);
+  }).finally(() => {
+    if (geminiLoginProfiles.get(job.profileId) === job.id) geminiLoginProfiles.delete(job.profileId);
+  });
+  return { job };
+});
+app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await getGeminiProfile(String(req.params.id));
+  if (!profile) return reply.code(404).send({error:'profile not found'});
+  if (Number(profile.active || 0)) return reply.code(409).send({error:'不能删除当前正在使用的 Gemini 账户，请先切换到其他账户'});
+  const refs = await geminiSessionReferenceCount(String(profile.id));
+  if (refs > 0) return reply.code(409).send({error:'该 Gemini 账户仍被历史会话引用，不能删除', references:refs});
+  await db.run('DELETE FROM gemini_profiles WHERE id=?1', [String(profile.id)]);
+  await deleteGeminiProfileDir(String(profile.home_dir)).catch(()=>{});
+  return { ok:true };
+});
+app.get('/api/gemini-login/:jobId', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const job = geminiLoginJobs.get(String(req.params.jobId));
+  if (!job) return reply.code(404).send({error:'not found'});
+  return { job };
+});
+app.post('/api/gemini-login/:jobId/input', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const job = geminiLoginJobs.get(String(req.params.jobId));
+  if (!job) return reply.code(404).send({error:'not found'});
+  return reply.code(409).send({error:'当前 Gemini ACP 登录方式未要求网页输入 code'});
+});
+app.post('/api/gemini-login/:jobId/cancel', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const job = geminiLoginJobs.get(String(req.params.jobId));
+  if (!job) return reply.code(404).send({error:'not found'});
+  if (job.status === 'done' || job.status === 'error') return { job };
+  job.status = 'cancelled';
+  if (geminiLoginProfiles.get(job.profileId) === job.id) geminiLoginProfiles.delete(job.profileId);
+  return { job };
 });
 app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (req:any) => {
   const profile = await getProfile(String(req.params.id));
@@ -377,7 +526,7 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   const settings = await appSettings();
   const mode = normalizeMode(req.body?.mode) || settings.defaultMode;
   if (provider === 'antigravity') {
-    const status = await antigravity.status();
+    const status = await cachedAntigravityStatus();
     if (!status.ok) return reply.code(409).send({error:'Antigravity CLI 不可用，不能创建 Antigravity 会话'});
     const activeProfile:any = await getActiveAntigravityProfile();
     if (!activeProfile?.home_dir) return reply.code(409).send({error:'请先登录 Antigravity'});
@@ -395,13 +544,17 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   }
   if (provider === 'gemini') {
     if (!USE_AGENT_RUNTIME) return reply.code(409).send({error:'Gemini ACP 需要 persistent runtime'});
-    const status = await geminiProvider.status();
+    const status = await cachedGeminiStatus();
     if (!status.ok) return reply.code(409).send({error:status.error || 'Gemini CLI 不可用'});
+    const activeProfile:any = await getActiveGeminiProfile();
+    if (!activeProfile?.id) return reply.code(409).send({error:'请先添加并登录 Gemini 账户'});
+    if (!activeProfile.login?.ok) return reply.code(409).send({error:'当前 Gemini 账户未登录，请前往账户页登录'});
     const id = crypto.randomUUID();
     const model = cleanAgentModel(req.body?.model) || cleanAgentModel(settings.defaultModels?.gemini) || null;
     const opts = modeOptions(mode, model || undefined);
     const created = await runtime.createGeminiSession({
       sessionId:id,
+      accountId: activeProfile.id,
       cwd: projectDir,
       title,
       mode,
@@ -709,6 +862,50 @@ async function cachedCodexStatus() {
   });
   return codexStatusCache.promise;
 }
+async function cachedAntigravityStatus(force = false) {
+  return cachedProviderStatus(
+    antigravityStatusCache,
+    cache => { antigravityStatusCache = cache; },
+    'antigravity.status',
+    force,
+    () => antigravity.status()
+  );
+}
+async function cachedGeminiStatus(force = false) {
+  return cachedProviderStatus(
+    geminiStatusCache,
+    cache => { geminiStatusCache = cache; },
+    'geminiProvider.status',
+    force,
+    () => geminiProvider.status({ forceAcpHelp: force })
+  );
+}
+async function cachedProviderStatus(
+  cache: { expiresAt:number; promise?:Promise<any>; value?:any },
+  update: (cache:{ expiresAt:number; promise?:Promise<any>; value?:any }) => void,
+  label: string,
+  force: boolean,
+  read: () => Promise<any>
+) {
+  const now = Date.now();
+  if (!force && cache.value && cache.expiresAt > now) return cache.value;
+  if (!force && cache.promise) return cache.promise;
+  const startedAt = Date.now();
+  const promise = read().then(status => {
+    const ms = Date.now() - startedAt;
+    app.log.info({ ms }, `${label} computed`);
+    const ttl = status?.ok ? PROVIDER_STATUS_OK_CACHE_MS : PROVIDER_STATUS_FAIL_CACHE_MS;
+    const next = { value: status, expiresAt: Date.now() + ttl };
+    update(next);
+    return status;
+  }).catch(err => {
+    app.log.info({ ms:Date.now() - startedAt }, `${label} failed`);
+    update({ expiresAt: 0 });
+    throw err;
+  });
+  update({ ...cache, promise });
+  return promise;
+}
 async function ensureProfiles() {
   await mkdir(PROFILES_DIR, { recursive:true });
   const existing = await db.get('SELECT * FROM codex_profiles LIMIT 1');
@@ -723,6 +920,39 @@ async function ensureProfiles() {
   if (active?.id && active?.codex_home) await updateProfileEmailName(String(active.id), String(active.codex_home)).catch(()=>{});
   const settings = await appSettings();
   if (!settings.defaultMode) await setSetting('defaultMode', 'yolo');
+}
+async function ensureGeminiProfiles() {
+  await mkdir(GEMINI_PROFILES_DIR, { recursive:true, mode:0o700 });
+  await chmod(path.dirname(GEMINI_PROFILES_DIR), 0o700).catch(()=>{});
+  await chmod(GEMINI_PROFILES_DIR, 0o700).catch(()=>{});
+  const defaultHome = process.env.GEMINI_PROFILE_ROOT || path.join(GEMINI_PROFILES_DIR, 'default');
+  if (existsSync(defaultHome)) {
+    await mkdir(defaultHome, { recursive:true, mode:0o700 });
+    await chmod(defaultHome, 0o700).catch(()=>{});
+    const existing = await getGeminiProfile('default');
+    const anyActive = await db.get('SELECT id FROM gemini_profiles WHERE active=1 LIMIT 1');
+    const anyProfile = await db.get('SELECT id FROM gemini_profiles LIMIT 1');
+    const login = await geminiLoginStatus(defaultHome, existing?.auth_type ? String(existing.auth_type) : null).catch(()=>({ ok:false, email:null, text:'Not logged in', authType:null }));
+    const name = login.email || existing?.name || 'Gemini Account';
+    const active = anyActive ? Number(existing?.active || 0) : (!anyProfile ? 1 : 0);
+    await db.run(
+      `INSERT INTO gemini_profiles (id,name,home_dir,auth_type,active,created_at,updated_at)
+       VALUES ('default',?1,?2,?3,?4,?5,?5)
+       ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, auth_type=COALESCE(gemini_profiles.auth_type, excluded.auth_type), active=CASE WHEN gemini_profiles.active=1 THEN 1 ELSE excluded.active END, updated_at=excluded.updated_at`,
+      [name, defaultHome, login.authType || existing?.auth_type || null, active, Date.now()]
+    );
+  }
+  const single = await db.get('SELECT COUNT(*) count FROM gemini_profiles');
+  const activeCount = await db.get('SELECT COUNT(*) count FROM gemini_profiles WHERE active=1');
+  if (Number(single?.count || 0) === 1 && Number(activeCount?.count || 0) === 0) {
+    await db.run('UPDATE gemini_profiles SET active=1, updated_at=?1 WHERE id=(SELECT id FROM gemini_profiles LIMIT 1)', [Date.now()]);
+  }
+  if (Number(activeCount?.count || 0) > 1) {
+    const active = await db.get('SELECT id FROM gemini_profiles WHERE active=1 ORDER BY updated_at DESC LIMIT 1');
+    if (active?.id) await activateGeminiProfile(String(active.id));
+  }
+  await db.run("UPDATE sessions SET account_id='default' WHERE provider_id='gemini' AND (account_id IS NULL OR account_id='')").catch(()=>{});
+  await runtimeDb.run("UPDATE sessions SET account_id='default' WHERE (provider_id='gemini' OR provider='gemini') AND (account_id IS NULL OR account_id='')").catch(()=>{});
 }
 async function ensureSharedCodexDirs(codexHome:string) {
   await mkdir(codexHome, { recursive:true });
@@ -816,6 +1046,202 @@ async function deleteProfileDir(codexHome:string) {
   const parent = path.dirname(realpathSync(codexHome));
   if (!parent.startsWith(root + path.sep)) return;
   await rm(parent, { recursive:true, force:true });
+}
+function geminiHomeForProfile(id:string) {
+  if (!/^[a-f0-9]{16}$/i.test(id)) throw new Error('invalid Gemini profile id');
+  return path.join(GEMINI_PROFILES_DIR, id, 'home');
+}
+async function listGeminiProfiles() {
+  const rows = await db.all('SELECT id,name,home_dir,auth_type,active,created_at,updated_at FROM gemini_profiles ORDER BY active DESC, updated_at DESC');
+  return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
+}
+async function getGeminiProfile(id:string) {
+  return db.get('SELECT id,name,home_dir,auth_type,active,created_at,updated_at FROM gemini_profiles WHERE id=?1', [id]);
+}
+async function getGeminiProfileDto(id:string) {
+  const row = await getGeminiProfile(id);
+  return row ? geminiProfileDto(row) : null;
+}
+async function getActiveGeminiProfile() {
+  const row = await db.get('SELECT id,name,home_dir,auth_type,active,created_at,updated_at FROM gemini_profiles WHERE active=1 ORDER BY updated_at DESC LIMIT 1');
+  return row ? geminiProfileDto(row) : null;
+}
+async function activateGeminiProfile(id:string) {
+  await db.run('UPDATE gemini_profiles SET active=0');
+  await db.run('UPDATE gemini_profiles SET active=1, updated_at=?1 WHERE id=?2', [Date.now(), id]);
+}
+async function geminiProfileDto(row:any) {
+  const login = await geminiLoginStatus(String(row.home_dir), String(row.auth_type || '') || null);
+  const name = login.email || (String(row.name || '').trim() && row.name !== 'Gemini Account' ? row.name : 'Gemini Account');
+  return {
+    id:String(row.id),
+    name,
+    active:Number(row.active || 0),
+    authType: row.auth_type || login.authType || null,
+    login,
+    created_at:Number(row.created_at || 0),
+    updated_at:Number(row.updated_at || 0),
+  };
+}
+async function refreshGeminiProfileName(id:string, homeDir:string, authType:string|null) {
+  const login = await geminiLoginStatus(homeDir, authType);
+  if (login.email || login.authType) {
+    await db.run('UPDATE gemini_profiles SET name=COALESCE(?1,name), auth_type=COALESCE(?2,auth_type), updated_at=?3 WHERE id=?4', [login.email || null, login.authType || null, Date.now(), id]);
+  }
+}
+async function geminiLoginStatus(homeDir:string, authType:string|null = null) {
+  const secretFile = path.join(homeDir, 'agentdeck.env');
+  const hasApiKey = await geminiSecretEnvHas(secretFile, 'GEMINI_API_KEY').catch(()=>false);
+  const email = await scanGeminiEmail(homeDir).catch(()=>null);
+  const detectedAuthType = authType || (hasApiKey ? 'api_key' : (email ? 'oauth' : null));
+  const ok = hasApiKey || !!email;
+  return { ok, email, text: ok ? 'Logged in' : 'Not logged in', authType: detectedAuthType };
+}
+async function geminiSecretEnvHas(file:string, key:string) {
+  if (!existsSync(file)) return false;
+  const text = await readFile(file, 'utf8');
+  return text.split(/\r?\n/).some(line => line.trimStart().startsWith(`${key}=`) && line.split('=').slice(1).join('=').trim().length > 0);
+}
+async function scanGeminiEmail(homeDir:string) {
+  const roots = [path.join(homeDir, '.gemini'), path.join(homeDir, '.config', 'gemini')];
+  for (const root of roots) {
+    const found = await limitedEmailScan(root, 0, { files:0 });
+    if (found) return found;
+  }
+  return null;
+}
+async function limitedEmailScan(dir:string, depth:number, state:{ files:number }): Promise<string|null> {
+  if (depth > 3 || state.files > 40) return null;
+  let entries:any[] = [];
+  try { entries = await readdir(dir, { withFileTypes:true }); } catch { return null; }
+  for (const entry of entries) {
+    if (state.files > 40) return null;
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!/^(config|oauth|auth|account|profiles?|\.gemini)$/i.test(entry.name) && depth > 0) continue;
+      const found = await limitedEmailScan(p, depth + 1, state);
+      if (found) return found;
+    } else if (entry.isFile() && /^(settings|oauth|auth|account|credentials|projects)\.(json|toml|yaml|yml|txt)$/i.test(entry.name)) {
+      const st = await stat(p).catch(()=>null);
+      if (!st || st.size > 256 * 1024) continue;
+      state.files++;
+      const text = await readFile(p, 'utf8').catch(()=>'');
+      const found = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0];
+      if (found) return found.slice(0, 120);
+    }
+  }
+  return null;
+}
+async function geminiSessionReferenceCount(profileId:string) {
+  const web = await db.get("SELECT COUNT(*) count FROM sessions WHERE provider_id='gemini' AND account_id=?1", [profileId]).catch(()=>({ count:0 }));
+  const runtime = await runtimeDb.get("SELECT COUNT(*) count FROM sessions WHERE (provider_id='gemini' OR provider='gemini') AND account_id=?1", [profileId]).catch(()=>({ count:0 }));
+  return Number(web?.count || 0) + Number(runtime?.count || 0);
+}
+async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
+  const profile:any = await getGeminiProfile(job.profileId);
+  if (!profile) throw new Error('profile not found');
+  if (job.status === 'cancelled') return;
+  job.status = 'verifying';
+  const method = job.methodId.toLowerCase();
+  if (method === 'api_key' || method === 'apikey' || method.includes('api')) {
+    const apiKey = String(body.apiKey || '').trim();
+    if (!/^[A-Za-z0-9_.-]{20,}$/.test(apiKey)) throw new Error('Gemini API Key 格式不正确');
+    await writeGeminiProfileSecret(String(profile.home_dir), { GEMINI_API_KEY: apiKey });
+    await db.run("UPDATE gemini_profiles SET auth_type='api_key', updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+    await runtime.restartGeminiProfile(job.profileId).catch(()=>null);
+    const status = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
+    if (status?.error) throw new Error(String(status.error));
+    await refreshGeminiProfileName(job.profileId, String(profile.home_dir), 'api_key').catch(()=>{});
+    job.status = 'done';
+    return;
+  }
+  if (method.includes('oauth') || method.includes('google')) {
+    job.status = 'waiting_user';
+    job.error = `当前 Gemini CLI 0.49.0 的 Google OAuth 会把授权 URL 写入 ACP 进程的终端流，未通过 ACP response 提供可安全桥接的 URL/code。请通过 SSH 执行：HOME=<profile> GEMINI_CONFIG_DIR=<profile> gemini，并完成 Google 登录；完成后回到这里点击重新检测。`;
+    return;
+  }
+  if (method.includes('vertex') || method.includes('gateway')) {
+    job.status = 'error';
+    job.error = '该 Gemini 登录方式需要额外的受控配置表单，本版本暂未在 Web 中启用。';
+    return;
+  }
+  const initialized = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
+  if (initialized?.error) throw new Error(String(initialized.error));
+  const authMethods = Array.isArray(initialized?.authMethods) ? initialized.authMethods : [];
+  const selected = authMethods.find((m:any) => String(m?.id || '') === job.methodId);
+  if (!selected) throw new Error('Gemini ACP 未返回该登录方式');
+  if (String(selected.type || '').toLowerCase() === 'terminal') {
+    job.status = 'waiting_user';
+    job.error = '当前 Gemini CLI 的 Google OAuth 通过终端交互完成；远程网页模式暂不桥接 loopback 登录。请通过 SSH 使用该 Profile 的 HOME/GEMINI_CONFIG_DIR 完成登录后点击重新检测。';
+    return;
+  }
+  await runtime.authenticateGeminiProfile(job.profileId, job.methodId);
+  await runtime.restartGeminiProfile(job.profileId).catch(()=>null);
+  const verified = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
+  if (verified?.error) throw new Error(String(verified.error));
+  if (Array.isArray(verified?.authMethods) && verified.authMethods.length) throw new Error('Gemini 登录未完成，请重新检测或改用 API Key/Vertex');
+  await refreshGeminiProfileName(job.profileId, String(profile.home_dir), null).catch(()=>{});
+  job.status = 'done';
+}
+async function writeGeminiProfileSecret(homeDir:string, values:Record<string,string>) {
+  await mkdir(homeDir, { recursive:true, mode:0o700 });
+  await chmod(homeDir, 0o700).catch(()=>{});
+  const allowed = new Set(['GEMINI_API_KEY','GOOGLE_API_KEY','GOOGLE_CLOUD_PROJECT','GOOGLE_CLOUD_LOCATION','GOOGLE_APPLICATION_CREDENTIALS']);
+  const existing:Record<string,string> = await readGeminiSecretEnv(path.join(homeDir, 'agentdeck.env')).catch(()=>({} as Record<string,string>));
+  const next:Record<string,string> = { ...existing };
+  for (const [key, value] of Object.entries(values)) {
+    if (allowed.has(key) && value) next[key] = value;
+  }
+  const body = Object.entries(next)
+    .filter(([key]) => allowed.has(key))
+    .map(([key, value]) => `${key}=${envFileQuote(value)}`)
+    .join('\n') + '\n';
+  const file = path.join(homeDir, 'agentdeck.env');
+  await writeFile(file, body, { mode:0o600 });
+  await chmod(file, 0o600).catch(()=>{});
+}
+async function removeGeminiProfileSecret(homeDir:string, key:string) {
+  const file = path.join(homeDir, 'agentdeck.env');
+  const existing:Record<string,string> = await readGeminiSecretEnv(file).catch(()=>({} as Record<string,string>));
+  delete existing[key];
+  const body = Object.entries(existing).map(([k, v]) => `${k}=${envFileQuote(v)}`).join('\n');
+  await writeFile(file, body ? body + '\n' : '', { mode:0o600 });
+  await chmod(file, 0o600).catch(()=>{});
+}
+async function readGeminiSecretEnv(file:string) {
+  const allowed = new Set(['GEMINI_API_KEY','GOOGLE_API_KEY','GOOGLE_CLOUD_PROJECT','GOOGLE_CLOUD_LOCATION','GOOGLE_APPLICATION_CREDENTIALS']);
+  const text = await readFile(file, 'utf8');
+  const env:Record<string,string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    if (!allowed.has(key)) continue;
+    let value = line.slice(idx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    env[key] = value;
+  }
+  return env;
+}
+function envFileQuote(value:string) {
+  return JSON.stringify(String(value || ''));
+}
+function sanitizeGeminiRuntimeStatus(status:any) {
+  if (!status || typeof status !== 'object') return status;
+  const { profileDir, ...rest } = status;
+  return rest;
+}
+function safeGeminiError(e:any) {
+  return redactLine(String(e?.message || e || 'Gemini request failed')).replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]');
+}
+async function deleteGeminiProfileDir(homeDir:string) {
+  const root = realpathSync(GEMINI_PROFILES_DIR);
+  const resolvedHome = realpathSync(homeDir);
+  if (resolvedHome === root || !resolvedHome.startsWith(root + path.sep)) return;
+  const parent = path.dirname(resolvedHome);
+  if (parent === root || parent.startsWith(root + path.sep)) await rm(parent, { recursive:true, force:true });
 }
 async function listAntigravityProfiles() {
   await syncAntigravityProfilesFromDisk().catch(()=>{});

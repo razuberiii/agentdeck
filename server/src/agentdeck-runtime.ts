@@ -7,8 +7,8 @@ import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
-import { readFileSync, realpathSync } from 'node:fs';
-import { cp, lstat, mkdir, readlink, rm, symlink } from 'node:fs/promises';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { chmod, cp, lstat, mkdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
@@ -199,18 +199,92 @@ class CodexAccountRuntime extends EventEmitter {
 const db = new Db(DB_FILE);
 await db.init();
 await initRuntimeSchema();
-const gemini = new GeminiAcpRuntime({
-  db,
-  dataDir: DATA_DIR,
-  defaultCwd: DEFAULT_WORKDIR,
-  logger: {
-    info: (obj:any, msg?:string) => app.log.info(obj, msg),
-    warn: (obj:any, msg?:string) => app.log.warn(obj, msg),
-    error: (obj:any, msg?:string) => app.log.error(obj, msg),
-  },
-  appendEvent,
-  updateSession: updateRuntimeSession,
-});
+class GeminiRuntimeManager {
+  private runtimes = new Map<string, GeminiAcpRuntime>();
+  private inFlight = new Map<string, Promise<GeminiAcpRuntime>>();
+
+  async get(profileId:string) {
+    const id = normalizeGeminiProfileId(profileId);
+    const existing = this.runtimes.get(id);
+    if (existing) return existing;
+    const pending = this.inFlight.get(id);
+    if (pending) return pending;
+    const promise = this.create(id).finally(() => this.inFlight.delete(id));
+    this.inFlight.set(id, promise);
+    return promise;
+  }
+
+  async status(profileId = 'default') {
+    const id = normalizeGeminiProfileId(profileId);
+    const runtime = this.runtimes.get(id);
+    if (runtime) return runtime.status();
+    return {
+      installed: existsSync(process.env.GEMINI_BIN || '/usr/bin/gemini'),
+      command: process.env.GEMINI_BIN || '/usr/bin/gemini',
+      acpArgs: (process.env.GEMINI_ACP_ARGS || '--acp').split(/\s+/).filter(Boolean),
+      connected: false,
+      initialized: false,
+      authenticated: false,
+      authMethods: [],
+      capabilities: null,
+      agentInfo: null,
+      profileId:id,
+      lastError: null,
+    };
+  }
+
+  async initialize(profileId:string) {
+    const runtime = await this.get(profileId);
+    await runtime.ensureInitialized();
+    return runtime.status();
+  }
+
+  async authenticate(profileId:string, methodId:string) {
+    const runtime = await this.get(profileId);
+    return runtime.authenticate(methodId);
+  }
+
+  async logout(profileId:string) {
+    const runtime = await this.get(profileId);
+    return runtime.logout();
+  }
+
+  async restart(profileId:string) {
+    const runtime = await this.get(profileId);
+    await runtime.restart();
+    return runtime.status();
+  }
+
+  answerPermission(requestId:string, optionId:string|null) {
+    for (const runtime of this.runtimes.values()) {
+      if (runtime.answerPermission(requestId, optionId)) return true;
+    }
+    return false;
+  }
+
+  private async create(profileId:string) {
+    const profileDir = geminiProfileDir(profileId);
+    await mkdir(profileDir, { recursive:true, mode:0o700 });
+    await chmod(profileDir, 0o700).catch(()=>{});
+    return new GeminiAcpRuntime({
+      db,
+      dataDir: DATA_DIR,
+      defaultCwd: DEFAULT_WORKDIR,
+      profileId,
+      profileDir,
+      profileEnv: await readGeminiProfileEnv(profileDir),
+      logger: {
+        info: (obj:any, msg?:string) => app.log.info(obj, msg),
+        warn: (obj:any, msg?:string) => app.log.warn(obj, msg),
+        error: (obj:any, msg?:string) => app.log.error(obj, msg),
+      },
+      appendEvent,
+      updateSession: updateRuntimeSession,
+    });
+  }
+}
+
+const geminiManager = new GeminiRuntimeManager();
 
 const subscriptions = new Map<string, Set<any>>();
 const runtimes = new Map<string, CodexAccountRuntime>();
@@ -266,10 +340,19 @@ app.get('/diagnostics', async () => ({
   },
 }));
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
-app.get('/gemini/status', async () => gemini.status());
+app.get('/gemini/status', async (req:any) => geminiManager.status(String(req.query?.profileId || 'default')));
+app.get('/gemini/profiles/:id/status', async (req:any) => geminiManager.status(String(req.params.id)));
+app.post('/gemini/profiles/:id/initialize', async (req:any) => geminiManager.initialize(String(req.params.id)));
+app.post('/gemini/profiles/:id/authenticate', async (req:any, reply) => {
+  const methodId = String(req.body?.methodId || '').trim();
+  if (!methodId) return reply.code(400).send({ error:'methodId required' });
+  return geminiManager.authenticate(String(req.params.id), methodId);
+});
+app.post('/gemini/profiles/:id/logout', async (req:any) => geminiManager.logout(String(req.params.id)));
+app.post('/gemini/profiles/:id/restart', async (req:any) => geminiManager.restart(String(req.params.id)));
 app.post('/gemini/approvals/:id', async (req:any, reply) => {
   const optionId = typeof req.body?.optionId === 'string' ? req.body.optionId : null;
-  if (!gemini.answerPermission(String(req.params.id), optionId)) return reply.code(404).send({ error:'approval request not found' });
+  if (!geminiManager.answerPermission(String(req.params.id), optionId)) return reply.code(404).send({ error:'approval request not found' });
   return { ok:true };
 });
 
@@ -352,20 +435,22 @@ app.post('/gemini/sessions', async (req:any, reply) => {
   const body = req.body || {};
   const cwd = String(body.cwd || DEFAULT_WORKDIR);
   const localSessionId = String(body.sessionId || crypto.randomUUID());
+  const accountId = String(body.accountId || 'default');
   const now = Date.now();
   const opts = turnOptions(body);
   await db.run(
     `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_profile_id)
-     VALUES (?1,?1,?2,?3,'initializing',?4,?5,?6,?7,0,?8,?8,'gemini',?9,?7,?2,NULL,'gemini',NULL,NULL,0,NULL,'default')
+     VALUES (?1,?1,?2,?3,'initializing',?4,?5,?6,?7,0,?8,?8,'gemini',?9,?7,?2,NULL,'gemini',NULL,NULL,0,NULL,?9)
      ON CONFLICT(id) DO UPDATE SET project_dir=excluded.project_dir,title=excluded.title,provider_id='gemini',provider='gemini',updated_at=excluded.updated_at`,
-    [localSessionId, cwd, cleanTitle(body.title || path.basename(cwd), cwd), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, body.accountId || 'default']
+    [localSessionId, cwd, cleanTitle(body.title || path.basename(cwd), cwd), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, accountId]
   );
   try {
+    const gemini = await geminiManager.get(accountId);
     const state = await gemini.createSession({ localSessionId, cwd, mode:opts.permissionMode, model:opts.model || null });
     return { session: await getSession(localSessionId), providerSessionId:state.providerSessionId, gemini:gemini.status() };
   } catch (e:any) {
     await db.run('UPDATE sessions SET status=?1, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_session_new_failed', Date.now(), localSessionId]);
-    return reply.code(String(e?.message || '').includes('requires login') ? 409 : 500).send({ error:e?.message || String(e), gemini:gemini.status(), session:await getSession(localSessionId) });
+    return reply.code(String(e?.message || '').includes('requires login') ? 409 : 500).send({ error:e?.message || String(e), gemini:await geminiManager.status(accountId), session:await getSession(localSessionId) });
   }
 });
 
@@ -469,6 +554,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
     const body = req.body || {};
     try {
+      const gemini = await geminiManager.get(String(session.account_id || 'default'));
       await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir));
       const input = Array.isArray(body.input) ? body.input : [{ type:'text', text:String(body.text || '') }];
       const prompt = input.map(geminiContentBlock).filter(Boolean);
@@ -481,7 +567,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
       const message = e?.message || String(e);
       await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_turn_start_failed', Date.now(), session.id]);
       await appendEvent(session.id, 'turn/failed', { provider:'gemini', error:{ message } });
-      return reply.code(message.includes('requires login') ? 409 : 500).send({ error:message, gemini:gemini.status() });
+      return reply.code(message.includes('requires login') ? 409 : 500).send({ error:message, gemini:await geminiManager.status(String(session.account_id || 'default')) });
     }
   }
   const account = await getAccount(String(session.account_id || 'default'));
@@ -539,7 +625,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
 app.post('/sessions/:id/stop', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
-  if (session.provider_id === 'gemini' || session.provider === 'gemini') return gemini.cancel(session.id);
+  if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.account_id || 'default'))).cancel(session.id);
   if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
   const account = await getAccount(String(session.account_id || 'default'));
   if (!account) return reply.code(409).send({ error:'account not found' });
@@ -595,6 +681,45 @@ async function initRuntimeSchema() {
   await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_key ON events(session_id, event_key)');
   await db.run('CREATE INDEX IF NOT EXISTS idx_events_session_type_sequence ON events(session_id, event_type, sequence)');
   await db.run('CREATE INDEX IF NOT EXISTS idx_sessions_upstream_thread_id ON sessions(upstream_thread_id)');
+}
+
+function normalizeGeminiProfileId(value:string) {
+  const id = String(value || 'default');
+  if (id === 'default' || /^[a-f0-9]{16}$/i.test(id)) return id;
+  throw new Error('invalid Gemini profile id');
+}
+
+function geminiProfileDir(profileId:string) {
+  const id = normalizeGeminiProfileId(profileId);
+  if (id === 'default') return process.env.GEMINI_PROFILE_ROOT || path.join(DATA_DIR, 'gemini', 'profiles', 'default');
+  return path.join(DATA_DIR, 'gemini', 'profiles', id, 'home');
+}
+
+async function readGeminiProfileEnv(profileDir:string) {
+  const allowed = new Set(['GEMINI_API_KEY','GOOGLE_API_KEY','GOOGLE_CLOUD_PROJECT','GOOGLE_CLOUD_LOCATION','GOOGLE_APPLICATION_CREDENTIALS']);
+  const file = path.join(profileDir, 'agentdeck.env');
+  let text = '';
+  try { text = await readFile(file, 'utf8'); } catch { return {}; }
+  const env:Record<string,string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    if (!allowed.has(key)) continue;
+    let value = line.slice(idx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    if (key === 'GOOGLE_APPLICATION_CREDENTIALS') {
+      const resolved = path.resolve(profileDir, value);
+      const root = realpathSync(profileDir);
+      const parent = realpathSync(path.dirname(resolved));
+      if (!(parent === root || parent.startsWith(root + path.sep))) continue;
+      value = resolved;
+    }
+    if (value) env[key] = value;
+  }
+  return env;
 }
 
 async function ensureAccount(id:string, codexHome:string) {

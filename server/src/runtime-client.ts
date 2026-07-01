@@ -15,6 +15,11 @@ export class RuntimeClient {
   rateLimits() { return this.request('GET', '/codex/rate-limits'); }
   models(includeHidden = false) { return this.request('GET', `/codex/models?hidden=${includeHidden ? '1' : '0'}`); }
   geminiStatus() { return this.request('GET', '/gemini/status'); }
+  geminiProfileStatus(profileId:string) { return this.request('GET', `/gemini/profiles/${encodeURIComponent(profileId)}/status`); }
+  initializeGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/initialize`); }
+  authenticateGeminiProfile(profileId:string, methodId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/authenticate`, { methodId }); }
+  logoutGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/logout`); }
+  restartGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/restart`); }
   answerGeminiApproval(requestId:string, body:any) { return this.request('POST', `/gemini/approvals/${encodeURIComponent(requestId)}`, body); }
   createCodexSession(body:any) { return this.request('POST', '/codex/sessions', body); }
   createGeminiSession(body:any) { return this.request('POST', '/gemini/sessions', body); }

@@ -29,9 +29,9 @@ export type AgentStatus = {
 export interface AgentProvider {
   id: AgentProviderId;
   displayName: string;
-  getVersion(): Promise<string | null>;
+  getVersion(command?: string | null): Promise<string | null>;
   listModels(includeHidden?: boolean, env?: NodeJS.ProcessEnv): Promise<{ models: AgentModel[]; current: string; error: string | null }>;
-  status(): Promise<AgentStatus>;
+  status(options?: { forceAcpHelp?: boolean }): Promise<AgentStatus>;
 }
 
 export class AntigravityProvider implements AgentProvider {
@@ -39,10 +39,10 @@ export class AntigravityProvider implements AgentProvider {
   displayName = 'Antigravity';
   private candidates = [process.env.ANTIGRAVITY_BIN, 'agy', 'antigravity', 'google-antigravity', 'gemini'].filter(Boolean) as string[];
 
-  async getVersion() {
-    const found = await this.detectCommand();
+  async getVersion(command?: string | null) {
+    const found = command === undefined ? await this.detectCommand() : command;
     if (!found) return null;
-    const version = await tryExec(found, ['--version']);
+    const version = await tryExec(found, ['--version'], 'antigravity --version');
     return version || null;
   }
 
@@ -96,7 +96,7 @@ export class AntigravityProvider implements AgentProvider {
         installHint: '需要先安装 Google 官方 Antigravity/Gemini Coding Agent CLI，并确认登录、模型、恢复会话等命令后才能启用。',
       };
     }
-    const version = await this.getVersion();
+    const version = await this.getVersion(found);
     return {
       id: this.id,
       displayName: this.displayName,
@@ -121,11 +121,12 @@ export class GeminiProvider implements AgentProvider {
   id: AgentProviderId = 'gemini';
   displayName = 'Gemini';
   private candidates = [process.env.GEMINI_BIN, 'gemini'].filter(Boolean) as string[];
+  private acpHelpCache: { command:string; acp:boolean; checkedAt:number } | null = null;
 
-  async getVersion() {
-    const found = await this.detectCommand();
+  async getVersion(command?: string | null) {
+    const found = command === undefined ? await this.detectCommand() : command;
     if (!found) return null;
-    return await tryExec(found, ['--version']) || null;
+    return await tryExec(found, ['--version'], 'gemini --version') || null;
   }
 
   async listModels() {
@@ -136,7 +137,7 @@ export class GeminiProvider implements AgentProvider {
     };
   }
 
-  async status(): Promise<AgentStatus> {
+  async status(options: { forceAcpHelp?: boolean } = {}): Promise<AgentStatus> {
     const found = await this.detectCommand();
     if (!found) {
       return {
@@ -150,9 +151,15 @@ export class GeminiProvider implements AgentProvider {
         installHint: '需要 Node.js 20+ 并安装 @google/gemini-cli，然后用 --acp 启动。',
       };
     }
-    const version = await this.getVersion();
-    const help = await tryExec(found, ['--help']);
-    const acp = /\s--acp\b/.test(help);
+    const version = await this.getVersion(found);
+    let acp = true;
+    if (options.forceAcpHelp || (this.acpHelpCache && this.acpHelpCache.command === found)) {
+      if (!this.acpHelpCache || options.forceAcpHelp || this.acpHelpCache.command !== found) {
+        const help = await tryExec(found, ['--help'], 'gemini --help');
+        this.acpHelpCache = { command: found, acp: /\s--acp\b/.test(help), checkedAt: Date.now() };
+      }
+      acp = this.acpHelpCache.acp;
+    }
     return {
       id: this.id,
       displayName: this.displayName,
@@ -200,16 +207,19 @@ function shellQuote(value: string) {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-async function tryExec(file: string, args: string[]) {
-  const result = await tryExecDetailed(file, args);
+async function tryExec(file: string, args: string[], label?: string) {
+  const result = await tryExecDetailed(file, args, undefined, 5000, label);
   return result.ok ? result.output : '';
 }
 
-async function tryExecDetailed(file: string, args: string[], env?: NodeJS.ProcessEnv, timeout = 5000) {
+async function tryExecDetailed(file: string, args: string[], env?: NodeJS.ProcessEnv, timeout = 5000, label?: string) {
+  const startedAt = Date.now();
   try {
     const { stdout, stderr } = await execFileAsync(file, args, { env, timeout, maxBuffer: 1024 * 1024 });
+    if (label) console.info(`[perf] provider-cli label="${label}" ms=${Date.now() - startedAt}`);
     return { ok: true, output: (stdout || stderr).trim() };
   } catch (e: any) {
+    if (label) console.info(`[perf] provider-cli label="${label}" ms=${Date.now() - startedAt}`);
     return { ok: false, output: String(e?.stdout || e?.stderr || e?.message || e).trim() };
   }
 }
