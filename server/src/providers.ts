@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 
 const execFileAsync = promisify(execFile);
 
-export type AgentProviderId = 'codex' | 'antigravity';
+export type AgentProviderId = 'codex' | 'gemini' | 'antigravity';
 
 export type AgentModel = {
   id: string;
@@ -105,6 +105,62 @@ export class AntigravityProvider implements AgentProvider {
       version,
       command: found,
       error: version ? null : '已发现 CLI，但 --version 未返回可用版本',
+    };
+  }
+
+  private async detectCommand() {
+    for (const name of this.candidates) {
+      const found = await commandPath(name);
+      if (found) return found;
+    }
+    return null;
+  }
+}
+
+export class GeminiProvider implements AgentProvider {
+  id: AgentProviderId = 'gemini';
+  displayName = 'Gemini';
+  private candidates = [process.env.GEMINI_BIN, 'gemini'].filter(Boolean) as string[];
+
+  async getVersion() {
+    const found = await this.detectCommand();
+    if (!found) return null;
+    return await tryExec(found, ['--version']) || null;
+  }
+
+  async listModels() {
+    return {
+      models: [],
+      current: '',
+      error: 'Gemini CLI ACP 当前未提供稳定的可机读模型列表；仅在 ACP config options 返回模型时显示。',
+    };
+  }
+
+  async status(): Promise<AgentStatus> {
+    const found = await this.detectCommand();
+    if (!found) {
+      return {
+        id: this.id,
+        displayName: this.displayName,
+        ok: false,
+        installed: false,
+        version: null,
+        command: null,
+        error: 'Gemini CLI 未安装',
+        installHint: '需要 Node.js 20+ 并安装 @google/gemini-cli，然后用 --acp 启动。',
+      };
+    }
+    const version = await this.getVersion();
+    const help = await tryExec(found, ['--help']);
+    const acp = /\s--acp\b/.test(help);
+    return {
+      id: this.id,
+      displayName: this.displayName,
+      ok: !!version && acp,
+      installed: true,
+      version,
+      command: found,
+      error: version ? (acp ? null : '已安装 Gemini CLI，但 --help 未显示 --acp') : '已发现 CLI，但 --version 未返回可用版本',
     };
   }
 

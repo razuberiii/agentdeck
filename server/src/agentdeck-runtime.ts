@@ -7,11 +7,12 @@ import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { cp, lstat, mkdir, readlink, rm, symlink } from 'node:fs/promises';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
+import { GeminiAcpRuntime } from './acp/gemini-runtime.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -55,6 +56,8 @@ type RuntimeSession = {
   approval_policy:string;
   sandbox_mode:string;
   model:string | null;
+  provider_id?: string | null;
+  provider_session_id?: string | null;
   created_at:number;
   updated_at:number;
   last_sequence:number;
@@ -196,6 +199,18 @@ class CodexAccountRuntime extends EventEmitter {
 const db = new Db(DB_FILE);
 await db.init();
 await initRuntimeSchema();
+const gemini = new GeminiAcpRuntime({
+  db,
+  dataDir: DATA_DIR,
+  defaultCwd: DEFAULT_WORKDIR,
+  logger: {
+    info: (obj:any, msg?:string) => app.log.info(obj, msg),
+    warn: (obj:any, msg?:string) => app.log.warn(obj, msg),
+    error: (obj:any, msg?:string) => app.log.error(obj, msg),
+  },
+  appendEvent,
+  updateSession: updateRuntimeSession,
+});
 
 const subscriptions = new Map<string, Set<any>>();
 const runtimes = new Map<string, CodexAccountRuntime>();
@@ -251,6 +266,7 @@ app.get('/diagnostics', async () => ({
   },
 }));
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
+app.get('/gemini/status', async () => gemini.status());
 
 app.get('/sessions', async (req:any) => {
   const requestId = req.id;
@@ -325,6 +341,27 @@ app.post('/codex/sessions', async (req:any) => {
   await appendEvent(String(thread.id), 'thread/start', { thread, source:'runtime' });
   if (title) await runtime.request('thread/name/set', { threadId:thread.id, name:title }).catch(()=>{});
   return { session: await getSession(String(thread.id)), thread };
+});
+
+app.post('/gemini/sessions', async (req:any, reply) => {
+  const body = req.body || {};
+  const cwd = String(body.cwd || DEFAULT_WORKDIR);
+  const localSessionId = String(body.sessionId || crypto.randomUUID());
+  const now = Date.now();
+  const opts = turnOptions(body);
+  await db.run(
+    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_profile_id)
+     VALUES (?1,?1,?2,?3,'initializing',?4,?5,?6,?7,0,?8,?8,'gemini',?9,?7,?2,NULL,'gemini',NULL,NULL,0,NULL,'default')
+     ON CONFLICT(id) DO UPDATE SET project_dir=excluded.project_dir,title=excluded.title,provider_id='gemini',provider='gemini',updated_at=excluded.updated_at`,
+    [localSessionId, cwd, cleanTitle(body.title || path.basename(cwd), cwd), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, body.accountId || 'default']
+  );
+  try {
+    const state = await gemini.createSession({ localSessionId, cwd, mode:opts.permissionMode, model:opts.model || null });
+    return { session: await getSession(localSessionId), providerSessionId:state.providerSessionId, gemini:gemini.status() };
+  } catch (e:any) {
+    await db.run('UPDATE sessions SET status=?1, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_session_new_failed', Date.now(), localSessionId]);
+    return reply.code(String(e?.message || '').includes('requires login') ? 409 : 500).send({ error:e?.message || String(e), gemini:gemini.status(), session:await getSession(localSessionId) });
+  }
 });
 
 app.post('/codex/sessions/resume', async (req:any, reply) => {
@@ -424,6 +461,24 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
 app.post('/sessions/:id/turns', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
+  if (session.provider_id === 'gemini' || session.provider === 'gemini') {
+    const body = req.body || {};
+    try {
+      await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir));
+      const input = Array.isArray(body.input) ? body.input : [{ type:'text', text:String(body.text || '') }];
+      const prompt = input.map(geminiContentBlock).filter(Boolean);
+      if (!prompt.length) return reply.code(400).send({ error:'empty message' });
+      await appendEvent(session.id, 'user', { input });
+      const running = gemini.prompt(session.id, prompt as any[]);
+      running.catch(e => app.log.warn({ err:e, sessionId:session.id }, 'gemini prompt failed'));
+      return { ok:true, provider:'gemini' };
+    } catch (e:any) {
+      const message = e?.message || String(e);
+      await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_turn_start_failed', Date.now(), session.id]);
+      await appendEvent(session.id, 'turn/failed', { provider:'gemini', error:{ message } });
+      return reply.code(message.includes('requires login') ? 409 : 500).send({ error:message, gemini:gemini.status() });
+    }
+  }
   const account = await getAccount(String(session.account_id || 'default'));
   if (!account) return reply.code(409).send({ error:'account not found' });
   const runtime = await runtimeForAccount(account.id);
@@ -479,6 +534,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
 app.post('/sessions/:id/stop', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
+  if (session.provider_id === 'gemini' || session.provider === 'gemini') return gemini.cancel(session.id);
   if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
   const account = await getAccount(String(session.account_id || 'default'));
   if (!account) return reply.code(409).send({ error:'account not found' });
@@ -521,6 +577,9 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE sessions ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN interruption_reason TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN provider_profile_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN provider_capabilities TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN provider_metadata TEXT').catch(()=>{});
   await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN sequence INTEGER').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN event_type TEXT').catch(()=>{});
@@ -1221,6 +1280,41 @@ function cleanModel(value:any) {
 function cleanTitle(value:any, cwd:string) {
   const raw = String(value || '').split(/\r?\n/)[0].trim();
   return (raw || path.basename(cwd)).slice(0, 120);
+}
+
+async function updateRuntimeSession(sessionId:string, values:Record<string, string | number | null>) {
+  const entries = Object.entries(values);
+  if (!entries.length) return;
+  const assignments = entries.map(([key], index) => `${key}=?${index + 1}`).join(',');
+  await db.run(`UPDATE sessions SET ${assignments} WHERE id=?${entries.length + 1} OR codex_thread_id=?${entries.length + 1}`, [...entries.map(([, value]) => value), sessionId]);
+}
+
+function geminiContentBlock(item:any) {
+  if (item?.type === 'text') return { type:'text', text:String(item.text || '') };
+  if (item?.type === 'localImage' && item.path) {
+    const filePath = String(item.path);
+    const mimeType = mimeFromPath(filePath) || 'application/octet-stream';
+    if (mimeType.startsWith('image/')) {
+      try {
+        return { type:'image', data:readFileSync(filePath).toString('base64'), mimeType, uri:`file://${filePath}` };
+      } catch {
+        return { type:'resource_link', name:path.basename(filePath), uri:`file://${filePath}`, mimeType };
+      }
+    }
+    return { type:'resource_link', name:path.basename(filePath), uri:`file://${filePath}`, mimeType };
+  }
+  return null;
+}
+
+function mimeFromPath(filePath:string) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.txt' || ext === '.md' || ext === '.log' || ext === '.patch' || ext === '.diff') return 'text/plain';
+  if (ext === '.json') return 'application/json';
+  if (ext === '.pdf') return 'application/pdf';
+  return null;
 }
 
 function portForAccount(accountId:string) {

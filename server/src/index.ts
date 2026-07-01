@@ -4,6 +4,7 @@ import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import staticPlugin from '@fastify/static';
+import multipart from '@fastify/multipart';
 import argon2 from 'argon2';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -12,13 +13,14 @@ import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import { promisify } from 'node:util';
-import { realpathSync, existsSync } from 'node:fs';
+import { createWriteStream, realpathSync, existsSync } from 'node:fs';
 import { chmod, cp, lstat, mkdir, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { rm } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
 import { Db } from './db.js';
 import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
-import { AntigravityProvider, type AgentProviderId } from './providers.js';
+import { AntigravityProvider, GeminiProvider, type AgentProviderId } from './providers.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -31,7 +33,9 @@ const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
-const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 16 * 1024 * 1024);
+const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 32 * 1024 * 1024);
+const MAX_ATTACHMENTS_PER_MESSAGE = Number(process.env.MAX_ATTACHMENTS_PER_MESSAGE || 10);
+const MAX_TOTAL_ATTACHMENT_BYTES = Number(process.env.MAX_TOTAL_ATTACHMENT_BYTES || 64 * 1024 * 1024);
 const ARCHIVED_SESSION_RETENTION_DAYS = Number(process.env.ARCHIVED_SESSION_RETENTION_DAYS || 30);
 const ARCHIVED_SESSION_CLEANUP_INTERVAL_MS = Number(process.env.ARCHIVED_SESSION_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const IMAGE_TYPES: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/pjpeg': '.jpg', 'image/webp': '.webp' };
@@ -48,6 +52,7 @@ const codex = new CodexBridge(DEFAULT_HOME, DEFAULT_CODEX_HOME);
 const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
 const antigravity = new AntigravityProvider();
+const geminiProvider = new GeminiProvider();
 const clients = new Map<string, Set<any>>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
@@ -81,6 +86,9 @@ await db.run('ALTER TABLE sessions ADD COLUMN model_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN workspace_path TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN provider_session_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN provider_profile_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN provider_capabilities TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN provider_metadata TEXT').catch(()=>{});
 await runtimeDb.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
 await db.run("UPDATE sessions SET provider_id='codex' WHERE provider_id IS NULL OR provider_id=''").catch(()=>{});
 await db.run('UPDATE sessions SET provider_session_id=codex_thread_id WHERE provider_session_id IS NULL AND codex_thread_id IS NOT NULL').catch(()=>{});
@@ -98,6 +106,7 @@ const app = Fastify({ bodyLimit: Number(process.env.BODY_LIMIT_BYTES || 25 * 102
 await app.register(cookie, { secret: process.env.COOKIE_SECRET || crypto.randomBytes(32).toString('hex') });
 await app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
 await app.register(websocket);
+await app.register(multipart, { limits: { fileSize: MAX_ATTACHMENT_BYTES, files: MAX_ATTACHMENTS_PER_MESSAGE } });
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 await app.register(staticPlugin, { root: publicDir, prefix: '/' });
 app.addHook('preHandler', async (req, reply) => { if (['POST','PUT','PATCH','DELETE'].includes(req.method) && !['/api/login'].includes(req.url)) { const csrf = req.cookies[CSRF_COOKIE]; if (!csrf || req.headers['x-csrf-token'] !== csrf) return reply.code(403).send({error:'csrf'}); } });
@@ -114,7 +123,9 @@ app.get('/api/status', async (req) => {
   const activeAntigravityProfile = await getActiveAntigravityProfile();
   const codexStatus = await cachedCodexStatus();
   const antigravityStatus = await antigravity.status();
-  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeAntigravityProfile, capabilities: { imageInput: true, imageOutput: true, attachmentTypes: Object.keys(IMAGE_TYPES), maxAttachmentBytes: MAX_ATTACHMENT_BYTES } };
+  const geminiStatus = await geminiProvider.status();
+  const geminiRuntime = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : { error:'persistent runtime disabled' };
+  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeAntigravityProfile, capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
@@ -127,6 +138,21 @@ app.post('/api/maintenance/cleanup-archived', { preHandler: ensureAuth }, async 
 app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const settings = await appSettings();
   const provider = normalizeProvider(req.query?.provider) || settings.activeProvider;
+  if (provider === 'gemini') {
+    const status = await geminiProvider.status();
+    const runtimeStatus = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : null;
+    return {
+      providerId: 'gemini',
+      account: null,
+      rateLimits: null,
+      provider: { ...status, runtime: runtimeStatus },
+      errors: {
+        account: runtimeStatus?.authenticated ? null : 'Gemini CLI 未提供可用额度接口，且当前 profile 尚未完成登录或 API key 配置',
+        rateLimits: 'Gemini CLI 未提供稳定的可机读额度接口',
+      },
+      checkedAt: Date.now(),
+    };
+  }
   if (provider === 'antigravity') {
     const status = await antigravity.status();
     const activeProfile:any = await getActiveAntigravityProfile();
@@ -157,7 +183,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
     checkedAt: Date.now(),
   };
 });
-app.get('/api/settings', { preHandler: ensureAuth }, async () => { await syncAntigravityProfilesFromDisk().catch(()=>{}); const codexStatus = await cachedCodexStatus(); const antigravityStatus = await antigravity.status(); return { settings: await appSettings(), profiles: await listProfiles(), activeProfile: await getActiveProfile(), antigravityProfiles: await listAntigravityProfiles(), activeAntigravityProfile: await getActiveAntigravityProfile(), codex: codexStatus, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), antigravityStatus] }; });
+app.get('/api/settings', { preHandler: ensureAuth }, async () => { await syncAntigravityProfilesFromDisk().catch(()=>{}); const codexStatus = await cachedCodexStatus(); const antigravityStatus = await antigravity.status(); const geminiStatus = await geminiProvider.status(); const geminiRuntime = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : { error:'persistent runtime disabled' }; return { settings: await appSettings(), profiles: await listProfiles(), activeProfile: await getActiveProfile(), antigravityProfiles: await listAntigravityProfiles(), activeAntigravityProfile: await getActiveAntigravityProfile(), codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] }; });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
   if (provider) await setSetting('activeProvider', provider);
@@ -166,8 +192,8 @@ app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultModel')) {
     const settings = await appSettings();
     const modelProvider = normalizeProvider(req.body?.provider) || provider || settings.activeProvider;
-    const model = modelProvider === 'antigravity' ? cleanAgentModel(req.body?.defaultModel) : cleanModel(req.body?.defaultModel);
-    await setSetting(modelProvider === 'antigravity' ? 'defaultModelAntigravity' : 'defaultModelCodex', model || '');
+    const model = modelProvider === 'antigravity' || modelProvider === 'gemini' ? cleanAgentModel(req.body?.defaultModel) : cleanModel(req.body?.defaultModel);
+    await setSetting(modelProvider === 'antigravity' ? 'defaultModelAntigravity' : modelProvider === 'gemini' ? 'defaultModelGemini' : 'defaultModelCodex', model || '');
   }
   return { settings: await appSettings() };
 });
@@ -367,6 +393,24 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     );
     return rowSessionDto(await findSession(id));
   }
+  if (provider === 'gemini') {
+    if (!USE_AGENT_RUNTIME) return reply.code(409).send({error:'Gemini ACP 需要 persistent runtime'});
+    const status = await geminiProvider.status();
+    if (!status.ok) return reply.code(409).send({error:status.error || 'Gemini CLI 不可用'});
+    const id = crypto.randomUUID();
+    const model = cleanAgentModel(req.body?.model) || cleanAgentModel(settings.defaultModels?.gemini) || null;
+    const opts = modeOptions(mode, model || undefined);
+    const created = await runtime.createGeminiSession({
+      sessionId:id,
+      cwd: projectDir,
+      title,
+      mode,
+      model,
+      approvalPolicy: opts.approvalPolicy,
+      sandboxMode: opts.sandboxMode,
+    });
+    return rowSessionDto(created.session);
+  }
   const model = cleanModel(req.body?.model) || cleanModel(settings.defaultModels?.codex);
   const activeProfile:any = await getActiveProfile();
   const accountId = activeProfile?.id || null;
@@ -433,7 +477,7 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
   sanitizeThreadForMobile(read.thread);
   return { session: await indexedSession(read.thread), thread: read.thread, branch: await gitBranch(read.thread.cwd), interrupted: (row?.status === 'interrupted') };
 });
-app.patch('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); const provider = normalizeProvider(row?.provider_id) || 'codex'; const title = String(req.body?.title || '').trim(); const mode = normalizeMode(req.body?.mode); if (title) { if (provider === 'codex') { if (USE_AGENT_RUNTIME) await runtime.setSessionTitle(threadId, title).catch(()=>{}); else await codex.setName(threadId, title); } await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title, Date.now(), threadId]); } if (mode) { const fields = modeFields(mode); await db.run('UPDATE sessions SET permission_mode=?1, approval_policy=?2, sandbox_mode=?3, updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',[fields.permission_mode, fields.approval_policy, fields.sandbox_mode, Date.now(), threadId]); } if (Object.prototype.hasOwnProperty.call(req.body || {}, 'model')) { const model = provider === 'antigravity' ? cleanAgentModel(req.body?.model) : cleanModel(req.body?.model); await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model || null, Date.now(), threadId]); } return {ok:true}; });
+app.patch('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); const provider = normalizeProvider(row?.provider_id) || 'codex'; const title = String(req.body?.title || '').trim(); const mode = normalizeMode(req.body?.mode); if (title) { if (provider === 'codex') { if (USE_AGENT_RUNTIME) await runtime.setSessionTitle(threadId, title).catch(()=>{}); else await codex.setName(threadId, title); } await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title, Date.now(), threadId]); } if (mode) { const fields = modeFields(mode); await db.run('UPDATE sessions SET permission_mode=?1, approval_policy=?2, sandbox_mode=?3, updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',[fields.permission_mode, fields.approval_policy, fields.sandbox_mode, Date.now(), threadId]); } if (Object.prototype.hasOwnProperty.call(req.body || {}, 'model')) { const model = provider === 'antigravity' || provider === 'gemini' ? cleanAgentModel(req.body?.model) : cleanModel(req.body?.model); await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model || null, Date.now(), threadId]); } return {ok:true}; });
 app.post('/api/sessions/:id/archive', { preHandler: ensureAuth }, async (req:any) => {
   const row = await findSession(req.params.id);
   const threadId = String(row?.codex_thread_id || req.params.id);
@@ -471,6 +515,7 @@ app.get('/api/sessions/:id/diff', { preHandler: ensureAuth }, async (req:any, re
 app.post('/api/sessions/:id/attachments', { preHandler: ensureAuth }, async (req:any, reply) => {
   const row = await findSession(req.params.id);
   if (!row) return reply.code(404).send({error:'not found'});
+  if (req.isMultipart?.()) return uploadMultipartAttachment(req, reply, row);
   const type = String(req.body?.type || '');
   const name = cleanFileName(String(req.body?.name || 'image'));
   const data = String(req.body?.data || '');
@@ -481,13 +526,13 @@ app.post('/api/sessions/:id/attachments', { preHandler: ensureAuth }, async (req
   if (!looksLikeImage(buffer, type)) return reply.code(400).send({error:'image content does not match type'});
   const threadId = String(row.codex_thread_id || row.id);
   const attachmentId = crypto.randomBytes(16).toString('base64url');
-  const dir = path.join(ATTACHMENTS_DIR, threadId);
-  await mkdir(dir, { recursive: true });
-  const filename = `${attachmentId}${ext}`;
+  const dir = path.join(ATTACHMENTS_DIR, threadId, attachmentId);
+  await mkdir(dir, { recursive: true, mode:0o700 });
+  const filename = cleanFileName(name).replace(/\.[^.]+$/, '') + ext;
   const filePath = path.join(dir, filename);
-  const meta = { id: attachmentId, sessionId: threadId, name, type, size: buffer.length, path: filePath, createdAt: Date.now() };
+  const meta = { id: attachmentId, sessionId: threadId, name, type, mime:type, kind:'image', size: buffer.length, path: filePath, storagePath:filePath, createdAt: Date.now() };
   await writeFile(filePath, buffer, { flag: 'wx' });
-  await writeFile(path.join(dir, `${attachmentId}.json`), JSON.stringify(meta));
+  await writeFile(path.join(dir, 'meta.json'), JSON.stringify(meta));
   return attachmentDto(meta);
 });
 app.get('/api/sessions/:id/attachments/:attachmentId', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -497,7 +542,9 @@ app.get('/api/sessions/:id/attachments/:attachmentId', { preHandler: ensureAuth 
   if (!meta) return reply.code(404).send({error:'not found'});
   const buffer = await readFile(meta.path);
   reply.header('Cache-Control', 'private, max-age=86400');
-  return reply.type(meta.type).send(buffer);
+  reply.header('X-Content-Type-Options', 'nosniff');
+  if (!safeInlineMime(meta.type || meta.mime)) reply.header('Content-Disposition', `attachment; filename="${String(meta.name || 'download').replace(/"/g, '_')}"`);
+  return reply.type(meta.type || meta.mime || 'application/octet-stream').send(buffer);
 });
 app.get('/api/sessions/:id/image-file/:token', { preHandler: ensureAuth }, async (req:any, reply) => {
   const row = await findSession(req.params.id);
@@ -532,7 +579,7 @@ app.get('/api/sessions/:id/files/:artifactId', { preHandler: ensureAuth }, async
   reply.header('Cache-Control', 'private, max-age=86400');
   return reply.type(String(artifact.mime)).send(await readFile(String(artifact.path)));
 });
-app.post('/api/sessions/:id/stop', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); if (USE_AGENT_RUNTIME && (!row || normalizeProvider(row.provider_id) === 'codex')) { await runtime.stopTurn(threadId); } else { await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); return {ok:true}; });
+app.post('/api/sessions/:id/stop', { preHandler: ensureAuth }, async (req:any) => { await stopTurn(String(req.params.id)); return {ok:true}; });
 app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
   cleanupPendingApprovals();
   const requestKey = String(req.params.requestId);
@@ -714,12 +761,13 @@ async function appSettings() {
   const legacyAntigravityModel = legacyCodexModel ? '' : (cleanAgentModel(map.defaultModel) || '');
   const defaultModels = {
     codex: cleanModel(map.defaultModelCodex) || legacyCodexModel,
+    gemini: cleanAgentModel(map.defaultModelGemini) || '',
     antigravity: cleanAgentModel(map.defaultModelAntigravity) || legacyAntigravityModel,
   };
   return {
     activeProvider,
     defaultMode: normalizeMode(map.defaultMode) || 'yolo',
-    defaultModel: activeProvider === 'antigravity' ? defaultModels.antigravity : defaultModels.codex,
+    defaultModel: activeProvider === 'antigravity' ? defaultModels.antigravity : activeProvider === 'gemini' ? defaultModels.gemini : defaultModels.codex,
     defaultModels,
   };
 }
@@ -978,7 +1026,7 @@ function isUsefulAntigravityUsage(text:string){ return /usage|quota|limit|额度
 function redactLine(line:string){ return line.replace(/(token|secret|password|refresh_token|access_token)[^\n]*/ig, '$1=[redacted]'); }
 function shellQuote(value:string) { return `'${value.replaceAll("'", "'\\''")}'`; }
 function normalizeMode(value:any) { const v = String(value || ''); return ['yolo','workspace-write','read-only'].includes(v) ? v : null; }
-function normalizeProvider(value:any): AgentProviderId | null { const v = String(value || ''); return v === 'codex' || v === 'antigravity' ? v : null; }
+function normalizeProvider(value:any): AgentProviderId | null { const v = String(value || ''); return v === 'codex' || v === 'gemini' || v === 'antigravity' ? v : null; }
 function cleanModel(value:any) { const v = String(value || '').trim(); return /^[\w./:-]{1,120}$/.test(v) ? v : ''; }
 function cleanAgentModel(value:any) { const v = String(value || '').trim(); return /^[\w ./:()+-]{1,160}$/.test(v) ? v : ''; }
 function modeFields(mode:string) {
@@ -986,7 +1034,7 @@ function modeFields(mode:string) {
   if (mode === 'workspace-write') return { permission_mode:'workspace-write', approval_policy:'on-request', sandbox_mode:'workspace-write' };
   return { permission_mode:'yolo', approval_policy:'never', sandbox_mode:'danger-full-access' };
 }
-function modeOptions(mode:string, model?:string) { const f = modeFields(mode); return { approvalPolicy:f.approval_policy, sandboxMode:f.sandbox_mode, model:cleanModel(model) || undefined }; }
+function modeOptions(mode:string, model?:string) { const f = modeFields(mode); return { approvalPolicy:f.approval_policy, sandboxMode:f.sandbox_mode, model:cleanModel(model) || cleanAgentModel(model) || undefined }; }
 function sessionMode(row:any) { return normalizeMode(row?.permission_mode) || (row?.sandbox_mode === 'read-only' ? 'read-only' : row?.sandbox_mode === 'workspace-write' ? 'workspace-write' : 'yolo'); }
 function modeLabel(mode:string) { if (mode === 'read-only') return 'Read Only'; if (mode === 'workspace-write') return 'Workspace Write'; return 'YOLO · Full Access'; }
 async function effectiveModel(row:any) { const settings = await appSettings(); return cleanModel(row?.model) || cleanModel(settings.defaultModels?.codex) || undefined; }
@@ -1009,6 +1057,19 @@ function providerModelCatalog(result:any) {
   return { models: normalized, current: String(result?.current || normalized.find((m:any)=>m.isDefault)?.model || normalized[0]?.model || ''), error: result?.error || null };
 }
 async function modelCatalog(includeHidden = false, provider: AgentProviderId = 'codex') {
+  if (provider === 'gemini') {
+    const runtimeStatus = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : null;
+    const configOptions = runtimeStatus?.runtime?.configOptions || runtimeStatus?.configOptions || [];
+    const modelOptions = Array.isArray(configOptions)
+      ? configOptions.filter((opt:any) => String(opt.category || '').includes('model') || String(opt.id || opt.name || '').toLowerCase().includes('model'))
+      : [];
+    return {
+      models: [],
+      current: '',
+      error: modelOptions.length ? null : 'Gemini CLI ACP 当前没有返回稳定的模型列表；保持 CLI 当前配置。',
+      configOptions: modelOptions,
+    };
+  }
   if (provider === 'antigravity') {
     const activeProfile:any = await getActiveAntigravityProfile();
     if (!activeProfile?.home_dir) return { models: [], current: '', error: '请先登录 Antigravity，再读取模型列表' };
@@ -1085,11 +1146,32 @@ function codexProviderStatus(status:any) {
     command: 'codex',
   };
 }
+function attachmentCapabilities(geminiRuntime:any = null) {
+  return {
+    imageInput: true,
+    imageOutput: true,
+    fileInput: false,
+    attachmentTypes: Object.keys(IMAGE_TYPES),
+    maxAttachmentBytes: MAX_ATTACHMENT_BYTES,
+    maxAttachmentsPerMessage: Number(process.env.MAX_ATTACHMENTS_PER_MESSAGE || 10),
+    maxTotalAttachmentBytes: Number(process.env.MAX_TOTAL_ATTACHMENT_BYTES || 64 * 1024 * 1024),
+    providers: {
+      codex: { imageInput:true, fileInput:false, fileTransport:'path' },
+      gemini: {
+        imageInput: !!geminiRuntime?.capabilities?.promptCapabilities?.image,
+        fileInput: true,
+        fileTransport: geminiRuntime?.capabilities?.promptCapabilities?.embeddedContext ? 'embedded' : 'resource-link',
+        loadSession: !!geminiRuntime?.capabilities?.loadSession,
+      },
+      antigravity: { imageInput:true, fileInput:false, fileTransport:'path' },
+    },
+  };
+}
 function pathAllowed(p:string){ try { const rp = realpathSync(p); return roots.some(r => rp === r || rp.startsWith(r + path.sep)); } catch { return false; } }
 async function findSession(id:string){ return db.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1',[id]); }
 async function upsertThread(thread:any, extra:any = {}) { if (!thread?.id || !pathAllowed(thread.cwd)) return; const existing:any = await findSession(String(thread.id)); const title = cleanTitle(extra.title || existing?.title || thread.name || thread.preview, thread.cwd); const now = Date.now(); const mode = normalizeMode(extra.permission_mode) || 'yolo'; const fields = { ...modeFields(mode), ...extra }; const model = cleanModel(fields.model); await db.run("INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'codex',?12,?8,?2,?1) ON CONFLICT(id) DO UPDATE SET codex_thread_id=excluded.codex_thread_id, project_dir=excluded.project_dir, title=excluded.title, status=excluded.status, archived=excluded.archived, provider_id=COALESCE(sessions.provider_id,'codex'), account_id=COALESCE(sessions.account_id,excluded.account_id), model_id=excluded.model_id, workspace_path=excluded.workspace_path, provider_session_id=excluded.provider_session_id, updated_at=excluded.updated_at", [thread.id, thread.cwd, title, extra.status || statusName(thread.status), fields.permission_mode, fields.approval_policy, fields.sandbox_mode, model || null, extra.archived ?? 0, (thread.createdAt || Math.floor(now/1000))*1000, (thread.updatedAt || Math.floor(now/1000))*1000, fields.account_id || null]); }
 async function indexedSession(thread:any){ const row = await findSession(thread.id); return sessionDto(thread, row || undefined); }
-function sessionDto(thread:any, row:any = {}) { const fields = modeFields(sessionMode(row)); const providerId = normalizeProvider(row.provider_id) || 'codex'; return { id: thread.id, codex_thread_id: thread.id, provider_id: providerId, providerId, provider_session_id: row.provider_session_id || thread.id, account_id: row.account_id || null, workspace_path: row.workspace_path || thread.cwd, project_dir: thread.cwd, title: cleanTitle(row.title || thread.name || thread.preview, thread.cwd), status: row.status || statusName(thread.status), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model:cleanModel(row.model), model_id: cleanModel(row.model_id) || cleanModel(row.model), archived: Number(row.archived || 0), created_at: (thread.createdAt || 0)*1000, updated_at: (thread.updatedAt || 0)*1000, last_sequence:Number(row.last_sequence || 0), path: thread.path || null }; }
+function sessionDto(thread:any, row:any = {}) { const fields = modeFields(sessionMode(row)); const providerId = normalizeProvider(row.provider_id) || 'codex'; const model = providerId === 'codex' ? cleanModel(row.model) : cleanAgentModel(row.model); const modelId = providerId === 'codex' ? cleanModel(row.model_id) || model : cleanAgentModel(row.model_id) || model; return { id: thread.id, codex_thread_id: thread.id, provider_id: providerId, providerId, provider_session_id: row.provider_session_id || thread.id, account_id: row.account_id || null, workspace_path: row.workspace_path || thread.cwd, project_dir: thread.cwd, title: cleanTitle(row.title || thread.name || thread.preview, thread.cwd), status: row.status || statusName(thread.status), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived: Number(row.archived || 0), created_at: (thread.createdAt || 0)*1000, updated_at: (thread.updatedAt || 0)*1000, last_sequence:Number(row.last_sequence || 0), path: thread.path || null }; }
 function threadFromRow(row:any) {
   const now = Date.now();
   return {
@@ -1203,8 +1285,8 @@ function compactSnapshotItem(item:any) {
 function rowSessionDto(row:any) {
   const fields = modeFields(sessionMode(row));
   const providerId = normalizeProvider(row.provider_id) || 'codex';
-  const model = providerId === 'antigravity' ? cleanAgentModel(row.model) : cleanModel(row.model);
-  const modelId = providerId === 'antigravity' ? cleanAgentModel(row.model_id) || model : cleanModel(row.model_id) || model;
+  const model = providerId === 'antigravity' || providerId === 'gemini' ? cleanAgentModel(row.model) : cleanModel(row.model);
+  const modelId = providerId === 'antigravity' || providerId === 'gemini' ? cleanAgentModel(row.model_id) || model : cleanModel(row.model_id) || model;
   return { id:String(row.codex_thread_id || row.id), codex_thread_id:String(row.codex_thread_id || row.id), provider_id:providerId, providerId, provider_session_id:String(row.provider_session_id || row.codex_thread_id || row.id), account_id:row.account_id || null, workspace_path:String(row.workspace_path || row.project_dir), project_dir:String(row.project_dir), title:String(row.title || projectNameFromPath(String(row.project_dir))), status:String(row.status || 'idle'), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived:Number(row.archived || 0), created_at:Number(row.created_at || 0), updated_at:Number(row.updated_at || 0), last_sequence:Number(row.last_sequence || 0), path:null };
 }
 async function antigravityThread(row:any) {
@@ -1355,6 +1437,27 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   if (normalizeProvider(row.provider_id) === 'antigravity') {
     await sendAntigravityTurn(row, text, attachments);
     ack('accepted');
+    return;
+  }
+  if (normalizeProvider(row.provider_id) === 'gemini') {
+    const input = await buildTurnInput(threadId, text, attachments);
+    const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+    const subscription = ensureRuntimePushSubscription(threadId);
+    broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['submitting',Date.now(),threadId]).catch(()=>{});
+    broadcast(threadId, userMessage);
+    ack('persisted');
+    try {
+      await runtime.startTurn(threadId, { input, text, cwd:String(row.project_dir), approvalPolicy:row.approval_policy, sandboxMode:row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]).catch(()=>{});
+      ack('accepted');
+    } catch (e:any) {
+      const message = e?.message || String(e);
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+      ack('failed', message);
+      broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
+      throw e;
+    }
     return;
   }
   const input = await buildTurnInput(threadId, text, attachments);
@@ -1735,12 +1838,80 @@ async function buildTurnInput(threadId:string, text:string, attachments:any[]){
   if (text.trim()) input.push({ type:'text', text, text_elements: [] });
   for (const a of attachments) {
     const meta = await readAttachmentMeta(threadId, String(a.id));
-    input.push({ type:'localImage', path: meta.path, detail:'high' });
+    if (String(meta.kind || '').startsWith('image') || String(meta.type || meta.mime || '').startsWith('image/')) input.push({ type:'localImage', path: meta.path, detail:'high' });
+    else input.push({ type:'text', text:`Attachment: ${meta.name}\nMIME: ${meta.type || meta.mime}\nSize: ${meta.size} bytes\nLocal path: ${meta.path}\nRead this file from the local path if needed.`, text_elements: [] });
   }
   if (!input.length) throw new Error('empty message');
   return input;
 }
 function cleanFileName(name:string){ return path.basename(name).replace(/[^\w.\- ()]/g, '_').slice(0, 120) || 'image'; }
+async function uploadMultipartAttachment(req:any, reply:any, row:any) {
+  const part = await req.file();
+  if (!part) return reply.code(400).send({ error:'file required' });
+  const threadId = String(row.codex_thread_id || row.id);
+  const attachmentId = crypto.randomBytes(16).toString('base64url');
+  const name = cleanFileName(String(part.filename || 'attachment'));
+  const dir = path.join(ATTACHMENTS_DIR, threadId, attachmentId);
+  const tmpDir = path.join(ATTACHMENTS_DIR, '.tmp');
+  await mkdir(dir, { recursive:true, mode:0o700 });
+  await mkdir(tmpDir, { recursive:true, mode:0o700 });
+  const tmp = path.join(tmpDir, `${attachmentId}.upload`);
+  let size = 0;
+  part.file.on('data', (chunk:Buffer) => { size += chunk.length; });
+  try {
+    await pipeline(part.file, createWriteStream(tmp, { flags:'wx', mode:0o600 }));
+    const st = await stat(tmp);
+    size = st.size;
+    if (!size) throw Object.assign(new Error('empty file'), { statusCode:400 });
+    if (size > MAX_ATTACHMENT_BYTES) throw Object.assign(new Error('file too large'), { statusCode:413 });
+    const head = await readFileHead(tmp, 4096);
+    const detected = detectAttachmentType(head, name, String(part.mimetype || ''));
+    const finalName = cleanFileName(name) || `attachment${detected.ext || ''}`;
+    const finalPath = path.join(dir, finalName);
+    await rename(tmp, finalPath);
+    const meta = { id:attachmentId, sessionId:threadId, name:finalName, type:detected.mime, mime:detected.mime, kind:detected.kind, size, path:finalPath, storagePath:finalPath, createdAt:Date.now() };
+    await writeFile(path.join(dir, 'meta.json'), JSON.stringify(meta));
+    return attachmentDto(meta);
+  } catch (e:any) {
+    await rm(tmp, { force:true }).catch(()=>{});
+    await rm(dir, { recursive:true, force:true }).catch(()=>{});
+    return reply.code(e?.statusCode || 500).send({ error:e?.message || String(e) });
+  }
+}
+async function readFileHead(filePath:string, bytes:number) {
+  const buffer = await readFile(filePath);
+  return buffer.subarray(0, Math.min(bytes, buffer.length));
+}
+function detectAttachmentType(head:Buffer, name:string, browserMime:string) {
+  if (head.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))) return { mime:'image/png', kind:'image', ext:'.png' };
+  if (head[0] === 0xff && head[1] === 0xd8) return { mime:'image/jpeg', kind:'image', ext:'.jpg' };
+  if (head.subarray(0, 4).toString() === 'RIFF' && head.subarray(8, 12).toString() === 'WEBP') return { mime:'image/webp', kind:'image', ext:'.webp' };
+  if (head.subarray(0, 4).toString() === '%PDF') return { mime:'application/pdf', kind:'document', ext:'.pdf' };
+  if (head.subarray(0, 2).toString('hex') === '504b') return { mime:officeOrZipMime(name), kind:isOfficeName(name) ? 'document' : 'archive', ext:path.extname(name).toLowerCase() };
+  if (head.subarray(0, 2).toString('hex') === '1f8b') return { mime:'application/gzip', kind:'archive', ext:'.gz' };
+  const ext = path.extname(name).toLowerCase();
+  const textExt = new Set(['.txt','.md','.json','.yaml','.yml','.xml','.csv','.log','.patch','.diff','.ts','.tsx','.js','.jsx','.mjs','.cjs','.css','.html','.py','.go','.rs','.java','.kt','.swift','.sh','.sql']);
+  if (textExt.has(ext) || looksText(head)) return { mime:mimeForTextExt(ext), kind:'text', ext };
+  if (browserMime && /^[-\w.]+\/[-\w.+]+$/.test(browserMime) && !browserMime.startsWith('text/html')) return { mime:browserMime, kind:'binary', ext };
+  return { mime:'application/octet-stream', kind:'binary', ext };
+}
+function officeOrZipMime(name:string) {
+  const ext = path.extname(name).toLowerCase();
+  if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === '.pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+  return 'application/zip';
+}
+function isOfficeName(name:string) { return ['.docx','.xlsx','.pptx'].includes(path.extname(name).toLowerCase()); }
+function looksText(head:Buffer) { return !head.includes(0) && head.subarray(0, 512).every(b => b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127) || b >= 0x80); }
+function mimeForTextExt(ext:string) {
+  if (ext === '.json') return 'application/json; charset=utf-8';
+  if (ext === '.csv') return 'text/csv; charset=utf-8';
+  if (ext === '.xml') return 'application/xml; charset=utf-8';
+  if (ext === '.yaml' || ext === '.yml') return 'application/yaml; charset=utf-8';
+  return 'text/plain; charset=utf-8';
+}
+function safeInlineMime(mime:string) { return /^image\/(png|jpeg|webp)$/.test(mime) || mime.startsWith('text/') || mime.startsWith('application/pdf'); }
 function looksLikeImage(buffer:Buffer, type:string){
   if (type === 'image/png') return buffer.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
   if (type === 'image/jpeg') return buffer[0] === 0xff && buffer[1] === 0xd8;
@@ -1750,13 +1921,15 @@ function looksLikeImage(buffer:Buffer, type:string){
 async function readAttachmentMeta(threadId:string, attachmentId:string){
   if (!/^[A-Za-z0-9_-]{10,80}$/.test(attachmentId)) throw new Error('bad attachment id');
   const dir = path.join(ATTACHMENTS_DIR, threadId);
-  const meta = JSON.parse(await readFile(path.join(dir, `${attachmentId}.json`), 'utf8'));
+  const nested = path.join(dir, attachmentId, 'meta.json');
+  const legacy = path.join(dir, `${attachmentId}.json`);
+  const meta = JSON.parse(await readFile(existsSync(nested) ? nested : legacy, 'utf8'));
   const rp = realpathSync(meta.path);
   const root = realpathSync(dir);
   if (!rp.startsWith(root + path.sep)) throw new Error('attachment outside session');
-  return { ...meta, path: rp };
+  return { ...meta, type:meta.type || meta.mime, mime:meta.mime || meta.type, path: rp };
 }
-function attachmentDto(meta:any){ return { id: meta.id, name: meta.name, type: meta.type, size: meta.size, url: `/api/sessions/${encodeURIComponent(meta.sessionId)}/attachments/${encodeURIComponent(meta.id)}` }; }
+function attachmentDto(meta:any){ return { id: meta.id, name: meta.name, type: meta.type || meta.mime, mime:meta.mime || meta.type, kind:meta.kind || ((meta.type || meta.mime || '').startsWith('image/') ? 'image' : 'binary'), size: meta.size, url: `/api/sessions/${encodeURIComponent(meta.sessionId)}/attachments/${encodeURIComponent(meta.id)}`, previewUrl: safeInlineMime(meta.type || meta.mime || '') ? `/api/sessions/${encodeURIComponent(meta.sessionId)}/attachments/${encodeURIComponent(meta.id)}` : undefined }; }
 function decorateThreadImages(thread:any, threadId:string, projectDir:string){
   for (const turn of thread?.turns || []) for (const item of turn.items || []) {
     if (item.type === 'userMessage') for (const c of item.content || []) if (c?.type === 'localImage' && imageFileAllowed(String(c.path || ''), projectDir, threadId)) c.viewerUrl = attachmentUrlFromPath(threadId, String(c.path)) || imageUrl(threadId, String(c.path));
