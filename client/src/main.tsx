@@ -508,7 +508,8 @@ function AttachmentTray({items,onRemove,onOpen}:{items:Attachment[];onRemove:(id
 function ImageViewer({image,onClose}:{image:Attachment;onClose:()=>void}){ const toast=useToast(); const src=image.previewUrl||image.url; return <div className="viewer" onClick={onClose}><header><button onClick={onClose}>关闭</button><button onClick={async(e)=>{e.stopPropagation(); try{await navigator.clipboard.writeText(src); toast('success','已复制链接');}catch{toast('error','复制失败')}}}>复制链接</button><a href={src} download target="_blank" rel="noreferrer">保存</a></header><img src={src} alt={image.name}/></div>; }
 function DiffPanel({diff,onClose}:{diff:string;onClose:()=>void}){ return <section className="diff"><header><b>Diff</b><button onClick={onClose}>关闭</button></header><pre>{diff}</pre></section>; }
 function QuotaSheet({quota,onRefresh,onClose}:{quota:any;onRefresh:()=>void;onClose:()=>void}){
-  const account=quota?.account?.account || quota?.account;
+  const providerStatus = quota?.providerStatus as ProviderStatus|undefined;
+  const account=providerStatus?.accountSummary || providerStatus?.account || quota?.account?.account || quota?.account;
   const limit=quota?.rateLimits?.rateLimitsByLimitId?.codex || quota?.rateLimits?.rateLimits;
   const email = findDeepEmail(account);
   const unsupported = quota?.supported === false;

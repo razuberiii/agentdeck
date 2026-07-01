@@ -63,11 +63,18 @@ function isHiddenGeminiUtilitySession(row) {
 
 function quota(db) {
   const profile = activeGeminiProfile(db);
+  const providerStatus = {
+    id:'gemini',
+    auth:profile ? 'authenticated' : 'unauthenticated',
+    accountSummary:profile ? { profileId:profile.id, email:profile.email, authType:profile.auth_type } : null,
+    canQueryQuota:false,
+  };
   return {
     provider:'gemini',
     supported:false,
+    providerStatus,
     account:profile ? { id:profile.id, email:profile.email, name:profile.name, authType:profile.auth_type } : null,
-    message:'Gemini CLI 暂未提供稳定的实时剩余额度接口',
+    message:'Gemini ACP 暂未提供稳定的独立实时剩余额度查询。',
     errors:{},
   };
 }
@@ -157,8 +164,10 @@ test('quota uses active authenticated profile and reports unsupported as informa
   const response = quota(db);
 
   assert.equal(response.supported, false);
+  assert.equal(response.providerStatus.auth, 'authenticated');
+  assert.equal(response.providerStatus.accountSummary.email, 'razuberiiii2139@gmail.com');
   assert.equal(response.account.email, 'razuberiiii2139@gmail.com');
-  assert.equal(response.message, 'Gemini CLI 暂未提供稳定的实时剩余额度接口');
+  assert.equal(response.message, 'Gemini ACP 暂未提供稳定的独立实时剩余额度查询。');
   assert.deepEqual(response.errors, {});
 });
 

@@ -249,11 +249,14 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.query?.provider) || settings.activeProvider;
   if (provider === 'gemini') {
     const activeProfile:any = await getActiveGeminiProfile();
+    const providerStatuses = await unifiedProviderStatuses(false);
+    const geminiProviderStatus = providerStatuses.gemini;
     const account = activeProfile ? geminiAccountSnapshot(activeProfile) : null;
     return {
       provider: 'gemini',
       providerId: 'gemini',
       supported: false,
+      providerStatus: geminiProviderStatus,
       account: account ? {
         id: account.id,
         email: account.email || null,
@@ -261,7 +264,7 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
         authType: account.authType || activeProfile?.authType || null,
       } : null,
       rateLimits: null,
-      message: 'Gemini CLI 暂未提供稳定的实时剩余额度接口',
+      message: 'Gemini ACP 暂未提供稳定的独立实时剩余额度查询。',
       errors: {},
       checkedAt: Date.now(),
     };
