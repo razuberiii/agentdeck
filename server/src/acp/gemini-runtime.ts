@@ -39,9 +39,20 @@ type GeminiSessionState = {
   localSessionId: string;
   providerSessionId: string;
   cwd: string;
+  configOptions: any[];
+  model: string | null;
   activePrompt: Promise<any> | null;
   promptController: AbortController | null;
 };
+
+export class GeminiModelSwitchUnsupportedError extends Error {
+  code = 'gemini_model_switch_unsupported';
+  statusCode = 409;
+
+  constructor(message = '当前 Gemini CLI ACP 未公开可切换模型，继续使用 CLI 默认配置。') {
+    super(message);
+  }
+}
 
 type PendingPermission = {
   requestId: string;
@@ -64,6 +75,7 @@ export class GeminiAcpRuntime {
   private lastError: string | null = null;
   private restarting = false;
   private authState: 'unknown' | 'authenticated' | 'needs_login' | 'failed' = 'unknown';
+  private launchModel: string | null = null;
 
   constructor(private options: GeminiRuntimeOptions) {}
 
@@ -93,6 +105,7 @@ export class GeminiAcpRuntime {
   }
 
   async createSession(params: { localSessionId: string; cwd: string; mode?: string; model?: string | null }) {
+    if (!this.initializeResponse && params.model) this.launchModel = params.model;
     await this.ensureInitialized();
     const existing = this.sessions.get(params.localSessionId);
     if (existing) return existing;
@@ -112,6 +125,8 @@ export class GeminiAcpRuntime {
       localSessionId: params.localSessionId,
       providerSessionId: response.sessionId,
       cwd: params.cwd,
+      configOptions: Array.isArray(response.configOptions) ? response.configOptions : [],
+      model: params.model || currentGeminiModelFromOptions(response.configOptions) || null,
       activePrompt: null,
       promptController: null,
     };
@@ -120,7 +135,7 @@ export class GeminiAcpRuntime {
     await this.options.updateSession(params.localSessionId, {
       provider_session_id: response.sessionId,
       provider_capabilities: JSON.stringify(this.initializeResponse?.agentCapabilities || {}),
-      provider_metadata: JSON.stringify({ agentInfo: this.initializeResponse?.agentInfo || null, modes: response.modes || null, configOptions: response.configOptions || null }),
+      provider_metadata: JSON.stringify({ agentInfo: this.initializeResponse?.agentInfo || null, modes: response.modes || null, configOptions: response.configOptions || null, currentModel: state.model || null }),
       status: 'idle',
       updated_at: Date.now(),
     });
@@ -131,6 +146,47 @@ export class GeminiAcpRuntime {
       capabilities: this.initializeResponse?.agentCapabilities || null,
     });
     return state;
+  }
+
+  async setSessionModel(localSessionId: string, model: string | null) {
+    await this.ensureInitialized();
+    const state = this.sessions.get(localSessionId);
+    if (!state) throw new GeminiModelSwitchUnsupportedError();
+    const modelConfig = findGeminiModelConfig(state.configOptions);
+    if (!modelConfig?.id) throw new GeminiModelSwitchUnsupportedError();
+    if (!model) throw new GeminiModelSwitchUnsupportedError('当前 Gemini CLI ACP 未公开可切换为自动模型，继续使用当前配置。');
+    const allowed = geminiModelValues(modelConfig);
+    if (allowed.length && !allowed.includes(model)) {
+      const err:any = new Error(`Gemini 模型不在当前 ACP 会话返回的可选列表中：${model}`);
+      err.code = 'gemini_model_not_available';
+      err.statusCode = 400;
+      throw err;
+    }
+    const response:any = await this.agent!.request(methods.agent.session.setConfigOption, {
+      sessionId: state.providerSessionId,
+      configId: modelConfig.id,
+      value: model,
+    });
+    if (Array.isArray(response?.configOptions)) state.configOptions = response.configOptions;
+    state.model = currentGeminiModelFromOptions(state.configOptions) || model;
+    await this.options.updateSession(localSessionId, {
+      model: state.model,
+      model_id: state.model,
+      provider_metadata: JSON.stringify({
+        agentInfo: this.initializeResponse?.agentInfo || null,
+        configOptions: state.configOptions,
+        currentModel: state.model,
+        modelSwitch: { supported:true, configId:modelConfig.id, updatedAt:Date.now() },
+      }),
+      updated_at: Date.now(),
+    });
+    await this.options.appendEvent(localSessionId, 'gemini/model_changed', {
+      provider:'gemini',
+      providerSessionId:state.providerSessionId,
+      model:state.model,
+      configId:modelConfig.id,
+    });
+    return { supported:true, model:state.model, configOptions:state.configOptions };
   }
 
   async authenticate(methodId: string) {
@@ -252,7 +308,8 @@ export class GeminiAcpRuntime {
       try {
         const response = await this.agent!.request(methods.agent.session.load, { sessionId:providerSessionId, cwd, mcpServers:[] } as any);
         if (response !== undefined) {
-          const state = { localSessionId, providerSessionId, cwd, activePrompt:null, promptController:null };
+          const configOptions = Array.isArray((response as any)?.configOptions) ? (response as any).configOptions : [];
+          const state = { localSessionId, providerSessionId, cwd, configOptions, model:currentGeminiModelFromOptions(configOptions), activePrompt:null, promptController:null };
           this.sessions.set(localSessionId, state);
           this.providerToLocal.set(providerSessionId, localSessionId);
           await this.options.appendEvent(localSessionId, 'runtime/recovering', { provider:'gemini', loaded:true, providerSessionId });
@@ -430,12 +487,44 @@ export class GeminiAcpRuntime {
   }
 
   private geminiArgs() {
-    return (process.env.GEMINI_ACP_ARGS || '--acp').split(/\s+/).filter(Boolean);
+    const args = (process.env.GEMINI_ACP_ARGS || '--acp').split(/\s+/).filter(Boolean);
+    if (this.launchModel && !args.includes('--model') && !args.includes('-m')) args.push('--model', this.launchModel);
+    return args;
   }
 
   private profileDir() {
     return this.options.profileDir;
   }
+}
+
+function findGeminiModelConfig(options:any[]) {
+  return (Array.isArray(options) ? options : []).find((opt:any) => {
+    const text = `${opt?.category || ''} ${opt?.id || ''} ${opt?.name || ''} ${opt?.title || ''}`.toLowerCase();
+    return text.includes('model');
+  }) || null;
+}
+
+function geminiModelValues(option:any) {
+  const values = Array.isArray(option?.values) ? option.values
+    : Array.isArray(option?.options) ? option.options
+    : Array.isArray(option?.items) ? option.items
+    : Array.isArray(option?.choices) ? option.choices
+    : [];
+  return values.map((value:any) => typeof value === 'string' ? value : String(value?.id || value?.value || value?.model || value?.name || '')).filter(Boolean);
+}
+
+function currentGeminiModelFromOptions(options:any[]) {
+  const config = findGeminiModelConfig(options);
+  if (!config) return null;
+  const direct = String(config.currentValue || config.value || '').trim();
+  if (direct) return direct;
+  const values = Array.isArray(config?.values) ? config.values
+    : Array.isArray(config?.options) ? config.options
+    : Array.isArray(config?.items) ? config.items
+    : Array.isArray(config?.choices) ? config.choices
+    : [];
+  const selected = values.find((value:any) => value?.selected || value?.default);
+  return selected ? String(selected.id || selected.value || selected.model || selected.name || '').trim() || null : null;
 }
 
 function isGeminiAuthenticationError(error:any) {

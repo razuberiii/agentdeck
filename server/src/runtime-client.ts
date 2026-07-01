@@ -29,6 +29,7 @@ export class RuntimeClient {
   answerGeminiApproval(requestId:string, body:any) { return this.request('POST', `/gemini/approvals/${encodeURIComponent(requestId)}`, body); }
   createCodexSession(body:any) { return this.request('POST', '/codex/sessions', body); }
   createGeminiSession(body:any) { return this.request('POST', '/gemini/sessions', body); }
+  setGeminiSessionModel(id:string, model:string | null) { return this.request('POST', `/gemini/sessions/${encodeURIComponent(id)}/model`, { model }); }
   resumeCodexSession(body:any) { return this.request('POST', '/codex/sessions/resume', body); }
   listSessions(archived = false) { return this.request('GET', `/sessions?archived=${archived ? '1' : '0'}`); }
   readSession(id:string) { return this.request('GET', `/sessions/${encodeURIComponent(id)}`); }

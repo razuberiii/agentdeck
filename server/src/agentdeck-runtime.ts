@@ -12,7 +12,7 @@ import { chmod, cp, lstat, mkdir, readFile, readlink, rm, symlink } from 'node:f
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
-import { GeminiAcpRuntime } from './acp/gemini-runtime.js';
+import { GeminiAcpRuntime, GeminiModelSwitchUnsupportedError } from './acp/gemini-runtime.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -486,6 +486,29 @@ app.post('/gemini/sessions', async (req:any, reply) => {
       message:'Gemini 会话初始化失败',
       detail:redactRuntimeError(message),
       gemini:await geminiManager.status(accountId),
+    });
+  }
+});
+
+app.post('/gemini/sessions/:id/model', async (req:any, reply) => {
+  const session = await getSession(String(req.params.id));
+  if (!session || (session.provider_id !== 'gemini' && session.provider !== 'gemini')) return reply.code(404).send({ error:'not found' });
+  const accountId = String(session.current_upstream_account_id || session.account_id || req.body?.accountId || 'default');
+  const model = cleanModel(req.body?.model) || null;
+  try {
+    const gemini = await geminiManager.get(accountId);
+    const result = await gemini.setSessionModel(String(session.id), model);
+    return { ok:true, session:await getSession(String(session.id)), ...result };
+  } catch (e:any) {
+    const message = e?.message || String(e);
+    const statusCode = e instanceof GeminiModelSwitchUnsupportedError || e?.code === 'gemini_model_switch_unsupported'
+      ? 409
+      : Number(e?.statusCode || 502);
+    return reply.code(statusCode).send({
+      error:e?.code || 'gemini_model_switch_failed',
+      supported:false,
+      message: statusCode === 409 ? '当前 Gemini CLI ACP 未公开可切换模型，继续使用 CLI 默认配置。' : 'Gemini 模型切换失败',
+      detail:redactRuntimeError(message),
     });
   }
 });

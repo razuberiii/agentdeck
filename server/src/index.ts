@@ -151,6 +151,8 @@ await db.run('CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMAR
 await db.run("ALTER TABLE codex_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE antigravity_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE gemini_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'configured'").catch(()=>{});
+await db.run("ALTER TABLE gemini_profiles ADD COLUMN default_model_mode TEXT NOT NULL DEFAULT 'auto'").catch(()=>{});
+await db.run("ALTER TABLE gemini_profiles ADD COLUMN default_model TEXT").catch(()=>{});
 await db.run("UPDATE gemini_profiles SET status='bootstrap' WHERE id='default' AND auth_type IS NULL AND status='configured'").catch(()=>{});
 await db.run("UPDATE gemini_profiles SET status='bootstrap', active=0 WHERE auth_type IS NULL AND name='Gemini Account' AND status='configured'").catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS agent_messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)').catch(()=>{});
@@ -352,7 +354,8 @@ app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     const settings = await appSettings();
     const modelProvider = normalizeProvider(req.body?.provider) || provider || settings.activeProvider;
     const model = modelProvider === 'antigravity' || modelProvider === 'gemini' ? cleanAgentModel(req.body?.defaultModel) : cleanModel(req.body?.defaultModel);
-    await setSetting(modelProvider === 'antigravity' ? 'defaultModelAntigravity' : modelProvider === 'gemini' ? 'defaultModelGemini' : 'defaultModelCodex', model || '');
+    if (modelProvider === 'gemini') await setActiveGeminiDefaultModel(model || null);
+    else await setSetting(modelProvider === 'antigravity' ? 'defaultModelAntigravity' : 'defaultModelCodex', model || '');
   }
   return { settings: await appSettings() };
 });
@@ -887,7 +890,46 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
   sanitizeThreadForMobile(read.thread);
   return { session: await indexedSession(read.thread), thread: read.thread, branch: await gitBranch(read.thread.cwd), interrupted: (row?.status === 'interrupted') };
 });
-app.patch('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any) => { const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); const provider = normalizeProvider(row?.provider_id) || 'codex'; const title = String(req.body?.title || '').trim(); const mode = normalizeMode(req.body?.mode); if (title) { if (provider === 'codex') { if (USE_AGENT_RUNTIME) await runtime.setSessionTitle(threadId, title).catch(()=>{}); else await codex.setName(threadId, title); } await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title, Date.now(), threadId]); } if (mode) { const fields = modeFields(mode); await db.run('UPDATE sessions SET permission_mode=?1, approval_policy=?2, sandbox_mode=?3, updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',[fields.permission_mode, fields.approval_policy, fields.sandbox_mode, Date.now(), threadId]); } if (Object.prototype.hasOwnProperty.call(req.body || {}, 'model')) { const model = provider === 'antigravity' || provider === 'gemini' ? cleanAgentModel(req.body?.model) : cleanModel(req.body?.model); await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model || null, Date.now(), threadId]); } return {ok:true}; });
+app.patch('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const row = await findSession(req.params.id);
+  const threadId = String(row?.codex_thread_id || req.params.id);
+  const provider = normalizeProvider(row?.provider_id) || 'codex';
+  const title = String(req.body?.title || '').trim();
+  const mode = normalizeMode(req.body?.mode);
+  if (title) {
+    if (provider === 'codex') {
+      if (USE_AGENT_RUNTIME) await runtime.setSessionTitle(threadId, title).catch(()=>{});
+      else await codex.setName(threadId, title);
+    }
+    await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title, Date.now(), threadId]);
+  }
+  if (mode) {
+    const fields = modeFields(mode);
+    await db.run('UPDATE sessions SET permission_mode=?1, approval_policy=?2, sandbox_mode=?3, updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',[fields.permission_mode, fields.approval_policy, fields.sandbox_mode, Date.now(), threadId]);
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'model')) {
+    const model = provider === 'antigravity' || provider === 'gemini' ? cleanAgentModel(req.body?.model) : cleanModel(req.body?.model);
+    if (provider === 'gemini') {
+      if (!USE_AGENT_RUNTIME) return reply.code(409).send({ error:'gemini_model_switch_unsupported', supported:false, message:'当前 Gemini CLI ACP 未公开可切换模型，继续使用 CLI 默认配置。' });
+      let changed:any = null;
+      try {
+        changed = await runtime.setGeminiSessionModel(threadId, model || null);
+      } catch (e:any) {
+        return reply.code(e?.statusCode === 400 ? 400 : 409).send({
+          error:e?.body?.error || e?.code || 'gemini_model_switch_unsupported',
+          supported:false,
+          message:e?.body?.message || '当前 Gemini CLI ACP 未公开可切换模型，继续使用 CLI 默认配置。',
+          detail:safeGeminiError(e?.body?.detail || e?.message || String(e)),
+        });
+      }
+      const appliedModel = cleanAgentModel(changed?.model) || model || null;
+      await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[appliedModel, Date.now(), threadId]);
+      return { ok:true, model:appliedModel, supported:true };
+    }
+    await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model || null, Date.now(), threadId]);
+  }
+  return {ok:true};
+});
 app.post('/api/sessions/:id/archive', { preHandler: ensureAuth }, async (req:any) => {
   const row = await findSession(req.params.id);
   const threadId = String(row?.codex_thread_id || req.params.id);
@@ -1323,7 +1365,7 @@ async function activeCodexProfileSummary() {
   };
 }
 async function activeGeminiProfileSummary() {
-  const p = await db.get("SELECT id,name,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  const p = await db.get("SELECT id,name,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
   if (!p) return null;
   const name = String(p.name || '').trim() || 'Gemini Account';
   return {
@@ -1333,6 +1375,8 @@ async function activeGeminiProfileSummary() {
     state:String(p.status || 'authenticated'),
     status:String(p.status || 'authenticated'),
     authType:p.auth_type || null,
+    defaultModelMode: p.default_model_mode === 'manual' && cleanAgentModel(p.default_model) ? 'manual' : 'auto',
+    defaultModel: p.default_model_mode === 'manual' ? cleanAgentModel(p.default_model) : '',
     active:Number(p.active || 0),
     login:{ ok:String(p.status || '') === 'authenticated', email:findEmailInText(name) || undefined, text:'Cached account summary' },
     created_at:Number(p.created_at || 0),
@@ -1399,7 +1443,7 @@ async function ensureGeminiProfiles() {
 }
 async function reconcileGeminiProfilesOnStartup() {
   if (!USE_AGENT_RUNTIME) return;
-  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'configured') IN ('verifying','failed','configured','authenticating') ORDER BY updated_at DESC");
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'configured') IN ('verifying','failed','configured','authenticating') ORDER BY updated_at DESC");
   for (const row of rows as any[]) {
     const credential = await geminiCredentialState(row).catch(()=>({ exists:false, size:0 }));
     if (!credential.exists || credential.size <= 0) continue;
@@ -1450,9 +1494,10 @@ async function appSettings() {
   const activeProvider = normalizeProvider(map.activeProvider) || 'codex';
   const legacyCodexModel = cleanModel(map.defaultModel) || '';
   const legacyAntigravityModel = legacyCodexModel ? '' : (cleanAgentModel(map.defaultModel) || '');
+  const geminiDefault = await activeGeminiDefaultModel();
   const defaultModels = {
     codex: cleanModel(map.defaultModelCodex) || legacyCodexModel,
-    gemini: cleanAgentModel(map.defaultModelGemini) || '',
+    gemini: geminiDefault.model || cleanAgentModel(map.defaultModelGemini) || '',
     antigravity: cleanAgentModel(map.defaultModelAntigravity) || legacyAntigravityModel,
   };
   return {
@@ -1460,9 +1505,28 @@ async function appSettings() {
     defaultMode: normalizeMode(map.defaultMode) || 'yolo',
     defaultModel: activeProvider === 'antigravity' ? defaultModels.antigravity : activeProvider === 'gemini' ? defaultModels.gemini : defaultModels.codex,
     defaultModels,
+    defaultModelModes: { gemini:geminiDefault.mode },
   };
 }
 async function setSetting(key:string, value:string) { await db.run('INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value', [key, value]); }
+async function activeGeminiDefaultModel() {
+  const row = await db.get("SELECT default_model_mode, default_model FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1").catch(()=>null);
+  const mode = row?.default_model_mode === 'manual' && cleanAgentModel(row?.default_model) ? 'manual' : 'auto';
+  return { mode, model: mode === 'manual' ? cleanAgentModel(row?.default_model) : '' };
+}
+async function setActiveGeminiDefaultModel(model:string | null) {
+  const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (!active?.id) {
+    const err:any = new Error('请先登录 Gemini');
+    err.statusCode = 409;
+    throw err;
+  }
+  const clean = cleanAgentModel(model);
+  await db.run(
+    "UPDATE gemini_profiles SET default_model_mode=?1, default_model=?2, updated_at=?3 WHERE id=?4",
+    [clean ? 'manual' : 'auto', clean || null, Date.now(), String(active.id)]
+  );
+}
 async function createProviderLoginAttempt(provider:AgentProviderId, options:{ id?:string; profileId?:string|null; tempHome?:string|null; methodId?:string|null; displayName?:string } = {}) {
   const id = options.id || crypto.randomBytes(8).toString('hex');
   const tempHome = options.tempHome || (
@@ -1754,17 +1818,17 @@ function geminiHomeForProfile(id:string) {
   return path.join(GEMINI_PROFILES_DIR, id, 'home');
 }
 async function listGeminiProfiles() {
-  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft')='authenticated' ORDER BY active DESC, updated_at DESC");
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft')='authenticated' ORDER BY active DESC, updated_at DESC");
   return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
 }
 async function listGeminiPendingProfiles() {
   const attempts = await listProviderLoginAttempts('gemini');
-  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','authenticating','verifying','failed','needs_login','configured') ORDER BY updated_at DESC");
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','authenticating','verifying','failed','needs_login','configured') ORDER BY updated_at DESC");
   const legacy = await Promise.all(rows.map((p:any) => geminiProfileDto(p)));
   return [...attempts, ...legacy.filter((row:any) => !attempts.some((attempt:any) => attempt.id === row.id))];
 }
 async function getGeminiProfile(id:string) {
-  return db.get('SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE id=?1', [id]);
+  return db.get('SELECT id,name,home_dir,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE id=?1', [id]);
 }
 async function getGeminiProfileDto(id:string, options:{ includeHidden?:boolean } = {}) {
   const row = await getGeminiProfile(id);
@@ -1774,7 +1838,7 @@ async function getGeminiProfileDto(id:string, options:{ includeHidden?:boolean }
   return geminiProfileDto(row);
 }
 async function getActiveGeminiProfile() {
-  const row = await db.get("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  const row = await db.get("SELECT id,name,home_dir,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1");
   return row ? geminiProfileDto(row) : null;
 }
 async function activateGeminiProfile(id:string) {
@@ -1798,6 +1862,8 @@ async function geminiProfileDto(row:any) {
     status: state,
     state,
     authType: row.auth_type || login.authType || null,
+    defaultModelMode: row.default_model_mode === 'manual' && cleanAgentModel(row.default_model) ? 'manual' : 'auto',
+    defaultModel: row.default_model_mode === 'manual' ? cleanAgentModel(row.default_model) : '',
     error: geminiLoginProfiles.get(String(row.id)) ? geminiLoginJobs.get(String(geminiLoginProfiles.get(String(row.id))))?.error : undefined,
     loginJobId: geminiLoginProfiles.get(String(row.id)) || undefined,
     login: safeLogin,
@@ -1829,7 +1895,7 @@ function geminiProfileState(row:any, login?:any):'draft'|'authenticating'|'verif
 async function getReusableGeminiBootstrapProfile() {
   const visible = await db.get("SELECT id FROM gemini_profiles WHERE COALESCE(status,'draft')='authenticated' LIMIT 1");
   if (visible?.id) return null;
-  return db.get("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','failed') ORDER BY CASE WHEN id='default' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1");
+  return db.get("SELECT id,name,home_dir,auth_type,active,status,default_model_mode,default_model,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','failed') ORDER BY CASE WHEN id='default' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1");
 }
 async function ensureGeminiActiveProfile() {
   const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' LIMIT 1");
@@ -2690,9 +2756,10 @@ async function modelCatalog(includeHidden = false, provider: AgentProviderId = '
     }
     const anyGeminiSession = await runtimeDb.get("SELECT id FROM sessions WHERE (provider_id='gemini' OR provider='gemini') LIMIT 1").catch(()=>null);
     const hasGeminiSession = rows.length > 0 || !!anyGeminiSession;
+    const defaultModel = cleanAgentModel(activeProfile?.defaultModel) || '';
     return {
-      models: [],
-      current: '',
+      models: geminiFallbackModels(),
+      current: defaultModel,
       error: hasGeminiSession
         ? '当前 Gemini CLI ACP 未公开可切换模型，继续使用 CLI 默认配置。'
         : 'Gemini 的模型选项由 ACP 会话返回。创建首个会话后可查看；当前使用 Gemini CLI 默认模型配置。',
@@ -2774,6 +2841,13 @@ function codexProviderStatus(status:any) {
     error: status?.ok ? null : (status?.error || 'Codex CLI 不可用'),
     command: 'codex',
   };
+}
+function geminiFallbackModels() {
+  return [
+    { id:'auto', model:'', actualModel:'', displayName:'自动', description:'使用 Gemini CLI 默认模型配置', hidden:false, isDefault:false, inputModalities:[], upgrade:null },
+    { id:'gemini-2.5-pro', model:'gemini-2.5-pro', actualModel:'gemini-2.5-pro', displayName:'Pro', description:'当前 Gemini CLI 0.49.0 默认 Pro 模型别名', hidden:false, isDefault:false, inputModalities:[], upgrade:null },
+    { id:'gemini-2.5-flash', model:'gemini-2.5-flash', actualModel:'gemini-2.5-flash', displayName:'Flash', description:'当前 Gemini CLI 0.49.0 默认 Flash 模型别名', hidden:false, isDefault:false, inputModalities:[], upgrade:null },
+  ];
 }
 function attachmentCapabilities(geminiRuntime:any = null) {
   return {
