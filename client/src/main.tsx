@@ -62,6 +62,13 @@ function providerAuthLabel(status?:ProviderStatus|null){
   if(status?.availability==='error') return '状态异常';
   return ({checking:'正在检查',authenticated:'已登录',unauthenticated:'未登录',authenticating:'正在登录',unknown:'状态未知',not_applicable:'无需登录',error:'状态异常'} as any)[status?.auth || 'unknown'] || '状态未知';
 }
+function providerChoiceStatus(status?:ProviderStatus|null){
+  if(status?.availability==='unavailable' || status?.availability==='error') return '不可用';
+  if(status?.auth==='authenticated') return '已登录';
+  if(status?.auth==='unauthenticated') return '未登录';
+  if(status?.auth==='authenticating') return '正在登录';
+  return '状态未知';
+}
 function providerSubtitle(status?:ProviderStatus|null){
   if(!status) return '正在检查';
   const label = providerAuthLabel(status);
@@ -608,9 +615,9 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   const antigravityProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='antigravity') || localData?.antigravity;
   const activeProviderStatus = (localData?.providers||[]).find((p:any)=>p.id===activeProvider) || (activeProvider==='gemini' ? geminiProviderStatus : activeProvider==='antigravity' ? antigravityProviderStatus : codexProviderStatus);
   const title = page==='main' ? '设置' : page==='agent' ? 'Agent' : page==='mode' ? '沙盒' : page==='model' ? '模型' : page==='geminiMethods' ? '选择登录方式' : page==='geminiGoogle' ? 'Google 登录' : page==='geminiApiKey' ? 'Gemini API Key' : page==='geminiVertex' ? 'Vertex AI' : `${providerLabel(activeProvider)} 账户`;
-  const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? providerSubtitle(activeProviderStatus) : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProviderStatus?.canListModels?`${providerLabel(activeProvider)} 模型`:providerAuthLabel(activeProviderStatus)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
+  const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? undefined : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProviderStatus?.canListModels?`${providerLabel(activeProvider)} 模型`:providerAuthLabel(activeProviderStatus)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
   const goBack = () => setPage(page==='geminiMethods'?'account':(['geminiGoogle','geminiApiKey','geminiVertex'].includes(page)?'geminiMethods':'main') as any);
-  return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button onClick={goBack}>返回</button>:undefined}>
+  return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'&&page!=='agent'?<button onClick={goBack}>返回</button>:undefined}>
     {error&&<ErrorState title="设置读取失败" detail={error} action="重试" onAction={onRetry}/>}
     {loading&&!localData&&<LoadingRows count={4}/>}
     {localData&&<div className="settingsGrid">
@@ -620,11 +627,11 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
         <button onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.canListModels ? modelLabel(currentModel) : providerAuthLabel(activeProviderStatus)}</small></span><i>›</i></button>
         <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
       </div>}
-      {page==='agent'&&<section><b>Agent</b><div className="providerChoices">
-        <button className={activeProvider==='codex'?'active':''} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{providerSubtitle(codexProviderStatus)}</small></span><i/></button>
-        <button className={activeProvider==='gemini'?'active':''} onClick={()=>setActiveProvider('gemini')}><span><b>Gemini</b><small>{providerSubtitle(geminiProviderStatus)}</small></span><i/></button>
-        <button className={activeProvider==='antigravity'?'active':''} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{providerSubtitle(antigravityProviderStatus)}</small></span><i/></button>
-      </div>{activeProvider==='gemini'&&<InlineNotice tone={activeProviderStatus?.auth==='unauthenticated'?'error':'info'} text={providerNotice(activeProviderStatus)}/>} {activeProvider==='antigravity'&&<InlineNotice tone="info" text={providerNotice(activeProviderStatus)}/>}</section>}
+      {page==='agent'&&<section className="agentProviderPage"><div className="providerChoices">
+        <button className={activeProvider==='codex'?'active':''} aria-pressed={activeProvider==='codex'} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{providerChoiceStatus(codexProviderStatus)}</small></span><i/></button>
+        <button className={activeProvider==='gemini'?'active':''} aria-pressed={activeProvider==='gemini'} onClick={()=>setActiveProvider('gemini')}><span><b>Gemini</b><small>{providerChoiceStatus(geminiProviderStatus)}</small></span><i/></button>
+        <button className={activeProvider==='antigravity'?'active':''} aria-pressed={activeProvider==='antigravity'} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{providerChoiceStatus(antigravityProviderStatus)}</small></span><i/></button>
+      </div></section>}
       {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
       {page==='model'&&<section><b>模型</b>{models?.error&&<InlineNotice tone="info" text={models.error}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models?.error || (models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`)} onPick={setDefaultModel}/></section>}
       {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={profileLabel(p)} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}{!codexProfiles.length&&<div className="empty"><b>尚未添加 Codex 账户</b><span>登录后才能创建 Codex 会话。</span></div>}</div></section>{!!codexPendingProfiles.length&&<section><b>登录中的任务</b><div className="profileList">{codexPendingProfiles.map((p:any)=><PendingProfileRow key={p.id} profile={p} label={profileLabel(p)} onContinue={()=>deviceLogin(p.id)} onDelete={(p:any)=>{setProfileDeleteError('');setDeleteProfile(p)}}/>)}</div></section>}<section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
