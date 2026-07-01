@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { mkdir, readFile, writeFile, rename, chmod } from 'node:fs/promises';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   client,
@@ -63,6 +63,7 @@ export class GeminiAcpRuntime {
   private permissions = new Map<string, PendingPermission>();
   private lastError: string | null = null;
   private restarting = false;
+  private authState: 'unknown' | 'authenticated' | 'needs_login' | 'failed' = 'unknown';
 
   constructor(private options: GeminiRuntimeOptions) {}
 
@@ -73,7 +74,8 @@ export class GeminiAcpRuntime {
       acpArgs: this.geminiArgs(),
       connected: !!this.connection && !this.connection.signal.aborted,
       initialized: !!this.initializeResponse,
-      authenticated: !!this.initializeResponse && !this.initializeResponse.authMethods?.length,
+      authenticated: this.authState === 'authenticated' || (this.authState === 'unknown' && this.hasLocalCredentials()),
+      authState: this.authState,
       authMethods: this.initializeResponse?.authMethods || [],
       capabilities: this.initializeResponse?.agentCapabilities || null,
       agentInfo: this.initializeResponse?.agentInfo || null,
@@ -92,14 +94,20 @@ export class GeminiAcpRuntime {
 
   async createSession(params: { localSessionId: string; cwd: string; mode?: string; model?: string | null }) {
     await this.ensureInitialized();
-    this.requireAuthenticated();
     const existing = this.sessions.get(params.localSessionId);
     if (existing) return existing;
-    const response = await this.agent!.request(methods.agent.session.new, {
-      cwd: params.cwd,
-      mcpServers: [],
-      _meta: { agentdeckSessionId: params.localSessionId, profileId: this.options.profileId },
-    });
+    let response: any;
+    try {
+      response = await this.agent!.request(methods.agent.session.new, {
+        cwd: params.cwd,
+        mcpServers: [],
+        _meta: { agentdeckSessionId: params.localSessionId, profileId: this.options.profileId },
+      });
+      this.authState = 'authenticated';
+    } catch (e) {
+      this.noteAuthError(e);
+      throw e;
+    }
     const state: GeminiSessionState = {
       localSessionId: params.localSessionId,
       providerSessionId: response.sessionId,
@@ -188,7 +196,6 @@ export class GeminiAcpRuntime {
     const state = this.sessions.get(localSessionId);
     if (!state) throw new Error('Gemini session is not initialized');
     if (state.activePrompt) throw new Error('Gemini turn already running');
-    this.requireAuthenticated();
     const controller = new AbortController();
     state.promptController = controller;
     await this.options.updateSession(localSessionId, { status: 'running', updated_at: Date.now() });
@@ -203,6 +210,7 @@ export class GeminiAcpRuntime {
       return response;
     }).catch(async e => {
       const message = e?.message || String(e);
+      this.noteAuthError(e);
       await this.options.appendEvent(localSessionId, 'turn/failed', { provider:'gemini', providerSessionId:state.providerSessionId, error:{ message } });
       await this.options.updateSession(localSessionId, { status: 'interrupted', active_turn_id: null, interruption_reason: 'gemini_prompt_failed', updated_at: Date.now() });
       throw e;
@@ -240,7 +248,6 @@ export class GeminiAcpRuntime {
 
   async recoverSession(localSessionId: string, providerSessionId: string | null, cwd: string) {
     await this.ensureInitialized();
-    this.requireAuthenticated();
     if (providerSessionId && this.initializeResponse?.agentCapabilities?.loadSession) {
       try {
         const response = await this.agent!.request(methods.agent.session.load, { sessionId:providerSessionId, cwd, mcpServers:[] } as any);
@@ -252,6 +259,10 @@ export class GeminiAcpRuntime {
           return state;
         }
       } catch (e:any) {
+        if (isGeminiAuthenticationError(e)) {
+          this.authState = 'needs_login';
+          throw e;
+        }
         await this.options.appendEvent(localSessionId, 'runtime/recovering', { provider:'gemini', loaded:false, providerSessionId, error:e?.message || String(e) });
       }
     }
@@ -334,7 +345,8 @@ export class GeminiAcpRuntime {
     });
     const initialized = this.initializeResponse!;
     this.lastError = null;
-    this.options.logger?.info({ provider:'gemini', profileId:this.options.profileId, pid:child.pid, env:envSummary, agentInfo:initialized.agentInfo, capabilities:initialized.agentCapabilities, authRequired:!!initialized.authMethods?.length }, 'gemini acp initialized');
+    if (this.hasLocalCredentials()) this.authState = 'authenticated';
+    this.options.logger?.info({ provider:'gemini', profileId:this.options.profileId, pid:child.pid, env:envSummary, agentInfo:initialized.agentInfo, capabilities:initialized.agentCapabilities, authMethodCount:initialized.authMethods?.length || 0 }, 'gemini acp initialized');
   }
 
   private async handleUpdate(notification: SessionNotification) {
@@ -397,9 +409,19 @@ export class GeminiAcpRuntime {
     throw new Error('path outside allowed Gemini session roots');
   }
 
-  private requireAuthenticated() {
-    if (this.initializeResponse?.authMethods?.length) {
-      throw new Error('Gemini CLI requires login or API key before ACP sessions can run');
+  private noteAuthError(error:any) {
+    if (isGeminiAuthenticationError(error)) this.authState = 'needs_login';
+  }
+
+  private hasLocalCredentials() {
+    const configDir = path.join(this.profileDir(), '.gemini');
+    if (existsSync(path.join(configDir, 'oauth_creds.json'))) return true;
+    const secretFile = path.join(this.profileDir(), 'agentdeck.env');
+    if (!existsSync(secretFile)) return false;
+    try {
+      return readFileSync(secretFile, 'utf8').split(/\r?\n/).some(line => line.trimStart().startsWith('GEMINI_API_KEY=') && line.split('=').slice(1).join('=').trim().length > 0);
+    } catch {
+      return false;
     }
   }
 
@@ -414,6 +436,11 @@ export class GeminiAcpRuntime {
   private profileDir() {
     return this.options.profileDir;
   }
+}
+
+function isGeminiAuthenticationError(error:any) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return /\b(unauthenticated|unauthorized|authentication required|not authenticated|not logged in|login required|requires login|invalid credentials|invalid_grant|api key.*invalid|permission denied)\b/i.test(message);
 }
 
 function redactSecretText(text:string) {

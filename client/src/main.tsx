@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { loginMethodViews, type LoginMethodView } from './login-methods';
 import './styles.css';
 
 type ProviderId = 'codex'|'gemini'|'antigravity';
@@ -554,7 +555,7 @@ function SettingsSheet({data,loading,error,onRetry,onChanged,onClose}:{data:any;
   const codexProfiles = (localData?.profiles?.length ? localData.profiles : (localData?.activeProfile ? [localData.activeProfile] : []));
   const codexPendingProfiles = (localData?.pendingProfiles||[]).filter((p:any)=>['draft','authenticating','verifying','failed'].includes(String(p.state||p.status||'')));
   const geminiProfiles = (localData?.geminiProfiles?.length ? localData.geminiProfiles : (localData?.activeGeminiProfile ? [localData.activeGeminiProfile] : [])).filter((p:any)=>(p.state||p.status)==='authenticated');
-  const geminiPendingProfiles = (localData?.geminiPendingProfiles||[]).filter((p:any)=>['draft','authenticating','verifying','failed'].includes(String(p.state||p.status||'')));
+  const geminiPendingProfiles = (localData?.geminiPendingProfiles||[]).filter((p:any)=>['draft','authenticating','verifying','failed','needs_login'].includes(String(p.state||p.status||'')));
   const codexProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='codex');
   const geminiProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='gemini') || localData?.gemini;
   const antigravityProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='antigravity') || localData?.antigravity;
@@ -581,9 +582,9 @@ function SettingsSheet({data,loading,error,onRetry,onChanged,onClose}:{data:any;
       {page==='model'&&<section><b>模型</b>{models?.error&&<InlineNotice tone="info" text={models.error}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`} onPick={setDefaultModel}/></section>}
       {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={profileLabel(p)} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}{!codexProfiles.length&&<div className="empty"><b>尚未添加 Codex 账户</b><span>登录后才能创建 Codex 会话。</span></div>}</div></section>{!!codexPendingProfiles.length&&<section><b>登录中的账户</b><div className="profileList">{codexPendingProfiles.map((p:any)=><PendingProfileRow key={p.id} profile={p} label={profileLabel(p)} onContinue={()=>deviceLogin(p.id)} onDelete={(p:any)=>{setProfileDeleteError('');setDeleteProfile(p)}}/>)}</div></section>}<section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
       {page==='account'&&activeProvider==='gemini'&&<><section><b>账户</b><div className="profileList">{geminiProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={geminiProfileLabel(p)} onSwitch={switchGeminiProfile} onLogin={()=>openGeminiLogin(p)} onLogout={logoutGeminiProfile} onDelete={(p:any)=>{setGeminiDeleteError('');setDeleteGeminiProfile(p)}}/>)}{!geminiProfiles.length&&<div className="empty"><b>尚未添加 Gemini 账户</b><span>添加账户后才能创建 Gemini 会话。</span></div>}</div></section>{!!geminiPendingProfiles.length&&<section><b>登录中的账户</b><div className="profileList">{geminiPendingProfiles.map((p:any)=><PendingProfileRow key={p.id} profile={p} label={geminiProfileLabel(p)} onContinue={()=>openGeminiLogin(p)} onDelete={(p:any)=>{setGeminiDeleteError('');setDeleteGeminiProfile(p)}}/>)}</div></section>}<section><b>添加账户</b><button disabled={!activeProviderStatus?.ok} onClick={loginNewGeminiProfile}>登录新账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Gemini 未安装</b><span>安装 Gemini CLI 后才能登录。</span></div>}</section>{geminiLoginJob&&<GeminiLoginJobPanel job={geminiLoginJob} onCancel={cancelGeminiLogin}/>}</>}
-      {page==='geminiMethods'&&<GeminiMethodList methods={geminiAuthMethods} onPick={(m:any)=>setPage(m.kind==='oauth'?'geminiGoogle':m.kind==='api-key'?'geminiApiKey':m.kind==='vertex'?'geminiVertex':'geminiMethods')}/>}
-      {page==='geminiGoogle'&&<GeminiGoogleLogin profile={geminiAuthProfile} job={geminiLoginJob} code={geminiAuthCode} onCode={setGeminiAuthCode} onStart={()=>startGeminiLogin('oauth')} onSubmitCode={submitGeminiAuthCode} onCancel={cancelGeminiLogin} onRefresh={syncSettings}/>}
-      {page==='geminiApiKey'&&<GeminiApiKeyLogin apiKey={geminiApiKey} onApiKey={setGeminiApiKey} job={geminiLoginJob} onSubmit={()=>startGeminiLogin('api_key')}/>}
+      {page==='geminiMethods'&&<GeminiMethodList methods={geminiAuthMethods} onPick={(m:any)=>{ setGeminiAuthMethods((list:any[])=>list.map(x=>({...x,selected:x.id===m.id}))); setPage(m.kind==='oauth'?'geminiGoogle':m.kind==='api-key'?'geminiApiKey':m.kind==='vertex'?'geminiVertex':'geminiMethods'); }}/>}
+      {page==='geminiGoogle'&&<GeminiGoogleLogin profile={geminiAuthProfile} job={geminiLoginJob} code={geminiAuthCode} onCode={setGeminiAuthCode} onStart={()=>startGeminiLogin((geminiAuthMethods.find((m:any)=>m.selected&&m.kind==='oauth')||geminiAuthMethods.find((m:any)=>m.kind==='oauth'))?.methodId || 'oauth')} onSubmitCode={submitGeminiAuthCode} onCancel={cancelGeminiLogin} onRefresh={syncSettings}/>}
+      {page==='geminiApiKey'&&<GeminiApiKeyLogin apiKey={geminiApiKey} onApiKey={setGeminiApiKey} job={geminiLoginJob} onSubmit={()=>startGeminiLogin((geminiAuthMethods.find((m:any)=>m.selected&&m.kind==='api-key')||geminiAuthMethods.find((m:any)=>m.kind==='api-key'))?.methodId || 'api_key')}/>}
       {page==='geminiVertex'&&<GeminiVertexLogin/>}
       {page==='account'&&activeProvider==='antigravity'&&<section><b>账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={(p:any)=>{setAntigravityDeleteError('');setDeleteAntigravityProfile(p)}}/>)}{!(localData?.antigravityProfiles||[]).length&&<div className="empty"><b>尚未添加 Antigravity 账户</b><span>登录后才能创建 Antigravity 会话。</span></div>}</div><button disabled={!activeProviderStatus?.ok || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Antigravity 未安装</b><span>安装后才能登录 Google 账户。</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode} onCancel={cancelAntigravityLogin}/>}</section>}
     </div>}
@@ -618,7 +619,7 @@ function ProfileRow({profile,label,onSwitch,onLogin,onLogout,onDelete}:{profile:
 }
 function PendingProfileRow({profile,label,onContinue,onDelete}:{profile:any;label:string;onContinue:(p:any)=>void;onDelete:(p:any)=>void}){
   const state=String(profile.state||profile.status||'draft');
-  const stateText=state==='verifying'?'正在验证':state==='failed'?'登录失败':state==='authenticating'?'等待授权':'尚未完成';
+  const stateText=state==='verifying'?'正在保存凭据':state==='failed'?'登录失败':state==='needs_login'?'需要重新登录':state==='authenticating'?'等待授权':'尚未完成';
   return <div className="profileRow">
     <div><strong>{label}</strong><span className="profileBadges"><i>{stateText}</i>{profile.authType&&<i>{authTypeLabel(profile.authType)}</i>}{profile.error&&<em>{profile.error}</em>}</span></div>
     <button onClick={()=>onContinue(profile)}>{state==='failed'?'重试':'继续登录'}</button>
@@ -669,24 +670,6 @@ function AntigravityLoginPanel({job,code,onCode,onSubmit,onCancel}:{job:any;code
     </div>
   </section>;
 }
-type LoginMethodView = { id:string; title:string; description:string; kind:'oauth'|'api-key'|'vertex'|'gateway'|'unsupported' };
-function loginMethodViews(methods:any[]):LoginMethodView[]{
-  const views:LoginMethodView[] = [
-    { id:'oauth', title:'Google 登录', description:'使用 Google 账号和订阅额度', kind:'oauth' },
-    { id:'api_key', title:'Gemini API Key', description:'使用 Google AI Studio API Key', kind:'api-key' },
-    { id:'vertex', title:'Vertex AI', description:'使用 Google Cloud 项目', kind:'vertex' },
-  ];
-  const seen = new Set(views.map(v=>v.id));
-  for(const raw of methods||[]){
-    const id=String(raw?.id||'').trim(); if(!id || seen.has(id)) continue;
-    const text=`${raw?.name||''} ${raw?.description||''} ${raw?.type||''} ${id}`.toLowerCase();
-    const kind:LoginMethodView['kind']=text.includes('oauth')||text.includes('google')?'oauth':text.includes('api')?'api-key':text.includes('vertex')?'vertex':text.includes('gateway')?'gateway':'unsupported';
-    views.push({id,title:kind==='unsupported'?'暂不支持':(raw?.name||id),description:raw?.description||'Gemini CLI 返回的其他登录方式',kind});
-    seen.add(id);
-  }
-  return views.sort((a,b)=>methodOrder(a.kind)-methodOrder(b.kind));
-}
-function methodOrder(kind:string){ return kind==='oauth'?0:kind==='api-key'?1:kind==='vertex'?2:3; }
 function GeminiMethodList({methods,onPick}:{methods:LoginMethodView[];onPick:(m:LoginMethodView)=>void}){
   const list = methods?.length ? methods : loginMethodViews([]);
   return <section className="loginMethodList">

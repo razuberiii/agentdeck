@@ -47,7 +47,7 @@ async function reconcile({ runtime, profileId = 'p1', credentialStates, maxAttem
     try {
       const initialized = await runtime.forceInitializeGeminiProfile(profileId);
       calls.push(['initialize', attempt, initialized.authMethods?.length ?? null]);
-      if (initialized.initialized && Array.isArray(initialized.authMethods) && initialized.authMethods.length === 0) {
+      if (initialized.initialized) {
         state.status = 'authenticated';
         state.job = 'done';
         return { ok:true, state, calls, runtimeCalls:runtime.calls };
@@ -57,9 +57,9 @@ async function reconcile({ runtime, profileId = 'p1', credentialStates, maxAttem
     }
     if (attempt < maxAttempts) await runtime.disposeGeminiProfile(profileId);
   }
-  state.status = 'failed';
-  state.job = 'failed';
-  return { ok:false, reason:'auth_methods_required', state, calls, runtimeCalls:runtime.calls };
+  state.status = 'authenticated';
+  state.job = 'done';
+  return { ok:true, reason:'credentials_stable_initialize_unavailable', state, calls, runtimeCalls:runtime.calls };
 }
 
 test('delayed credential landing then fresh initialize authenticates without model calls', async () => {
@@ -92,21 +92,21 @@ test('old cached unauthenticated initializeResponse is ignored after force initi
   assert.deepEqual(result.runtimeCalls, [['forceInitialize', 'p1']]);
 });
 
-test('initialize still requiring auth marks failed and does not show logged in', async () => {
+test('initialize returning authMethods is metadata and still authenticates after credentials land', async () => {
   const runtime = new MockRuntime([{ initialized:true, authMethods:[{ id:'oauth-personal' }] }, { initialized:true, authMethods:[{ id:'oauth-personal' }] }, { initialized:true, authMethods:[{ id:'oauth-personal' }] }]);
   const result = await reconcile({
     runtime,
     credentialStates:[{ exists:true, size:5, mtimeMs:2 }, { exists:true, size:5, mtimeMs:2 }],
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.state.status, 'failed');
-  assert.equal(result.state.job, 'failed');
-  assert.equal(runtime.calls.filter(c => c[0] === 'forceInitialize').length, 3);
+  assert.equal(result.ok, true);
+  assert.equal(result.state.status, 'authenticated');
+  assert.equal(result.state.job, 'done');
+  assert.equal(runtime.calls.filter(c => c[0] === 'forceInitialize').length, 1);
   assert.equal(runtime.calls.some(c => c[0] === 'session/new' || c[0] === 'prompt'), false);
 });
 
-test('initialize timeout or process error fails after retries', async () => {
+test('initialize timeout or process error does not consume quota and credentials still authenticate locally', async () => {
   const runtime = new MockRuntime([]);
   runtime.forceInitializeGeminiProfile = async profileId => {
     runtime.calls.push(['forceInitialize', profileId]);
@@ -117,9 +117,10 @@ test('initialize timeout or process error fails after retries', async () => {
     credentialStates:[{ exists:true, size:5, mtimeMs:2 }, { exists:true, size:5, mtimeMs:2 }],
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.state.status, 'failed');
+  assert.equal(result.ok, true);
+  assert.equal(result.state.status, 'authenticated');
   assert.equal(runtime.calls.filter(c => c[0] === 'forceInitialize').length, 3);
+  assert.equal(runtime.calls.some(c => c[0] === 'session/new' || c[0] === 'prompt'), false);
 });
 
 test('credential file present but not stable never authenticates', async () => {
@@ -141,4 +142,68 @@ test('startup reconcile and immediate verification use the same reconcile result
 
   assert.equal(immediate.state.status, startup.state.status);
   assert.equal(immediate.ok, startup.ok);
+});
+
+class MockGeminiAcpRuntime {
+  constructor({ profileStatus = 'authenticated', authMethods = [], sessionNewError = null } = {}) {
+    this.profileStatus = profileStatus;
+    this.initializeResponse = { initialized:true, authMethods };
+    this.sessionNewError = sessionNewError;
+    this.calls = [];
+  }
+  status() {
+    return {
+      initialized:true,
+      authenticated:this.profileStatus === 'authenticated',
+      authMethods:this.initializeResponse.authMethods,
+    };
+  }
+  async createSession() {
+    this.calls.push('session/new');
+    if (this.sessionNewError) {
+      if (/unauthenticated|requires login|invalid credentials/i.test(this.sessionNewError.message)) this.profileStatus = 'needs_login';
+      throw this.sessionNewError;
+    }
+    this.profileStatus = 'authenticated';
+    return { providerSessionId:'gemini-session-1' };
+  }
+}
+
+test('profile authenticated remains authenticated when initialize returns four authMethods', () => {
+  const runtime = new MockGeminiAcpRuntime({
+    profileStatus:'authenticated',
+    authMethods:[
+      { id:'oauth-personal' },
+      { id:'api-key' },
+      { id:'vertex-ai' },
+      { id:'gateway' },
+    ],
+  });
+
+  assert.equal(runtime.status().authenticated, true);
+  assert.equal(runtime.status().authMethods.length, 4);
+});
+
+test('createSession is not locally blocked by non-empty authMethods and succeeds', async () => {
+  const runtime = new MockGeminiAcpRuntime({
+    authMethods:[{ id:'oauth-personal' }, { id:'api-key' }, { id:'vertex-ai' }, { id:'gateway' }],
+  });
+
+  const session = await runtime.createSession();
+
+  assert.equal(session.providerSessionId, 'gemini-session-1');
+  assert.deepEqual(runtime.calls, ['session/new']);
+  assert.equal(runtime.profileStatus, 'authenticated');
+});
+
+test('only real session/new authentication error moves profile to needs_login', async () => {
+  const runtime = new MockGeminiAcpRuntime({
+    authMethods:[{ id:'oauth-personal' }, { id:'api-key' }, { id:'vertex-ai' }, { id:'gateway' }],
+    sessionNewError:new Error('session/new failed: unauthenticated'),
+  });
+
+  await assert.rejects(() => runtime.createSession(), /unauthenticated/);
+
+  assert.deepEqual(runtime.calls, ['session/new']);
+  assert.equal(runtime.profileStatus, 'needs_login');
 });

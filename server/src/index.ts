@@ -411,7 +411,7 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
   if (geminiLoginProfiles.has(String(profile.id))) return reply.code(409).send({error:'该 Gemini Profile 已有登录任务在运行'});
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({error:'methodId required'});
-  await db.run("UPDATE gemini_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND status IN ('bootstrap','draft','failed')", [Date.now(), String(profile.id)]).catch(()=>{});
+  await db.run("UPDATE gemini_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND status IN ('bootstrap','draft','failed','needs_login','configured')", [Date.now(), String(profile.id)]).catch(()=>{});
   const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'preparing', startedAt:Date.now() };
   geminiLoginJobs.set(job.id, job);
   geminiLoginProfiles.set(String(profile.id), job.id);
@@ -693,8 +693,8 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
       });
     } catch (e:any) {
       const message = safeGeminiError(e);
-      if (message.includes('requires login')) {
-        await markGeminiProfileLoginFailed(String(activeProfile.id), message);
+      if (isGeminiAuthenticationErrorMessage(message)) {
+        await markGeminiProfileNeedsLogin(String(activeProfile.id), message);
         return reply.code(409).send({ error:'请先登录 Gemini' });
       }
       throw e;
@@ -1278,7 +1278,7 @@ async function listGeminiProfiles() {
   return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
 }
 async function listGeminiPendingProfiles() {
-  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','authenticating','verifying','failed','configured') ORDER BY updated_at DESC");
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','authenticating','verifying','failed','needs_login','configured') ORDER BY updated_at DESC");
   return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
 }
 async function getGeminiProfile(id:string) {
@@ -1333,10 +1333,11 @@ function geminiAccountSnapshot(profile:any) {
     timestamp:Date.now(),
   };
 }
-function geminiProfileState(row:any, login?:any):'draft'|'authenticating'|'verifying'|'authenticated'|'failed'|'disabled' {
+function geminiProfileState(row:any, login?:any):'draft'|'authenticating'|'verifying'|'authenticated'|'needs_login'|'failed'|'disabled' {
   const explicit = String(row?.status || '').trim();
   if (explicit === 'disabled') return 'disabled';
   if (explicit === 'failed') return 'failed';
+  if (explicit === 'needs_login') return 'needs_login';
   if (explicit === 'verifying') return 'verifying';
   if (explicit === 'authenticating') return 'authenticating';
   if (explicit === 'authenticated') return 'authenticated';
@@ -1364,10 +1365,10 @@ async function refreshGeminiProfileName(id:string, homeDir:string, authType:stri
     if (login.ok) await activateGeminiProfile(id);
   }
 }
-async function markGeminiProfileLoginFailed(id:string, reason:string) {
-  await db.run("UPDATE gemini_profiles SET status='failed', active=0, updated_at=?1 WHERE id=?2", [Date.now(), id]).catch(()=>{});
+async function markGeminiProfileNeedsLogin(id:string, reason:string) {
+  await db.run("UPDATE gemini_profiles SET status='needs_login', active=0, updated_at=?1 WHERE id=?2", [Date.now(), id]).catch(()=>{});
   await ensureGeminiActiveProfile().catch(()=>{});
-  app.log.warn({ provider:'gemini', profileId:id, reason:safeGeminiError(reason) }, 'gemini profile marked failed after ACP login check');
+  app.log.warn({ provider:'gemini', profileId:id, reason:safeGeminiError(reason) }, 'gemini profile marked needs_login after ACP authentication error');
 }
 
 type GeminiCredentialState = { exists:boolean; size:number; mtimeMs:number; path:string; stable?:boolean };
@@ -1424,6 +1425,7 @@ async function reconcileGeminiProfileAuthentication(profileId:string, options:{ 
   const delays = [1000, 2000, 4000];
   let lastStatus:any = null;
   let lastReason = '';
+  let initializedRuntimeStatus:any = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const runtimeStatus = await step(`forceInitialize${attempt}`, () => runtime.forceInitializeGeminiProfile(profileId));
@@ -1440,21 +1442,11 @@ async function reconcileGeminiProfileAuthentication(profileId:string, options:{ 
         authMethodCount,
         elapsedMs:runtimeStatus?.elapsedMs,
       }, 'gemini fresh initialize completed');
-      if (runtimeStatus?.initialized && authMethodCount === 0) {
-        const login = await geminiLoginStatus(String(profile.home_dir), String(profile.auth_type || '') || null);
-        await db.run("UPDATE gemini_profiles SET name=COALESCE(?1,name), auth_type=COALESCE(?2,auth_type), status='authenticated', updated_at=?3 WHERE id=?4", [login.email || null, login.authType || profile.auth_type || null, Date.now(), profileId]);
-        const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' LIMIT 1");
-        if (!active?.id) await activateGeminiProfile(profileId).catch(()=>{});
-        if (options.job) {
-          options.job.status = 'done';
-          options.job.error = undefined;
-          options.job.codeSubmitted = false;
-          geminiLoginProfiles.delete(profileId);
-        }
-        app.log.info({ ...logBase, from:'verifying', to:'authenticated', reason:'fresh_initialize_authMethods_empty', timings, totalMs:Date.now() - started }, 'gemini authentication reconcile succeeded');
-        return { ok:true, status:'authenticated', reason:'fresh_initialize_authMethods_empty', credential, timings, runtimeStatus };
+      if (runtimeStatus?.initialized) {
+        initializedRuntimeStatus = runtimeStatus;
+        break;
       }
-      lastReason = runtimeStatus?.initialized ? `Gemini ACP 仍要求登录 (${authMethodCount} auth methods)` : 'Gemini ACP 初始化未完成';
+      lastReason = 'Gemini ACP 初始化未完成';
     } catch (e:any) {
       lastReason = safeGeminiError(e);
       app.log.warn({ ...logBase, attempt, error:lastReason }, 'gemini fresh initialize attempt failed');
@@ -1468,14 +1460,19 @@ async function reconcileGeminiProfileAuthentication(profileId:string, options:{ 
       break;
     }
   }
-  await db.run("UPDATE gemini_profiles SET status='failed', active=0, updated_at=?1 WHERE id=?2", [Date.now(), profileId]);
-  await ensureGeminiActiveProfile().catch(()=>{});
+  const login = await geminiLoginStatus(String(profile.home_dir), String(profile.auth_type || '') || null);
+  await db.run("UPDATE gemini_profiles SET name=COALESCE(?1,name), auth_type=COALESCE(?2,auth_type), status='authenticated', updated_at=?3 WHERE id=?4", [login.email || null, login.authType || profile.auth_type || null, Date.now(), profileId]);
+  const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' LIMIT 1");
+  if (!active?.id) await activateGeminiProfile(profileId).catch(()=>{});
   if (options.job) {
-    setGeminiJobStatus(options.job, 'failed', lastReason || 'Gemini 登录验证失败');
+    options.job.status = 'done';
+    options.job.error = undefined;
     options.job.codeSubmitted = false;
+    geminiLoginProfiles.delete(profileId);
   }
-  app.log.warn({ ...logBase, from:'verifying', to:'failed', reason:lastReason, authMethodCount:Array.isArray(lastStatus?.authMethods) ? lastStatus.authMethods.length : null, timings, totalMs:Date.now() - started }, 'gemini authentication reconcile failed');
-  return { ok:false, status:'failed', reason:lastReason || 'Gemini 登录验证失败', credential, timings, runtimeStatus:lastStatus };
+  const reason = initializedRuntimeStatus ? 'credentials_stable_initialize_completed' : 'credentials_stable_initialize_unavailable';
+  app.log.info({ ...logBase, from:'verifying', to:'authenticated', reason, initializeWarning:lastReason || null, authMethodCount:Array.isArray(lastStatus?.authMethods) ? lastStatus.authMethods.length : null, timings, totalMs:Date.now() - started }, 'gemini authentication reconcile succeeded');
+  return { ok:true, status:'authenticated', reason, credential, timings, runtimeStatus:initializedRuntimeStatus || lastStatus };
 }
 
 async function geminiLoginStatus(homeDir:string, authType:string|null = null) {
@@ -1549,9 +1546,13 @@ async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
     const apiKey = String(body.apiKey || '').trim();
     if (!/^[A-Za-z0-9_.-]{20,}$/.test(apiKey)) throw new Error('Gemini API Key 格式不正确');
     await writeGeminiProfileSecret(String(profile.home_dir), { GEMINI_API_KEY: apiKey });
-    await db.run("UPDATE gemini_profiles SET auth_type='api_key', status='configured', updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
-    const result = await reconcileGeminiProfileAuthentication(job.profileId, { reason:'api_key_login', job });
-    if (!result.ok) throw new Error(result.reason || 'Gemini API Key 验证失败');
+    await db.run("UPDATE gemini_profiles SET auth_type='api_key', status='authenticated', updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+    const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' LIMIT 1");
+    if (!active?.id) await activateGeminiProfile(job.profileId).catch(()=>{});
+    job.status = 'done';
+    job.error = undefined;
+    job.codeSubmitted = false;
+    geminiLoginProfiles.delete(job.profileId);
     return;
   }
   if (method.includes('oauth') || method.includes('google')) {
@@ -1880,6 +1881,9 @@ function sanitizeGeminiRuntimeStatus(status:any) {
 }
 function safeGeminiError(e:any) {
   return redactLine(String(e?.message || e || 'Gemini request failed')).replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]');
+}
+function isGeminiAuthenticationErrorMessage(message:string) {
+  return /\b(unauthenticated|unauthorized|authentication required|not authenticated|not logged in|login required|requires login|invalid credentials|invalid_grant|api key.*invalid|permission denied)\b/i.test(String(message || ''));
 }
 async function deleteGeminiProfileDir(homeDir:string) {
   const root = realpathSync(GEMINI_PROFILES_DIR);
@@ -2562,7 +2566,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
       ack('accepted');
     } catch (e:any) {
       const message = e?.message || String(e);
-      if (message.includes('requires login')) await markGeminiProfileLoginFailed(String(dto.id), message);
+      if (isGeminiAuthenticationErrorMessage(message)) await markGeminiProfileNeedsLogin(String(dto.id), message);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
       ack('failed', message);
       broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});

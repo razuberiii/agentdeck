@@ -486,7 +486,8 @@ app.post('/gemini/sessions', async (req:any, reply) => {
     return { session: await getSession(localSessionId), providerSessionId:state.providerSessionId, gemini:gemini.status() };
   } catch (e:any) {
     await db.run('UPDATE sessions SET status=?1, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_session_new_failed', Date.now(), localSessionId]);
-    return reply.code(String(e?.message || '').includes('requires login') ? 409 : 500).send({ error:e?.message || String(e), gemini:await geminiManager.status(accountId), session:await getSession(localSessionId) });
+    const message = e?.message || String(e);
+    return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId), session:await getSession(localSessionId) });
   }
 });
 
@@ -615,7 +616,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
       const message = e?.message || String(e);
       await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_turn_start_failed', Date.now(), session.id]);
       await appendEvent(session.id, 'turn/failed', { provider:'gemini', error:{ message } });
-      return reply.code(message.includes('requires login') ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId) });
+      return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId) });
     }
   }
   const account = await getAccount(String(session.account_id || 'default'));
@@ -1503,6 +1504,10 @@ function geminiContentBlock(item:any) {
     return { type:'resource_link', name:path.basename(filePath), uri:`file://${filePath}`, mimeType };
   }
   return null;
+}
+
+function isGeminiAuthenticationErrorMessage(message:string) {
+  return /\b(unauthenticated|unauthorized|authentication required|not authenticated|not logged in|login required|requires login|invalid credentials|invalid_grant|api key.*invalid|permission denied)\b/i.test(String(message || ''));
 }
 
 function mimeFromPath(filePath:string) {
