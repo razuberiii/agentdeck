@@ -28,8 +28,8 @@ test('pending UI presents login jobs as tasks, not accounts', () => {
   assert.match(clientSource, /登录中的任务/);
   assert.doesNotMatch(clientSource, /登录中的账户/);
   assert.match(clientSource, /取消登录/);
-  assert.match(clientSource, /deleteProfile\.isLoginAttempt\?'取消登录？':'删除 Codex 账户？'/);
-  assert.match(clientSource, /deleteGeminiProfile\.isLoginAttempt\?'取消登录？':'删除 Gemini 账户？'/);
+  assert.match(clientSource, /deleteProfile\.isLoginAttempt\?'继续登录':'取消'/);
+  assert.match(clientSource, /deleteGeminiProfile\.isLoginAttempt\?'继续登录':'取消'/);
 });
 
 test('formal account queries exclude login attempts', () => {

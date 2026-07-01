@@ -52,10 +52,13 @@ function isMobileInput(){ return matchMedia('(pointer: coarse)').matches || /And
 function modeLabel(mode?:string){ if(mode==='read-only')return 'Read Only'; if(mode==='workspace-write')return 'Workspace Write'; return 'YOLO'; }
 function profileLabel(profile:any){ return profile?.login?.email || profile?.name || 'Codex Account'; }
 function geminiProfileLabel(profile:any){ return profile?.login?.email || profile?.name || 'Gemini Account'; }
-function geminiDeleteDetail(profile:any, profiles:any[]){
-  const only = (profiles||[]).filter((p:any)=>(p.state||p.status)==='authenticated').length <= 1;
-  return `将删除 ${geminiProfileLabel(profile)} 的本地登录凭据并停止对应的 Gemini 进程。历史会话和消息不会删除；后续继续这些会话时，将使用当前可用的 Gemini 账户。${only?' 删除后 Gemini 将处于未登录状态，重新登录后可继续使用现有会话。':''}`;
+function activeAccountCount(profiles:any[]){
+  return (profiles||[]).filter((p:any)=>p.login?.ok || (p.state||p.status)==='authenticated').length;
 }
+function deleteAccountDetail(only:boolean){
+  return `将删除该账户在本机保存的登录凭据。历史会话和消息不会删除；之后继续会话时，将使用当前可用的账户。${only?' 删除后该 Agent 将处于未登录状态，重新登录后仍可继续已有会话。':''}`;
+}
+function cancelLoginDetail(){ return '将停止本次登录并删除临时授权信息。'; }
 function providerLabel(id?:string){ return id==='antigravity' ? 'Antigravity' : id==='gemini' ? 'Gemini' : 'Codex'; }
 function providerAuthLabel(status?:ProviderStatus|null){
   if(status?.availability==='unavailable') return '服务不可用';
@@ -656,9 +659,9 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
       {page==='geminiVertex'&&<GeminiVertexLogin/>}
       {page==='account'&&activeProvider==='antigravity'&&<><CurrentAccountSummary provider="antigravity" profile={activeAntigravityProfile} status={activeProviderStatus}/><section><b>已保存账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={(p:any)=>{setAntigravityDeleteError('');setDeleteAntigravityProfile(p)}}/>)}{!(localData?.antigravityProfiles||[]).length&&<div className="empty"><b>尚未添加 Antigravity 账户</b><span>登录后才能创建 Antigravity 会话。</span></div>}</div><button disabled={activeProviderStatus?.availability==='unavailable' || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{activeProviderStatus?.availability==='unavailable'&&<div className="empty"><b>Antigravity 服务不可用</b><span>{activeProviderStatus?.message || '安装后才能登录 Google 账户。'}</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode} onCancel={cancelAntigravityLogin}/>}</section></>}
     </div>}
-    {deleteProfile&&<ConfirmDialog title={deleteProfile.isLoginAttempt?'取消登录？':'删除 Codex 账户？'} detail={deleteProfile.isLoginAttempt?'将停止本次登录并删除临时授权信息。':`将删除 ${profileLabel(deleteProfile)} 在本机保存的登录凭据。历史会话和消息不会删除；之后继续会话时，将使用当前可用的账户。`} confirm={profileDeleteBusy?(deleteProfile.isLoginAttempt?'取消中':'删除中'):(deleteProfile.isLoginAttempt?'取消登录':'删除账户')} busy={profileDeleteBusy} error={profileDeleteError} onCancel={()=>!profileDeleteBusy&&setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
-    {deleteGeminiProfile&&<ConfirmDialog title={deleteGeminiProfile.isLoginAttempt?'取消登录？':'删除 Gemini 账户？'} detail={deleteGeminiProfile.isLoginAttempt?'将停止本次登录并删除临时授权信息。':geminiDeleteDetail(deleteGeminiProfile, geminiProfiles)} confirm={geminiDeleteBusy?(deleteGeminiProfile.isLoginAttempt?'取消中':'删除中'):(deleteGeminiProfile.isLoginAttempt?'取消登录':'删除账户')} busy={geminiDeleteBusy} error={geminiDeleteError} onCancel={()=>!geminiDeleteBusy&&setDeleteGeminiProfile(null)} onConfirm={()=>removeGeminiProfile(deleteGeminiProfile)}/>}
-    {deleteAntigravityProfile&&<ConfirmDialog title="删除 Antigravity 账户？" detail={`删除 ${antigravityProfileLabel(deleteAntigravityProfile)} 的本地登录配置。有历史会话引用时会从账户列表隐藏，历史记录仍保留。`} confirm={antigravityDeleteBusy?'删除中':'删除'} busy={antigravityDeleteBusy} error={antigravityDeleteError} onCancel={()=>!antigravityDeleteBusy&&setDeleteAntigravityProfile(null)} onConfirm={()=>removeAntigravityProfile(deleteAntigravityProfile)}/>}
+    {deleteProfile&&<ConfirmDialog title={deleteProfile.isLoginAttempt?'取消登录？':'删除 Codex 账户？'} detail={deleteProfile.isLoginAttempt?cancelLoginDetail():deleteAccountDetail(activeAccountCount(codexProfiles)<=1)} cancel={deleteProfile.isLoginAttempt?'继续登录':'取消'} confirm={deleteProfile.isLoginAttempt?'取消登录':'删除账户'} busy={profileDeleteBusy} error={profileDeleteError} onCancel={()=>!profileDeleteBusy&&setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
+    {deleteGeminiProfile&&<ConfirmDialog title={deleteGeminiProfile.isLoginAttempt?'取消登录？':'删除 Gemini 账户？'} detail={deleteGeminiProfile.isLoginAttempt?cancelLoginDetail():deleteAccountDetail(activeAccountCount(geminiProfiles)<=1)} cancel={deleteGeminiProfile.isLoginAttempt?'继续登录':'取消'} confirm={deleteGeminiProfile.isLoginAttempt?'取消登录':'删除账户'} busy={geminiDeleteBusy} error={geminiDeleteError} onCancel={()=>!geminiDeleteBusy&&setDeleteGeminiProfile(null)} onConfirm={()=>removeGeminiProfile(deleteGeminiProfile)}/>}
+    {deleteAntigravityProfile&&<ConfirmDialog title="删除 Antigravity 账户？" detail={deleteAccountDetail(activeAccountCount(localData?.antigravityProfiles||[])<=1)} confirm="删除账户" busy={antigravityDeleteBusy} error={antigravityDeleteError} onCancel={()=>!antigravityDeleteBusy&&setDeleteAntigravityProfile(null)} onConfirm={()=>removeAntigravityProfile(deleteAntigravityProfile)}/>}
   </Sheet>;
 }
 function mergeSettingsData(current:any, next:any){
@@ -834,7 +837,10 @@ function sessionUsageSummary(usage:any){
 function formatNumber(value:any){ const n=Number(value || 0); return Number.isFinite(n) ? new Intl.NumberFormat('zh-CN').format(n) : String(value); }
 function quotaDuration(mins:number){ if(mins===300)return '5 小时窗口'; if(mins===10080)return '7 天窗口'; if(mins%60===0)return `${mins/60} 小时窗口`; return `${mins} 分钟窗口`; }
 function Sheet({children,title,subtitle,actions,onClose,className=''}:{children:React.ReactNode;title:string;subtitle?:string;actions?:React.ReactNode;onClose:()=>void;className?:string}){ return <div className="sheetBackdrop" onClick={onClose}><section className={`sheet ${className}`} onClick={e=>e.stopPropagation()}><header><div><b>{title}</b>{subtitle&&<span>{subtitle}</span>}</div><div className="sheetActions">{actions}<button onClick={onClose}>关闭</button></div></header>{children}</section></div>; }
-function ConfirmDialog({title,detail,confirm,busy=false,error='',onCancel,onConfirm}:{title:string;detail:string;confirm:string;busy?:boolean;error?:string;onCancel:()=>void;onConfirm:()=>void}){ return <div className="dialogBackdrop"><section className="dialog"><h2>{title}</h2><p>{detail}</p>{error&&<pre className="errorText">{error}</pre>}<div><button disabled={busy} onClick={onCancel}>取消</button><button className="danger" disabled={busy} onClick={onConfirm}>{confirm}</button></div></section></div>; }
+function ConfirmDialog({title,detail,confirm,cancel='取消',busy=false,error='',onCancel,onConfirm}:{title:string;detail:string;confirm:string;cancel?:string;busy?:boolean;error?:string;onCancel:()=>void;onConfirm:()=>void}){
+  useEffect(()=>{ const previous=document.body.style.overflow; document.body.style.overflow='hidden'; return()=>{ document.body.style.overflow=previous; }; },[]);
+  return <div className="dialogBackdrop"><section className="dialog"><h2>{title}</h2><p>{detail}</p>{error&&<pre className="errorText">{error}</pre>}<div><button disabled={busy} onClick={onCancel}>{cancel}</button><button className="danger" disabled={busy} onClick={onConfirm}>{confirm}</button></div></section></div>;
+}
 function EmptyState({title,detail}:{title:string;detail:string}){ return <div className="empty"><b>{title}</b><span>{detail}</span></div>; }
 function LoadingRows({count=4}:{count?:number}){ return <div className="loadingRows" aria-label="正在加载">{Array.from({length:count}).map((_,i)=><div className="skeletonRow" key={i}><i/><span/><small/></div>)}</div>; }
 function ErrorState({title,detail,action,onAction}:{title:string;detail:string;action:string;onAction:()=>void}){ return <div className="errorState"><b>{title}</b><span>{detail}</span><button onClick={onAction}>{action}</button></div>; }
