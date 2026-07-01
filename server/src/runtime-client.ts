@@ -81,7 +81,10 @@ export class RuntimeClient {
           let parsed:any = null;
           try { parsed = text ? JSON.parse(text) : null; } catch {}
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(parsed?.error || text || `runtime ${res.statusCode}`));
+            const err:any = new Error(parsed?.message || parsed?.error || text || `runtime ${res.statusCode}`);
+            err.statusCode = res.statusCode || 500;
+            err.body = parsed || null;
+            reject(err);
           } else {
             resolve(parsed);
           }

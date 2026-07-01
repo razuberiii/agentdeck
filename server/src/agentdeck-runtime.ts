@@ -485,9 +485,15 @@ app.post('/gemini/sessions', async (req:any, reply) => {
     const state = await gemini.createSession({ localSessionId, cwd, mode:opts.permissionMode, model:opts.model || null });
     return { session: await getSession(localSessionId), providerSessionId:state.providerSessionId, gemini:gemini.status() };
   } catch (e:any) {
-    await db.run('UPDATE sessions SET status=?1, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_session_new_failed', Date.now(), localSessionId]);
     const message = e?.message || String(e);
-    return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId), session:await getSession(localSessionId) });
+    await db.run('DELETE FROM sessions WHERE id=?1 AND provider_session_id IS NULL AND last_sequence=0', [localSessionId]).catch(()=>{});
+    app.log.warn({ provider:'gemini', accountId, localSessionId, error:redactRuntimeError(message), code:e?.code || null }, 'gemini session create failed');
+    return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 502).send({
+      error:'gemini_session_create_failed',
+      message:'Gemini 会话初始化失败',
+      detail:redactRuntimeError(message),
+      gemini:await geminiManager.status(accountId),
+    });
   }
 });
 
@@ -1508,6 +1514,12 @@ function geminiContentBlock(item:any) {
 
 function isGeminiAuthenticationErrorMessage(message:string) {
   return /\b(unauthenticated|unauthorized|authentication required|not authenticated|not logged in|login required|requires login|invalid credentials|invalid_grant|api key.*invalid|permission denied)\b/i.test(String(message || ''));
+}
+
+function redactRuntimeError(message:string) {
+  return String(message || 'Gemini request failed')
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]')
+    .replace(/(access_token|refresh_token|id_token|client_secret|authorization code)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
 }
 
 function mimeFromPath(filePath:string) {

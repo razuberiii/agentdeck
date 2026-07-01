@@ -225,17 +225,21 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const settings = await appSettings();
   const provider = normalizeProvider(req.query?.provider) || settings.activeProvider;
   if (provider === 'gemini') {
-    const status = await cachedGeminiStatus();
-    const runtimeStatus = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : null;
+    const activeProfile:any = await getActiveGeminiProfile();
+    const account = activeProfile ? geminiAccountSnapshot(activeProfile) : null;
     return {
+      provider: 'gemini',
       providerId: 'gemini',
-      account: null,
+      supported: false,
+      account: account ? {
+        id: account.id,
+        email: account.email || null,
+        name: account.name || account.email || 'Gemini Account',
+        authType: account.authType || activeProfile?.authType || null,
+      } : null,
       rateLimits: null,
-      provider: { ...status, runtime: runtimeStatus },
-      errors: {
-        account: runtimeStatus?.authenticated ? null : 'Gemini CLI 未提供可用额度接口，且当前 profile 尚未完成登录或 API key 配置',
-        rateLimits: 'Gemini CLI 未提供稳定的可机读额度接口',
-      },
+      message: 'Gemini CLI 暂未提供稳定的实时剩余额度接口',
+      errors: {},
       checkedAt: Date.now(),
     };
   }
@@ -457,6 +461,15 @@ app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:an
 app.get('/api/gemini-login/:jobId', { preHandler: ensureAuth }, async (req:any, reply) => {
   const job = geminiLoginJobs.get(String(req.params.jobId));
   if (!job) return reply.code(404).send({error:'not found'});
+  const profile = await getGeminiProfileDto(job.profileId, { includeHidden:true }).catch(()=>null);
+  if (profile?.status === 'authenticated') {
+    job.status = 'done';
+    job.error = undefined;
+    clearGeminiLoginJobChallenge(job);
+    job.codeSubmitted = false;
+    geminiLoginProfiles.delete(job.profileId);
+    return { completed:true, job };
+  }
   return { job };
 });
 app.post('/api/gemini-login/:jobId/input', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -680,6 +693,7 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     const opts = modeOptions(mode, model || undefined);
     let created:any;
     try {
+      app.log.info({ provider:'gemini', operation:'create_session_start', activeProvider:provider, profileId:String(activeProfile.id), profileStatus:activeProfile.status, localSessionId:id, cwd:projectDir }, 'gemini session create requested');
       created = await runtime.createGeminiSession({
         sessionId:id,
         accountId: activeProfile.id,
@@ -695,9 +709,16 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
       const message = safeGeminiError(e);
       if (isGeminiAuthenticationErrorMessage(message)) {
         await markGeminiProfileNeedsLogin(String(activeProfile.id), message);
-        return reply.code(409).send({ error:'请先登录 Gemini' });
+        return reply.code(409).send({ error:'gemini_needs_login', message:'请先登录 Gemini', detail:message });
       }
-      throw e;
+      const body = e?.body || {};
+      const detail = safeGeminiError(body.detail || body.message || body.error || message);
+      app.log.warn({ provider:'gemini', operation:'create_session_failed', profileId:String(activeProfile.id), localSessionId:id, statusCode:e?.statusCode || null, detail }, 'gemini session create failed');
+      return reply.code(e?.statusCode === 409 ? 409 : 502).send({
+        error:'gemini_session_create_failed',
+        message:'Gemini 会话初始化失败',
+        detail,
+      });
     }
     return rowSessionDto(created.session);
   }
@@ -1467,6 +1488,7 @@ async function reconcileGeminiProfileAuthentication(profileId:string, options:{ 
   if (options.job) {
     options.job.status = 'done';
     options.job.error = undefined;
+    clearGeminiLoginJobChallenge(options.job);
     options.job.codeSubmitted = false;
     geminiLoginProfiles.delete(profileId);
   }
@@ -1551,6 +1573,7 @@ async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
     if (!active?.id) await activateGeminiProfile(job.profileId).catch(()=>{});
     job.status = 'done';
     job.error = undefined;
+    clearGeminiLoginJobChallenge(job);
     job.codeSubmitted = false;
     geminiLoginProfiles.delete(job.profileId);
     return;
@@ -1724,6 +1747,12 @@ function setGeminiJobStatus(job:GeminiLoginJob, status:GeminiLoginJob['status'],
   const profileStatus = status === 'done' ? 'authenticated' : status === 'verifying' ? 'verifying' : status === 'failed' || status === 'error' || status === 'fallback' ? 'failed' : status === 'cancelled' ? 'failed' : status === 'waiting_user' || status === 'preparing' ? 'authenticating' : null;
   if (profileStatus) db.run("UPDATE gemini_profiles SET status=?1, active=CASE WHEN ?1='authenticated' THEN active ELSE 0 END, updated_at=?2 WHERE id=?3", [profileStatus, Date.now(), job.profileId]).catch(()=>{});
   if (previous !== status) app.log.info({ jobId:job.id, profileId:job.profileId, from:previous, to:status, ptyAlive:!!geminiLoginWorkers.get(job.id), elapsedMs:Date.now() - job.startedAt }, 'gemini login job state changed');
+}
+function clearGeminiLoginJobChallenge(job:GeminiLoginJob) {
+  job.loginUrl = undefined;
+  job.deviceCode = undefined;
+  job.requiresCodeInput = false;
+  job.fallbackCommand = undefined;
 }
 async function cancelGeminiLoginForProfile(profileId:string) {
   const jobId = geminiLoginProfiles.get(profileId);
@@ -2424,6 +2453,7 @@ async function listIndexedThreads(archived:boolean){
     const runtimeStartedAt = Date.now();
     const runtimeSessions = await runtimeDb.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived ? 1 : 0]).catch(()=>[]);
     for (const session of runtimeSessions as any[]) {
+      if (isHiddenGeminiUtilitySession(session)) continue;
       if (!pathAllowed(String(session.project_dir || session.workspace_path || ''))) continue;
       byId.set(String(session.codex_thread_id || session.id), rowSessionDto(session));
     }
@@ -2431,6 +2461,7 @@ async function listIndexedThreads(archived:boolean){
     const localStartedAt = Date.now();
     const rows = await db.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived ? 1 : 0]);
     for (const row of rows) {
+      if (isHiddenGeminiUtilitySession(row)) continue;
       const id = String(row.codex_thread_id || row.id);
       if (!byId.has(id) && pathAllowed(String(row.project_dir))) byId.set(id, rowSessionDto(row));
     }
@@ -2447,10 +2478,18 @@ async function listIndexedThreads(archived:boolean){
   }
   const rows = await db.all('SELECT * FROM sessions WHERE archived=?1 ORDER BY updated_at DESC LIMIT 500', [archived ? 1 : 0]);
   for (const row of rows) {
+    if (isHiddenGeminiUtilitySession(row)) continue;
     const id = String(row.codex_thread_id || row.id);
     if (!byId.has(id) && pathAllowed(String(row.project_dir))) byId.set(id, rowSessionDto(row));
   }
   return [...byId.values()].sort((a:any,b:any)=>Number(b.updated_at || 0)-Number(a.updated_at || 0));
+}
+function isHiddenGeminiUtilitySession(row:any) {
+  if (normalizeProvider(row?.provider_id || row?.provider) !== 'gemini') return false;
+  const id = String(row?.id || row?.codex_thread_id || '');
+  const title = String(row?.title || '');
+  if (String(row?.interruption_reason || '') === 'gemini_session_new_failed' && !row?.provider_session_id && Number(row?.last_sequence || 0) === 0) return true;
+  return id.startsWith('gemini-login-verify-') || id.startsWith('gemini-smoke-') || title === 'Gemini login verification' || title === 'Gemini smoke test';
 }
 function projectNameFromPath(p:string){ return p.split(path.sep).filter(Boolean).pop() || p; }
 async function joinAndResume(id:string, ws:any, lastSequence = 0){
