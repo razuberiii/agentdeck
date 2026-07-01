@@ -431,7 +431,17 @@ app.post('/codex/sessions', async (req:any) => {
   const account = await ensureAccount(String(body.accountId || 'default'), String(body.codexHome || DEFAULT_CODEX_HOME));
   const runtime = await runtimeForAccount(account.id);
   const opts = turnOptions(body);
-  const started = await runtime.request('thread/start', withModel({ cwd:String(body.cwd || DEFAULT_WORKDIR), approvalPolicy:opts.approvalPolicy, sandbox:opts.sandboxMode }, opts));
+  let started:any;
+  try {
+    started = await runtime.request('thread/start', withModel({ cwd:String(body.cwd || DEFAULT_WORKDIR), approvalPolicy:opts.approvalPolicy, sandbox:opts.sandboxMode }, opts));
+  } catch (e:any) {
+    throw new StructuredRuntimeError(502, {
+      code:'codex_session_create_failed',
+      layer:'runtime_session_service',
+      message:'Codex 会话初始化失败',
+      safeDetail:redactRuntimeError(e?.message || String(e)),
+    });
+  }
   const thread = started.thread;
   const now = Date.now();
   const title = cleanTitle(body.title || thread.name || thread.preview, thread.cwd);

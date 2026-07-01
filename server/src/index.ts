@@ -790,21 +790,28 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   }
   const model = cleanModel(req.body?.model) || cleanModel(settings.defaultModels?.codex);
   const activeProfile:any = await getActiveProfile();
+  const codexPreflight = await codexCreateSessionPreflight(activeProfile);
+  if (!codexPreflight.ok) return reply.code(codexPreflight.statusCode).send(codexPreflight.body);
   const accountId = activeProfile?.id || null;
   const opts = modeOptions(mode, model);
   if (USE_AGENT_RUNTIME) {
-    const created = await runtime.createCodexSession({
-      accountId: accountId || 'default',
-      codexHome: activeProfile?.codex_home || DEFAULT_CODEX_HOME,
-      cwd: projectDir,
-      title,
-      mode,
-      model,
-      approvalPolicy: opts.approvalPolicy,
-      sandboxMode: opts.sandboxMode,
-    });
-    await upsertThread(created.thread, { title, archived: 0, status:'idle', model, account_id: accountId, ...modeFields(mode) });
-    return sessionDto(created.thread, { title, status:'idle', archived:0, model, account_id: accountId, ...modeFields(mode) });
+    try {
+      const created = await runtime.createCodexSession({
+        accountId,
+        codexHome: activeProfile.codex_home,
+        cwd: projectDir,
+        title,
+        mode,
+        model,
+        approvalPolicy: opts.approvalPolicy,
+        sandboxMode: opts.sandboxMode,
+      });
+      await upsertThread(created.thread, { title, archived: 0, status:'idle', model, account_id: accountId, ...modeFields(mode) });
+      return sessionDto(created.thread, { title, status:'idle', archived:0, model, account_id: accountId, ...modeFields(mode) });
+    } catch (e:any) {
+      const body = structuredSessionCreateError('codex', e, 'web_session_api');
+      return reply.code(body.statusCode).send(body.body);
+    }
   }
   const started = await codex.startThread(projectDir, opts);
   const thread = started.thread;
@@ -1505,6 +1512,61 @@ async function findCodexProfileByEmail(email:string) {
     if (found && found.trim().toLowerCase() === normalized) return row;
   }
   return null;
+}
+async function codexCreateSessionPreflight(activeProfile:any) {
+  if (!activeProfile?.id) {
+    return {
+      ok:false,
+      statusCode:409,
+      body:{ code:'codex_no_active_profile', message:'请先登录 Codex', safeDetail:'没有可用于创建会话的 active Codex Profile', layer:'web_session_api' },
+    };
+  }
+  const raw = await getProfile(String(activeProfile.id));
+  const status = String(raw?.status || activeProfile.status || 'authenticated');
+  if (status === 'unresolved_identity') {
+    return {
+      ok:false,
+      statusCode:409,
+      body:{ code:'codex_profile_identity_unresolved', message:'Codex 账户信息尚未读取完成', safeDetail:'当前 active Codex Profile 的账户身份未解析', layer:'web_session_api' },
+    };
+  }
+  if (['draft','authenticating','verifying','failed','disabled'].includes(status) || activeProfile.isLoginAttempt) {
+    return {
+      ok:false,
+      statusCode:409,
+      body:{ code:'codex_profile_not_authenticated', message:'请先完成 Codex 登录', safeDetail:`当前 Codex Profile 状态为 ${status}`, layer:'web_session_api' },
+    };
+  }
+  if (String(raw?.name || activeProfile.name || '') === 'Codex Account' && !activeProfile.email && !activeProfile.login?.email) {
+    return {
+      ok:false,
+      statusCode:409,
+      body:{ code:'codex_profile_identity_unresolved', message:'Codex 账户信息尚未读取完成', safeDetail:'当前 Codex Profile 仍是占位身份 Codex Account', layer:'web_session_api' },
+    };
+  }
+  if (!activeProfile.login?.ok) {
+    return {
+      ok:false,
+      statusCode:409,
+      body:{ code:'codex_profile_not_authenticated', message:'请先登录 Codex', safeDetail:'当前 Codex Profile 没有可用登录凭据', layer:'web_session_api' },
+    };
+  }
+  return { ok:true as const };
+}
+function structuredSessionCreateError(provider:AgentProviderId, e:any, layer:string) {
+  const statusCode = e?.statusCode === 503 ? 503 : e?.statusCode === 409 ? 409 : 502;
+  const raw = e?.body || {};
+  const safeDetail = redactLine(String(raw.safeDetail || raw.detail || raw.message || raw.error || e?.message || `${provider} session create failed`)).slice(0, 1000);
+  return {
+    statusCode,
+    body:{
+      code:raw.code || `${provider}_session_create_failed`,
+      message:raw.message || `${providerDisplayName(provider)} 会话初始化失败`,
+      safeDetail,
+      layer:raw.layer || layer,
+      requestId:raw.requestId || undefined,
+    },
+  };
 }
 async function listProfiles() {
   const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY active DESC, updated_at DESC");
