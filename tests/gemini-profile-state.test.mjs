@@ -19,6 +19,8 @@ function setup() {
       id TEXT PRIMARY KEY,
       provider_id TEXT NOT NULL,
       account_id TEXT,
+      current_upstream_account_id TEXT,
+      account_snapshot_json TEXT,
       status TEXT NOT NULL
     );
   `);
@@ -36,11 +38,11 @@ function reusableBootstrap(db) {
 }
 
 function deleteProfile(db, id) {
-  const refs = db.prepare("SELECT COUNT(*) count FROM sessions WHERE provider_id='gemini' AND account_id=?").get(id).count;
-  if (refs > 0) {
-    db.prepare("UPDATE gemini_profiles SET active=0,status='disabled' WHERE id=?").run(id);
-    return { hidden: true, references: refs };
-  }
+  const running = db.prepare("SELECT id FROM sessions WHERE provider_id='gemini' AND (current_upstream_account_id=? OR (current_upstream_account_id IS NULL AND account_id=?)) AND status IN ('running','submitting','recovering')").get(id, id);
+  if (running) return { conflict: true };
+  const profile = db.prepare("SELECT * FROM gemini_profiles WHERE id=?").get(id);
+  const snapshot = JSON.stringify({ id, provider:'gemini', name:profile?.name || 'Gemini Account', timestamp:1 });
+  db.prepare("UPDATE sessions SET account_snapshot_json=COALESCE(account_snapshot_json, ?) WHERE provider_id='gemini' AND account_id=?").run(snapshot, id);
   db.prepare('DELETE FROM gemini_profiles WHERE id=?').run(id);
   return { deleted: true };
 }
@@ -65,12 +67,22 @@ test('unreferenced bootstrap can be hard deleted without regenerating a visible 
   assert.deepEqual(visibleProfiles(db), []);
 });
 
-test('referenced profile is disabled and hidden instead of rejected', () => {
+test('referenced Gemini profile is deleted while history keeps a display snapshot', () => {
   const db = setup();
   db.prepare("INSERT INTO gemini_profiles VALUES ('default','Gemini Account','/tmp/default',NULL,1,'bootstrap',1,1)").run();
-  db.prepare("INSERT INTO sessions VALUES ('s1','gemini','default','idle')").run();
+  db.prepare("INSERT INTO sessions VALUES ('s1','gemini','default',NULL,NULL,'idle')").run();
 
-  assert.deepEqual(deleteProfile(db, 'default'), { hidden: true, references: 1 });
+  assert.deepEqual(deleteProfile(db, 'default'), { deleted: true });
   assert.deepEqual(visibleProfiles(db), []);
-  assert.equal(db.prepare("SELECT status,active FROM gemini_profiles WHERE id='default'").get().status, 'disabled');
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM gemini_profiles WHERE id='default'").get().count, 0);
+  assert.match(db.prepare("SELECT account_snapshot_json FROM sessions WHERE id='s1'").get().account_snapshot_json, /Gemini Account/);
+});
+
+test('currently running Gemini upstream account cannot be deleted', () => {
+  const db = setup();
+  db.prepare("INSERT INTO gemini_profiles VALUES ('a','Gemini A','/tmp/a',NULL,1,'authenticated',1,1)").run();
+  db.prepare("INSERT INTO sessions VALUES ('s1','gemini','old','a',NULL,'running')").run();
+
+  assert.deepEqual(deleteProfile(db, 'a'), { conflict: true });
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM gemini_profiles WHERE id='a'").get().count, 1);
 });

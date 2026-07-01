@@ -137,6 +137,25 @@ export class GeminiAcpRuntime {
     return response || {};
   }
 
+  async dispose(reason = 'Gemini ACP disposed') {
+    for (const pending of this.permissions.values()) pending.resolve({ outcome:{ outcome:'cancelled' } });
+    this.permissions.clear();
+    for (const state of this.sessions.values()) {
+      state.promptController?.abort();
+      await this.options.updateSession(state.localSessionId, { active_turn_id:null, updated_at:Date.now() }).catch(()=>{});
+      await this.options.appendEvent(state.localSessionId, 'runtime/disconnect', { provider:'gemini', reason }).catch(()=>{});
+    }
+    this.sessions.clear();
+    this.providerToLocal.clear();
+    this.connection?.close(new Error(reason));
+    this.connection = null;
+    this.agent = null;
+    this.initializeResponse = null;
+    if (this.child && !this.child.killed) this.child.kill();
+    this.child = null;
+    this.lastError = reason;
+  }
+
   async restart() {
     this.restarting = true;
     try {
@@ -243,6 +262,13 @@ export class GeminiAcpRuntime {
     const configDir = path.join(this.profileDir(), '.gemini');
     await mkdir(configDir, { recursive:true, mode:0o700 });
     await chmod(configDir, 0o700).catch(()=>{});
+    const envSummary = {
+      HOME:this.profileDir(),
+      GEMINI_CONFIG_DIR:configDir,
+      XDG_CONFIG_HOME:path.join(this.profileDir(), '.config'),
+      workingDirectory:this.options.defaultCwd,
+      profileId:this.options.profileId,
+    };
     const child = spawn(this.geminiBin(), this.geminiArgs(), {
       cwd: this.options.defaultCwd,
       env: {
@@ -299,7 +325,7 @@ export class GeminiAcpRuntime {
     });
     const initialized = this.initializeResponse!;
     this.lastError = null;
-    this.options.logger?.info({ provider:'gemini', profileId:this.options.profileId, pid:child.pid, agentInfo:initialized.agentInfo, capabilities:initialized.agentCapabilities, authRequired:!!initialized.authMethods?.length }, 'gemini acp initialized');
+    this.options.logger?.info({ provider:'gemini', profileId:this.options.profileId, pid:child.pid, env:envSummary, agentInfo:initialized.agentInfo, capabilities:initialized.agentCapabilities, authRequired:!!initialized.authMethods?.length }, 'gemini acp initialized');
   }
 
   private async handleUpdate(notification: SessionNotification) {

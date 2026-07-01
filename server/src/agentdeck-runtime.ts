@@ -58,6 +58,9 @@ type RuntimeSession = {
   model:string | null;
   provider_id?: string | null;
   provider_session_id?: string | null;
+  last_execution_account_id?: string | null;
+  current_upstream_account_id?: string | null;
+  account_snapshot_json?: string | null;
   created_at:number;
   updated_at:number;
   last_sequence:number;
@@ -255,6 +258,15 @@ class GeminiRuntimeManager {
     return runtime.status();
   }
 
+  async dispose(profileId:string) {
+    const id = normalizeGeminiProfileId(profileId);
+    const runtime = this.runtimes.get(id);
+    if (runtime) await runtime.dispose('Gemini profile disposed');
+    this.runtimes.delete(id);
+    this.inFlight.delete(id);
+    return { ok:true, profileId:id };
+  }
+
   answerPermission(requestId:string, optionId:string|null) {
     for (const runtime of this.runtimes.values()) {
       if (runtime.answerPermission(requestId, optionId)) return true;
@@ -350,6 +362,7 @@ app.post('/gemini/profiles/:id/authenticate', async (req:any, reply) => {
 });
 app.post('/gemini/profiles/:id/logout', async (req:any) => geminiManager.logout(String(req.params.id)));
 app.post('/gemini/profiles/:id/restart', async (req:any) => geminiManager.restart(String(req.params.id)));
+app.post('/gemini/profiles/:id/dispose', async (req:any) => geminiManager.dispose(String(req.params.id)));
 app.post('/gemini/approvals/:id', async (req:any, reply) => {
   const optionId = typeof req.body?.optionId === 'string' ? req.body.optionId : null;
   if (!geminiManager.answerPermission(String(req.params.id), optionId)) return reply.code(404).send({ error:'approval request not found' });
@@ -439,10 +452,10 @@ app.post('/gemini/sessions', async (req:any, reply) => {
   const now = Date.now();
   const opts = turnOptions(body);
   await db.run(
-    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_profile_id)
-     VALUES (?1,?1,?2,?3,'initializing',?4,?5,?6,?7,0,?8,?8,'gemini',?9,?7,?2,NULL,'gemini',NULL,NULL,0,NULL,?9)
+    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json)
+     VALUES (?1,?1,?2,?3,'initializing',?4,?5,?6,?7,0,?8,?8,'gemini',?9,?7,?2,NULL,'gemini',NULL,NULL,0,NULL,?9,?9,?9,?10)
      ON CONFLICT(id) DO UPDATE SET project_dir=excluded.project_dir,title=excluded.title,provider_id='gemini',provider='gemini',updated_at=excluded.updated_at`,
-    [localSessionId, cwd, cleanTitle(body.title || path.basename(cwd), cwd), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, accountId]
+    [localSessionId, cwd, cleanTitle(body.title || path.basename(cwd), cwd), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, accountId, JSON.stringify(body.accountSnapshot || null)]
   );
   try {
     const gemini = await geminiManager.get(accountId);
@@ -553,12 +566,24 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
   if (!session) return reply.code(404).send({ error:'not found' });
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
     const body = req.body || {};
+    const accountId = String(body.accountId || session.current_upstream_account_id || session.account_id || 'default');
+    const previousAccountId = String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || '');
+    const accountSwitched = !!previousAccountId && previousAccountId !== accountId;
     try {
-      const gemini = await geminiManager.get(String(session.account_id || 'default'));
-      await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir));
       const input = Array.isArray(body.input) ? body.input : [{ type:'text', text:String(body.text || '') }];
       const prompt = input.map(geminiContentBlock).filter(Boolean);
       if (!prompt.length) return reply.code(400).send({ error:'empty message' });
+      const gemini = await geminiManager.get(accountId);
+      if (accountSwitched) {
+        const context = await geminiRecoveryContextInput(session, previousAccountId, accountId);
+        await gemini.createSession({ localSessionId:session.id, cwd:String(body.cwd || session.project_dir), mode:body.permissionMode || session.permission_mode, model:body.model || session.model || null });
+        await appendEvent(session.id, 'system', { text:'已切换 Gemini 账户，上游会话已在新账户下重建。', previousAccountId, accountId });
+        await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=?2,updated_at=?3 WHERE id=?4', [accountId, JSON.stringify(body.accountSnapshot || null), Date.now(), session.id]);
+        prompt.unshift(context as any);
+      } else {
+        await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir));
+        await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [accountId, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
+      }
       await appendEvent(session.id, 'user', { input });
       const running = gemini.prompt(session.id, prompt as any[]);
       running.catch(e => app.log.warn({ err:e, sessionId:session.id }, 'gemini prompt failed'));
@@ -567,7 +592,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
       const message = e?.message || String(e);
       await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_turn_start_failed', Date.now(), session.id]);
       await appendEvent(session.id, 'turn/failed', { provider:'gemini', error:{ message } });
-      return reply.code(message.includes('requires login') ? 409 : 500).send({ error:message, gemini:await geminiManager.status(String(session.account_id || 'default')) });
+      return reply.code(message.includes('requires login') ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId) });
     }
   }
   const account = await getAccount(String(session.account_id || 'default'));
@@ -625,7 +650,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
 app.post('/sessions/:id/stop', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
-  if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.account_id || 'default'))).cancel(session.id);
+  if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || 'default'))).cancel(session.id);
   if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
   const account = await getAccount(String(session.account_id || 'default'));
   if (!account) return reply.code(409).send({ error:'account not found' });
@@ -671,6 +696,9 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE sessions ADD COLUMN provider_profile_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN provider_capabilities TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN provider_metadata TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN last_execution_account_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN current_upstream_account_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN account_snapshot_json TEXT').catch(()=>{});
   await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN sequence INTEGER').catch(()=>{});
   await db.run('ALTER TABLE events ADD COLUMN event_type TEXT').catch(()=>{});
@@ -992,6 +1020,24 @@ async function recoveryContextInput(session:RuntimeSession) {
       'Continue the same local mobile session using this recovery context. Do not repeat this context verbatim to the user.',
       `Project path: ${session.project_dir}`,
       `Local session title: ${session.title}`,
+      recent ? `Recent visible conversation:\n${recent}` : 'No prior visible conversation could be reconstructed from runtime events.',
+    ].join('\n\n'),
+    text_elements:[],
+  };
+}
+
+async function geminiRecoveryContextInput(session:RuntimeSession, previousAccountId:string, accountId:string) {
+  const recent = await recentConversationSummary(session.id, 16);
+  return {
+    type:'text',
+    text:[
+      RECOVERY_CONTEXT_MARKER,
+      'The AgentDeck Gemini upstream ACP session was recreated because the current execution account changed.',
+      'Continue the same local AgentDeck conversation using this local visible history. Do not repeat this context verbatim to the user.',
+      `Project path: ${session.project_dir}`,
+      `Local session title: ${session.title}`,
+      `Previous execution account id: ${previousAccountId}`,
+      `Current execution account id: ${accountId}`,
       recent ? `Recent visible conversation:\n${recent}` : 'No prior visible conversation could be reconstructed from runtime events.',
     ].join('\n\n'),
     text_elements:[],

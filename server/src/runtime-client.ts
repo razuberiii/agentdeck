@@ -20,6 +20,7 @@ export class RuntimeClient {
   authenticateGeminiProfile(profileId:string, methodId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/authenticate`, { methodId }); }
   logoutGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/logout`); }
   restartGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/restart`); }
+  disposeGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/dispose`); }
   answerGeminiApproval(requestId:string, body:any) { return this.request('POST', `/gemini/approvals/${encodeURIComponent(requestId)}`, body); }
   createCodexSession(body:any) { return this.request('POST', '/codex/sessions', body); }
   createGeminiSession(body:any) { return this.request('POST', '/gemini/sessions', body); }

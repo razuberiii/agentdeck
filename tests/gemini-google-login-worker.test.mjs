@@ -106,7 +106,7 @@ class WorkerHarness {
   }
   input(code) {
     if (!this.job.requiresCodeInput) throw new Error('not waiting for code');
-    this.child.write(`${code}\n`);
+    this.child.write(`${code}\r`);
     this.job.codeSubmitted = true;
     this.job.status = 'verifying';
   }
@@ -190,13 +190,13 @@ Enter the authorization code:`);
   assert.equal(h.child.killed, true);
 });
 
-test('authorization code input is written back to the PTY with a newline', () => {
+test('authorization code input is written back to the PTY with terminal carriage return', () => {
   const h = new WorkerHarness();
   h.child.emitData(realGemini049Output);
 
   h.input('4/0AbCdEf');
 
-  assert.deepEqual(h.child.writes, ['4/0AbCdEf\n']);
+  assert.deepEqual(h.child.writes, ['4/0AbCdEf\r']);
   assert.equal(h.job.codeSubmitted, true);
   assert.equal(h.job.status, 'verifying');
 });
@@ -232,7 +232,7 @@ test('invalid authorization code enters failed and can accept another code', () 
   assert.equal(h.job.codeSubmitted, false);
   h.job.status = 'waiting_user';
   h.input('good-code');
-  assert.deepEqual(h.child.writes, ['bad-code\n', 'good-code\n']);
+  assert.deepEqual(h.child.writes, ['bad-code\r', 'good-code\r']);
 });
 
 test('successful PTY exit remains error when ACP verification fails', () => {
