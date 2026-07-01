@@ -4,7 +4,7 @@ import './styles.css';
 
 type ProviderId = 'codex'|'gemini'|'antigravity';
 type ProviderStatus = { id:ProviderId; displayName:string; ok:boolean; installed:boolean; version?:string|null; error?:string|null; installHint?:string; runtime?:any };
-type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; capabilities:Capabilities; activeProfile?:any };
+type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; capabilities:Capabilities; activeProfile?:any; activeGeminiProfile?:any; activeAntigravityProfile?:any };
 type Capabilities = { imageInput:boolean; imageOutput:boolean; fileInput?:boolean; attachmentTypes:string[]; maxAttachmentBytes:number; maxAttachmentsPerMessage?:number; maxTotalAttachmentBytes?:number; providers?:Record<string,any> };
 type Session = { id:string; codex_thread_id:string; provider_id?:ProviderId; providerId?:ProviderId; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number; last_sequence?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
@@ -46,7 +46,20 @@ function normalizeRuntimeConnection(value:any):RuntimeConnection {
 function isMobileInput(){ return matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent); }
 function modeLabel(mode?:string){ if(mode==='read-only')return 'Read Only'; if(mode==='workspace-write')return 'Workspace Write'; return 'YOLO'; }
 function profileLabel(profile:any){ return profile?.login?.email || profile?.name || 'Codex Account'; }
+function geminiProfileLabel(profile:any){ return profile?.login?.email || profile?.name || 'Gemini Account'; }
 function providerLabel(id?:string){ return id==='antigravity' ? 'Antigravity' : id==='gemini' ? 'Gemini' : 'Codex'; }
+function activeStatusProfileLabel(status:any){
+  const provider=status?.activeProvider || 'codex';
+  if(provider==='gemini') return geminiProfileLabel(status?.activeGeminiProfile);
+  if(provider==='antigravity') return antigravityProfileLabel(status?.activeAntigravityProfile);
+  return profileLabel(status?.activeProfile);
+}
+function accountSubtitle(provider:string, codexProfile:any, geminiProfile:any, antigravityProfile:any, providerStatus:any){
+  if(provider==='codex') return profileLabel(codexProfile);
+  if(provider==='gemini') return providerStatus?.ok ? geminiProfileLabel(geminiProfile) : 'Gemini 未安装';
+  return providerStatus?.ok ? antigravityProfileLabel(antigravityProfile) : 'Antigravity 未安装';
+}
+function authTypeLabel(type:string){ const v=String(type||''); if(v==='api_key') return 'API Key'; if(v==='oauth') return 'Google'; if(v==='vertex') return 'Vertex'; return v; }
 function sessionProvider(session:Session){ return session.provider_id || session.providerId || 'codex'; }
 
 function ToastProvider({children}:{children:React.ReactNode}){
@@ -65,7 +78,7 @@ function App(){
   const [checked,setChecked]=useState(false);
   const [view,setView]=useState(location.hash || '#/');
   useEffect(()=>{const f=()=>setView(location.hash||'#/'); addEventListener('hashchange',f); return()=>removeEventListener('hashchange',f)},[]);
-  useEffect(()=>{api('/api/status').then(s=>setAuthed(s.authed)).catch(()=>setAuthed(false)).finally(()=>setChecked(true))},[]);
+  useEffect(()=>{api('/api/auth/status').then(s=>setAuthed(!!(s.authenticated ?? s.authed))).catch(()=>setAuthed(false)).finally(()=>setChecked(true))},[]);
   if(!checked) return <main className="boot">{APP_NAME}</main>;
   if(!authed) return <Login onLogin={()=>setAuthed(true)}/>;
   const m=view.match(/^#\/s\/([^/]+)/);
@@ -97,7 +110,7 @@ function Home(){
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell">
     <header className="homeTop">
-      <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(status?.activeProvider)} · {status?.mode || 'Full Access'} · {profileLabel(status?.activeProfile)}</span></div>
+      <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(status?.activeProvider)} · {status?.mode || 'Full Access'} · {activeStatusProfileLabel(status)}</span></div>
       <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={showSettings}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" onClick={()=>refresh(true)}>↻</button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
@@ -146,16 +159,17 @@ function SessionView({id}:{id:string}){
   const [text,setText]=useState(''); const [attachments,setAttachments]=useState<Attachment[]>([]); const [status,setStatus]=useState<Status|null>(null);
   const [busy,setBusy]=useState(''); const [online,setOnline]=useState(navigator.onLine); const [browserConnection,setBrowserConnection]=useState<'connected'|'reconnecting'|'offline'>(navigator.onLine?'reconnecting':'offline'); const [runtimeConnection,setRuntimeConnection]=useState<RuntimeConnection>('checking'); const [turnStatus,setTurnStatus]=useState<'idle'|'running'|'completed'|'interrupted'|'unknown'>('unknown'); const [diff,setDiff]=useState(''); const [menu,setMenu]=useState(false); const [modelOpen,setModelOpen]=useState(false); const [models,setModels]=useState<any>(null); const [modelsProvider,setModelsProvider]=useState<string>(''); const [confirmDelete,setConfirmDelete]=useState(false); const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [viewer,setViewer]=useState<Attachment|null>(null); const [showBottom,setShowBottom]=useState(false); const [drag,setDrag]=useState(false); const [approvals,setApprovals]=useState<ApprovalRequest[]>([]);
   const [menuPage,setMenuPage]=useState<'main'|'mode'|'manage'>('main');
-  const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const mountedRef=useRef(false); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true); const clientAppliedSequenceRef=useRef(0); const snapshotCoveredSequenceRef=useRef(0); const seenRuntimeEventsRef=useRef<Set<string>>(new Set()); const pendingMessagesRef=useRef<Map<string,{text:string;attachments:Attachment[]}>>(new Map());
-  useEffect(()=>{ mountedRef.current=true; clientAppliedSequenceRef.current=Number(localStorage.getItem(sequenceKey(id)) || 0); snapshotCoveredSequenceRef.current=0; seenRuntimeEventsRef.current=new Set(); pendingMessagesRef.current=new Map(); setLoading(true); setEvents([]); setLive([]); setApprovals([]); setRuntimeConnection('checking'); setTurnStatus('unknown'); setText(localStorage.getItem(draftKey(id)) || ''); setAttachments(loadDraftAttachments(id)); load(); connect(); const on=()=>{ const isOnline=navigator.onLine; setOnline(isOnline); setBrowserConnection(isOnline?(wsRef.current?.readyState===WebSocket.OPEN?'connected':'reconnecting'):'offline'); }; addEventListener('online',on); addEventListener('offline',on); return()=>{ mountedRef.current=false; removeEventListener('online',on); removeEventListener('offline',on); if(reconnectRef.current) clearTimeout(reconnectRef.current); wsRef.current?.close(); }; },[id]);
+  const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const mountedRef=useRef(false); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true); const clientAppliedSequenceRef=useRef(0); const snapshotCoveredSequenceRef=useRef(0); const joinSentAtRef=useRef(0); const seenRuntimeEventsRef=useRef<Set<string>>(new Set()); const pendingMessagesRef=useRef<Map<string,{text:string;attachments:Attachment[]}>>(new Map());
+  useEffect(()=>{ mountedRef.current=true; clientAppliedSequenceRef.current=Number(localStorage.getItem(sequenceKey(id)) || 0); snapshotCoveredSequenceRef.current=0; seenRuntimeEventsRef.current=new Set(); pendingMessagesRef.current=new Map(); setLoading(true); setEvents([]); setLive([]); setApprovals([]); setRuntimeConnection('checking'); setTurnStatus('unknown'); setText(localStorage.getItem(draftKey(id)) || ''); setAttachments(loadDraftAttachments(id)); load(); refreshStatus(); connect(); const on=()=>{ const isOnline=navigator.onLine; setOnline(isOnline); setBrowserConnection(isOnline?(wsRef.current?.readyState===WebSocket.OPEN?'connected':'reconnecting'):'offline'); }; addEventListener('online',on); addEventListener('offline',on); return()=>{ mountedRef.current=false; removeEventListener('online',on); removeEventListener('offline',on); if(reconnectRef.current) clearTimeout(reconnectRef.current); wsRef.current?.close(); }; },[id]);
   useEffect(()=>{ if(!session) return; const provider=sessionProvider(session); setModels(null); setModelsProvider(provider); api('/api/models?provider='+encodeURIComponent(provider)).then(setModels).catch(()=>{}); },[id,session?.provider_id,session?.providerId]);
   useEffect(()=>{ if(nearBottomRef.current) requestAnimationFrame(()=>feedRef.current?.scrollTo({top:feedRef.current.scrollHeight})); },[events,live]);
   useEffect(()=>{ const el=textareaRef.current; if(!el)return; el.style.height='auto'; if(!text.trim()){ el.style.height='42px'; el.style.overflowY='hidden'; return; } const next=Math.min(Math.max(el.scrollHeight, 42), 180); el.style.height=next+'px'; el.style.overflowY=el.scrollHeight>180?'auto':'hidden'; },[text]);
   useEffect(()=>{ if(text.trim()) localStorage.setItem(draftKey(id), text); else localStorage.removeItem(draftKey(id)); },[id,text]);
   useEffect(()=>{ saveDraftAttachments(id, attachments); },[id,attachments]);
-  async function load(resetLive=false){ try{ const [d,st]=await Promise.all([api('/api/sessions/'+id), api('/api/status')]); setSession(d.session); setEvents(threadEvents(d.thread)); setStatus(st); const covered=Number(d.snapshot?.coveredSequence || 0); snapshotCoveredSequenceRef.current=covered; if(covered>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=covered; localStorage.setItem(sequenceKey(id), String(covered)); } setTurnStatus(normalizeTurnStatus(d.session?.status)); setRuntimeConnection(d.snapshot?.error?'recovering':'checking'); if(resetLive) setLive(v=>v.filter(m=>Number(m.runtimeSequence||0)>covered)); return clientAppliedSequenceRef.current; } catch(e:any){ toast('error','读取会话失败：'+shortError(e)); return clientAppliedSequenceRef.current; } finally { setLoading(false); } }
-  function connect(){ if(!mountedRef.current) return; const proto=location.protocol==='https:'?'wss':'ws'; const ws=new WebSocket(`${proto}://${location.host}/ws`); wsRef.current=ws; setBrowserConnection(navigator.onLine?'reconnecting':'offline'); ws.onopen=async()=>{ setBrowserConnection('connected'); const after=await load(true); if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'join',sessionId:id,lastSequence:after,clientAppliedSequence:after,snapshotCoveredSequence:snapshotCoveredSequenceRef.current})); }; ws.onmessage=e=>applySocketMessage(JSON.parse(e.data)); ws.onclose=()=>{ if(wsRef.current===ws) wsRef.current=null; setBrowserConnection(navigator.onLine?'reconnecting':'offline'); if(mountedRef.current) reconnectRef.current=window.setTimeout(connect,1500); }; }
-  function applySocketMessage(msg:any){ if(!acceptRuntimeEvent(msg)) return; if(msg.type==='joined'){ if(msg.runtimeConnection) setRuntimeConnection(normalizeRuntimeConnection(msg.runtimeConnection)); return; } if(msg.type==='runtimeConnection'){ setRuntimeConnection(normalizeRuntimeConnection(msg.status)); markRuntimeApplied(msg); return; } if(msg.type==='messageStatus'){ const mid=String(msg.clientMessageId||''); if(msg.status==='failed'){ const pending=pendingMessagesRef.current.get(mid); if(pending){ setText(pending.text); setAttachments(pending.attachments); } toast('error','发送失败：'+shortError(msg.error||'runtime 未接受任务')); } if(msg.status==='accepted'||msg.status==='failed'||msg.status==='completed') pendingMessagesRef.current.delete(mid); setLive(v=>[...v,msg]); return; } if(msg.type==='thread_snapshot'){ if(msg.thread){ setEvents(threadEvents(msg.thread)); const covered=Number(msg.snapshot?.coveredSequence || msg.runtimeSequence || 0); snapshotCoveredSequenceRef.current=Math.max(snapshotCoveredSequenceRef.current, covered); setLive(v=>v.filter(x=>Number(x.runtimeSequence||0)>covered)); if(covered>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=covered; localStorage.setItem(sequenceKey(id), String(covered)); } } if(msg.status) setTurnStatus(normalizeTurnStatus(msg.status)); markRuntimeApplied(msg); return; } if(msg.type==='approval'){ setApprovals(v=>v.some(a=>a.requestId===String(msg.requestId))?v:[...v,{requestId:String(msg.requestId),method:String(msg.method),params:msg.params}]); haptic(); toast('info','Codex 请求授权'); return; } if(msg.type==='sessionTitle') setSession(s=>s?{...s,title:msg.title}:s); if(msg.type==='codex'&&msg.method==='turn/started'){ setSession(s=>s?{...s,status:'running'}:s); setTurnStatus('running'); } if(msg.type==='codex'&&msg.method==='turn/completed'){ const interrupted=turnFailed(msg.params?.turn); setSession(s=>s?{...s,status:interrupted?'interrupted':'idle'}:s); setTurnStatus(interrupted?'interrupted':'completed'); } if(msg.type==='codex'&&(msg.method==='turn/failed'||msg.method==='turn/interrupted')){ setSession(s=>s?{...s,status:'interrupted'}:s); setTurnStatus('interrupted'); } if(msg.type==='error') toast('error','请求失败：'+msg.error); setLive(v=>[...v,msg]); markRuntimeApplied(msg); }
+  async function refreshStatus(){ try{ setStatus(await api('/api/status')); } catch{} }
+  async function load(resetLive=false){ const startedAt=performance.now(); try{ const d=await api('/api/sessions/'+id); setSession(d.session); setEvents(threadEvents(d.thread)); const covered=Number(d.snapshot?.coveredSequence || 0); snapshotCoveredSequenceRef.current=covered; if(covered>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=covered; localStorage.setItem(sequenceKey(id), String(covered)); } setTurnStatus(normalizeTurnStatus(d.session?.status)); setRuntimeConnection(d.snapshot?.error?'recovering':'checking'); if(resetLive) setLive(v=>v.filter(m=>Number(m.runtimeSequence||0)>covered)); console.info(`[perf] session-view-load ms=${Math.round(performance.now()-startedAt)}`); return clientAppliedSequenceRef.current; } catch(e:any){ toast('error','读取会话失败：'+shortError(e)); return clientAppliedSequenceRef.current; } finally { setLoading(false); } }
+  function connect(){ if(!mountedRef.current) return; const proto=location.protocol==='https:'?'wss':'ws'; const ws=new WebSocket(`${proto}://${location.host}/ws`); wsRef.current=ws; setBrowserConnection(navigator.onLine?'reconnecting':'offline'); ws.onopen=()=>{ const openedAt=performance.now(); setBrowserConnection('connected'); const after=clientAppliedSequenceRef.current; if(ws.readyState===WebSocket.OPEN){ joinSentAtRef.current=performance.now(); ws.send(JSON.stringify({type:'join',sessionId:id,lastSequence:after,clientAppliedSequence:after,snapshotCoveredSequence:snapshotCoveredSequenceRef.current})); console.info(`[perf] ws-open-to-join ms=${Math.round(performance.now()-openedAt)}`); } load(true); refreshStatus(); }; ws.onmessage=e=>applySocketMessage(JSON.parse(e.data)); ws.onclose=()=>{ if(wsRef.current===ws) wsRef.current=null; setBrowserConnection(navigator.onLine?'reconnecting':'offline'); if(mountedRef.current) reconnectRef.current=window.setTimeout(connect,1500); }; }
+  function applySocketMessage(msg:any){ if(!acceptRuntimeEvent(msg)) return; if(msg.type==='joined'){ if(joinSentAtRef.current) console.info(`[perf] ws-join-to-connected ms=${Math.round(performance.now()-joinSentAtRef.current)}`); if(msg.runtimeConnection) setRuntimeConnection(normalizeRuntimeConnection(msg.runtimeConnection)); return; } if(msg.type==='runtimeConnection'){ setRuntimeConnection(normalizeRuntimeConnection(msg.status)); markRuntimeApplied(msg); return; } if(msg.type==='messageStatus'){ const mid=String(msg.clientMessageId||''); if(msg.status==='failed'){ const pending=pendingMessagesRef.current.get(mid); if(pending){ setText(pending.text); setAttachments(pending.attachments); } toast('error','发送失败：'+shortError(msg.error||'runtime 未接受任务')); } if(msg.status==='accepted'||msg.status==='failed'||msg.status==='completed') pendingMessagesRef.current.delete(mid); setLive(v=>[...v,msg]); return; } if(msg.type==='thread_snapshot'){ if(msg.thread){ setEvents(threadEvents(msg.thread)); const covered=Number(msg.snapshot?.coveredSequence || msg.runtimeSequence || 0); snapshotCoveredSequenceRef.current=Math.max(snapshotCoveredSequenceRef.current, covered); setLive(v=>v.filter(x=>Number(x.runtimeSequence||0)>covered)); if(covered>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=covered; localStorage.setItem(sequenceKey(id), String(covered)); } } if(msg.status) setTurnStatus(normalizeTurnStatus(msg.status)); markRuntimeApplied(msg); return; } if(msg.type==='approval'){ setApprovals(v=>v.some(a=>a.requestId===String(msg.requestId))?v:[...v,{requestId:String(msg.requestId),method:String(msg.method),params:msg.params}]); haptic(); toast('info','Codex 请求授权'); return; } if(msg.type==='sessionTitle') setSession(s=>s?{...s,title:msg.title}:s); if(msg.type==='codex'&&msg.method==='turn/started'){ setSession(s=>s?{...s,status:'running'}:s); setTurnStatus('running'); } if(msg.type==='codex'&&msg.method==='turn/completed'){ const interrupted=turnFailed(msg.params?.turn); setSession(s=>s?{...s,status:interrupted?'interrupted':'idle'}:s); setTurnStatus(interrupted?'interrupted':'completed'); } if(msg.type==='codex'&&(msg.method==='turn/failed'||msg.method==='turn/interrupted')){ setSession(s=>s?{...s,status:'interrupted'}:s); setTurnStatus('interrupted'); } if(msg.type==='error') toast('error','请求失败：'+msg.error); setLive(v=>[...v,msg]); markRuntimeApplied(msg); }
   function acceptRuntimeEvent(msg:any){ const seq=Number(msg.runtimeSequence||0); if(!seq) return true; if(seq<=snapshotCoveredSequenceRef.current && msg.type!=='thread_snapshot') return false; const generation=String(msg.runtimeGeneration||'legacy'); const key=`${generation}:${seq}:${msg.type||''}:${msg.method||msg.status||''}`; if(seenRuntimeEventsRef.current.has(key)) return false; seenRuntimeEventsRef.current.add(key); return true; }
   function markRuntimeApplied(msg:any){ const seq=Number(msg.runtimeSequence||0); if(seq>clientAppliedSequenceRef.current){ clientAppliedSequenceRef.current=seq; localStorage.setItem(sequenceKey(id), String(seq)); } }
   function onScroll(){ const el=feedRef.current; if(!el)return; nearBottomRef.current=el.scrollHeight-el.scrollTop-el.clientHeight<120; setShowBottom(!nearBottomRef.current); }
@@ -452,8 +466,13 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   const [models,setModels]=useState<any>(null);
   const [loginJob,setLoginJob]=useState<any>(null);
   const [agLoginJob,setAgLoginJob]=useState<any>(null);
+  const [geminiLoginJob,setGeminiLoginJob]=useState<any>(null);
+  const [geminiAuthProfile,setGeminiAuthProfile]=useState<any>(null);
+  const [geminiAuthMethods,setGeminiAuthMethods]=useState<any[]>([]);
+  const [geminiApiKey,setGeminiApiKey]=useState('');
   const [agCode,setAgCode]=useState('');
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
+  const [deleteGeminiProfile,setDeleteGeminiProfile]=useState<any>(null);
   const [page,setPage]=useState<'main'|'agent'|'mode'|'model'|'account'>('main');
   const activeProvider = localData?.settings?.activeProvider || 'codex';
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
@@ -467,6 +486,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   }
   useEffect(()=>{ if(!loginJob?.id || loginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/profile-login/'+loginJob.id); setLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录未完成'); } }catch{} },1500); return()=>window.clearInterval(timer); },[loginJob?.id,loginJob?.status]);
   useEffect(()=>{ if(!agLoginJob?.id || agLoginJob.status!=='running') return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/antigravity-login/'+agLoginJob.id); setAgLoginJob(r.job); if(r.job.status!=='running'){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录失败'); } }catch{} },1500); return()=>window.clearInterval(timer); },[agLoginJob?.id,agLoginJob?.status]);
+  useEffect(()=>{ if(!geminiLoginJob?.id || !['starting','waiting_user','verifying'].includes(geminiLoginJob.status)) return; const timer=window.setInterval(async()=>{ try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id); setGeminiLoginJob(r.job); if(!['starting','waiting_user','verifying'].includes(r.job.status)){ window.clearInterval(timer); await syncSettings(); toast(r.job.status==='done'?'success':'error', r.job.status==='done'?'登录完成':'登录失败'); } }catch{} },1500); return()=>window.clearInterval(timer); },[geminiLoginJob?.id,geminiLoginJob?.status]);
   async function setActiveProvider(provider:string){ setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),activeProvider:provider}})); try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); haptic(); toast('success','Agent 已切换'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function setDefaultMode(mode:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultMode:mode})}); haptic(); toast('success','已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
   async function setDefaultModel(model:string){ try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({defaultModel:model,provider:activeProvider})}); setLocalData((d:any)=>({...d,settings:{...(d?.settings||{}),defaultModel:model,defaultModels:{...(d?.settings?.defaultModels||{}),[activeProvider]:model}}})); haptic(); toast('success','模型已更新'); await syncSettings(); } catch(e:any){ toast('error','更新失败：'+shortError(e)); } }
@@ -475,26 +495,34 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   async function loginNewProfile(){ try{ const r=await api('/api/profiles',{method:'POST',body:JSON.stringify({name:'Codex Account'})}); await deviceLogin(r.profile.id, true); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function loginAntigravity(){ try{ const r=await api('/api/antigravity/profiles/login',{method:'POST'}); setAgLoginJob(r.job); setAgCode(''); toast('info','Antigravity 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function submitAntigravityCode(){ if(!agLoginJob?.id || !agCode.trim()) return; try{ const r=await api('/api/antigravity-login/'+agLoginJob.id+'/input',{method:'POST',body:JSON.stringify({code:agCode.trim()})}); setAgLoginJob((job:any)=>({...job,...(r.job||{}), codeSubmitted:true})); setAgCode(''); toast('info','授权码已提交，正在确认登录'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
+  async function loginNewGeminiProfile(){ try{ const r=await api('/api/gemini/profiles',{method:'POST',body:JSON.stringify({name:'Gemini Account'})}); await openGeminiLogin(r.profile); } catch(e:any){ toast('error','创建 Gemini 账户失败：'+shortError(e)); } }
+  async function openGeminiLogin(profile:any){ try{ const r=await api(`/api/gemini/profiles/${profile.id}/refresh`,{method:'POST'}); setGeminiAuthProfile(r.profile || profile); setGeminiAuthMethods(r.runtime?.authMethods || []); setGeminiApiKey(''); } catch(e:any){ setGeminiAuthProfile(profile); setGeminiAuthMethods([]); setGeminiApiKey(''); toast('error','读取登录方式失败：'+shortError(e)); } }
+  async function startGeminiLogin(methodId:string){ if(!geminiAuthProfile?.id) return; try{ const body:any={methodId}; if(methodId==='api_key' || methodId.toLowerCase().includes('api')) body.apiKey=geminiApiKey; const r=await api(`/api/gemini/profiles/${geminiAuthProfile.id}/login`,{method:'POST',body:JSON.stringify(body)}); setGeminiLoginJob(r.job); setGeminiApiKey(''); setGeminiAuthProfile(null); toast('info','Gemini 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
+  async function switchGeminiProfile(id:string){ try{ await api(`/api/gemini/profiles/${id}/switch`,{method:'POST'}); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function logoutGeminiProfile(profile:any){ try{ await api(`/api/gemini/profiles/${profile.id}/logout`,{method:'POST'}); haptic(); toast('success','已退出登录'); await syncSettings(); } catch(e:any){ toast('error','退出失败：'+shortError(e)); } }
+  async function removeGeminiProfile(profile:any){ try{ await api(`/api/gemini/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteGeminiProfile(null); await syncSettings(); } catch(e:any){ toast('error','删除失败：'+shortError(e)); } }
   async function switchAntigravityProfile(id:string){ try{ await api(`/api/antigravity/profiles/${id}/switch`,{method:'POST'}); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
   async function removeAntigravityProfile(profile:any){ try{ await api(`/api/antigravity/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); await syncSettings(); } catch(e:any){ toast('error','删除失败：'+shortError(e)); } }
   async function removeProfile(profile:any){ try{ await api(`/api/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteProfile(null); await syncSettings(); } catch(e:any){ toast('error','删除失败：'+shortError(e)); } }
   const currentModel = localData?.settings?.defaultModels ? (localData.settings.defaultModels[activeProvider] || catalogCurrent(models)) : (localData?.settings?.defaultModel || catalogCurrent(models));
   const activeProfile = (localData?.profiles||[]).find((p:any)=>p.active) || localData?.activeProfile;
+  const activeGeminiProfile = (localData?.geminiProfiles||[]).find((p:any)=>p.active) || localData?.activeGeminiProfile;
   const activeAntigravityProfile = (localData?.antigravityProfiles||[]).find((p:any)=>p.active) || localData?.activeAntigravityProfile;
   const codexProfiles = (localData?.profiles?.length ? localData.profiles : (localData?.activeProfile ? [localData.activeProfile] : []));
+  const geminiProfiles = (localData?.geminiProfiles?.length ? localData.geminiProfiles : (localData?.activeGeminiProfile ? [localData.activeGeminiProfile] : []));
   const codexProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='codex');
   const geminiProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='gemini') || localData?.gemini;
   const antigravityProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='antigravity') || localData?.antigravity;
   const activeProviderStatus = (localData?.providers||[]).find((p:any)=>p.id===activeProvider) || (activeProvider==='gemini' ? geminiProviderStatus : activeProvider==='antigravity' ? antigravityProviderStatus : codexProviderStatus);
   const title = page==='main' ? '设置' : page==='agent' ? 'Agent' : page==='mode' ? '沙盒' : page==='model' ? '模型' : `${providerLabel(activeProvider)} 账户`;
-  const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? providerLabel(activeProvider) : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProvider==='codex'?modelLabel(currentModel):(activeProviderStatus?.ok?'Antigravity 模型':'Antigravity 未安装')) : (activeProvider==='codex'?profileLabel(activeProfile):(activeProviderStatus?.ok?antigravityProfileLabel(activeAntigravityProfile):'Antigravity 未安装'));
+  const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? providerLabel(activeProvider) : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProvider==='codex'?modelLabel(currentModel):(activeProviderStatus?.ok?`${providerLabel(activeProvider)} 模型`:`${providerLabel(activeProvider)} 未安装`)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
   return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button onClick={()=>setPage('main')}>返回</button>:undefined}>
     <div className="settingsGrid">
       {page==='main'&&<div className="settingsNav">
         <button onClick={()=>setPage('agent')}><span><b>Agent</b><small>{providerLabel(activeProvider)}{activeProvider==='antigravity'&&!activeProviderStatus?.ok?' · 未安装':''}</small></span><i>›</i></button>
         <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
         <button onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.ok ? modelLabel(currentModel) : `${providerLabel(activeProvider)} 未安装`}</small></span><i>›</i></button>
-        <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{activeProvider==='codex'?profileLabel(activeProfile):(activeProviderStatus?.ok?antigravityProfileLabel(activeAntigravityProfile):'Antigravity 未安装')}</small></span><i>›</i></button>
+        <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
       </div>}
       {page==='agent'&&<section><b>Agent</b><div className="providerChoices">
         <button className={activeProvider==='codex'?'active':''} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{codexProviderStatus?.ok ? codexProviderStatus.version : (codexProviderStatus?.error || 'Codex CLI 不可用')}</small></span><i/></button>
@@ -503,27 +531,36 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
       </div>{activeProvider==='gemini'&&<InlineNotice tone={geminiProviderStatus?.runtime?.authenticated?'info':'error'} text={geminiProviderStatus?.runtime?.authenticated?'Gemini ACP 可用。':'Gemini CLI 已接入 ACP，但当前 default profile 需要完成 Google 登录或 API key 配置后才能运行会话。'}/>} {activeProvider==='antigravity'&&!activeProviderStatus?.ok&&<InlineNotice tone="info" text={activeProviderStatus?.installHint || '需要先安装官方 CLI 后才能登录和创建 Antigravity 会话。'}/>}</section>}
       {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
       {page==='model'&&<section><b>模型</b>{models?.error&&<InlineNotice tone="info" text={models.error}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`} onPick={setDefaultModel}/></section>}
-      {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
+      {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={profileLabel(p)} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
+      {page==='account'&&activeProvider==='gemini'&&<><section><b>账户</b><div className="profileList">{geminiProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={geminiProfileLabel(p)} onSwitch={switchGeminiProfile} onLogin={()=>openGeminiLogin(p)} onLogout={logoutGeminiProfile} onDelete={setDeleteGeminiProfile}/>)}</div></section><section><b>添加账户</b><button disabled={!activeProviderStatus?.ok} onClick={loginNewGeminiProfile}>登录新账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Gemini 未安装</b><span>安装 Gemini CLI 后才能登录。</span></div>}</section>{geminiLoginJob&&<GeminiLoginJobPanel job={geminiLoginJob}/>}</>}
       {page==='account'&&activeProvider==='antigravity'&&<section><b>账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={removeAntigravityProfile}/>)}</div><button disabled={!activeProviderStatus?.ok || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Antigravity 未安装</b><span>安装后才能登录 Google 账户。</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode}/>}</section>}
     </div>
     {deleteProfile&&<ConfirmDialog title="删除账户？" detail={`删除 ${profileLabel(deleteProfile)} 的本地登录配置。当前账户不能删除。`} confirm="删除" onCancel={()=>setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
+    {deleteGeminiProfile&&<ConfirmDialog title="删除 Gemini 账户？" detail={`删除 ${geminiProfileLabel(deleteGeminiProfile)} 的本地登录配置。有历史会话引用的账户不能删除。`} confirm="删除" onCancel={()=>setDeleteGeminiProfile(null)} onConfirm={()=>removeGeminiProfile(deleteGeminiProfile)}/>}
+    {geminiAuthProfile&&<GeminiAuthPicker profile={geminiAuthProfile} methods={geminiAuthMethods} apiKey={geminiApiKey} onApiKey={setGeminiApiKey} onPick={startGeminiLogin} onClose={()=>setGeminiAuthProfile(null)}/>}
   </Sheet>;
 }
 function mergeSettingsData(current:any, next:any){
-  if(!current?.profiles?.length || !next?.profiles?.length) return next;
-  const byId = new Map(next.profiles.map((p:any)=>[p.id,p]));
-  const ordered = current.profiles.map((p:any)=>byId.get(p.id)).filter(Boolean);
-  for(const p of next.profiles) if(!current.profiles.some((x:any)=>x.id===p.id)) ordered.push(p);
-  return {...next, profiles:activeFirst(ordered)};
+  if(!current) return next;
+  const merged:any = {...next};
+  for(const key of ['profiles','geminiProfiles','antigravityProfiles']){
+    if(!current?.[key]?.length || !next?.[key]?.length) continue;
+    const byId = new Map(next[key].map((p:any)=>[p.id,p]));
+    const ordered = current[key].map((p:any)=>byId.get(p.id)).filter(Boolean);
+    for(const p of next[key]) if(!current[key].some((x:any)=>x.id===p.id)) ordered.push(p);
+    merged[key]=activeFirst(ordered);
+  }
+  return merged;
 }
 function activeFirst(profiles:any[]){ return [...profiles].sort((a:any,b:any)=>Number(b.active || 0)-Number(a.active || 0)); }
-function ProfileRow({profile,onSwitch,onLogin,onDelete}:{profile:any;onSwitch:(id:string)=>void;onLogin:(id:string)=>void;onDelete:(p:any)=>void}){
+function ProfileRow({profile,label,onSwitch,onLogin,onLogout,onDelete}:{profile:any;label:string;onSwitch:(id:string)=>void;onLogin:(id:string)=>void;onLogout?:(p:any)=>void;onDelete:(p:any)=>void}){
   const loggedIn = !!profile.login?.ok;
   const active = !!profile.active;
   return <div className="profileRow">
-    <div><strong>{profileLabel(profile)}</strong><span className="profileBadges">{active&&<i>当前</i>}<i>{loggedIn?'已登录':'未登录'}</i>{profile.login?.email&&<em>{profile.login.email}</em>}</span></div>
+    <div><strong>{label}</strong><span className="profileBadges">{active&&<i>当前</i>}<i>{loggedIn?'已登录':'未登录'}</i>{profile.authType&&<i>{authTypeLabel(profile.authType)}</i>}{profile.login?.email&&<em>{profile.login.email}</em>}</span></div>
     {!active&&loggedIn&&<button onClick={()=>onSwitch(profile.id)}>切换</button>}
     {!loggedIn&&<button onClick={()=>onLogin(profile.id)}>登录</button>}
+    {loggedIn&&onLogout&&<button onClick={()=>onLogout(profile)}>退出登录</button>}
     <button className="dangerText" onClick={()=>onDelete(profile)} disabled={active&&loggedIn}>删除</button>
   </div>;
 }
@@ -568,6 +605,32 @@ function AntigravityLoginPanel({job,code,onCode,onSubmit}:{job:any;code:string;o
       <button disabled={!code.trim() || job.status!=='running'} onClick={onSubmit}>{submitted?'正在确认':job.status==='running'?'提交授权码':'已结束'}</button>
       <small>{job.status==='running'?(submitted?'已提交授权码，正在等待 Antigravity 确认登录':'完成 Google 登录后，把页面上的授权码粘贴到这里。'):job.status==='done'?'登录完成':'登录失败，未完成账户会自动清理'}</small>
     </div>
+  </section>;
+}
+function GeminiAuthPicker({profile,methods,apiKey,onApiKey,onPick,onClose}:{profile:any;methods:any[];apiKey:string;onApiKey:(v:string)=>void;onPick:(id:string)=>void;onClose:()=>void}){
+  const runtimeMethods = (methods||[]).filter((m:any)=>m?.id);
+  return <div className="dialogBackdrop"><section className="dialog geminiAuthDialog">
+    <h2>Gemini 登录</h2>
+    <p>{geminiProfileLabel(profile)}</p>
+    <div className="loginCodeCard ready">
+      <span>Gemini API Key</span>
+      <input type="password" value={apiKey} onChange={e=>onApiKey(e.target.value)} placeholder="输入 Gemini API Key" autoComplete="off"/>
+      <button disabled={!apiKey.trim()} onClick={()=>onPick('api_key')}>使用 API Key 登录</button>
+      <small>API Key 只写入当前 Gemini Profile 的私有配置，不会回显。</small>
+    </div>
+    {!!runtimeMethods.length&&<div className="modelChoices">
+      {runtimeMethods.map((m:any)=><button key={m.id} onClick={()=>onPick(String(m.id))}><span><b>{m.name || m.id}</b>{m.description&&<small>{m.description}</small>}</span><i>›</i></button>)}
+    </div>}
+    {!runtimeMethods.length&&<InlineNotice tone="info" text="未从 Gemini ACP 读取到可网页直连的登录方式。API Key 可直接在这里完成；Google OAuth 如果需要终端/本机回调，请先通过 SSH 登录后点重新检测。"/>}
+    <div><button onClick={onClose}>取消</button></div>
+  </section></div>;
+}
+function GeminiLoginJobPanel({job}:{job:any}){
+  return <section><b>Gemini 登录</b>
+    <span>{job.status==='starting'?'正在启动':job.status==='verifying'?'正在验证':job.status==='waiting_user'?'等待用户操作':job.status==='done'?'登录完成':job.status==='cancelled'?'已取消':'登录失败'}</span>
+    {job.loginUrl&&<a className="loginLink" href={job.loginUrl} target="_blank" rel="noreferrer">打开登录网页</a>}
+    {job.deviceCode&&<div className="loginCodeCard ready"><span>认证码</span><div className="loginCodeLine"><strong>{job.deviceCode}</strong></div></div>}
+    {job.error&&<InlineNotice tone={job.status==='waiting_user'?'info':'error'} text={job.error}/>}
   </section>;
 }
 function stripAnsi(text:string){ return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g,''); }
