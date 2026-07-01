@@ -21,6 +21,7 @@ import { Db } from './db.js';
 import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
 import { AntigravityProvider, GeminiProvider, type AgentProviderId } from './providers.js';
+import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -102,6 +103,7 @@ let projectsCache: { expiresAt:number; promise?:Promise<any[]>; value?:any[] } =
 let codexStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let antigravityStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let geminiStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
+let unifiedProviderStatusCache: { expiresAt:number; promise?:Promise<Record<AgentProviderId, ProviderStatus>>; value?:Record<AgentProviderId, ProviderStatus>; generation:number } = { expiresAt: 0, generation: 0 };
 let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any>; value?:any } = { key:'', expiresAt: 0 };
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
@@ -173,6 +175,7 @@ app.get('/api/status', async (req) => {
     antigravityStatus,
     geminiStatus,
     geminiRuntime,
+    providerStatuses,
   ] = await Promise.all([
     appSettings(),
     getActiveProfile(),
@@ -182,16 +185,18 @@ app.get('/api/status', async (req) => {
     cachedAntigravityStatus(force),
     cachedGeminiStatus(force),
     USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
+    unifiedProviderStatuses(force),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
-  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
+  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
   const settings = await appSettings();
   const codexStatus = cachedCodexStatusSnapshot();
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
   const antigravityStatus = cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value);
+  const providerStatuses = await unifiedProviderStatuses(false);
   return {
     authed:true,
     authenticated:true,
@@ -199,7 +204,8 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     codex:codexStatus,
     gemini:geminiStatus,
     antigravity:antigravityStatus,
-    providers:[codexProviderStatus(codexStatus), geminiStatus, antigravityStatus],
+    providers:providerStatusArray(providerStatuses),
+    providerStatus:providerStatuses,
     activeProvider:settings.activeProvider,
     roots,
     defaultWorkspace:DEFAULT_WORKSPACE_DIR,
@@ -212,6 +218,10 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     activeAntigravityProfile:await activeAntigravityProfileSummary(),
     capabilities:attachmentCapabilities(null),
   };
+});
+app.get('/api/providers/status', { preHandler: ensureAuth }, async (req:any) => {
+  const providers = await unifiedProviderStatuses(req.query?.refresh === '1');
+  return { providers, checkedAt:new Date().toISOString() };
 });
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
@@ -290,6 +300,7 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     antigravityStatus,
     geminiStatus,
     geminiRuntime,
+    providerStatuses,
   ] = await Promise.all([
     appSettings(),
     listProfiles(),
@@ -304,13 +315,14 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     light ? Promise.resolve(cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value)) : cachedAntigravityStatus(force),
     light ? Promise.resolve(cachedProviderStatusSnapshot('gemini', geminiStatusCache.value)) : cachedGeminiStatus(force),
     light || !USE_AGENT_RUNTIME ? Promise.resolve({ error: light ? 'not refreshed' : 'persistent runtime disabled' }) : runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })),
+    unifiedProviderStatuses(force && !light),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
-  return { settings, profiles, pendingProfiles, activeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] };
+  return { settings, profiles, pendingProfiles, activeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses };
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
-  if (provider) await setSetting('activeProvider', provider);
+  if (provider) { await setSetting('activeProvider', provider); invalidateUnifiedProviderStatuses(); }
   const mode = normalizeMode(req.body?.defaultMode);
   if (mode) await setSetting('defaultMode', mode);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultModel')) {
@@ -346,6 +358,7 @@ app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any)
   }
   await updateProfileEmailName(String(profile.id), String(profile.codex_home)).catch(()=>{});
   codexStatusCache = { expiresAt:0 };
+  invalidateUnifiedProviderStatuses();
   return { ok:!warning, warning, activeProfile: await getActiveProfile() };
 });
 app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -358,11 +371,13 @@ app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, repl
   if (refs > 0) {
     await db.run("UPDATE codex_profiles SET active=0, status='disabled', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
     await ensureCodexActiveProfile();
+    invalidateUnifiedProviderStatuses();
     return { ok:true, hidden:true, references:refs };
   }
   await db.run('DELETE FROM codex_profiles WHERE id=?1', [String(profile.id)]);
   await deleteProfileDir(String(profile.codex_home)).catch(()=>{});
   await ensureCodexActiveProfile();
+  invalidateUnifiedProviderStatuses();
   return { ok:true };
 });
 app.get('/api/gemini/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listGeminiProfiles(), pendingProfiles: await listGeminiPendingProfiles(), activeGeminiProfile: await getActiveGeminiProfile() }));
@@ -389,6 +404,7 @@ app.post('/api/gemini/profiles/:id/switch', { preHandler: ensureAuth }, async (r
   const dto = await getGeminiProfileDto(String(profile.id), { includeHidden:true });
   if (dto?.status !== 'authenticated' || !dto.login?.ok) return reply.code(409).send({error:'请先登录该 Gemini 账户'});
   await activateGeminiProfile(String(profile.id));
+  invalidateUnifiedProviderStatuses();
   return { ok:true, activeGeminiProfile: await getActiveGeminiProfile() };
 });
 app.post('/api/gemini/profiles/:id/refresh', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -407,6 +423,7 @@ app.post('/api/gemini/profiles/:id/logout', { preHandler: ensureAuth }, async (r
   await removeGeminiProfileSecret(String(profile.home_dir), 'GEMINI_API_KEY').catch(()=>{});
   await db.run("UPDATE gemini_profiles SET auth_type=NULL, active=0, status='configured', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
   await ensureGeminiActiveProfile();
+  invalidateUnifiedProviderStatuses();
   return { ok:true, profile: await getGeminiProfileDto(String(profile.id)) };
 });
 app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -416,6 +433,7 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({error:'methodId required'});
   await db.run("UPDATE gemini_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND status IN ('bootstrap','draft','failed','needs_login','configured')", [Date.now(), String(profile.id)]).catch(()=>{});
+  invalidateUnifiedProviderStatuses();
   const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'preparing', startedAt:Date.now() };
   geminiLoginJobs.set(job.id, job);
   geminiLoginProfiles.set(String(profile.id), job.id);
@@ -448,6 +466,7 @@ app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:an
     await db.run('DELETE FROM gemini_profiles WHERE id=?1', [String(profile.id)]);
   });
   await step('chooseActive', () => ensureGeminiActiveProfile());
+  invalidateUnifiedProviderStatuses();
   const homeDir = String(profile.home_dir);
   setTimeout(() => {
     const started = Date.now();
@@ -626,6 +645,7 @@ app.post('/api/antigravity/profiles/:id/switch', { preHandler: ensureAuth }, asy
   const profile = await getAntigravityProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
   await activateAntigravityProfile(String(profile.id));
+  invalidateUnifiedProviderStatuses();
   return { activeProfile: await getActiveAntigravityProfile() };
 });
 app.delete('/api/antigravity/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -639,11 +659,13 @@ app.delete('/api/antigravity/profiles/:id', { preHandler: ensureAuth }, async (r
     await db.run("UPDATE antigravity_profiles SET active=0, status='disabled', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
     await deleteAntigravityProfileDir(String(profile.home_dir)).catch(()=>{});
     await ensureAntigravityActiveProfile();
+    invalidateUnifiedProviderStatuses();
     return { ok:true, hidden:true, references:refs };
   }
   await db.run('DELETE FROM antigravity_profiles WHERE id=?1', [String(profile.id)]);
   await deleteAntigravityProfileDir(String(profile.home_dir)).catch(()=>{});
   await ensureAntigravityActiveProfile();
+  invalidateUnifiedProviderStatuses();
   return { ok:true };
 });
 app.get('/api/antigravity-login/:jobId', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -664,6 +686,16 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   const title = String(req.body?.title || path.basename(projectDir));
   const settings = await appSettings();
   const mode = normalizeMode(req.body?.mode) || settings.defaultMode;
+  const statuses = await unifiedProviderStatuses();
+  const selectedStatus = statuses[provider];
+  if (!selectedStatus?.canCreateSession) {
+    const statusCode = selectedStatus?.availability === 'unavailable' ? 503 : 409;
+    return reply.code(statusCode).send({
+      error: `${provider}_cannot_create_session`,
+      message: selectedStatus?.message || `${providerDisplayName(provider)} 当前不能创建会话`,
+      detail: selectedStatus ? `availability=${selectedStatus.availability}; auth=${selectedStatus.auth}` : 'provider status unavailable',
+    });
+  }
   if (provider === 'antigravity') {
     const status = await cachedAntigravityStatus();
     if (!status.ok) return reply.code(409).send({error:'Antigravity CLI 不可用，不能创建 Antigravity 会话'});
@@ -1072,6 +1104,111 @@ async function cachedProviderStatus(
   update({ ...cache, promise });
   return promise;
 }
+function invalidateUnifiedProviderStatuses() {
+  unifiedProviderStatusCache = { expiresAt: 0, generation: unifiedProviderStatusCache.generation + 1 };
+}
+function providerStatusArray(statuses:Record<AgentProviderId, ProviderStatus>) {
+  return [statuses.codex, statuses.gemini, statuses.antigravity];
+}
+function providerDisplayName(provider:AgentProviderId) {
+  return provider === 'gemini' ? 'Gemini' : provider === 'antigravity' ? 'Antigravity' : 'Codex';
+}
+async function unifiedProviderStatuses(force = false):Promise<Record<AgentProviderId, ProviderStatus>> {
+  const now = Date.now();
+  if (!force && unifiedProviderStatusCache.value && unifiedProviderStatusCache.expiresAt > now) return unifiedProviderStatusCache.value;
+  if (!force && unifiedProviderStatusCache.promise) return unifiedProviderStatusCache.promise;
+  const generation = unifiedProviderStatusCache.generation;
+  const promise = buildUnifiedProviderStatuses(force).then(value => {
+    if (generation === unifiedProviderStatusCache.generation) {
+      unifiedProviderStatusCache = { value, expiresAt: Date.now() + 5000, generation };
+    }
+    return value;
+  }).catch(err => {
+    if (generation === unifiedProviderStatusCache.generation) unifiedProviderStatusCache = { expiresAt: 0, generation };
+    throw err;
+  });
+  unifiedProviderStatusCache = { ...unifiedProviderStatusCache, promise };
+  return promise;
+}
+async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentProviderId, ProviderStatus>> {
+  const checkedAt = new Date().toISOString();
+  const [codexCli, geminiCli, antigravityCli, codexProfile, geminiProfile, antigravityProfile, geminiPendingProfiles, codexPendingProfiles] = await Promise.all([
+    force ? codexStatus() : cachedCodexStatus().catch((e:any)=>({ ok:false, error:e?.message || String(e) })),
+    cachedGeminiStatus(force).catch((e:any)=>({ id:'gemini', displayName:'Gemini', ok:false, error:e?.message || String(e) })),
+    cachedAntigravityStatus(force).catch((e:any)=>({ id:'antigravity', displayName:'Antigravity', ok:false, error:e?.message || String(e) })),
+    activeCodexProfileSummary(),
+    activeGeminiProfileSummary(),
+    activeAntigravityProfileSummary(),
+    listGeminiPendingProfiles().catch(()=>[]),
+    listPendingProfiles().catch(()=>[]),
+  ]);
+  const codexLogin:any = codexProfile?.login || {};
+  const codexEmail = findEmailInText(String(codexLogin.email || codexProfile?.name || '')) || undefined;
+  const codexAuthenticating = codexPendingProfiles.some((p:any) => ['draft','authenticating','verifying'].includes(String(p.state || p.status || '')));
+  const codexAuth = codexProfile?.id ? 'authenticated' : codexAuthenticating ? 'authenticating' : 'unauthenticated';
+  const geminiAuthenticating = geminiPendingProfiles.some((p:any) => ['draft','authenticating','verifying'].includes(String(p.state || p.status || '')));
+  const geminiAuth = geminiProfile?.status === 'authenticated' ? 'authenticated' : geminiAuthenticating ? 'authenticating' : 'unauthenticated';
+  const geminiEmail = findEmailInText(String(geminiProfile?.login?.email || geminiProfile?.name || '')) || undefined;
+  const geminiReason = !geminiCli?.ok ? 'gemini_unavailable' : !USE_AGENT_RUNTIME ? 'gemini_runtime_disabled' : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'gemini_authenticating' : 'gemini_not_logged_in';
+  const geminiMessage = !geminiCli?.ok ? (geminiCli?.error || 'Gemini CLI 不可用') : !USE_AGENT_RUNTIME ? 'Gemini ACP 需要 persistent runtime' : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'Gemini 正在登录' : '请先登录 Gemini';
+  const antigravityEmail = findEmailInText(String(antigravityProfile?.login?.email || antigravityProfile?.name || '')) || undefined;
+  const antigravityAuth = antigravityProfile?.id ? 'unknown' : 'unauthenticated';
+  const antigravityCanCreate = !!antigravityCli?.ok && !!antigravityProfile?.id && !!antigravityProfile?.login?.ok;
+  return {
+    codex: providerStatus({
+      provider:'codex',
+      displayName:'Codex',
+      cliStatus: codexCli,
+      auth: codexAuth,
+      activeProfileId: codexProfile?.id || null,
+      account: codexProfile?.id ? { id:codexProfile.id, profileId:codexProfile.id, email:codexEmail, displayName:codexEmail || codexProfile.name } : null,
+      canCreateSession: !!codexCli?.ok && codexAuth === 'authenticated',
+      canManageAccounts: true,
+      canLogout: codexAuth === 'authenticated',
+      canQueryQuota: true,
+      canListModels: !!codexCli?.ok,
+      reasonCode: codexCli?.ok ? (codexAuth === 'authenticated' ? null : 'codex_not_logged_in') : 'codex_unavailable',
+      message: codexCli?.ok ? (codexAuth === 'authenticated' ? null : '请先登录 Codex') : (codexCli?.error || 'Codex CLI 不可用'),
+      checkedAt,
+      command:'codex',
+    }),
+    gemini: providerStatus({
+      provider:'gemini',
+      displayName:'Gemini',
+      cliStatus: geminiCli,
+      auth: geminiAuth,
+      activeProfileId: geminiProfile?.id || null,
+      account: geminiProfile?.id ? { id:geminiProfile.id, profileId:geminiProfile.id, email:geminiEmail, displayName:geminiEmail || geminiProfile.name, authType:geminiProfile.authType ? String(geminiProfile.authType) : undefined } : null,
+      canCreateSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated',
+      canManageAccounts: true,
+      canLogout: geminiAuth === 'authenticated',
+      canQueryQuota: true,
+      canListModels: !!geminiCli?.ok,
+      reasonCode: geminiReason,
+      message: geminiMessage,
+      checkedAt,
+      command:'gemini',
+    }),
+    antigravity: providerStatus({
+      provider:'antigravity',
+      displayName:'Antigravity',
+      cliStatus: antigravityCli,
+      auth: antigravityAuth,
+      activeProfileId: antigravityProfile?.id || null,
+      account: antigravityProfile?.id ? { id:antigravityProfile.id, profileId:antigravityProfile.id, email:antigravityEmail, displayName:antigravityEmail || antigravityProfile.name } : null,
+      canCreateSession: antigravityCanCreate,
+      canManageAccounts: true,
+      canLogout: false,
+      canQueryQuota: true,
+      canListModels: !!antigravityCli?.ok && !!antigravityProfile?.id,
+      reasonCode: !antigravityCli?.ok ? 'antigravity_unavailable' : antigravityProfile?.id ? 'antigravity_auth_unknown' : 'antigravity_not_logged_in',
+      message: !antigravityCli?.ok ? (antigravityCli?.error || 'Antigravity CLI 不可用') : antigravityProfile?.id ? 'Antigravity 登录状态无法可靠探测' : '请先添加 Antigravity 账户',
+      checkedAt,
+      command:'agy',
+      installHint:'需要先安装官方 CLI 后才能登录和创建 Antigravity 会话。',
+    }),
+  };
+}
 async function activeCodexProfileSummary() {
   const p = await db.get("SELECT id,name,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
   if (!p) return null;
@@ -1249,6 +1386,7 @@ async function getActiveProfile() {
 async function activateProfile(id:string) {
   await db.run('UPDATE codex_profiles SET active=0');
   await db.run("UPDATE codex_profiles SET active=1, updated_at=?1 WHERE id=?2 AND COALESCE(status,'authenticated')='authenticated'", [Date.now(), id]);
+  invalidateUnifiedProviderStatuses();
 }
 async function ensureCodexActiveProfile() {
   const active = await db.get("SELECT id FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' LIMIT 1");
@@ -1319,6 +1457,7 @@ async function getActiveGeminiProfile() {
 async function activateGeminiProfile(id:string) {
   await db.run('UPDATE gemini_profiles SET active=0');
   await db.run('UPDATE gemini_profiles SET active=1, updated_at=?1 WHERE id=?2', [Date.now(), id]);
+  invalidateUnifiedProviderStatuses();
 }
 async function geminiProfileDto(row:any) {
   const login = await geminiLoginStatus(String(row.home_dir), String(row.auth_type || '') || null);
@@ -1389,6 +1528,7 @@ async function refreshGeminiProfileName(id:string, homeDir:string, authType:stri
 async function markGeminiProfileNeedsLogin(id:string, reason:string) {
   await db.run("UPDATE gemini_profiles SET status='needs_login', active=0, updated_at=?1 WHERE id=?2", [Date.now(), id]).catch(()=>{});
   await ensureGeminiActiveProfile().catch(()=>{});
+  invalidateUnifiedProviderStatuses();
   app.log.warn({ provider:'gemini', profileId:id, reason:safeGeminiError(reason) }, 'gemini profile marked needs_login after ACP authentication error');
 }
 
@@ -1746,6 +1886,7 @@ function setGeminiJobStatus(job:GeminiLoginJob, status:GeminiLoginJob['status'],
   if (error) job.error = error;
   const profileStatus = status === 'done' ? 'authenticated' : status === 'verifying' ? 'verifying' : status === 'failed' || status === 'error' || status === 'fallback' ? 'failed' : status === 'cancelled' ? 'failed' : status === 'waiting_user' || status === 'preparing' ? 'authenticating' : null;
   if (profileStatus) db.run("UPDATE gemini_profiles SET status=?1, active=CASE WHEN ?1='authenticated' THEN active ELSE 0 END, updated_at=?2 WHERE id=?3", [profileStatus, Date.now(), job.profileId]).catch(()=>{});
+  if (profileStatus) invalidateUnifiedProviderStatuses();
   if (previous !== status) app.log.info({ jobId:job.id, profileId:job.profileId, from:previous, to:status, ptyAlive:!!geminiLoginWorkers.get(job.id), elapsedMs:Date.now() - job.startedAt }, 'gemini login job state changed');
 }
 function clearGeminiLoginJobChallenge(job:GeminiLoginJob) {
@@ -1943,6 +2084,7 @@ async function getAntigravityProfile(id:string) { return db.get('SELECT id,name,
 async function activateAntigravityProfile(id:string) {
   await db.run('UPDATE antigravity_profiles SET active=0');
   await db.run("UPDATE antigravity_profiles SET active=1, updated_at=?1 WHERE id=?2 AND COALESCE(status,'authenticated')='authenticated'", [Date.now(), id]);
+  invalidateUnifiedProviderStatuses();
 }
 async function ensureAntigravityActiveProfile() {
   const active = await db.get("SELECT id FROM antigravity_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' LIMIT 1");
@@ -2193,16 +2335,34 @@ function providerModelCatalog(result:any) {
 }
 async function modelCatalog(includeHidden = false, provider: AgentProviderId = 'codex') {
   if (provider === 'gemini') {
-    const runtimeStatus = USE_AGENT_RUNTIME ? await runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : null;
-    const configOptions = runtimeStatus?.runtime?.configOptions || runtimeStatus?.configOptions || [];
-    const modelOptions = Array.isArray(configOptions)
-      ? configOptions.filter((opt:any) => String(opt.category || '').includes('model') || String(opt.id || opt.name || '').toLowerCase().includes('model'))
-      : [];
+    const activeProfile:any = await getActiveGeminiProfile();
+    const rows = await runtimeDb.all(
+      "SELECT id, model, provider_metadata, updated_at FROM sessions WHERE (provider_id='gemini' OR provider='gemini') AND provider_metadata IS NOT NULL AND (?1 IS NULL OR account_id=?1 OR current_upstream_account_id=?1) ORDER BY updated_at DESC LIMIT 10",
+      [activeProfile?.id || null]
+    ).catch(()=>[]);
+    for (const row of rows as any[]) {
+      let metadata:any = null;
+      try { metadata = JSON.parse(String(row.provider_metadata || '{}')); } catch { metadata = null; }
+      const models = extractGeminiModelOptions(metadata || {});
+      if (models.length) {
+        return {
+          models,
+          current: cleanAgentModel(row.model) || models.find((m:any)=>m.isDefault)?.model || models[0]?.model || '',
+          error: null,
+          configOptions: metadata?.configOptions || [],
+          sourceSessionId: String(row.id || ''),
+        };
+      }
+    }
+    const anyGeminiSession = await runtimeDb.get("SELECT id FROM sessions WHERE (provider_id='gemini' OR provider='gemini') LIMIT 1").catch(()=>null);
+    const hasGeminiSession = rows.length > 0 || !!anyGeminiSession;
     return {
       models: [],
       current: '',
-      error: modelOptions.length ? null : 'Gemini CLI ACP 当前没有返回稳定的模型列表；保持 CLI 当前配置。',
-      configOptions: modelOptions,
+      error: hasGeminiSession
+        ? '当前 Gemini CLI ACP 未公开可切换模型，继续使用 CLI 默认配置。'
+        : 'Gemini 的模型选项由 ACP 会话返回。创建首个会话后可查看；当前使用 Gemini CLI 默认模型配置。',
+      configOptions: [],
     };
   }
   if (provider === 'antigravity') {
