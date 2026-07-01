@@ -74,10 +74,19 @@ function providerNotice(status?:ProviderStatus|null){
   if(status?.message && status.auth !== 'authenticated') return status.message;
   return `${providerLabel(status?.id)} ${label}。`;
 }
-function activeStatusProfileLabel(status:any){
-  const provider=status?.activeProvider || 'codex';
-  const providerStatus = (status?.providers||[]).find((p:any)=>p.id===provider) || status?.providerStatus?.[provider];
-  return providerStatus?.accountSummary?.email || providerStatus?.accountSummary?.displayName || providerStatus?.account?.email || providerStatus?.account?.displayName || (provider==='gemini'?'尚未添加 Gemini 账户':provider==='antigravity'?'尚未添加 Antigravity 账户':'尚未添加 Codex 账户');
+function homeServerLabel(error:string, loading:boolean, refreshing:boolean, providerStatus?:ProviderStatus|null, runtime?:any){
+  if(error) return '异常';
+  if(loading || refreshing) return '检查中';
+  if(!navigator.onLine) return '异常';
+  if(runtime?.error) return '异常';
+  if(providerStatus?.availability==='unavailable' || providerStatus?.availability==='error') return '异常';
+  return '在线';
+}
+function homeAgentLabel(provider:ProviderId, status?:ProviderStatus|null){
+  const name = providerLabel(provider);
+  if(status?.availability==='unavailable' || status?.availability==='error') return `${name} · 不可用`;
+  if(status?.auth==='unauthenticated') return `${name} · 需要登录`;
+  return name;
 }
 function accountSubtitle(provider:string, codexProfile:any, geminiProfile:any, antigravityProfile:any, providerStatus:any){
   if(providerStatus?.accountSummary?.email || providerStatus?.accountSummary?.displayName) return providerStatus.accountSummary.email || providerStatus.accountSummary.displayName;
@@ -141,19 +150,21 @@ function Home(){
   }
   async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
   async function loadSettings(){ setSettingsLoading(true); setSettingsError(''); try{ setSettings(await api('/api/settings?light=1')); } catch(e:any){ const msg=shortError(e); setSettingsError(msg); toast('error','设置读取失败：'+msg); } finally { setSettingsLoading(false); } }
-  function showSettings(){ setSettingsOpen(true); loadSettings(); }
+  const [settingsInitialPage,setSettingsInitialPage]=useState<'main'|'agent'>('main');
+  function showSettings(page:'main'|'agent'='main'){ setSettingsInitialPage(page); setSettingsOpen(true); loadSettings(); }
   const activeProvider=status?.activeProvider || 'codex';
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
+  const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell">
     <header className="homeTop">
-      <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(status?.activeProvider)} · {status?.mode || 'Full Access'} · {activeStatusProfileLabel(status)}</span></div>
-      <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={showSettings}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}>↻</button></div>
+      <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(activeProvider)} · {modeLabel(status?.defaultMode)}</span></div>
+      <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={()=>showSettings()}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}>↻</button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="statusStrip">
-      <div><span>服务器</span><b>{error?'异常':statusRefreshing?'刷新中':'在线'}</b></div>
-      <div><span>{providerLabel(activeProvider)}</span><b>{providerSubtitle(activeProviderStatus)}</b></div>
+      <div><span>服务器</span><b>{homeServerLabel(error, appStateLoading, statusRefreshing, activeProviderStatus, runtimeForHome)}</b></div>
+      <button className="statusRowButton" aria-label="打开提供方选择" onClick={()=>showSettings('agent')}><span aria-hidden="true">Agent</span><b aria-hidden="true">{homeAgentLabel(activeProvider, activeProviderStatus)}</b></button>
       <div><span>模式</span><b>{modeLabel(status?.defaultMode)}</b></div>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
@@ -172,7 +183,7 @@ function Home(){
     </section>
     {picker&&<ProjectPicker projects={projects} busy={busy} loading={projectsLoading} onRefresh={()=>loadProjects(true)} onClose={()=>setPicker(false)} onPick={(p)=>newSession(p.path,p.name)}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
-    {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} onRetry={loadSettings} onChanged={async()=>{ refresh(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
+    {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} initialPage={settingsInitialPage} onRetry={loadSettings} onChanged={async()=>{ refresh(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
   </main>;
 }
 
@@ -513,7 +524,7 @@ class SettingsErrorBoundary extends React.Component<SettingsBoundaryProps, Setti
     </Sheet>;
   }
 }
-function SettingsSheet({data,loading,error,onRetry,onChanged,onClose}:{data:any;loading:boolean;error:string;onRetry:()=>void;onChanged:()=>any|Promise<any>;onClose:()=>void}){
+function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose}:{data:any;loading:boolean;error:string;initialPage?:'main'|'agent';onRetry:()=>void;onChanged:()=>any|Promise<any>;onClose:()=>void}){
   const toast=useToast();
   const [localData,setLocalData]=useState<any>(data);
   const [models,setModels]=useState<any>(null);
@@ -534,7 +545,7 @@ function SettingsSheet({data,loading,error,onRetry,onChanged,onClose}:{data:any;
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
   const [deleteGeminiProfile,setDeleteGeminiProfile]=useState<any>(null);
   const [deleteAntigravityProfile,setDeleteAntigravityProfile]=useState<any>(null);
-  const [page,setPage]=useState<'main'|'agent'|'mode'|'model'|'account'|'geminiMethods'|'geminiGoogle'|'geminiApiKey'|'geminiVertex'>('main');
+  const [page,setPage]=useState<'main'|'agent'|'mode'|'model'|'account'|'geminiMethods'|'geminiGoogle'|'geminiApiKey'|'geminiVertex'>(initialPage || 'main');
   const activeProvider = localData?.settings?.activeProvider || 'codex';
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
   useEffect(()=>{ if(page!=='model') return; setModels(null); api('/api/models?provider='+encodeURIComponent(activeProvider)).then(setModels).catch((e:any)=>setModels({models:[], error:shortError(e)})); },[page,activeProvider]);
