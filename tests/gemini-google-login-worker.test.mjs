@@ -110,6 +110,16 @@ class WorkerHarness {
     this.job.codeSubmitted = true;
     this.job.status = 'verifying';
   }
+  verifyWithoutExit({ credentialsOk = true, smokeOk = true } = {}) {
+    if (credentialsOk && smokeOk) {
+      this.job.status = 'done';
+      this.child.kill();
+    } else {
+      this.job.status = 'failed';
+      this.job.error = credentialsOk ? 'smoke failed' : 'invalid_grant';
+      this.job.codeSubmitted = false;
+    }
+  }
   handleExit(exitCode) {
     if (this.job.status === 'cancelled' || this.job.status === 'error') return;
     if (exitCode === 0 && this.verifyOk) this.job.status = 'done';
@@ -198,6 +208,31 @@ test('successful PTY exit only marks done after ACP verification succeeds', () =
   h.child.emitExit(0);
 
   assert.equal(h.job.status, 'done');
+});
+
+test('authorization code verification can finish before PTY exit', () => {
+  const h = new WorkerHarness({ verifyOk: true });
+  h.child.emitData(realGemini049Output);
+  h.input('code-ok');
+
+  h.verifyWithoutExit({ credentialsOk: true, smokeOk: true });
+
+  assert.equal(h.job.status, 'done');
+  assert.equal(h.child.killed, true);
+});
+
+test('invalid authorization code enters failed and can accept another code', () => {
+  const h = new WorkerHarness();
+  h.child.emitData(realGemini049Output);
+  h.input('bad-code');
+
+  h.verifyWithoutExit({ credentialsOk: false });
+
+  assert.equal(h.job.status, 'failed');
+  assert.equal(h.job.codeSubmitted, false);
+  h.job.status = 'waiting_user';
+  h.input('good-code');
+  assert.deepEqual(h.child.writes, ['bad-code\n', 'good-code\n']);
 });
 
 test('successful PTY exit remains error when ACP verification fails', () => {

@@ -66,6 +66,7 @@ const threadTokenUsage = new Map<string, any>();
 const runtimeDiagnostics = { subscribeStarts:0, subscribeReconnects:0, subscribeEvents:0, broadcasts:0, replayCalls:0 };
 type LoginJob = { id:string; profileId:string; output:string[]; status:'running'|'done'|'error'; code?:number|null; error?:string; startedAt:number; newProfile?:boolean; loginUrl?:string; deviceCode?:string };
 const loginJobs = new Map<string, LoginJob>();
+const loginChildren = new Map<string, any>();
 type AntigravityLoginJob = LoginJob & { providerId:'antigravity'; authCodePrompt?:boolean; codeSubmitted?:boolean };
 const antigravityLoginJobs = new Map<string, AntigravityLoginJob>();
 const antigravityLoginChildren = new Map<string, any>();
@@ -73,7 +74,7 @@ type GeminiLoginJob = {
   id:string;
   profileId:string;
   methodId:string;
-  status:'preparing'|'waiting_user'|'verifying'|'done'|'error'|'cancelled'|'fallback';
+  status:'preparing'|'waiting_user'|'verifying'|'done'|'failed'|'error'|'cancelled'|'fallback';
   loginUrl?:string;
   deviceCode?:string;
   requiresCodeInput?:boolean;
@@ -87,6 +88,7 @@ const geminiLoginJobs = new Map<string, GeminiLoginJob>();
 const geminiLoginProfiles = new Map<string, string>();
 const geminiLoginWorkers = new Map<string, any>();
 const GEMINI_LOGIN_TIMEOUT_MS = Number(process.env.GEMINI_LOGIN_TIMEOUT_MS || 5 * 60 * 1000);
+const GEMINI_LOGIN_VERIFY_TIMEOUT_MS = Number(process.env.GEMINI_LOGIN_VERIFY_TIMEOUT_MS || 60 * 1000);
 const GEMINI_GOOGLE_AUTH_TYPE = 'oauth-personal';
 const GEMINI_USER_CODE_REDIRECT_URI = 'https://codeassist.google.com/authcode';
 const roots = await existingRoots((process.env.ALLOWED_WORKSPACES || `${process.cwd()},/opt/projects`).split(',').map(s=>s.trim()).filter(Boolean));
@@ -124,6 +126,8 @@ await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
+await db.run("ALTER TABLE codex_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
+await db.run("ALTER TABLE antigravity_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE gemini_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'configured'").catch(()=>{});
 await db.run("UPDATE gemini_profiles SET status='bootstrap' WHERE id='default' AND auth_type IS NULL AND status='configured'").catch(()=>{});
 await db.run("UPDATE gemini_profiles SET status='bootstrap', active=0 WHERE auth_type IS NULL AND name='Gemini Account' AND status='configured'").catch(()=>{});
@@ -174,7 +178,7 @@ app.get('/api/status', async (req) => {
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
-  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, capabilities: attachmentCapabilities(geminiRuntime) };
+  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), { ...geminiStatus, runtime:geminiRuntime }, antigravityStatus], activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
@@ -237,8 +241,10 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const [
     settings,
     profiles,
+    pendingProfiles,
     activeProfile,
     geminiProfiles,
+    geminiPendingProfiles,
     activeGeminiProfile,
     antigravityProfiles,
     activeAntigravityProfile,
@@ -249,8 +255,10 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   ] = await Promise.all([
     appSettings(),
     listProfiles(),
+    listPendingProfiles(),
     getActiveProfile(),
     listGeminiProfiles(),
+    listGeminiPendingProfiles(),
     getActiveGeminiProfile(),
     listAntigravityProfiles(),
     getActiveAntigravityProfile(),
@@ -260,7 +268,7 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
-  return { settings, profiles, activeProfile, geminiProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] };
+  return { settings, profiles, pendingProfiles, activeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: [codexProviderStatus(codexStatus), {...geminiStatus,runtime:geminiRuntime}, antigravityStatus] };
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
@@ -276,14 +284,14 @@ app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   return { settings: await appSettings() };
 });
 app.get('/api/models', { preHandler: ensureAuth }, async (req:any) => modelCatalog(req.query?.hidden === '1', normalizeProvider(req.query?.provider) || (await appSettings()).activeProvider));
-app.get('/api/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listProfiles(), activeProfile: await getActiveProfile() }));
+app.get('/api/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listProfiles(), pendingProfiles: await listPendingProfiles(), activeProfile: await getActiveProfile() }));
 app.post('/api/profiles', { preHandler: ensureAuth }, async (req:any) => {
   const name = cleanProfileName(String(req.body?.name || 'Codex Account'));
   const id = crypto.randomBytes(8).toString('hex');
   const codexHome = path.join(PROFILES_DIR, id, '.codex');
   await mkdir(codexHome, { recursive:true });
   await ensureSharedCodexDirs(codexHome);
-  await db.run('INSERT INTO codex_profiles (id,name,codex_home,active,created_at,updated_at) VALUES (?1,?2,?3,0,?4,?4)', [id, name, codexHome, Date.now()]);
+  await db.run("INSERT INTO codex_profiles (id,name,codex_home,active,status,created_at,updated_at) VALUES (?1,?2,?3,0,'draft',?4,?4)", [id, name, codexHome, Date.now()]);
   return { profile: await getProfile(id) };
 });
 app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any) => {
@@ -305,12 +313,21 @@ app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any)
 app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
-  if (Number(profile.active || 0)) return reply.code(409).send({error:'不能删除当前正在使用的账户，请先切换到其他账户'});
+  const running = await db.get("SELECT id FROM sessions WHERE provider_id='codex' AND account_id=?1 AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]);
+  if (running) return reply.code(409).send({error:'该账户仍有正在运行的任务，请停止任务后再删除。'});
+  await cancelCodexLoginForProfile(String(profile.id));
+  const refs = await providerSessionReferenceCount('codex', String(profile.id));
+  if (refs > 0) {
+    await db.run("UPDATE codex_profiles SET active=0, status='disabled', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
+    await ensureCodexActiveProfile();
+    return { ok:true, hidden:true, references:refs };
+  }
   await db.run('DELETE FROM codex_profiles WHERE id=?1', [String(profile.id)]);
   await deleteProfileDir(String(profile.codex_home)).catch(()=>{});
+  await ensureCodexActiveProfile();
   return { ok:true };
 });
-app.get('/api/gemini/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listGeminiProfiles(), activeGeminiProfile: await getActiveGeminiProfile() }));
+app.get('/api/gemini/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listGeminiProfiles(), pendingProfiles: await listGeminiPendingProfiles(), activeGeminiProfile: await getActiveGeminiProfile() }));
 app.post('/api/gemini/profiles', { preHandler: ensureAuth }, async (req:any) => {
   const name = cleanProfileName(String(req.body?.name || 'Gemini Account'));
   const reusable = await getReusableGeminiBootstrapProfile();
@@ -360,13 +377,13 @@ app.post('/api/gemini/profiles/:id/login', { preHandler: ensureAuth }, async (re
   if (geminiLoginProfiles.has(String(profile.id))) return reply.code(409).send({error:'该 Gemini Profile 已有登录任务在运行'});
   const methodId = String(req.body?.methodId || '').trim();
   if (!methodId) return reply.code(400).send({error:'methodId required'});
-  await db.run("UPDATE gemini_profiles SET status='configured', updated_at=?1 WHERE id=?2 AND status='bootstrap'", [Date.now(), String(profile.id)]).catch(()=>{});
+  await db.run("UPDATE gemini_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND status IN ('bootstrap','draft','failed')", [Date.now(), String(profile.id)]).catch(()=>{});
   const job:GeminiLoginJob = { id:crypto.randomBytes(12).toString('base64url'), profileId:String(profile.id), methodId, status:'preparing', startedAt:Date.now() };
   geminiLoginJobs.set(job.id, job);
   geminiLoginProfiles.set(String(profile.id), job.id);
   runGeminiLoginJob(job, req.body || {}).catch((e:any) => {
-    job.status = 'error';
-    job.error = safeGeminiError(e);
+    setGeminiJobStatus(job, 'failed', safeGeminiError(e));
+    job.codeSubmitted = false;
   }).finally(() => {
     if (geminiLoginProfiles.get(job.profileId) === job.id) geminiLoginProfiles.delete(job.profileId);
   });
@@ -376,17 +393,21 @@ app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:an
   const profile = await getGeminiProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
   const running = await db.get("SELECT id FROM sessions WHERE provider_id='gemini' AND account_id=?1 AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]);
-  if (running) return reply.code(409).send({error:'该 Gemini 账户仍有正在运行的会话，不能删除'});
-  if (geminiLoginProfiles.has(String(profile.id))) return reply.code(409).send({error:'该 Gemini 账户正在登录，取消或完成登录后再删除'});
+  if (running) return reply.code(409).send({error:'该账户仍有正在运行的任务，请停止任务后再删除。'});
+  await cancelGeminiLoginForProfile(String(profile.id));
   const state = geminiProfileState(profile);
-  if (Number(profile.active || 0) && state === 'authenticated') return reply.code(409).send({error:'不能删除当前已登录的 Gemini 账户，请先切换到其他账户'});
   const refs = await geminiSessionReferenceCount(String(profile.id));
   if (refs > 0) {
+    await runtime.logoutGeminiProfile(String(profile.id)).catch(()=>{});
+    await runtime.restartGeminiProfile(String(profile.id)).catch(()=>null);
+    await removeGeminiProfileSecret(String(profile.home_dir), 'GEMINI_API_KEY').catch(()=>{});
     await db.run("UPDATE gemini_profiles SET active=0, status='disabled', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
     await ensureGeminiActiveProfile();
     return { ok:true, hidden:true, references:refs };
   }
   await db.run('DELETE FROM gemini_profiles WHERE id=?1', [String(profile.id)]);
+  await runtime.logoutGeminiProfile(String(profile.id)).catch(()=>{});
+  await runtime.restartGeminiProfile(String(profile.id)).catch(()=>null);
   await deleteGeminiProfileDir(String(profile.home_dir)).catch(()=>{});
   await ensureGeminiActiveProfile();
   return { ok:true, deleted:true };
@@ -400,37 +421,39 @@ app.post('/api/gemini-login/:jobId/input', { preHandler: ensureAuth }, async (re
   const job = geminiLoginJobs.get(String(req.params.jobId));
   if (!job) return reply.code(404).send({error:'not found'});
   const child = geminiLoginWorkers.get(job.id);
-  if (!child || !['waiting_user','verifying'].includes(job.status)) return reply.code(409).send({error:'Gemini 登录进程未在等待授权码'});
+  if (!child || !['waiting_user','failed'].includes(job.status)) return reply.code(409).send({error:'Gemini 登录进程未在等待授权码'});
   if (!job.requiresCodeInput) return reply.code(409).send({error:'当前 Gemini 登录流程未要求网页输入 code'});
   if (job.codeSubmitted) return reply.code(409).send({error:'授权码已提交，正在验证'});
   const code = String(req.body?.code || '').trim();
   if (!/^[A-Za-z0-9_./~+=-]{4,4096}$/.test(code)) return reply.code(400).send({error:'bad code'});
   child.write(code + '\n');
   job.codeSubmitted = true;
+  job.error = undefined;
   job.status = 'verifying';
+  const profile:any = await getGeminiProfile(job.profileId).catch(()=>null);
+  if (profile?.home_dir) verifyGeminiGoogleLoginJob(job, String(profile.home_dir), child).catch((e:any) => {
+    if (job.status === 'done' || job.status === 'cancelled') return;
+    setGeminiJobStatus(job, 'failed', safeGeminiError(e));
+    job.codeSubmitted = false;
+  });
   return { ok:true, job:{ ...job, codeSubmitted:true } };
 });
 app.post('/api/gemini-login/:jobId/cancel', { preHandler: ensureAuth }, async (req:any, reply) => {
   const job = geminiLoginJobs.get(String(req.params.jobId));
   if (!job) return reply.code(404).send({error:'not found'});
-  if (job.status === 'done' || job.status === 'error' || job.status === 'fallback') return { job };
-  const child = geminiLoginWorkers.get(job.id);
-  if (child) {
-    try { child.kill(); } catch {}
-    geminiLoginWorkers.delete(job.id);
-  }
-  job.status = 'cancelled';
-  job.error = '登录已取消';
-  if (geminiLoginProfiles.get(job.profileId) === job.id) geminiLoginProfiles.delete(job.profileId);
+  if (job.status === 'done' || job.status === 'error' || job.status === 'failed' || job.status === 'fallback') return { job };
+  await cancelGeminiLoginForProfile(job.profileId);
   return { job };
 });
 app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (req:any) => {
   const profile = await getProfile(String(req.params.id));
   if (!profile) throw new Error('profile not found');
+  await db.run("UPDATE codex_profiles SET status='authenticating', updated_at=?1 WHERE id=?2 AND COALESCE(status,'draft') IN ('draft','failed')", [Date.now(), String(profile.id)]).catch(()=>{});
   const jobId = crypto.randomBytes(12).toString('base64url');
   const job: LoginJob = { id:jobId, profileId:String(profile.id), output:[], status:'running', code:null, startedAt:Date.now(), newProfile:req.body?.newProfile === true };
   loginJobs.set(jobId, job);
   const child = spawn('codex', ['login','--device-auth'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:String(profile.codex_home)}, stdio:['ignore','pipe','pipe'] });
+  loginChildren.set(jobId, child);
   const push = (s:string) => {
     for (const line of s.split(/\r?\n/).filter(Boolean)) job.output.push(line.replace(/(token|secret|password)[^\n]*/ig, '$1=[redacted]'));
     job.output = job.output.slice(-80);
@@ -441,16 +464,15 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
   child.stdout.on('data', d=>push(d.toString()));
   child.stderr.on('data', d=>push(d.toString()));
   child.on('exit', async code => {
+    loginChildren.delete(jobId);
     job.code = code;
     job.status = code === 0 ? 'done' : 'error';
     if (code !== 0) (job as any).error = `codex login exited ${code}`;
-    if (code !== 0 && job.newProfile) {
-      await db.run('DELETE FROM codex_profiles WHERE id=?1 AND active=0', [String(profile.id)]).catch(()=>{});
-      await deleteProfileDir(String(profile.codex_home)).catch(()=>{});
-    }
+    if (code !== 0 && job.newProfile) await db.run("UPDATE codex_profiles SET status='failed', active=0, updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]).catch(()=>{});
     if (code === 0) {
       await ensureSharedCodexDirs(String(profile.codex_home)).catch(()=>{});
       await updateProfileEmailName(String(profile.id), String(profile.codex_home)).catch(()=>{});
+      await db.run("UPDATE codex_profiles SET status='authenticated', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]).catch(()=>{});
       await activateProfile(String(profile.id)).catch(()=>{});
       if (!USE_AGENT_RUNTIME) await codex.switchCodexHome(String(profile.codex_home)).catch(()=>{});
       codexStatusCache = { expiresAt:0 };
@@ -537,6 +559,13 @@ app.post('/api/antigravity-login/:jobId/input', { preHandler: ensureAuth }, asyn
   setTimeout(() => { maybeFinishAntigravityLoginJob(job).catch(()=>{}); }, 3000);
   return { ok:true };
 });
+app.post('/api/antigravity-login/:jobId/cancel', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const job = antigravityLoginJobs.get(String(req.params.jobId));
+  if (!job) return reply.code(404).send({error:'login job not found'});
+  await cancelAntigravityLoginForProfile(job.profileId);
+  await deleteAntigravityProfileDir(antigravityHomeForProfile(job.profileId)).catch(()=>{});
+  return { ok:true, job };
+});
 app.post('/api/antigravity/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getAntigravityProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
@@ -546,8 +575,19 @@ app.post('/api/antigravity/profiles/:id/switch', { preHandler: ensureAuth }, asy
 app.delete('/api/antigravity/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getAntigravityProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
+  const running = await db.get("SELECT id FROM sessions WHERE provider_id='antigravity' AND account_id=?1 AND status IN ('running','submitting','recovering') LIMIT 1", [String(profile.id)]);
+  if (running) return reply.code(409).send({error:'该账户仍有正在运行的任务，请停止任务后再删除。'});
+  await cancelAntigravityLoginForProfile(String(profile.id));
+  const refs = await providerSessionReferenceCount('antigravity', String(profile.id));
+  if (refs > 0) {
+    await db.run("UPDATE antigravity_profiles SET active=0, status='disabled', updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]);
+    await deleteAntigravityProfileDir(String(profile.home_dir)).catch(()=>{});
+    await ensureAntigravityActiveProfile();
+    return { ok:true, hidden:true, references:refs };
+  }
   await db.run('DELETE FROM antigravity_profiles WHERE id=?1', [String(profile.id)]);
   await deleteAntigravityProfileDir(String(profile.home_dir)).catch(()=>{});
+  await ensureAntigravityActiveProfile();
   return { ok:true };
 });
 app.get('/api/antigravity-login/:jobId', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -1046,22 +1086,48 @@ async function appSettings() {
 }
 async function setSetting(key:string, value:string) { await db.run('INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value', [key, value]); }
 async function listProfiles() {
-  const rows = await db.all('SELECT id,name,codex_home,active,created_at,updated_at FROM codex_profiles ORDER BY active DESC, updated_at DESC');
+  const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY active DESC, updated_at DESC");
   return Promise.all(rows.map(async (p:any)=>{
     const login = await profileLoginStatus(String(p.codex_home));
-    return { ...p, name: login.email || profileDisplayName(p.name), active:Number(p.active || 0), login };
+    return { ...p, provider:'codex', name: login.email || profileDisplayName(p.name), email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
   }));
 }
-async function getProfile(id:string) { return db.get('SELECT id,name,codex_home,active,created_at,updated_at FROM codex_profiles WHERE id=?1', [id]); }
+async function listPendingProfiles() {
+  const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated') IN ('draft','authenticating','verifying','failed') ORDER BY updated_at DESC");
+  return rows.map((p:any) => ({ ...p, provider:'codex', name:profileDisplayName(p.name), state:String(p.status || 'draft'), active:false, login:{ ok:false, text:'Not logged in' } }));
+}
+async function getProfile(id:string) { return db.get('SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE id=?1', [id]); }
 async function getActiveProfile() {
-  const p = await db.get('SELECT id,name,codex_home,active,created_at,updated_at FROM codex_profiles WHERE active=1 ORDER BY updated_at DESC LIMIT 1');
+  const p = await db.get("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
   if (!p) return null;
   const login = await profileLoginStatus(String(p.codex_home));
-  return { ...p, name: login.email || profileDisplayName(p.name), active:Number(p.active || 0), login };
+  return { ...p, provider:'codex', name: login.email || profileDisplayName(p.name), email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
 }
 async function activateProfile(id:string) {
   await db.run('UPDATE codex_profiles SET active=0');
-  await db.run('UPDATE codex_profiles SET active=1, updated_at=?1 WHERE id=?2', [Date.now(), id]);
+  await db.run("UPDATE codex_profiles SET active=1, updated_at=?1 WHERE id=?2 AND COALESCE(status,'authenticated')='authenticated'", [Date.now(), id]);
+}
+async function ensureCodexActiveProfile() {
+  const active = await db.get("SELECT id FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' LIMIT 1");
+  if (active?.id) {
+    await db.run("UPDATE codex_profiles SET active=0 WHERE active=1 AND id<>?1", [String(active.id)]).catch(()=>{});
+    return;
+  }
+  await db.run('UPDATE codex_profiles SET active=0').catch(()=>{});
+  const next = await db.get("SELECT id FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (next?.id) await activateProfile(String(next.id)).catch(()=>{});
+}
+async function cancelCodexLoginForProfile(profileId:string) {
+  for (const [jobId, job] of loginJobs.entries()) {
+    if (job.profileId !== profileId || job.status !== 'running') continue;
+    const child = loginChildren.get(jobId);
+    if (child) {
+      try { child.kill(); } catch {}
+      loginChildren.delete(jobId);
+    }
+    job.status = 'error';
+    job.error = '登录已取消';
+  }
 }
 async function syncDefaultCodexAppServerEnv(codexHome:string) {
   const file = path.join(DATA_DIR, 'agentdeck-app-server-default.env');
@@ -1086,7 +1152,11 @@ function geminiHomeForProfile(id:string) {
   return path.join(GEMINI_PROFILES_DIR, id, 'home');
 }
 async function listGeminiProfiles() {
-  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'configured') NOT IN ('bootstrap','disabled') ORDER BY active DESC, updated_at DESC");
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft')='authenticated' ORDER BY active DESC, updated_at DESC");
+  return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
+}
+async function listGeminiPendingProfiles() {
+  const rows = await db.all("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','authenticating','verifying','failed','configured') ORDER BY updated_at DESC");
   return Promise.all(rows.map((p:any) => geminiProfileDto(p)));
 }
 async function getGeminiProfile(id:string) {
@@ -1096,7 +1166,7 @@ async function getGeminiProfileDto(id:string, options:{ includeHidden?:boolean }
   const row = await getGeminiProfile(id);
   if (!row) return null;
   const state = geminiProfileState(row);
-  if (!options.includeHidden && (state === 'bootstrap' || state === 'disabled')) return null;
+  if (!options.includeHidden && (state === 'draft' || state === 'disabled')) return null;
   return geminiProfileDto(row);
 }
 async function getActiveGeminiProfile() {
@@ -1109,30 +1179,39 @@ async function activateGeminiProfile(id:string) {
 }
 async function geminiProfileDto(row:any) {
   const login = await geminiLoginStatus(String(row.home_dir), String(row.auth_type || '') || null);
-  const name = login.email || (String(row.name || '').trim() && row.name !== 'Gemini Account' ? row.name : 'Gemini Account');
+  const apiKey = row.auth_type === 'api_key';
+  const fallbackName = apiKey ? 'Gemini API Key' : 'Gemini Google Account';
+  const name = login.email || (String(row.name || '').trim() && row.name !== 'Gemini Account' ? row.name : fallbackName);
   const state = geminiProfileState(row, login);
   return {
     id:String(row.id),
+    provider:'gemini',
     name,
+    email:login.email || undefined,
     active: state === 'authenticated' ? Number(row.active || 0) : 0,
     status: state,
+    state,
     authType: row.auth_type || login.authType || null,
+    error: geminiLoginProfiles.get(String(row.id)) ? geminiLoginJobs.get(String(geminiLoginProfiles.get(String(row.id))))?.error : undefined,
+    loginJobId: geminiLoginProfiles.get(String(row.id)) || undefined,
     login,
     created_at:Number(row.created_at || 0),
     updated_at:Number(row.updated_at || 0),
   };
 }
-function geminiProfileState(row:any, login?:any):'bootstrap'|'configured'|'authenticated'|'disabled' {
+function geminiProfileState(row:any, login?:any):'draft'|'authenticating'|'verifying'|'authenticated'|'failed'|'disabled' {
   const explicit = String(row?.status || '').trim();
   if (explicit === 'disabled') return 'disabled';
   if (login?.ok || explicit === 'authenticated') return 'authenticated';
-  if (explicit === 'bootstrap') return 'bootstrap';
-  return row?.auth_type ? 'configured' : 'configured';
+  if (explicit === 'authenticating') return 'authenticating';
+  if (explicit === 'verifying') return 'verifying';
+  if (explicit === 'failed') return 'failed';
+  return 'draft';
 }
 async function getReusableGeminiBootstrapProfile() {
-  const visible = await db.get("SELECT id FROM gemini_profiles WHERE COALESCE(status,'configured') NOT IN ('bootstrap','disabled') LIMIT 1");
+  const visible = await db.get("SELECT id FROM gemini_profiles WHERE COALESCE(status,'draft')='authenticated' LIMIT 1");
   if (visible?.id) return null;
-  return db.get("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'bootstrap')='bootstrap' ORDER BY CASE WHEN id='default' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1");
+  return db.get("SELECT id,name,home_dir,auth_type,active,status,created_at,updated_at FROM gemini_profiles WHERE COALESCE(status,'draft') IN ('bootstrap','draft','failed') ORDER BY CASE WHEN id='default' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1");
 }
 async function ensureGeminiActiveProfile() {
   const active = await db.get("SELECT id FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' LIMIT 1");
@@ -1155,8 +1234,9 @@ async function geminiLoginStatus(homeDir:string, authType:string|null = null) {
   const secretFile = path.join(homeDir, 'agentdeck.env');
   const hasApiKey = await geminiSecretEnvHas(secretFile, 'GEMINI_API_KEY').catch(()=>false);
   const email = await scanGeminiEmail(homeDir).catch(()=>null);
-  const detectedAuthType = authType || (hasApiKey ? 'api_key' : (email ? GEMINI_GOOGLE_AUTH_TYPE : null));
-  const ok = hasApiKey || !!email;
+  const hasOAuthCredentials = existsSync(path.join(homeDir, '.gemini', 'oauth_creds.json'));
+  const detectedAuthType = authType || (hasApiKey ? 'api_key' : (hasOAuthCredentials ? GEMINI_GOOGLE_AUTH_TYPE : null));
+  const ok = hasApiKey || hasOAuthCredentials;
   return { ok, email, text: ok ? 'Logged in' : 'Not logged in', authType: detectedAuthType };
 }
 async function geminiSecretEnvHas(file:string, key:string) {
@@ -1165,10 +1245,19 @@ async function geminiSecretEnvHas(file:string, key:string) {
   return text.split(/\r?\n/).some(line => line.trimStart().startsWith(`${key}=`) && line.split('=').slice(1).join('=').trim().length > 0);
 }
 async function scanGeminiEmail(homeDir:string) {
-  const roots = [path.join(homeDir, '.gemini'), path.join(homeDir, '.config', 'gemini')];
-  for (const root of roots) {
-    const found = await limitedEmailScan(root, 0, { files:0 });
-    if (found) return found;
+  const candidates = [
+    path.join(homeDir, '.gemini', 'google_accounts.json'),
+    path.join(homeDir, '.gemini', 'account.json'),
+    path.join(homeDir, '.gemini', 'userinfo.json'),
+    path.join(homeDir, '.gemini', 'settings.json'),
+    path.join(homeDir, '.config', 'gemini', 'google_accounts.json'),
+  ];
+  for (const file of candidates) {
+    const st = await stat(file).catch(()=>null);
+    if (!st || st.size > 128 * 1024) continue;
+    const text = await readFile(file, 'utf8').catch(()=>'');
+    const found = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/)?.[0];
+    if (found) return found.slice(0, 120);
   }
   return null;
 }
@@ -1195,17 +1284,20 @@ async function limitedEmailScan(dir:string, depth:number, state:{ files:number }
   return null;
 }
 async function geminiSessionReferenceCount(profileId:string) {
-  const web = await db.get("SELECT COUNT(*) count FROM sessions WHERE provider_id='gemini' AND account_id=?1", [profileId]).catch(()=>({ count:0 }));
-  const runtime = await runtimeDb.get("SELECT COUNT(*) count FROM sessions WHERE (provider_id='gemini' OR provider='gemini') AND account_id=?1", [profileId]).catch(()=>({ count:0 }));
+  return providerSessionReferenceCount('gemini', profileId);
+}
+async function providerSessionReferenceCount(providerId:string, profileId:string) {
+  const web = await db.get("SELECT COUNT(*) count FROM sessions WHERE provider_id=?1 AND account_id=?2", [providerId, profileId]).catch(()=>({ count:0 }));
+  const runtime = await runtimeDb.get("SELECT COUNT(*) count FROM sessions WHERE (provider_id=?1 OR provider=?1) AND account_id=?2", [providerId, profileId]).catch(()=>({ count:0 }));
   return Number(web?.count || 0) + Number(runtime?.count || 0);
 }
 async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
   const profile:any = await getGeminiProfile(job.profileId);
   if (!profile) throw new Error('profile not found');
   if (job.status === 'cancelled') return;
-  job.status = 'verifying';
   const method = job.methodId.toLowerCase();
   if (method === 'api_key' || method === 'apikey' || method.includes('api')) {
+    setGeminiJobStatus(job, 'verifying');
     const apiKey = String(body.apiKey || '').trim();
     if (!/^[A-Za-z0-9_.-]{20,}$/.test(apiKey)) throw new Error('Gemini API Key 格式不正确');
     await writeGeminiProfileSecret(String(profile.home_dir), { GEMINI_API_KEY: apiKey });
@@ -1214,12 +1306,13 @@ async function runGeminiLoginJob(job:GeminiLoginJob, body:any) {
     const status = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
     if (status?.error) throw new Error(String(status.error));
     await refreshGeminiProfileName(job.profileId, String(profile.home_dir), 'api_key').catch(()=>{});
-    await db.run("UPDATE gemini_profiles SET status='authenticated', active=1, updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
+    await db.run("UPDATE gemini_profiles SET name=CASE WHEN name='Gemini Account' THEN 'Gemini API Key' ELSE name END, status='authenticated', active=1, updated_at=?1 WHERE id=?2", [Date.now(), job.profileId]);
     await db.run('UPDATE gemini_profiles SET active=0 WHERE id<>?1', [job.profileId]).catch(()=>{});
     job.status = 'done';
     return;
   }
   if (method.includes('oauth') || method.includes('google')) {
+    setGeminiJobStatus(job, 'preparing');
     await runGeminiGoogleLoginWorker(job, String(profile.home_dir));
     return;
   }
@@ -1318,35 +1411,32 @@ async function runGeminiGoogleLoginWorker(job:GeminiLoginJob, homeDir:string) {
       if (job.loginUrl) job.status = 'waiting_user';
     }
     if (parsed.failure && job.status !== 'cancelled') {
-      finalize(async () => {
-        try { child?.kill(); } catch {}
-        job.status = 'error';
-        job.error = parsed.failure || 'Gemini Google 登录失败';
-      }).catch(()=>{});
+      setGeminiJobStatus(job, 'failed', parsed.failure || 'Gemini Google 登录失败');
+      job.codeSubmitted = false;
     }
   };
   child.onData((d:string)=>handleOutput(d));
   child.onExit(async ({ exitCode }:any) => {
     await finalize(async () => {
-      if (job.status === 'cancelled' || job.status === 'error' || job.status === 'done') return;
+      if (job.status === 'cancelled' || job.status === 'done') return;
       try {
         const login = await geminiLoginStatus(homeDir, GEMINI_GOOGLE_AUTH_TYPE).catch(()=>({ ok:false }));
         if (exitCode === 0 && login.ok) {
           await finishGeminiGoogleLoginJob(job, homeDir);
         } else {
-          job.status = 'error';
-          job.error = exitCode === 0 ? 'Gemini 登录进程已退出，但未检测到有效 Google 登录。' : `Gemini 登录进程退出，code=${exitCode}`;
+          setGeminiJobStatus(job, 'failed', exitCode === 0 ? 'Gemini 登录进程已退出，但未检测到有效 Google 登录。' : `Gemini 登录进程退出，code=${exitCode}`);
+          job.codeSubmitted = false;
         }
       } catch (e:any) {
-        job.status = 'error';
-        job.error = safeGeminiError(e);
+        setGeminiJobStatus(job, 'failed', safeGeminiError(e));
+        job.codeSubmitted = false;
       }
     });
   });
   await complete;
 }
 async function finishGeminiGoogleLoginJob(job:GeminiLoginJob, homeDir:string) {
-  job.status = 'verifying';
+  setGeminiJobStatus(job, 'verifying');
   await db.run("UPDATE gemini_profiles SET auth_type=?1, status='configured', updated_at=?2 WHERE id=?3", [GEMINI_GOOGLE_AUTH_TYPE, Date.now(), job.profileId]);
   await runtime.restartGeminiProfile(job.profileId).catch(()=>null);
   const initialized = await runtime.initializeGeminiProfile(job.profileId).catch((e:any)=>({ error:safeGeminiError(e) }));
@@ -1362,11 +1452,62 @@ async function finishGeminiGoogleLoginJob(job:GeminiLoginJob, homeDir:string) {
     sandboxMode: 'read-only',
   }).catch((e:any) => { throw new Error(safeGeminiError(e)); });
   const login = await geminiLoginStatus(homeDir, GEMINI_GOOGLE_AUTH_TYPE);
-  if (!login.ok || !login.email) throw new Error('Gemini ACP 验证通过，但未读取到 Google 登录邮箱');
-  await db.run("UPDATE gemini_profiles SET name=?1, auth_type=?2, status='authenticated', active=1, updated_at=?3 WHERE id=?4", [login.email, GEMINI_GOOGLE_AUTH_TYPE, Date.now(), job.profileId]);
+  if (!login.ok) throw new Error('Gemini ACP 验证通过，但未检测到 Google 登录凭据');
+  await db.run("UPDATE gemini_profiles SET name=?1, auth_type=?2, status='authenticated', active=1, updated_at=?3 WHERE id=?4", [login.email || 'Gemini Google Account', GEMINI_GOOGLE_AUTH_TYPE, Date.now(), job.profileId]);
   await db.run('UPDATE gemini_profiles SET active=0 WHERE id<>?1', [job.profileId]).catch(()=>{});
-  job.status = 'done';
+  setGeminiJobStatus(job, 'done');
   delete job.error;
+}
+async function verifyGeminiGoogleLoginJob(job:GeminiLoginJob, homeDir:string, child:any) {
+  const started = Date.now();
+  let lastCredentialOk = false;
+  let lastInitializeOk = false;
+  let lastSmokeOk = false;
+  while (Date.now() - started < GEMINI_LOGIN_VERIFY_TIMEOUT_MS) {
+    if (job.status === 'cancelled' || job.status === 'done') return;
+    const login = await geminiLoginStatus(homeDir, GEMINI_GOOGLE_AUTH_TYPE).catch(()=>({ ok:false, email:null }));
+    lastCredentialOk = !!login.ok;
+    if (lastCredentialOk) {
+      try {
+        await finishGeminiGoogleLoginJob(job, homeDir);
+        lastInitializeOk = true;
+        lastSmokeOk = true;
+        try { child?.kill(); } catch {}
+        geminiLoginWorkers.delete(job.id);
+        app.log.info({ jobId:job.id, profileId:job.profileId, state:job.status, ptyAlive:!!geminiLoginWorkers.get(job.id), credentialsOk:lastCredentialOk, initializeOk:lastInitializeOk, smokeOk:lastSmokeOk, elapsedMs:Date.now() - started }, 'gemini login verification completed');
+        return;
+      } catch (e:any) {
+        lastInitializeOk = !String(e?.message || e).includes('initialize');
+        job.error = safeGeminiError(e);
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+  if (job.status !== 'done' && job.status !== 'cancelled') {
+    setGeminiJobStatus(job, 'failed', '登录验证超时');
+    job.codeSubmitted = false;
+    app.log.warn({ jobId:job.id, profileId:job.profileId, state:job.status, ptyAlive:!!geminiLoginWorkers.get(job.id), credentialsOk:lastCredentialOk, initializeOk:lastInitializeOk, smokeOk:lastSmokeOk, elapsedMs:Date.now() - started }, 'gemini login verification timed out');
+  }
+}
+function setGeminiJobStatus(job:GeminiLoginJob, status:GeminiLoginJob['status'], error?:string) {
+  const previous = job.status;
+  job.status = status;
+  if (error) job.error = error;
+  const profileStatus = status === 'done' ? 'authenticated' : status === 'verifying' ? 'verifying' : status === 'failed' || status === 'error' || status === 'fallback' ? 'failed' : status === 'cancelled' ? 'failed' : status === 'waiting_user' || status === 'preparing' ? 'authenticating' : null;
+  if (profileStatus) db.run("UPDATE gemini_profiles SET status=?1, active=CASE WHEN ?1='authenticated' THEN active ELSE 0 END, updated_at=?2 WHERE id=?3", [profileStatus, Date.now(), job.profileId]).catch(()=>{});
+  if (previous !== status) app.log.info({ jobId:job.id, profileId:job.profileId, from:previous, to:status, ptyAlive:!!geminiLoginWorkers.get(job.id), elapsedMs:Date.now() - job.startedAt }, 'gemini login job state changed');
+}
+async function cancelGeminiLoginForProfile(profileId:string) {
+  const jobId = geminiLoginProfiles.get(profileId);
+  if (!jobId) return;
+  const job = geminiLoginJobs.get(jobId);
+  const child = geminiLoginWorkers.get(jobId);
+  if (child) {
+    try { child.kill(); } catch {}
+    geminiLoginWorkers.delete(jobId);
+  }
+  if (job && job.status !== 'done') setGeminiJobStatus(job, 'cancelled', '登录已取消');
+  geminiLoginProfiles.delete(profileId);
 }
 function geminiConfigDir(homeDir:string) {
   return path.join(homeDir, '.gemini');
@@ -1514,26 +1655,36 @@ async function deleteGeminiProfileDir(homeDir:string) {
 }
 async function listAntigravityProfiles() {
   await syncAntigravityProfilesFromDisk().catch(()=>{});
-  const rows = await db.all('SELECT id,name,home_dir,active,created_at,updated_at FROM antigravity_profiles ORDER BY active DESC, updated_at DESC');
+  const rows = await db.all("SELECT id,name,home_dir,active,status,created_at,updated_at FROM antigravity_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY active DESC, updated_at DESC");
   const profiles = await Promise.all(rows.map(async (p:any)=>{
     const login = await antigravityLoginStatus(String(p.home_dir));
     const name = login.email || (String(p.name || '').trim() && p.name !== 'Google Account' ? p.name : 'Antigravity Account');
-    return { ...p, name, active:Number(p.active || 0), login };
+    return { ...p, provider:'antigravity', name, email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
   }));
   return profiles.filter(Boolean);
 }
 async function getActiveAntigravityProfile() {
   await syncAntigravityProfilesFromDisk().catch(()=>{});
-  const p = await db.get('SELECT id,name,home_dir,active,created_at,updated_at FROM antigravity_profiles WHERE active=1 ORDER BY updated_at DESC LIMIT 1');
+  const p = await db.get("SELECT id,name,home_dir,active,status,created_at,updated_at FROM antigravity_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
   if (!p) return null;
   const login = await antigravityLoginStatus(String(p.home_dir));
   const name = login.email || (String(p.name || '').trim() && p.name !== 'Google Account' ? p.name : 'Antigravity Account');
-  return { ...p, name, active:Number(p.active || 0), login };
+  return { ...p, provider:'antigravity', name, email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
 }
-async function getAntigravityProfile(id:string) { return db.get('SELECT id,name,home_dir,active,created_at,updated_at FROM antigravity_profiles WHERE id=?1', [id]); }
+async function getAntigravityProfile(id:string) { return db.get('SELECT id,name,home_dir,active,status,created_at,updated_at FROM antigravity_profiles WHERE id=?1', [id]); }
 async function activateAntigravityProfile(id:string) {
   await db.run('UPDATE antigravity_profiles SET active=0');
-  await db.run('UPDATE antigravity_profiles SET active=1, updated_at=?1 WHERE id=?2', [Date.now(), id]);
+  await db.run("UPDATE antigravity_profiles SET active=1, updated_at=?1 WHERE id=?2 AND COALESCE(status,'authenticated')='authenticated'", [Date.now(), id]);
+}
+async function ensureAntigravityActiveProfile() {
+  const active = await db.get("SELECT id FROM antigravity_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' LIMIT 1");
+  if (active?.id) {
+    await db.run("UPDATE antigravity_profiles SET active=0 WHERE active=1 AND id<>?1", [String(active.id)]).catch(()=>{});
+    return;
+  }
+  await db.run('UPDATE antigravity_profiles SET active=0').catch(()=>{});
+  const next = await db.get("SELECT id FROM antigravity_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  if (next?.id) await activateAntigravityProfile(String(next.id)).catch(()=>{});
 }
 async function syncAntigravityProfilesFromDisk() {
   let dirs:any[] = [];
@@ -1547,7 +1698,7 @@ async function syncAntigravityProfilesFromDisk() {
     if (!login.ok) continue;
     const name = login.email || await antigravityProfileName(homeDir).catch(()=>null) || 'Antigravity Account';
     const active = activated ? 0 : 1;
-    await db.run('INSERT INTO antigravity_profiles (id,name,home_dir,active,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, updated_at=excluded.updated_at', [entry.name, name, homeDir, active, Date.now()]);
+    await db.run("INSERT INTO antigravity_profiles (id,name,home_dir,active,status,created_at,updated_at) VALUES (?1,?2,?3,?4,'authenticated',?5,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, updated_at=excluded.updated_at, active=CASE WHEN antigravity_profiles.status='disabled' THEN 0 ELSE antigravity_profiles.active END", [entry.name, name, homeDir, active, Date.now()]);
     if (!activated) {
       await setSetting('activeProvider', 'antigravity').catch(()=>{});
       activated = true;
@@ -1563,7 +1714,7 @@ async function finishAntigravityLoginJob(job:AntigravityLoginJob, email?:string|
   const login = await antigravityLoginStatus(homeDir);
   const name = email || login.email || await antigravityProfileName(homeDir).catch(()=>null) || 'Antigravity Account';
   const now = Date.now();
-  await db.run('INSERT INTO antigravity_profiles (id,name,home_dir,active,created_at,updated_at) VALUES (?1,?2,?3,0,?4,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, updated_at=excluded.updated_at', [job.profileId, name, homeDir, now]);
+  await db.run("INSERT INTO antigravity_profiles (id,name,home_dir,active,status,created_at,updated_at) VALUES (?1,?2,?3,0,'authenticated',?4,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name, home_dir=excluded.home_dir, status='authenticated', updated_at=excluded.updated_at", [job.profileId, name, homeDir, now]);
   await activateAntigravityProfile(job.profileId).catch(()=>{});
   await setSetting('activeProvider', 'antigravity').catch(()=>{});
   job.status = 'done';
@@ -1587,6 +1738,18 @@ async function maybeFinishAntigravityLoginJob(job:AntigravityLoginJob) {
   if (!login.ok) return false;
   await finishAntigravityLoginJob(job, login.email);
   return true;
+}
+async function cancelAntigravityLoginForProfile(profileId:string) {
+  for (const [jobId, job] of antigravityLoginJobs.entries()) {
+    if (job.profileId !== profileId || job.status !== 'running') continue;
+    const child = antigravityLoginChildren.get(jobId);
+    if (child) {
+      try { child.kill(); } catch {}
+      antigravityLoginChildren.delete(jobId);
+    }
+    job.status = 'error';
+    job.error = '登录已取消';
+  }
 }
 async function antigravityLoginStatus(homeDir:string) {
   try {
