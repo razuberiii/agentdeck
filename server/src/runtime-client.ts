@@ -15,6 +15,7 @@ export class RuntimeClient {
   rateLimits() { return this.request('GET', '/codex/rate-limits'); }
   models(includeHidden = false) { return this.request('GET', `/codex/models?hidden=${includeHidden ? '1' : '0'}`); }
   geminiStatus() { return this.request('GET', '/gemini/status'); }
+  answerGeminiApproval(requestId:string, body:any) { return this.request('POST', `/gemini/approvals/${encodeURIComponent(requestId)}`, body); }
   createCodexSession(body:any) { return this.request('POST', '/codex/sessions', body); }
   createGeminiSession(body:any) { return this.request('POST', '/gemini/sessions', body); }
   resumeCodexSession(body:any) { return this.request('POST', '/codex/sessions/resume', body); }

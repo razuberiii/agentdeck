@@ -267,6 +267,11 @@ app.get('/diagnostics', async () => ({
 }));
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
 app.get('/gemini/status', async () => gemini.status());
+app.post('/gemini/approvals/:id', async (req:any, reply) => {
+  const optionId = typeof req.body?.optionId === 'string' ? req.body.optionId : null;
+  if (!gemini.answerPermission(String(req.params.id), optionId)) return reply.code(404).send({ error:'approval request not found' });
+  return { ok:true };
+});
 
 app.get('/sessions', async (req:any) => {
   const requestId = req.id;

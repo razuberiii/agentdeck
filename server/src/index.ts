@@ -583,6 +583,15 @@ app.post('/api/sessions/:id/stop', { preHandler: ensureAuth }, async (req:any) =
 app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
   cleanupPendingApprovals();
   const requestKey = String(req.params.requestId);
+  if (requestKey.startsWith('gemini-')) {
+    const decision = req.body?.decision === 'decline' ? 'decline' : 'accept';
+    const options = Array.isArray(req.body?.options) ? req.body.options : [];
+    const preferred = decision === 'accept'
+      ? options.find((option:any) => String(option?.kind || '').startsWith('allow')) || options[0]
+      : options.find((option:any) => String(option?.kind || '').startsWith('reject')) || options[0];
+    await runtime.answerGeminiApproval(requestKey, { optionId: preferred?.optionId || null });
+    return {ok:true};
+  }
   const pending = pendingApprovals.get(requestKey);
   if (!pending) return reply.code(404).send({error:'approval request not found'});
   pendingApprovals.delete(requestKey);
@@ -1630,6 +1639,10 @@ async function runtimeEventMessages(threadId:string, event:any) {
   if (eventType === 'thread_recovered_with_new_upstream') {
     out.push({ type:'system', text:String(payload?.warning || '上游会话已重建，部分模型上下文可能丢失'), ...base });
     out.push({ type:'runtimeConnection', status:'connected', ...base });
+    return out;
+  }
+  if (eventType === 'approval/requested') {
+    out.push({ type:'approval', requestId:payload?.requestId, method:'gemini/session/request_permission', params:payload?.request || {}, ...base });
     return out;
   }
   if (eventType === 'thread_snapshot') {
