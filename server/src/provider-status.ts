@@ -8,6 +8,13 @@ export type ProviderStatus = {
   displayName: string;
   availability: ProviderAvailability;
   auth: ProviderAuth;
+  accountSummary: {
+    profileId?: string;
+    providerAccountId?: string;
+    email?: string;
+    displayName?: string;
+    authType?: string;
+  } | null;
   account: {
     id?: string;
     email?: string;
@@ -18,10 +25,13 @@ export type ProviderStatus = {
   version: string | null;
   activeProfileId: string | null;
   canCreateSession: boolean;
+  canContinueSession: boolean;
   canManageAccounts: boolean;
   canLogout: boolean;
   canQueryQuota: boolean;
   canListModels: boolean;
+  canSelectModel: boolean;
+  capabilities: Record<string, any>;
   reasonCode: string | null;
   message: string | null;
   checkedAt: string;
@@ -40,10 +50,13 @@ type ProviderStatusInput = {
   account?: ProviderStatus['account'];
   activeProfileId?: string | null;
   canCreateSession?: boolean;
+  canContinueSession?: boolean;
   canManageAccounts?: boolean;
   canLogout?: boolean;
   canQueryQuota?: boolean;
   canListModels?: boolean;
+  canSelectModel?: boolean;
+  capabilities?: Record<string, any>;
   reasonCode?: string | null;
   message?: string | null;
   installHint?: string;
@@ -58,20 +71,32 @@ export function providerStatus(input: ProviderStatusInput): ProviderStatus {
   const message = input.message ?? (availability === 'ready' ? null : String(cli.error || `${input.displayName} CLI 不可用`));
   const version = cli.version ? String(cli.version) : null;
   const canCreateSession = input.canCreateSession ?? (availability === 'ready' && input.auth === 'authenticated');
+  const canListModels = input.canListModels ?? availability === 'ready';
+  const accountSummary = input.account ? {
+    profileId: input.account.profileId || input.account.id,
+    providerAccountId: input.account.id,
+    email: input.account.email,
+    displayName: input.account.displayName,
+    authType: input.account.authType,
+  } : null;
   return {
     provider: input.provider,
     id: input.provider,
     displayName: input.displayName,
     availability,
     auth: input.auth,
+    accountSummary,
     account: input.account || null,
     version,
     activeProfileId: input.activeProfileId || null,
     canCreateSession,
+    canContinueSession: input.canContinueSession ?? canCreateSession,
     canManageAccounts: input.canManageAccounts ?? true,
     canLogout: input.canLogout ?? input.auth === 'authenticated',
     canQueryQuota: input.canQueryQuota ?? input.provider === 'codex',
-    canListModels: input.canListModels ?? availability === 'ready',
+    canListModels,
+    canSelectModel: input.canSelectModel ?? canListModels,
+    capabilities: input.capabilities || {},
     reasonCode: input.reasonCode || null,
     message,
     checkedAt: input.checkedAt || new Date().toISOString(),

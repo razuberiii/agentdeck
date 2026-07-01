@@ -7,7 +7,8 @@ import './styles.css';
 type ProviderId = 'codex'|'gemini'|'antigravity';
 type ProviderAvailability = 'checking'|'ready'|'unavailable'|'error';
 type ProviderAuth = 'checking'|'authenticated'|'unauthenticated'|'authenticating'|'unknown'|'not_applicable'|'error';
-type ProviderStatus = { provider?:ProviderId; id:ProviderId; displayName:string; availability?:ProviderAvailability; auth?:ProviderAuth; account?:{id?:string;email?:string;displayName?:string;profileId?:string;authType?:string}|null; version?:string|null; activeProfileId?:string|null; canCreateSession?:boolean; canManageAccounts?:boolean; canLogout?:boolean; canQueryQuota?:boolean; canListModels?:boolean; reasonCode?:string|null; message?:string|null; checkedAt?:string; ok:boolean; installed:boolean; error?:string|null; installHint?:string; runtime?:any };
+type AccountSummary = {profileId?:string;providerAccountId?:string;email?:string;displayName?:string;authType?:string};
+type ProviderStatus = { provider?:ProviderId; id:ProviderId; displayName:string; availability?:ProviderAvailability; auth?:ProviderAuth; accountSummary?:AccountSummary|null; account?:{id?:string;email?:string;displayName?:string;profileId?:string;authType?:string}|null; version?:string|null; activeProfileId?:string|null; canCreateSession?:boolean; canContinueSession?:boolean; canManageAccounts?:boolean; canLogout?:boolean; canQueryQuota?:boolean; canListModels?:boolean; canSelectModel?:boolean; capabilities?:Record<string,any>; reasonCode?:string|null; message?:string|null; checkedAt?:string; ok:boolean; installed:boolean; error?:string|null; installHint?:string; runtime?:any };
 type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultWorkspace?:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; providerStatus?:Record<ProviderId,ProviderStatus>; capabilities:Capabilities; activeProfile?:any; activeGeminiProfile?:any; activeAntigravityProfile?:any };
 type Capabilities = { imageInput:boolean; imageOutput:boolean; fileInput?:boolean; attachmentTypes:string[]; maxAttachmentBytes:number; maxAttachmentsPerMessage?:number; maxTotalAttachmentBytes?:number; providers?:Record<string,any> };
 type Session = { id:string; codex_thread_id:string; provider_id?:ProviderId; providerId?:ProviderId; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number; last_sequence?:number };
@@ -64,7 +65,7 @@ function providerAuthLabel(status?:ProviderStatus|null){
 function providerSubtitle(status?:ProviderStatus|null){
   if(!status) return '正在检查';
   const label = providerAuthLabel(status);
-  const account = status.account?.email || status.account?.displayName;
+  const account = status.accountSummary?.email || status.accountSummary?.displayName || status.account?.email || status.account?.displayName;
   if(status.availability==='unavailable') return [status.version, label].filter(Boolean).join(' · ') || label;
   return [status.version, label, account].filter(Boolean).join(' · ');
 }
@@ -76,9 +77,10 @@ function providerNotice(status?:ProviderStatus|null){
 function activeStatusProfileLabel(status:any){
   const provider=status?.activeProvider || 'codex';
   const providerStatus = (status?.providers||[]).find((p:any)=>p.id===provider) || status?.providerStatus?.[provider];
-  return providerStatus?.account?.email || providerStatus?.account?.displayName || (provider==='gemini'?'尚未添加 Gemini 账户':provider==='antigravity'?'尚未添加 Antigravity 账户':'尚未添加 Codex 账户');
+  return providerStatus?.accountSummary?.email || providerStatus?.accountSummary?.displayName || providerStatus?.account?.email || providerStatus?.account?.displayName || (provider==='gemini'?'尚未添加 Gemini 账户':provider==='antigravity'?'尚未添加 Antigravity 账户':'尚未添加 Codex 账户');
 }
 function accountSubtitle(provider:string, codexProfile:any, geminiProfile:any, antigravityProfile:any, providerStatus:any){
+  if(providerStatus?.accountSummary?.email || providerStatus?.accountSummary?.displayName) return providerStatus.accountSummary.email || providerStatus.accountSummary.displayName;
   if(providerStatus?.account?.email || providerStatus?.account?.displayName) return providerStatus.account.email || providerStatus.account.displayName;
   if(providerStatus?.availability==='unavailable') return `${providerLabel(provider)} 服务不可用`;
   return providerAuthLabel(providerStatus);

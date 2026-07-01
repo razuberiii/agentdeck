@@ -16,8 +16,17 @@ test('Gemini authenticated profile remains authenticated with authMethods metada
 
   assert.equal(status.auth, 'authenticated');
   assert.equal(status.canCreateSession, true);
+  assert.equal(status.canContinueSession, true);
+  assert.equal(status.canSelectModel, true);
   assert.equal(providerAuthLabel(status.auth, status.availability), '已登录');
   assert.equal(status.account.email, 'user@example.com');
+  assert.deepEqual(status.accountSummary, {
+    profileId: 'g1',
+    providerAccountId: 'g1',
+    email: 'user@example.com',
+    displayName: undefined,
+    authType: 'oauth-personal',
+  });
 });
 
 test('Codex authenticated and unauthenticated statuses use same contract', () => {
@@ -41,6 +50,12 @@ test('Codex authenticated and unauthenticated statuses use same contract', () =>
   assert.equal(providerAuthLabel(authenticated.auth, authenticated.availability), '已登录');
   assert.equal(providerAuthLabel(unauthenticated.auth, unauthenticated.availability), '未登录');
   assert.equal(unauthenticated.canCreateSession, false);
+  assert.equal(unauthenticated.canContinueSession, false);
+  assert.equal(typeof unauthenticated.canManageAccounts, 'boolean');
+  assert.equal(typeof unauthenticated.canQueryQuota, 'boolean');
+  assert.equal(typeof unauthenticated.canListModels, 'boolean');
+  assert.equal(typeof unauthenticated.canSelectModel, 'boolean');
+  assert.equal(typeof unauthenticated.capabilities, 'object');
 });
 
 test('Antigravity unknown auth is neutral, not unauthenticated', () => {
@@ -57,6 +72,33 @@ test('Antigravity unknown auth is neutral, not unauthenticated', () => {
   assert.equal(status.auth, 'unknown');
   assert.equal(providerAuthLabel(status.auth, status.availability), '状态未知');
   assert.equal(status.canCreateSession, true);
+  assert.equal(status.canContinueSession, true);
+});
+
+test('ProviderStatus exposes the full phase 8 contract without UI inference', () => {
+  const status = providerStatus({
+    provider: 'codex',
+    displayName: 'Codex',
+    cliStatus: { ok:true, version:'codex-cli 0.133.0' },
+    auth: 'authenticated',
+    account: { id:'provider-c1', profileId:'profile-c1', email:'codex@example.com', displayName:'Codex User', authType:'chatgpt' },
+    activeProfileId: 'profile-c1',
+    canCreateSession: true,
+    canContinueSession: true,
+    canManageAccounts: true,
+    canQueryQuota: true,
+    canListModels: true,
+    canSelectModel: true,
+    capabilities: { imageInput:true },
+    checkedAt: '2026-07-01T00:00:00.000Z',
+  });
+
+  for (const key of ['provider','availability','auth','accountSummary','version','activeProfileId','canCreateSession','canContinueSession','canManageAccounts','canQueryQuota','canListModels','canSelectModel','capabilities','reasonCode','message','checkedAt']) {
+    assert.ok(Object.hasOwn(status, key), `${key} missing`);
+  }
+  assert.equal(status.accountSummary.profileId, 'profile-c1');
+  assert.equal(status.accountSummary.providerAccountId, 'provider-c1');
+  assert.equal(status.capabilities.imageInput, true);
 });
 
 test('unavailable availability renders service unavailable instead of not logged in', () => {

@@ -517,6 +517,7 @@ app.get('/api/gemini-login/:jobId', { preHandler: ensureAuth }, async (req:any, 
     clearGeminiLoginJobChallenge(job);
     job.codeSubmitted = false;
     geminiLoginProfiles.delete(job.profileId);
+    invalidateUnifiedProviderStatuses();
     return { completed:true, job };
   }
   return { job };
@@ -593,6 +594,7 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
       await activateProfile(String(finalProfile.id)).catch(()=>{});
       if (!USE_AGENT_RUNTIME) await codex.switchCodexHome(String(finalProfile.codex_home)).catch(()=>{});
       codexStatusCache = { expiresAt:0 };
+      invalidateUnifiedProviderStatuses();
     }
   });
   return { jobId, job };
@@ -1217,10 +1219,13 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       activeProfileId: codexProfile?.id || null,
       account: codexProfile?.id ? { id:codexProfile.id, profileId:codexProfile.id, email:codexEmail, displayName:codexEmail || codexProfile.name } : null,
       canCreateSession: !!codexCli?.ok && codexAuth === 'authenticated',
+      canContinueSession: !!codexCli?.ok && codexAuth === 'authenticated',
       canManageAccounts: true,
       canLogout: codexAuth === 'authenticated',
       canQueryQuota: true,
       canListModels: !!codexCli?.ok,
+      canSelectModel: !!codexCli?.ok,
+      capabilities: attachmentCapabilities(null).providers?.codex || {},
       reasonCode: codexCli?.ok ? (codexAuth === 'authenticated' ? null : 'codex_not_logged_in') : 'codex_unavailable',
       message: codexCli?.ok ? (codexAuth === 'authenticated' ? null : '请先登录 Codex') : (codexCli?.error || 'Codex CLI 不可用'),
       checkedAt,
@@ -1234,10 +1239,13 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       activeProfileId: geminiProfile?.id || null,
       account: geminiProfile?.id ? { id:geminiProfile.id, profileId:geminiProfile.id, email:geminiEmail, displayName:geminiEmail || geminiProfile.name, authType:geminiProfile.authType ? String(geminiProfile.authType) : undefined } : null,
       canCreateSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated',
+      canContinueSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated',
       canManageAccounts: true,
       canLogout: geminiAuth === 'authenticated',
-      canQueryQuota: true,
+      canQueryQuota: false,
       canListModels: !!geminiCli?.ok,
+      canSelectModel: !!geminiCli?.ok,
+      capabilities: attachmentCapabilities(null).providers?.gemini || {},
       reasonCode: geminiReason,
       message: geminiMessage,
       checkedAt,
@@ -1251,10 +1259,13 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       activeProfileId: antigravityProfile?.id || null,
       account: antigravityProfile?.id ? { id:antigravityProfile.id, profileId:antigravityProfile.id, email:antigravityEmail, displayName:antigravityEmail || antigravityProfile.name } : null,
       canCreateSession: antigravityCanCreate,
+      canContinueSession: antigravityCanCreate,
       canManageAccounts: true,
       canLogout: false,
-      canQueryQuota: true,
+      canQueryQuota: false,
       canListModels: !!antigravityCli?.ok && !!antigravityProfile?.id,
+      canSelectModel: false,
+      capabilities: attachmentCapabilities(null).providers?.antigravity || {},
       reasonCode: !antigravityCli?.ok ? 'antigravity_unavailable' : antigravityProfile?.id ? 'antigravity_auth_unknown' : 'antigravity_not_logged_in',
       message: !antigravityCli?.ok ? (antigravityCli?.error || 'Antigravity CLI 不可用') : antigravityProfile?.id ? 'Antigravity 登录状态无法可靠探测' : '请先添加 Antigravity 账户',
       checkedAt,
