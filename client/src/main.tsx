@@ -177,11 +177,13 @@ function SessionView({id}:{id:string}){
   const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=turnStatus==='unknown'?liveStatus(live,session?.status):turnStatus; const activeModel=session?.model || (modelsProvider===(session ? sessionProvider(session) : '') ? catalogCurrent(models) : '') || status?.defaultModel;
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
     <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · 浏览器 {connectionLabel(browserConnection)} · Runtime {connectionLabel(runtimeConnection)}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
-    {!online&&<InlineNotice tone="error" text="网络离线，发送会在连接恢复后可用。"/>}
-    {online&&browserConnection!=='connected'&&<InlineNotice tone="info" text="浏览器正在重新连接会话。"/>}
-    {runtimeConnection==='checking'&&currentStatus==='running'&&<InlineNotice tone="info" text="Runtime 正在检查连接。"/>}
-    {runtimeConnection==='recovering'&&currentStatus==='running'&&<InlineNotice tone="info" text="Runtime 正在恢复，会话恢复后可继续发送。"/>}
-    {runtimeConnection==='unavailable'&&<InlineNotice tone="error" text="Runtime 暂不可用，稍后会自动恢复。"/>}
+    <div className="noticeStack" aria-live="polite">
+      {!online&&<InlineNotice tone="error" text="网络离线，发送会在连接恢复后可用。"/>}
+      {online&&browserConnection!=='connected'&&<InlineNotice tone="info" text="浏览器正在重新连接会话。"/>}
+      {runtimeConnection==='checking'&&currentStatus==='running'&&<InlineNotice tone="info" text="Runtime 正在检查连接。"/>}
+      {runtimeConnection==='recovering'&&currentStatus==='running'&&<InlineNotice tone="info" text="Runtime 正在恢复，会话恢复后可继续发送。"/>}
+      {runtimeConnection==='unavailable'&&<InlineNotice tone="error" text="Runtime 暂不可用，稍后会自动恢复。"/>}
+    </div>
     {menu&&<><button className="menuScrim" aria-label="关闭菜单" onClick={closeMenu}/><nav className="moreMenu">
       {menuPage==='main'&&<><button disabled={!!busy} onClick={openModelPicker}><b>模型</b><span>{modelLabel(activeModel)}</span></button><button disabled={!!busy} onClick={()=>setMenuPage('mode')}><b>权限模式</b><span>{modeLabel(session?.permission_mode)}</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); showDiff(); }}><b>Diff</b><span>查看当前改动</span></button><button disabled={!!busy} onClick={()=>setMenuPage('manage')}><b>会话管理</b><span>改名、Fork、归档</span></button></>}
       {menuPage==='mode'&&<><button className="menuBack" onClick={()=>setMenuPage('main')}>‹ 权限模式</button><button disabled={!!busy} className={session?.permission_mode==='yolo'?'active':''} onClick={()=>setSessionMode('yolo')}><b>YOLO</b><span>自动允许写入和命令</span></button><button disabled={!!busy} className={session?.permission_mode==='workspace-write'?'active':''} onClick={()=>setSessionMode('workspace-write')}><b>Workspace</b><span>写工作区前确认</span></button><button disabled={!!busy} className={session?.permission_mode==='read-only'?'active':''} onClick={()=>setSessionMode('read-only')}><b>Read Only</b><span>只读模式</span></button></>}
