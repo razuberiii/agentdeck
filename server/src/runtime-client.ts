@@ -11,8 +11,12 @@ export class RuntimeClient {
   diagnostics() { return this.request('GET', '/diagnostics'); }
   ensureDefaultCodexAccount() { return this.request('POST', '/codex/accounts/default'); }
   restartDefaultCodexAccount(body:any) { return this.request('POST', '/codex/accounts/default/restart', body); }
-  account() { return this.request('GET', '/codex/account'); }
-  rateLimits() { return this.request('GET', '/codex/rate-limits'); }
+  account(accountId?:string|null, codexHome?:string|null) {
+    return this.request('GET', `/codex/account${codexAccountQuery(accountId, codexHome)}`);
+  }
+  rateLimits(accountId?:string|null, codexHome?:string|null) {
+    return this.request('GET', `/codex/rate-limits${codexAccountQuery(accountId, codexHome)}`);
+  }
   models(includeHidden = false) { return this.request('GET', `/codex/models?hidden=${includeHidden ? '1' : '0'}`); }
   geminiStatus() { return this.request('GET', '/gemini/status'); }
   geminiProfileStatus(profileId:string) { return this.request('GET', `/gemini/profiles/${encodeURIComponent(profileId)}/status`); }
@@ -96,4 +100,12 @@ export class RuntimeClient {
       req.end();
     });
   }
+}
+
+function codexAccountQuery(accountId?:string|null, codexHome?:string|null) {
+  const params = new URLSearchParams();
+  if (accountId) params.set('accountId', accountId);
+  if (codexHome) params.set('codexHome', codexHome);
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
 }

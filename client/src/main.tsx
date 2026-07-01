@@ -519,8 +519,8 @@ function QuotaSheet({quota,onRefresh,onClose}:{quota:any;onRefresh:()=>void;onCl
       <div className="quotaAccount"><b>账号</b><span>{email || account?.name || account?.type || '未返回账号'}{account?.planType?` · ${account.planType}`:''}</span></div>
       {quota?.rateLimits?.usageText&&<div className="quotaAccount usageText"><b>Antigravity Usage</b><pre>{quota.rateLimits.usageText}</pre></div>}
       {unsupported ? <div className="quotaAccount"><b>额度</b><span>{quota?.message || '当前 CLI 暂未提供稳定的实时额度接口'}</span></div> : limit ? <>
-        <QuotaBar title="5 小时额度" limitWindow={limit.primary}/>
-        <QuotaBar title="周额度" limitWindow={limit.secondary}/>
+        <QuotaBar title={quotaWindowTitle(limit.primary)} limitWindow={limit.primary}/>
+        {limit.secondary&&<QuotaBar title={quotaWindowTitle(limit.secondary)} limitWindow={limit.secondary}/>}
         <div className="quotaAccount"><b>Credits</b><span>{limit.credits?.unlimited?'不限':limit.credits?.balance?`余额 ${limit.credits.balance}`:limit.credits?.hasCredits?'可用':'0'}</span></div>
       </> : !isAntigravity && <div><b>额度</b><span>没有返回额度数据</span></div>}
       {isAntigravity&&!quota?.rateLimits?.usageText&&<div className="quotaAccount"><b>Antigravity Usage</b><span>{quota?.errors?.rateLimits || 'Google CLI 暂未暴露可读取额度'}</span></div>}
@@ -809,10 +809,19 @@ function ModelSheet({models,value,busy,onPick,onClose}:{models:ModelOption[];val
 }
 function ModeButtons({value,onPick}:{value:string;onPick:(mode:string)=>void}){ return <div className="modeButtons"><button className={value==='yolo'?'active':''} onClick={()=>onPick('yolo')}>YOLO</button><button className={value==='workspace-write'?'active':''} onClick={()=>onPick('workspace-write')}>Workspace</button><button className={value==='read-only'?'active':''} onClick={()=>onPick('read-only')}>Read Only</button></div>; }
 function QuotaBar({title,limitWindow}:{title:string;limitWindow:any}){
+  if(!limitWindow) return null;
   const used=Math.max(0,Math.min(100,Math.round(limitWindow?.usedPercent || 0)));
   const remaining=100-used;
   const tone=remaining>50?'good':remaining>20?'warn':'danger';
   return <div className={`quotaCard ${tone}`}><div className="quotaLine"><b>{title}</b><strong>剩余 {remaining}%</strong></div><div className="quotaTrack" role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={remaining} aria-label={`${title}剩余额度`}><i style={{width:`${remaining}%`}}/></div><span>已用 {used}% · {limitWindow?.windowDurationMins?quotaDuration(limitWindow.windowDurationMins):'滚动窗口'}{limitWindow?.resetsAt?` · 重置 ${new Date(limitWindow.resetsAt*1000).toLocaleString()}`:''}</span></div>;
+}
+function quotaWindowTitle(limitWindow:any){
+  const mins=Number(limitWindow?.windowDurationMins || 0);
+  if(mins===300) return '5 小时额度';
+  if(mins===10080) return '周额度';
+  if(mins===43200) return '30 天额度';
+  if(mins>0) return quotaDuration(mins).replace('窗口','额度');
+  return '滚动额度';
 }
 function usageSummary(summary:any){
   const parts = [
@@ -836,7 +845,7 @@ function sessionUsageSummary(usage:any){
   return parts.join(' · ');
 }
 function formatNumber(value:any){ const n=Number(value || 0); return Number.isFinite(n) ? new Intl.NumberFormat('zh-CN').format(n) : String(value); }
-function quotaDuration(mins:number){ if(mins===300)return '5 小时窗口'; if(mins===10080)return '7 天窗口'; if(mins%60===0)return `${mins/60} 小时窗口`; return `${mins} 分钟窗口`; }
+function quotaDuration(mins:number){ if(mins===300)return '5 小时窗口'; if(mins===10080)return '7 天窗口'; if(mins===43200)return '30 天窗口'; if(mins%60===0)return `${mins/60} 小时窗口`; return `${mins} 分钟窗口`; }
 function Sheet({children,title,subtitle,actions,onClose,className=''}:{children:React.ReactNode;title:string;subtitle?:string;actions?:React.ReactNode;onClose:()=>void;className?:string}){ return <div className="sheetBackdrop" onClick={onClose}><section className={`sheet ${className}`} onClick={e=>e.stopPropagation()}><header><div><b>{title}</b>{subtitle&&<span>{subtitle}</span>}</div><div className="sheetActions">{actions}<button onClick={onClose}>关闭</button></div></header>{children}</section></div>; }
 function ConfirmDialog({title,detail,confirm,cancel='取消',busy=false,error='',onCancel,onConfirm}:{title:string;detail:string;confirm:string;cancel?:string;busy?:boolean;error?:string;onCancel:()=>void;onConfirm:()=>void}){
   useEffect(()=>{ const previous=document.body.style.overflow; document.body.style.overflow='hidden'; return()=>{ document.body.style.overflow=previous; }; },[]);

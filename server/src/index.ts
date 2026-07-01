@@ -287,9 +287,16 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
       checkedAt: Date.now(),
     };
   }
-  const [account, limits] = await Promise.allSettled(USE_AGENT_RUNTIME ? [runtime.account(), runtime.rateLimits()] : [codex.account(), codex.rateLimits()]);
+  const activeProfile:any = await getActiveProfile().catch(()=>null);
+  const accountId = activeProfile?.id ? String(activeProfile.id) : 'default';
+  const codexHome = activeProfile?.codex_home ? String(activeProfile.codex_home) : DEFAULT_CODEX_HOME;
+  const [account, limits] = await Promise.allSettled(USE_AGENT_RUNTIME ? [runtime.account(accountId, codexHome), runtime.rateLimits(accountId, codexHome)] : [codex.account(), codex.rateLimits()]);
+  if (limits.status === 'fulfilled') {
+    app.log.info({ provider:'codex', operation:'quota_read', accountId, cache:'none', ...codexQuotaLogFields(limits.value) }, 'codex quota read');
+  }
   return {
     providerId: 'codex',
+    accountId,
     account: account.status === 'fulfilled' ? account.value : null,
     rateLimits: limits.status === 'fulfilled' ? limits.value : null,
     errors: {
@@ -1169,6 +1176,23 @@ function invalidateUnifiedProviderStatuses() {
 }
 function providerStatusArray(statuses:Record<AgentProviderId, ProviderStatus>) {
   return [statuses.codex, statuses.gemini, statuses.antigravity];
+}
+function codexQuotaLogFields(rateLimits:any) {
+  const limit = rateLimits?.rateLimitsByLimitId?.codex || rateLimits?.rateLimits || {};
+  const primary = limit?.primary || {};
+  const secondary = limit?.secondary || null;
+  return {
+    planType: limit?.planType || rateLimits?.planType || limit?.credits?.planType || null,
+    limitId: limit?.limitId || limit?.id || 'codex',
+    limitName: limit?.limitName || limit?.name || null,
+    primaryUsedPercent: primary?.usedPercent ?? null,
+    primaryWindowDurationMins: primary?.windowDurationMins ?? null,
+    primaryResetsAt: primary?.resetsAt ?? null,
+    secondaryPresent: !!secondary,
+    secondaryUsedPercent: secondary?.usedPercent ?? null,
+    secondaryWindowDurationMins: secondary?.windowDurationMins ?? null,
+    secondaryResetsAt: secondary?.resetsAt ?? null,
+  };
 }
 function providerDisplayName(provider:AgentProviderId) {
   return provider === 'gemini' ? 'Gemini' : provider === 'antigravity' ? 'Antigravity' : 'Codex';
