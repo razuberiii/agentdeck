@@ -470,6 +470,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
   const [geminiAuthProfile,setGeminiAuthProfile]=useState<any>(null);
   const [geminiAuthMethods,setGeminiAuthMethods]=useState<any[]>([]);
   const [geminiApiKey,setGeminiApiKey]=useState('');
+  const [geminiAuthCode,setGeminiAuthCode]=useState('');
   const [geminiDeleteBusy,setGeminiDeleteBusy]=useState(false);
   const [geminiDeleteError,setGeminiDeleteError]=useState('');
   const [agCode,setAgCode]=useState('');
@@ -502,6 +503,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
     setGeminiAuthProfile(profile);
     setGeminiAuthMethods(loginMethodViews([]));
     setGeminiApiKey('');
+    setGeminiAuthCode('');
     setPage('geminiMethods');
     try{
       const r=await api(`/api/gemini/profiles/${profile.id}/refresh`,{method:'POST'});
@@ -511,7 +513,8 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
       toast('error','读取登录方式失败：'+shortError(e));
     }
   }
-  async function startGeminiLogin(methodId:string){ if(!geminiAuthProfile?.id) return; try{ const body:any={methodId}; if(methodId==='api_key' || methodId.toLowerCase().includes('api')) body.apiKey=geminiApiKey; const r=await api(`/api/gemini/profiles/${geminiAuthProfile.id}/login`,{method:'POST',body:JSON.stringify(body)}); setGeminiLoginJob(r.job); setGeminiApiKey(''); toast('info','Gemini 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
+  async function startGeminiLogin(methodId:string){ if(!geminiAuthProfile?.id) return; try{ const body:any={methodId}; if(methodId==='api_key' || methodId.toLowerCase().includes('api')) body.apiKey=geminiApiKey; const r=await api(`/api/gemini/profiles/${geminiAuthProfile.id}/login`,{method:'POST',body:JSON.stringify(body)}); setGeminiLoginJob(r.job); setGeminiApiKey(''); setGeminiAuthCode(''); toast('info','Gemini 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
+  async function submitGeminiAuthCode(){ if(!geminiLoginJob?.id || !geminiAuthCode.trim()) return; try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id+'/input',{method:'POST',body:JSON.stringify({code:geminiAuthCode.trim()})}); setGeminiLoginJob((job:any)=>({...job,...(r.job||{}),codeSubmitted:true})); setGeminiAuthCode(''); toast('info','授权码已提交，正在确认登录'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
   async function cancelGeminiLogin(){ if(!geminiLoginJob?.id) return; try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id+'/cancel',{method:'POST'}); setGeminiLoginJob(r.job); toast('info','已取消登录'); } catch(e:any){ toast('error','取消失败：'+shortError(e)); } }
   async function switchGeminiProfile(id:string){ try{ await api(`/api/gemini/profiles/${id}/switch`,{method:'POST'}); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
   async function logoutGeminiProfile(profile:any){ try{ await api(`/api/gemini/profiles/${profile.id}/logout`,{method:'POST'}); haptic(); toast('success','已退出登录'); await syncSettings(); } catch(e:any){ toast('error','退出失败：'+shortError(e)); } }
@@ -550,7 +553,7 @@ function SettingsSheet({data,onChanged,onClose}:{data:any;onChanged:()=>any|Prom
       {page==='account'&&activeProvider==='codex'&&<><section><b>账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={profileLabel(p)} onSwitch={switchProfile} onLogin={deviceLogin} onDelete={setDeleteProfile}/>)}</div></section><section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&<LoginJobPanel job={loginJob}/>}</>}
       {page==='account'&&activeProvider==='gemini'&&<><section><b>账户</b><div className="profileList">{geminiProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={geminiProfileLabel(p)} onSwitch={switchGeminiProfile} onLogin={()=>openGeminiLogin(p)} onLogout={logoutGeminiProfile} onDelete={(p:any)=>{setGeminiDeleteError('');setDeleteGeminiProfile(p)}}/>)}{!geminiProfiles.length&&<div className="empty"><b>尚未添加 Gemini 账户</b><span>添加账户后才能创建 Gemini 会话。</span></div>}</div></section><section><b>添加账户</b><button disabled={!activeProviderStatus?.ok} onClick={loginNewGeminiProfile}>登录新账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Gemini 未安装</b><span>安装 Gemini CLI 后才能登录。</span></div>}</section>{geminiLoginJob&&<GeminiLoginJobPanel job={geminiLoginJob} onCancel={cancelGeminiLogin}/>}</>}
       {page==='geminiMethods'&&<GeminiMethodList methods={geminiAuthMethods} onPick={(m:any)=>setPage(m.kind==='oauth'?'geminiGoogle':m.kind==='api-key'?'geminiApiKey':m.kind==='vertex'?'geminiVertex':'geminiMethods')}/>}
-      {page==='geminiGoogle'&&<GeminiGoogleLogin profile={geminiAuthProfile} job={geminiLoginJob} onStart={()=>startGeminiLogin('oauth')} onCancel={cancelGeminiLogin}/>}
+      {page==='geminiGoogle'&&<GeminiGoogleLogin profile={geminiAuthProfile} job={geminiLoginJob} code={geminiAuthCode} onCode={setGeminiAuthCode} onStart={()=>startGeminiLogin('oauth')} onSubmitCode={submitGeminiAuthCode} onCancel={cancelGeminiLogin} onRefresh={syncSettings}/>}
       {page==='geminiApiKey'&&<GeminiApiKeyLogin apiKey={geminiApiKey} onApiKey={setGeminiApiKey} job={geminiLoginJob} onSubmit={()=>startGeminiLogin('api_key')}/>}
       {page==='geminiVertex'&&<GeminiVertexLogin/>}
       {page==='account'&&activeProvider==='antigravity'&&<section><b>账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={removeAntigravityProfile}/>)}</div><button disabled={!activeProviderStatus?.ok || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{!activeProviderStatus?.ok&&<div className="empty"><b>Antigravity 未安装</b><span>安装后才能登录 Google 账户。</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode}/>}</section>}
@@ -653,9 +656,9 @@ function GeminiMethodList({methods,onPick}:{methods:LoginMethodView[];onPick:(m:
     </button>)}
   </section>;
 }
-function GeminiGoogleLogin({profile,job,onStart,onCancel}:{profile:any;job:any;onStart:()=>void;onCancel:()=>void}){
+function GeminiGoogleLogin({profile,job,code,onCode,onStart,onSubmitCode,onCancel,onRefresh}:{profile:any;job:any;code:string;onCode:(v:string)=>void;onStart:()=>void;onSubmitCode:()=>void;onCancel:()=>void;onRefresh:()=>any|Promise<any>}){
   const running=job&&['starting','waiting_user','verifying'].includes(job.status);
-  return <section className="loginForm"><b>Google 登录</b><span className="formHelp">{geminiProfileLabel(profile)} · 使用 Google 账号和订阅额度</span><button disabled={running} onClick={onStart}>{running?'登录进行中':'继续'}</button>{job&&<GeminiLoginJobPanel job={job} onCancel={onCancel}/>}</section>;
+  return <section className="loginForm"><b>Google 登录</b><span className="formHelp">{geminiProfileLabel(profile)} · 使用 Google 账号和订阅额度</span><button disabled={running} onClick={onStart}>{running?'登录进行中':'继续'}</button>{job&&<GeminiLoginJobPanel job={job} code={code} onCode={onCode} onSubmitCode={onSubmitCode} onCancel={onCancel} onRefresh={onRefresh}/>}</section>;
 }
 function GeminiApiKeyLogin({apiKey,onApiKey,job,onSubmit}:{apiKey:string;onApiKey:(v:string)=>void;job:any;onSubmit:()=>void}){
   const running=job&&['starting','waiting_user','verifying'].includes(job.status);
@@ -664,13 +667,24 @@ function GeminiApiKeyLogin({apiKey,onApiKey,job,onSubmit}:{apiKey:string;onApiKe
 function GeminiVertexLogin(){
   return <section className="loginForm"><b>Vertex AI</b><InlineNotice tone="info" text="Vertex AI 需要项目、区域和凭据路径校验。本版本不会保存不完整配置。"/></section>;
 }
-function GeminiLoginJobPanel({job,onCancel}:{job:any;onCancel?:()=>void}){
+function GeminiLoginJobPanel({job,code='',onCode,onSubmitCode,onCancel,onRefresh}:{job:any;code?:string;onCode?:(v:string)=>void;onSubmitCode?:()=>void;onCancel?:()=>void;onRefresh?:()=>any|Promise<any>}){
+  const toast=useToast();
+  const running=['starting','waiting_user','verifying'].includes(job.status);
+  const statusText=job.status==='starting'?'正在准备 Google 登录':job.status==='verifying'?'正在验证登录':job.status==='waiting_user'?(job.loginUrl?'等待你在 Google 完成授权':'正在准备 Google 登录'):job.status==='done'?'登录完成':job.status==='cancelled'?'已取消':job.status==='fallback'?'需要 SSH 完成登录':'登录失败';
   return <section><b>Gemini 登录</b>
-    <span>{job.status==='starting'?'正在启动':job.status==='verifying'?'正在验证':job.status==='waiting_user'?'等待用户操作':job.status==='done'?'登录完成':job.status==='cancelled'?'已取消':'登录失败'}</span>
-    {job.loginUrl&&<a className="loginLink" href={job.loginUrl} target="_blank" rel="noreferrer">打开登录网页</a>}
+    <span>{statusText}</span>
+    {job.loginUrl&&<a className="loginLink" href={job.loginUrl} target="_blank" rel="noreferrer">打开 Google 登录页面</a>}
+    {job.loginUrl&&<button onClick={async()=>{try{await navigator.clipboard.writeText(job.loginUrl);toast('success','链接已复制')}catch{toast('error','复制失败')}}}>复制链接</button>}
+    {job.requiresCodeInput&&<div className="loginCodeCard ready">
+      <span>Authorization code</span>
+      <input value={code} onChange={e=>onCode?.(e.target.value)} placeholder="粘贴 Google 返回的 authorization code" autoComplete="off"/>
+      <button disabled={!code.trim()||!running||job.codeSubmitted} onClick={onSubmitCode}>{job.codeSubmitted?'正在确认':'提交授权码'}</button>
+      <small>{job.codeSubmitted?'已提交授权码，正在等待 Gemini CLI 确认登录':'Google 授权完成后，把页面显示的 code 粘贴到这里。'}</small>
+    </div>}
     {job.deviceCode&&<div className="loginCodeCard ready"><span>认证码</span><div className="loginCodeLine"><strong>{job.deviceCode}</strong></div></div>}
-    {job.error&&<InlineNotice tone={job.status==='waiting_user'?'info':'error'} text={job.error}/>}
-    {onCancel&&['starting','waiting_user','verifying'].includes(job.status)&&<button onClick={onCancel}>取消</button>}
+    {job.fallbackCommand&&job.status==='fallback'&&<div className="loginCodeCard ready"><span>SSH 命令</span><code className="loginCommand">{job.fallbackCommand}</code><button onClick={async()=>{try{await navigator.clipboard.writeText(job.fallbackCommand);toast('success','命令已复制')}catch{toast('error','复制失败')}}}>复制命令</button>{onRefresh&&<button onClick={()=>onRefresh()}>重新检测登录</button>}</div>}
+    {job.error&&<InlineNotice tone={job.status==='waiting_user'||job.status==='fallback'?'info':'error'} text={job.error}/>}
+    {onCancel&&running&&<button onClick={onCancel}>取消登录</button>}
   </section>;
 }
 function stripAnsi(text:string){ return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g,''); }

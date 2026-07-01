@@ -32,6 +32,7 @@ input,textarea{width:100%;border:1px solid var(--line);background:#0b1216;color:
 @media(orientation:landscape) and (max-height:520px){.feed{padding-top:8px}.composer textarea{max-height:96px}.sheet{max-height:92dvh}.quickStart{grid-template-columns:1fr 1fr}}
 html,body,#root{overflow-x:hidden}.chatShell,.appShell,.composer,.attachTray,.composeRow{min-width:0;max-width:100%}.composer{overflow:hidden}.attachTray{width:100%;max-width:100%;display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain;-webkit-overflow-scrolling:touch}.attachItem{flex:0 0 150px;max-width:150px;grid-template-columns:58px minmax(0,1fr) 28px}.attachItem span{min-width:0}.composeRow{width:100%;grid-template-columns:42px minmax(0,1fr) 42px minmax(58px,62px)}.sendBtn{width:100%;white-space:nowrap}
 .loginOutputVisible{max-height:180px;overflow:auto;margin:0;padding:10px;border:1px solid var(--line-soft);border-radius:8px;background:#070c10;color:#aebdc5;font-size:11px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere}
+.loginCommand{display:block;width:100%;box-sizing:border-box;border:1px solid var(--line-soft);border-radius:8px;background:#071014;padding:8px;font-size:11px;line-height:1.35;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere;text-align:left}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 
 /* Emergency mobile readability overrides */

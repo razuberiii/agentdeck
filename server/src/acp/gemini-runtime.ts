@@ -240,12 +240,15 @@ export class GeminiAcpRuntime {
   private async connect() {
     await mkdir(this.profileDir(), { recursive:true, mode:0o700 });
     await chmod(this.profileDir(), 0o700).catch(()=>{});
+    const configDir = path.join(this.profileDir(), '.gemini');
+    await mkdir(configDir, { recursive:true, mode:0o700 });
+    await chmod(configDir, 0o700).catch(()=>{});
     const child = spawn(this.geminiBin(), this.geminiArgs(), {
       cwd: this.options.defaultCwd,
       env: {
         ...process.env,
         HOME:this.profileDir(),
-        GEMINI_CONFIG_DIR:this.profileDir(),
+        GEMINI_CONFIG_DIR:configDir,
         XDG_CONFIG_HOME:path.join(this.profileDir(), '.config'),
         XDG_CACHE_HOME:path.join(this.profileDir(), '.cache'),
         ...(this.options.profileEnv || {}),
