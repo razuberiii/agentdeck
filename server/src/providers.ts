@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { existsSync } from 'node:fs';
+import { constants, existsSync } from 'node:fs';
+import { access } from 'node:fs/promises';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,7 +38,7 @@ export interface AgentProvider {
 export class AntigravityProvider implements AgentProvider {
   id: AgentProviderId = 'antigravity';
   displayName = 'Antigravity';
-  private candidates = [process.env.ANTIGRAVITY_BIN, 'agy', 'antigravity', 'google-antigravity', 'gemini'].filter(Boolean) as string[];
+  private command = process.env.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy';
 
   async getVersion(command?: string | null) {
     const found = command === undefined ? await this.detectCommand() : command;
@@ -91,9 +92,9 @@ export class AntigravityProvider implements AgentProvider {
         ok: false,
         installed: false,
         version: null,
-        command: null,
-        error: 'Antigravity CLI 未安装',
-        installHint: '需要先安装 Google 官方 Antigravity/Gemini Coding Agent CLI，并确认登录、模型、恢复会话等命令后才能启用。',
+        command: this.command,
+        error: 'provider_binary_not_found: configured Antigravity binary is missing or not executable',
+        installHint: '设置 ANTIGRAVITY_BIN 为实际 agy 可执行文件的绝对路径。',
       };
     }
     const version = await this.getVersion(found);
@@ -109,11 +110,7 @@ export class AntigravityProvider implements AgentProvider {
   }
 
   private async detectCommand() {
-    for (const name of this.candidates) {
-      const found = await commandPath(name);
-      if (found) return found;
-    }
-    return null;
+    return await executablePath(this.command);
   }
 }
 
@@ -126,7 +123,8 @@ export class GeminiProvider implements AgentProvider {
   async getVersion(command?: string | null) {
     const found = command === undefined ? await this.detectCommand() : command;
     if (!found) return null;
-    return await tryExec(found, ['--version'], 'gemini --version') || null;
+    const result = await tryExecDetailed(found, ['--version'], undefined, 10_000, 'gemini --version');
+    return result.ok ? result.output : null;
   }
 
   async listModels() {
@@ -155,8 +153,8 @@ export class GeminiProvider implements AgentProvider {
     let acp = true;
     if (options.forceAcpHelp || (this.acpHelpCache && this.acpHelpCache.command === found)) {
       if (!this.acpHelpCache || options.forceAcpHelp || this.acpHelpCache.command !== found) {
-        const help = await tryExec(found, ['--help'], 'gemini --help');
-        this.acpHelpCache = { command: found, acp: /\s--acp\b/.test(help), checkedAt: Date.now() };
+        const help = await tryExecDetailed(found, ['--help'], undefined, 10_000, 'gemini --help');
+        this.acpHelpCache = { command: found, acp: help.ok && /\s--acp\b/.test(help.output), checkedAt: Date.now() };
       }
       acp = this.acpHelpCache.acp;
     }
@@ -201,6 +199,18 @@ async function commandPath(name: string) {
   } catch {
     return null;
   }
+}
+
+async function executablePath(name: string) {
+  if (name.includes('/')) {
+    try {
+      await access(name, constants.X_OK);
+      return name;
+    } catch {
+      return null;
+    }
+  }
+  return commandPath(name);
 }
 
 function shellQuote(value: string) {

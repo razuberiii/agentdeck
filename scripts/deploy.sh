@@ -113,6 +113,42 @@ check_env_dir() {
   done
 }
 
+check_provider_binaries() {
+  node - "$ENV_DIR" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const envDir = process.argv[2];
+function readEnv(name) {
+  const file = path.join(envDir, name);
+  const out = {};
+  if (!fs.existsSync(file)) return out;
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (match) out[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
+  }
+  return out;
+}
+const web = readEnv('web.env');
+const runtime = readEnv('runtime.env');
+const checks = [
+  ['ANTIGRAVITY_BIN', web.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy'],
+  ['GEMINI_BIN', runtime.GEMINI_BIN || web.GEMINI_BIN || '/usr/bin/gemini'],
+];
+for (const [name, value] of checks) {
+  if (!value.startsWith('/')) {
+    console.error(`ERROR: ${name} must be an absolute path: ${value}`);
+    process.exit(1);
+  }
+  try {
+    fs.accessSync(value, fs.constants.X_OK);
+  } catch {
+    console.error(`ERROR: configured provider binary is not executable: ${name}=${value}`);
+    process.exit(1);
+  }
+}
+NODE
+}
+
 run_check() {
   cd "$ROOT"
   log "root=$ROOT data=$DATA_DIR"
@@ -125,6 +161,8 @@ run_check() {
   require_user_group
   log "checking env dir"
   check_env_dir
+  log "checking provider binaries"
+  check_provider_binaries
   log "checking active turns"
   check_active_turns warn
   log "checking systemd unit files"

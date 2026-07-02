@@ -28,7 +28,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.codex');
-const ANTIGRAVITY_BIN = process.env.ANTIGRAVITY_BIN || 'agy';
+const ANTIGRAVITY_BIN = process.env.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy';
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const ANTIGRAVITY_PROFILES_DIR = path.join(DATA_DIR, 'antigravity-profiles');
 const GEMINI_PROFILES_DIR = path.join(DATA_DIR, 'gemini', 'profiles');
@@ -851,12 +851,16 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
         return reply.code(409).send({ error:'gemini_needs_login', message:'请先登录 Gemini', detail:message });
       }
       const body = e?.body || {};
-      const detail = safeGeminiError(body.detail || body.message || body.error || message);
+      const code = body.code || body.error || 'gemini_session_create_failed';
+      const detail = safeGeminiError(body.safeDetail || body.detail || body.message || body.error || message);
       app.log.warn({ provider:'gemini', operation:'create_session_failed', profileId:String(activeProfile.id), localSessionId:id, statusCode:e?.statusCode || null, detail }, 'gemini session create failed');
       return reply.code(e?.statusCode === 409 ? 409 : 502).send({
-        error:'gemini_session_create_failed',
-        message:'Gemini 会话初始化失败',
+        error:code,
+        code,
+        layer:body.layer || 'web_session_api',
+        message:body.message || 'Gemini 会话初始化失败',
         detail,
+        safeDetail:detail,
       });
     }
     return rowSessionDto(created.session);
@@ -2620,6 +2624,21 @@ async function antigravityLoginStatus(homeDir:string) {
     return { ok:false, email:null, text: String(e?.message || 'Not logged in') };
   }
 }
+async function ensureAntigravityBinary() {
+  if (!ANTIGRAVITY_BIN.includes('/')) throw structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary must be configured as an absolute path', `ANTIGRAVITY_BIN=${ANTIGRAVITY_BIN}`);
+  try {
+    await stat(ANTIGRAVITY_BIN);
+  } catch {
+    throw structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary was not found', `ANTIGRAVITY_BIN=${ANTIGRAVITY_BIN}`);
+  }
+}
+function structuredProviderError(code:string, layer:string, message:string, safeDetail:string) {
+  const err:any = new Error(message);
+  err.code = code;
+  err.layer = layer;
+  err.safeDetail = safeDetail;
+  return err;
+}
 async function antigravityProfileName(homeDir:string) {
   return await scanEmail(path.join(homeDir, '.gemini')).catch(()=>null) || 'Antigravity Account';
 }
@@ -3382,6 +3401,7 @@ async function attachmentPromptText(threadId:string, attachments:any[]) {
   return lines.join('\n');
 }
 async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId:string, itemId:string) {
+  await ensureAntigravityBinary();
   return new Promise<string>((resolve, reject) => {
     const args:string[] = [];
     const model = cleanAgentModel(row.model);
@@ -3412,7 +3432,12 @@ async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId
       }
     });
     child.stderr.on('data', d => { err += d.toString(); });
-    child.on('error', e => { clearTimeout(timer); activeAntigravityTurns.delete(threadId); maybeExitAfterDrain(); reject(e); });
+    child.on('error', e => {
+      clearTimeout(timer);
+      activeAntigravityTurns.delete(threadId);
+      const detail = (e as any)?.code === 'ENOENT' ? `ANTIGRAVITY_BIN=${ANTIGRAVITY_BIN}` : String((e as any)?.message || e);
+      reject(structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary could not be started', detail));
+    });
     child.on('close', code => {
       clearTimeout(timer);
       activeAntigravityTurns.delete(threadId);

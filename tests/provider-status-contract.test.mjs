@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { extractGeminiModelOptions, providerAuthLabel, providerStatus } from '../server/dist/provider-status.js';
+
+const providersSource = readFileSync(new URL('../server/src/providers.ts', import.meta.url), 'utf8');
+const indexSource = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 
 test('Gemini authenticated profile remains authenticated with authMethods metadata', () => {
   const status = providerStatus({
@@ -114,6 +118,19 @@ test('unavailable availability renders service unavailable instead of not logged
   assert.equal(providerAuthLabel(status.auth, status.availability), '服务不可用');
 });
 
+test('Antigravity binary resolution is deterministic and reports ENOENT explicitly', () => {
+  const antigravityClass = providersSource.slice(
+    providersSource.indexOf('export class AntigravityProvider'),
+    providersSource.indexOf('export class GeminiProvider'),
+  );
+  assert.match(antigravityClass, /process\.env\.ANTIGRAVITY_BIN \|\| '\/home\/ubuntu\/\.local\/bin\/agy'/);
+  assert.doesNotMatch(antigravityClass, /'gemini'/);
+  assert.match(antigravityClass, /provider_binary_not_found/);
+  assert.match(indexSource, /const ANTIGRAVITY_BIN = process\.env\.ANTIGRAVITY_BIN \|\| '\/home\/ubuntu\/\.local\/bin\/agy'/);
+  assert.match(indexSource, /ensureAntigravityBinary/);
+  assert.match(indexSource, /structuredProviderError\('provider_binary_not_found'/);
+});
+
 test('Gemini ACP session configOptions expose model choices', () => {
   const models = extractGeminiModelOptions({
     configOptions: [{
@@ -138,4 +155,14 @@ test('Gemini legacy model fields are parsed without prompt calls', () => {
 
   assert.deepEqual(models.map(model => model.id), ['default-a', 'default-b']);
   assert.equal(models[1].isDefault, true);
+});
+
+test('Gemini CLI status allows slow version and help probes without prompt calls', () => {
+  const geminiClass = providersSource.slice(
+    providersSource.indexOf('export class GeminiProvider'),
+    providersSource.indexOf('function antigravityFallbackModels'),
+  );
+  assert.match(geminiClass, /tryExecDetailed\(found, \['--version'\], undefined, 10_000, 'gemini --version'\)/);
+  assert.match(geminiClass, /tryExecDetailed\(found, \['--help'\], undefined, 10_000, 'gemini --help'\)/);
+  assert.doesNotMatch(geminiClass, /prompt|sendMessage|generateContent/i);
 });

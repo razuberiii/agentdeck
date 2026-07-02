@@ -480,11 +480,15 @@ app.post('/gemini/sessions', async (req:any, reply) => {
   } catch (e:any) {
     const message = e?.message || String(e);
     await db.run('DELETE FROM sessions WHERE id=?1 AND provider_session_id IS NULL AND last_sequence=0', [localSessionId]).catch(()=>{});
-    app.log.warn({ provider:'gemini', accountId, localSessionId, error:redactRuntimeError(message), code:e?.code || null }, 'gemini session create failed');
-    return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 502).send({
-      error:'gemini_session_create_failed',
-      message:'Gemini 会话初始化失败',
-      detail:redactRuntimeError(message),
+    const classified = classifyGeminiSessionCreateError(e);
+    app.log.warn({ provider:'gemini', accountId, localSessionId, error:classified.safeDetail, code:classified.code }, 'gemini session create failed');
+    return reply.code(classified.statusCode).send({
+      code:classified.code,
+      error:classified.code,
+      layer:'gemini_acp_session_new',
+      message:classified.message,
+      safeDetail:classified.safeDetail,
+      detail:classified.safeDetail,
       gemini:await geminiManager.status(accountId),
     });
   }
@@ -1583,6 +1587,32 @@ function geminiContentBlock(item:any) {
 
 function isGeminiAuthenticationErrorMessage(message:string) {
   return /\b(unauthenticated|unauthorized|authentication required|not authenticated|not logged in|login required|requires login|invalid credentials|invalid_grant|api key.*invalid|permission denied)\b/i.test(String(message || ''));
+}
+
+function classifyGeminiSessionCreateError(e:any) {
+  const safeDetail = redactRuntimeError(e?.message || String(e));
+  if (/no longer supported|migrate to the Antigravity suite|Gemini Code Assist for individuals/i.test(safeDetail)) {
+    return {
+      statusCode: 409,
+      code: 'gemini_client_unsupported',
+      message: '当前 Gemini CLI 不再支持该个人账号创建会话',
+      safeDetail,
+    };
+  }
+  if (isGeminiAuthenticationErrorMessage(safeDetail)) {
+    return {
+      statusCode: 409,
+      code: 'gemini_needs_login',
+      message: '请先登录 Gemini',
+      safeDetail,
+    };
+  }
+  return {
+    statusCode: 502,
+    code: 'gemini_session_create_failed',
+    message: 'Gemini 会话初始化失败',
+    safeDetail,
+  };
 }
 
 function redactRuntimeError(message:string) {

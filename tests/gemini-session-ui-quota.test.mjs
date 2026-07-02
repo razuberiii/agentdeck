@@ -43,9 +43,12 @@ async function createGeminiSession(db, runtime) {
     return {
       status:e.statusCode === 409 ? 409 : 502,
       body:{
-        error:'gemini_session_create_failed',
-        message:'Gemini 会话初始化失败',
-        detail:e.body?.detail || e.message,
+        error:e.body?.code || e.body?.error || 'gemini_session_create_failed',
+        code:e.body?.code || e.body?.error || 'gemini_session_create_failed',
+        message:e.body?.message || 'Gemini 会话初始化失败',
+        detail:e.body?.safeDetail || e.body?.detail || e.message,
+        safeDetail:e.body?.safeDetail || e.body?.detail || e.message,
+        layer:e.body?.layer || 'web_session_api',
       },
     };
   }
@@ -143,8 +146,30 @@ test('runtime profile missing or create failure returns structured error and lea
 
   assert.equal(response.status, 502);
   assert.equal(response.body.error, 'gemini_session_create_failed');
+  assert.equal(response.body.code, 'gemini_session_create_failed');
   assert.equal(response.body.message, 'Gemini 会话初始化失败');
   assert.equal(response.body.detail, 'profile not found');
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM sessions").get().count, 0);
+});
+
+test('unsupported Gemini Code Assist client is reported as structured non-auth failure', async () => {
+  const db = setup();
+  db.prepare("INSERT INTO profiles VALUES ('g1','Gemini Account','user@example.com',1,'authenticated','oauth-personal')").run();
+  const error = new Error('This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google');
+  error.statusCode = 409;
+  error.body = {
+    code:'gemini_client_unsupported',
+    layer:'gemini_acp_session_new',
+    message:'当前 Gemini CLI 不再支持该个人账号创建会话',
+    safeDetail:error.message,
+  };
+
+  const response = await createGeminiSession(db, { async createGeminiSession() { throw error; } });
+
+  assert.equal(response.status, 409);
+  assert.equal(response.body.error, 'gemini_client_unsupported');
+  assert.equal(response.body.layer, 'gemini_acp_session_new');
+  assert.match(response.body.safeDetail, /no longer supported/);
   assert.equal(db.prepare("SELECT COUNT(*) count FROM sessions").get().count, 0);
 });
 
