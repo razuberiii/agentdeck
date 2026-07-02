@@ -72,6 +72,22 @@ function providerChoiceStatus(status?:ProviderStatus|null){
   if(status?.auth==='authenticating') return '正在登录';
   return '状态未知';
 }
+function providerChoiceDetail(status?:ProviderStatus|null){
+  const account = status?.accountSummary?.email || status?.accountSummary?.displayName || status?.account?.email || status?.account?.displayName || '';
+  if(status?.reasonCode==='gemini_client_unsupported') return account ? `已登录 · ${account}` : '已登录 · 个人版客户端已停止支持';
+  if(status?.availability==='unavailable' || status?.availability==='error') return `不可用 · ${shortProviderReason(status)}`;
+  if(status?.auth==='authenticated') return `已登录${account ? ` · ${account}` : ''}`;
+  if(status?.auth==='unauthenticated') return '未登录';
+  if(status?.auth==='authenticating') return '正在登录';
+  return '状态未知';
+}
+function providerChoiceNote(status?:ProviderStatus|null){
+  if(status?.reasonCode==='gemini_client_unsupported') return '个人版客户端已停止支持';
+  return '';
+}
+function shortProviderReason(status?:ProviderStatus|null){
+  return String(status?.message || status?.error || status?.reasonCode || '简短原因').split(/[。\n]/)[0].slice(0, 28);
+}
 function providerSubtitle(status?:ProviderStatus|null){
   if(!status) return '正在检查';
   const label = providerAuthLabel(status);
@@ -676,7 +692,7 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   const title = page==='main' ? '设置' : page==='agent' ? 'Agent' : page==='mode' ? '沙盒' : page==='model' ? '模型' : page==='geminiMethods' ? '选择登录方式' : page==='geminiGoogle' ? 'Google 登录' : page==='geminiApiKey' ? 'Gemini API Key' : page==='geminiVertex' ? 'Vertex AI' : `${providerLabel(activeProvider)} 账户`;
   const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? undefined : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProviderStatus?.canListModels?`${providerLabel(activeProvider)} 模型`:providerAuthLabel(activeProviderStatus)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
   const goBack = () => setPage(page==='geminiMethods'?'account':(['geminiGoogle','geminiApiKey','geminiVertex'].includes(page)?'geminiMethods':'main') as any);
-  return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'&&page!=='agent'?<button onClick={goBack}>返回</button>:undefined}>
+  return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button className="settingsBack" onClick={goBack}>返回</button>:undefined}>
     {error&&<ErrorState title="设置读取失败" detail={error} action="重试" onAction={onRetry}/>}
     {loading&&!localData&&<LoadingRows count={4}/>}
     {localData&&<div className="settingsGrid">
@@ -685,12 +701,11 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
         <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
         <button onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.canListModels ? modelLabel(currentModel) : providerAuthLabel(activeProviderStatus)}</small></span><i>›</i></button>
         <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
-        <button onClick={()=>{location.hash='#/diagnostics'; onClose();}}><span><b>诊断</b><small>Runtime、Provider 和事件序列</small></span><i>›</i></button>
       </div>}
       {page==='agent'&&<section className="agentProviderPage"><div className="providerChoices">
-        <button className={activeProvider==='codex'?'active':''} aria-pressed={activeProvider==='codex'} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{providerChoiceStatus(codexProviderStatus)}</small></span><i/></button>
-        <button className={activeProvider==='gemini'?'active':''} aria-pressed={activeProvider==='gemini'} onClick={()=>setActiveProvider('gemini')}><span><b>Gemini</b><small>{providerChoiceStatus(geminiProviderStatus)}</small></span><i/></button>
-        <button className={activeProvider==='antigravity'?'active':''} aria-pressed={activeProvider==='antigravity'} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{providerChoiceStatus(antigravityProviderStatus)}</small></span><i/></button>
+        <button className={activeProvider==='codex'?'active':''} aria-pressed={activeProvider==='codex'} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{providerChoiceDetail(codexProviderStatus)}</small>{providerChoiceNote(codexProviderStatus)&&<em>{providerChoiceNote(codexProviderStatus)}</em>}</span><i/></button>
+        <button className={activeProvider==='gemini'?'active':''} aria-pressed={activeProvider==='gemini'} onClick={()=>setActiveProvider('gemini')}><span><b>Gemini</b><small>{providerChoiceDetail(geminiProviderStatus)}</small>{providerChoiceNote(geminiProviderStatus)&&<em>{providerChoiceNote(geminiProviderStatus)}</em>}</span><i/></button>
+        <button className={activeProvider==='antigravity'?'active':''} aria-pressed={activeProvider==='antigravity'} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{providerChoiceDetail(antigravityProviderStatus)}</small>{providerChoiceNote(antigravityProviderStatus)&&<em>{providerChoiceNote(antigravityProviderStatus)}</em>}</span><i/></button>
       </div></section>}
       {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
       {page==='model'&&<section><b>模型</b>{activeProvider==='gemini'&&<GeminiModelSummary defaultModel={currentModel} currentSessionId={currentSessionId} currentModel={models?.current || currentModel}/>} {models?.error&&<InlineNotice tone="info" text={models.error}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models?.error || (models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`)} onPick={setDefaultModel}/>{activeProvider==='gemini'&&<div className="modelActions"><button disabled={!currentSessionId} onClick={()=>applyCurrentSessionModel(currentModel)}>仅应用到当前会话</button><button onClick={()=>saveDefaultAndApply(currentModel)}>保存为默认并应用到当前会话</button></div>}</section>}

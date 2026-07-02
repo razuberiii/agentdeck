@@ -5,33 +5,41 @@ import test from 'node:test';
 const source = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../client/src/styles.css', import.meta.url), 'utf8');
 
-test('Agent selection page renders only provider name and short status', () => {
+test('Agent selection page renders provider name with account-aware status', () => {
   const agentBlock = source.slice(
     source.indexOf("{page==='agent'&&"),
     source.indexOf("{page==='mode'&&")
   );
-  assert.match(agentBlock, /providerChoiceStatus\(codexProviderStatus\)/);
-  assert.match(agentBlock, /providerChoiceStatus\(geminiProviderStatus\)/);
-  assert.match(agentBlock, /providerChoiceStatus\(antigravityProviderStatus\)/);
+  assert.match(agentBlock, /providerChoiceDetail\(codexProviderStatus\)/);
+  assert.match(agentBlock, /providerChoiceDetail\(geminiProviderStatus\)/);
+  assert.match(agentBlock, /providerChoiceDetail\(antigravityProviderStatus\)/);
+  assert.match(agentBlock, /providerChoiceNote\(geminiProviderStatus\)/);
   assert.doesNotMatch(agentBlock, /providerSubtitle/);
   assert.doesNotMatch(agentBlock, /providerNotice/);
-  assert.doesNotMatch(agentBlock, /accountSummary/);
   assert.doesNotMatch(agentBlock, /version/);
-  assert.doesNotMatch(agentBlock, /email/);
 });
 
-test('Agent selection status helper only returns the allowed short labels', () => {
+test('Agent selection status helper displays account identity without CLI versions', () => {
   const helperBlock = source.slice(
-    source.indexOf('function providerChoiceStatus'),
+    source.indexOf('function providerChoiceDetail'),
     source.indexOf('function providerSubtitle')
   );
-  for (const label of ['不可用', '已登录', '未登录', '正在登录', '状态未知']) {
+  for (const label of ['不可用', '已登录', '未登录', '正在登录', '状态未知', '个人版客户端已停止支持']) {
     assert.match(helperBlock, new RegExp(label));
   }
-  assert.doesNotMatch(helperBlock, /服务不可用/);
-  assert.doesNotMatch(helperBlock, /状态异常/);
+  assert.match(helperBlock, /accountSummary\?\.email/);
   assert.doesNotMatch(helperBlock, /version/);
-  assert.doesNotMatch(helperBlock, /email/);
+});
+
+test('Settings secondary pages have back navigation and duplicate diagnostics is removed', () => {
+  const sheetBlock = source.slice(
+    source.indexOf('function SettingsSheet'),
+    source.indexOf('function mergeSettingsData')
+  );
+  assert.match(sheetBlock, /actions=\{page!=='main'\?<button className="settingsBack" onClick=\{goBack\}>返回<\/button>:undefined\}/);
+  const mainBlock = sheetBlock.slice(sheetBlock.indexOf("{page==='main'&&"), sheetBlock.indexOf("{page==='agent'&&"));
+  assert.doesNotMatch(mainBlock, /diagnostics/);
+  assert.match(source, /aria-label="诊断"/);
 });
 
 test('Agent sheet controls avoid horizontal overflow and per-character wrapping', () => {

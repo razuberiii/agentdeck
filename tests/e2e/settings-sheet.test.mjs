@@ -57,11 +57,12 @@ test('settings sheet opens, navigates providers, and does not black screen', asy
     await assertNotBlack(page);
 
     await page.getByRole('button', { name:'Agent' }).click();
+    await page.getByRole('button', { name:'返回', exact:true }).click();
+    await page.getByRole('button', { name:'Agent' }).waitFor({ timeout:3000 });
+    await page.getByRole('button', { name:'Agent' }).click();
     for (const provider of ['Codex', 'Gemini', 'Antigravity']) {
       await page.getByRole('button', { name:new RegExp(`^${provider}`) }).click();
-      await page.getByRole('button', { name:'关闭', exact:true }).click();
-      await page.getByLabel('设置').click();
-      await page.locator('.sheet').waitFor({ timeout:3000 });
+      await page.getByRole('button', { name:'返回', exact:true }).click();
       await page.getByRole('button', { name:'当前账户' }).click();
       await page.locator('.sheet header b').filter({ hasText:`${provider} 账户` }).waitFor({ timeout:3000 });
       await assertNotBlack(page);
