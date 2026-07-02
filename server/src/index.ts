@@ -807,8 +807,10 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   const selectedStatus = statuses[provider];
   if (!selectedStatus?.canCreateSession) {
     const statusCode = selectedStatus?.availability === 'unavailable' ? 503 : 409;
+    const code = selectedStatus?.reasonCode === 'gemini_client_unsupported' ? 'gemini_client_unsupported' : `${provider}_cannot_create_session`;
     return reply.code(statusCode).send({
-      error: `${provider}_cannot_create_session`,
+      error: code,
+      code,
       message: selectedStatus?.message || `${providerDisplayName(provider)} 当前不能创建会话`,
       detail: selectedStatus ? `availability=${selectedStatus.availability}; auth=${selectedStatus.auth}` : 'provider status unavailable',
     });
@@ -837,6 +839,15 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     const activeProfile:any = await getActiveGeminiProfile();
     if (!activeProfile?.id || activeProfile.status !== 'authenticated') return reply.code(409).send({error:'请先登录 Gemini'});
     if (!activeProfile.login?.ok) return reply.code(409).send({error:'当前 Gemini 账户需要重新登录'});
+    if (isGeminiPersonalUnsupportedProfile(activeProfile)) {
+      return reply.code(409).send({
+        error:'gemini_client_unsupported',
+        code:'gemini_client_unsupported',
+        layer:'web_session_api',
+        message:geminiPersonalUnsupportedMessage(),
+        safeDetail:'Gemini personal OAuth profile is authenticated but cannot create sessions with the current CLI client.',
+      });
+    }
     const id = crypto.randomUUID();
     const model = cleanAgentModel(req.body?.model) || cleanAgentModel(settings.defaultModels?.gemini) || null;
     const opts = modeOptions(mode, model || undefined);
@@ -1299,6 +1310,12 @@ function codexQuotaLogFields(rateLimits:any) {
 function providerDisplayName(provider:AgentProviderId) {
   return provider === 'gemini' ? 'Gemini' : provider === 'antigravity' ? 'Antigravity' : 'Codex';
 }
+function isGeminiPersonalUnsupportedProfile(profile:any) {
+  return String(profile?.authType || profile?.auth_type || profile?.login?.authType || '').toLowerCase() === 'oauth-personal';
+}
+function geminiPersonalUnsupportedMessage() {
+  return '个人版 Gemini CLI 客户端已停止支持，请使用 Antigravity，或改用仍受支持的 API Key/企业账户。';
+}
 async function unifiedProviderStatuses(force = false):Promise<Record<AgentProviderId, ProviderStatus>> {
   const now = Date.now();
   if (!force && unifiedProviderStatusCache.value && unifiedProviderStatusCache.expiresAt > now) return unifiedProviderStatusCache.value;
@@ -1335,8 +1352,9 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
   const geminiAuthenticating = geminiPendingProfiles.some((p:any) => ['draft','authenticating','verifying'].includes(String(p.state || p.status || '')));
   const geminiAuth = geminiProfile?.status === 'authenticated' ? 'authenticated' : geminiAuthenticating ? 'authenticating' : 'unauthenticated';
   const geminiEmail = findEmailInText(String(geminiProfile?.login?.email || geminiProfile?.name || '')) || undefined;
-  const geminiReason = !geminiCli?.ok ? 'gemini_unavailable' : !USE_AGENT_RUNTIME ? 'gemini_runtime_disabled' : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'gemini_authenticating' : 'gemini_not_logged_in';
-  const geminiMessage = !geminiCli?.ok ? (geminiCli?.error || 'Gemini CLI 不可用') : !USE_AGENT_RUNTIME ? 'Gemini ACP 需要 persistent runtime' : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'Gemini 正在登录' : '请先登录 Gemini';
+  const geminiPersonalUnsupported = geminiAuth === 'authenticated' && isGeminiPersonalUnsupportedProfile(geminiProfile);
+  const geminiReason = !geminiCli?.ok ? 'gemini_unavailable' : !USE_AGENT_RUNTIME ? 'gemini_runtime_disabled' : geminiPersonalUnsupported ? 'gemini_client_unsupported' : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'gemini_authenticating' : 'gemini_not_logged_in';
+  const geminiMessage = !geminiCli?.ok ? (geminiCli?.error || 'Gemini CLI 不可用') : !USE_AGENT_RUNTIME ? 'Gemini ACP 需要 persistent runtime' : geminiPersonalUnsupported ? geminiPersonalUnsupportedMessage() : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'Gemini 正在登录' : '请先登录 Gemini';
   const antigravityEmail = findEmailInText(String(antigravityProfile?.login?.email || antigravityProfile?.name || '')) || undefined;
   const antigravityAuth = antigravityProfile?.id ? 'unknown' : 'unauthenticated';
   const antigravityCanCreate = !!antigravityCli?.ok && !!antigravityProfile?.id && !!antigravityProfile?.login?.ok;
@@ -1373,8 +1391,8 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       auth: geminiAuth,
       activeProfileId: geminiProfile?.id || null,
       account: geminiProfile?.id ? { id:geminiProfile.id, profileId:geminiProfile.id, email:geminiEmail, displayName:geminiEmail || geminiProfile.name, authType:geminiProfile.authType ? String(geminiProfile.authType) : undefined } : null,
-      canCreateSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated',
-      canContinueSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated',
+      canCreateSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated' && !geminiPersonalUnsupported,
+      canContinueSession: !!geminiCli?.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated' && !geminiPersonalUnsupported,
       canManageAccounts: true,
       canLogout: geminiAuth === 'authenticated',
       canQueryQuota: false,

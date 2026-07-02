@@ -31,6 +31,13 @@ test('Agent selection status helper displays account identity without CLI versio
   assert.doesNotMatch(helperBlock, /version/);
 });
 
+test('Gemini personal unsupported disables executable session model actions', () => {
+  assert.match(source, /reasonCode==='gemini_client_unsupported'/);
+  assert.match(source, /个人版客户端已停止支持/);
+  assert.match(source, /disabled=\{!currentSessionId \|\| activeProviderStatus\?\.reasonCode==='gemini_client_unsupported'\}/);
+  assert.match(source, /disabled=\{activeProviderStatus\?\.reasonCode==='gemini_client_unsupported'\}/);
+});
+
 test('Settings secondary pages have back navigation and duplicate diagnostics is removed', () => {
   const sheetBlock = source.slice(
     source.indexOf('function SettingsSheet'),

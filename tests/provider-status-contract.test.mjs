@@ -33,6 +33,18 @@ test('Gemini authenticated profile remains authenticated with authMethods metada
   });
 });
 
+test('Gemini personal OAuth unsupported remains authenticated but cannot create sessions', () => {
+  assert.match(indexSource, /function isGeminiPersonalUnsupportedProfile/);
+  assert.match(indexSource, /geminiPersonalUnsupported/);
+  assert.match(indexSource, /reasonCode: geminiReason/);
+  assert.match(indexSource, /'gemini_client_unsupported'/);
+  assert.match(indexSource, /canCreateSession: !!geminiCli\?\.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated' && !geminiPersonalUnsupported/);
+  assert.match(indexSource, /canContinueSession: !!geminiCli\?\.ok && USE_AGENT_RUNTIME && geminiAuth === 'authenticated' && !geminiPersonalUnsupported/);
+  assert.match(indexSource, /isGeminiPersonalUnsupportedProfile\(activeProfile\)/);
+  assert.match(indexSource, /authType/);
+  assert.match(indexSource, /api_key/);
+});
+
 test('Codex authenticated and unauthenticated statuses use same contract', () => {
   const authenticated = providerStatus({
     provider: 'codex',
