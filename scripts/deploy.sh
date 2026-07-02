@@ -139,12 +139,12 @@ run_deploy() {
   else
     check_active_turns fail
   fi
-  "$ROOT/deploy/cutover.sh"
+  ROOT="$ROOT" DATA_DIR="$DATA_DIR" "$ROOT/deploy/cutover.sh"
 }
 
 run_rollback() {
   with_lock
-  "$ROOT/deploy/rollback.sh"
+  ROOT="$ROOT" DATA_DIR="$DATA_DIR" "$ROOT/deploy/rollback.sh"
 }
 
 case "${1:-}" in
