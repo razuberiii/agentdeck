@@ -2,14 +2,15 @@
 set -euo pipefail
 
 ROOT=${ROOT:-/opt/agentdeck}
-DATA_DIR=${DATA_DIR:-/var/lib/agentdeck}
-ENV_DIR=${ENV_DIR:-/etc/agentdeck}
+DATA_DIR=${DATA_DIR:-/opt/data/agentdeck}
+ENV_DIR=${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}
 LOG=${LOG:-$ROOT/.tools/production-cutover-result.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
 exec >>"$LOG" 2>&1
 
 echo "== production cutover $(date -Is) =="
 echo "root=$ROOT data=$DATA_DIR"
+echo "env_dir=$ENV_DIR"
 
 rollback() {
   code=$?
@@ -20,13 +21,19 @@ rollback() {
 trap rollback ERR
 
 cd "$ROOT"
+if [ ! -d "$ENV_DIR" ] || [ ! -w "$ENV_DIR" ]; then
+  echo "ERROR: env dir is not writable before cutover: $ENV_DIR" >&2
+  exit 1
+fi
+for name in web.env runtime.env agentdeck-app-server-default.env; do
+  if [ ! -f "$ENV_DIR/$name" ]; then
+    echo "ERROR: missing env file before cutover: $ENV_DIR/$name" >&2
+    exit 1
+  fi
+done
 npm run build
 
-if [ -f /etc/systemd/system/agentdeck-web.service ] && [ -f /etc/systemd/system/agentdeck-runtime.service ] && [ -f /etc/systemd/system/agentdeck-app-server@.service ] && [ -f "$ENV_DIR/runtime.env" ] && [ -f "$ENV_DIR/web.env" ] && [ -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
-  echo "units already installed; skipping /etc writes"
-else
-  ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" LOG="$ROOT/.tools/install-units.log" "$ROOT/deploy/install-units.sh"
-fi
+ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" LOG="$ROOT/.tools/install-units.log" "$ROOT/deploy/install-units.sh"
 
 sudo grep -q '^CODEX_APP_SERVER_PORT_BASE=' "$ENV_DIR/runtime.env" && sudo sed -i 's/^CODEX_APP_SERVER_PORT_BASE=.*/CODEX_APP_SERVER_PORT_BASE=4620/' "$ENV_DIR/runtime.env" || echo 'CODEX_APP_SERVER_PORT_BASE=4620' | sudo tee -a "$ENV_DIR/runtime.env" >/dev/null
 sudo grep -q '^CODEX_APP_SERVER_LISTEN=' "$ENV_DIR/agentdeck-app-server-default.env" && sudo sed -i 's#^CODEX_APP_SERVER_LISTEN=.*#CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668#' "$ENV_DIR/agentdeck-app-server-default.env" || echo 'CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668' | sudo tee -a "$ENV_DIR/agentdeck-app-server-default.env" >/dev/null
@@ -36,9 +43,9 @@ sudo systemctl stop agentdeck.service || true
 sleep 2
 ps -eo pid=,args= | awk '/codex app-server --listen stdio:\/\// && !/awk/ { print $1 }' | xargs -r kill || true
 
-echo "starting independent codex app-server"
-sudo systemctl restart agentdeck-app-server@default.service
-sleep 3
+echo "ensuring independent codex app-server"
+sudo systemctl start agentdeck-app-server@default.service
+sleep 1
 app_pid_before=$(pgrep -f 'codex app-server --listen ws://127.0.0.1:4668' | head -1 || true)
 echo "app_pid_before=$app_pid_before"
 test -n "$app_pid_before"

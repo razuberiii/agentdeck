@@ -14,7 +14,7 @@ Environment=HOME=/home/ubuntu
 Environment=DATA_DIR=/opt/data/agentdeck
 Environment=USE_AGENT_RUNTIME=1
 Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
-EnvironmentFile=/etc/agentdeck/web.env
+EnvironmentFile=@AGENTDECK_ENV_DIR@/web.env
 ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/index.js
 Restart=on-failure
 RestartSec=5

@@ -2,19 +2,17 @@
 set -euo pipefail
 
 ROOT=${ROOT:-/opt/agentdeck}
-DATA_DIR=${DATA_DIR:-/var/lib/agentdeck}
-ENV_DIR=${ENV_DIR:-/etc/agentdeck}
+DATA_DIR=${DATA_DIR:-/opt/data/agentdeck}
+ENV_DIR=${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}
 RUN_USER=${AGENTDECK_RUN_USER:-ubuntu}
 RUN_GROUP=${AGENTDECK_RUN_GROUP:-$RUN_USER}
 AGENTDECK_HOME=${AGENTDECK_HOME:-/home/$RUN_USER}
 LOG=${LOG:-$ROOT/.tools/install-units.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
-sudo mkdir -p "$ENV_DIR"
 exec >>"$LOG" 2>&1
 
 echo "== install-units $(date -Is) =="
-before=$(findmnt -T /etc -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION -n || true)
-echo "before: $before"
+echo "env_dir=$ENV_DIR"
 
 if ! getent passwd "$RUN_USER" >/dev/null; then
   echo "ERROR: configured service user does not exist: $RUN_USER" >&2
@@ -25,23 +23,21 @@ if ! getent group "$RUN_GROUP" >/dev/null; then
   exit 1
 fi
 
-remounted=0
-if findmnt -T /etc -n -o OPTIONS | tr ',' '\n' | grep -qx ro; then
-  sudo mount -o remount,bind,rw /etc || sudo mount -o remount,rw /etc
-  remounted=1
+if [ ! -d "$ENV_DIR" ]; then
+  echo "ERROR: env dir does not exist: $ENV_DIR" >&2
+  exit 1
+fi
+if [ ! -w "$ENV_DIR" ]; then
+  echo "ERROR: env dir is not writable: $ENV_DIR" >&2
+  exit 1
 fi
 
-cleanup() {
-  if [ "$remounted" = 1 ]; then
-    sudo mount -o remount,bind,ro /etc || sudo mount -o remount,ro /etc || true
-    echo "after: $(findmnt -T /etc -o TARGET,SOURCE,FSTYPE,OPTIONS,PROPAGATION -n || true)"
-  fi
-}
-trap cleanup EXIT
-
-sudo install -m 0644 "$ROOT/deploy/systemd/agentdeck-web.service" /etc/systemd/system/agentdeck-web.service
-sudo install -m 0644 "$ROOT/deploy/systemd/agentdeck-runtime.service" /etc/systemd/system/agentdeck-runtime.service
-sudo install -m 0644 "$ROOT/deploy/systemd/agentdeck-app-server@.service" /etc/systemd/system/agentdeck-app-server@.service
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+for unit in agentdeck-web.service agentdeck-runtime.service agentdeck-app-server@.service; do
+  sed "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" "$ROOT/deploy/systemd/$unit" > "$tmpdir/$unit"
+  sudo install -m 0644 "$tmpdir/$unit" "/etc/systemd/system/$unit"
+done
 
 if [ ! -f "$ENV_DIR/web.env" ]; then
   if [ -f "$ENV_DIR/.env" ]; then

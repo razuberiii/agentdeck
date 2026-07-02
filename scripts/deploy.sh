@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${DATA_DIR:-/opt/data/agentdeck}"
-ENV_DIR="${ENV_DIR:-/etc/agentdeck}"
+ENV_DIR="${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}"
 RUN_USER="${AGENTDECK_RUN_USER:-${CODEX_APP_SERVER_USER:-ubuntu}}"
 RUN_GROUP="${AGENTDECK_RUN_GROUP:-${CODEX_APP_SERVER_GROUP:-$RUN_USER}}"
 LOCK_DIR="${AGENTDECK_DEPLOY_LOCK:-/tmp/agentdeck-deploy.lock}"
@@ -48,12 +48,20 @@ NODE
 check_systemd_units() {
   for file in "$ROOT"/deploy/systemd/*.service; do
     [ -f "$file" ] || continue
+    verify_file="$file"
+    tmp_rendered=""
+    if grep -q '@AGENTDECK_ENV_DIR@' "$file"; then
+      tmp_rendered="$(mktemp --suffix=.service)"
+      sed "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" "$file" > "$tmp_rendered"
+      verify_file="$tmp_rendered"
+    fi
     if command -v systemd-analyze >/dev/null 2>&1; then
       tmp="$(mktemp)"
-      if ! systemd-analyze verify "$file" >"$tmp" 2>&1; then
-        if grep -Fq "$file" "$tmp" || grep -Fq "$(basename "$file")" "$tmp"; then
+      if ! systemd-analyze verify "$verify_file" >"$tmp" 2>&1; then
+        if grep -Fq "$verify_file" "$tmp" || grep -Fq "$(basename "$file")" "$tmp"; then
           cat "$tmp" >&2
           rm -f "$tmp"
+          [ -z "$tmp_rendered" ] || rm -f "$tmp_rendered"
           exit 1
         fi
         cat "$tmp" >&2
@@ -62,8 +70,10 @@ check_systemd_units() {
     fi
     if grep -q 'Restart=always' "$file"; then
       echo "ERROR: Restart=always is not allowed in $file" >&2
+      [ -z "$tmp_rendered" ] || rm -f "$tmp_rendered"
       exit 1
     fi
+    [ -z "$tmp_rendered" ] || rm -f "$tmp_rendered"
   done
 }
 
@@ -91,7 +101,16 @@ for (const row of rows) {
   }
   homes.set(row.home_dir, row.id);
 }
+
 NODE
+}
+
+check_env_dir() {
+  [ -d "$ENV_DIR" ] || { echo "ERROR: env dir does not exist: $ENV_DIR" >&2; exit 1; }
+  [ -w "$ENV_DIR" ] || { echo "ERROR: env dir is not writable: $ENV_DIR" >&2; exit 1; }
+  for name in web.env runtime.env agentdeck-app-server-default.env; do
+    [ -f "$ENV_DIR/$name" ] || { echo "ERROR: missing env file: $ENV_DIR/$name" >&2; exit 1; }
+  done
 }
 
 run_check() {
@@ -104,6 +123,8 @@ run_check() {
   npm ls --depth=0 >/dev/null
   log "checking service user"
   require_user_group
+  log "checking env dir"
+  check_env_dir
   log "checking active turns"
   check_active_turns warn
   log "checking systemd unit files"
@@ -139,12 +160,12 @@ run_deploy() {
   else
     check_active_turns fail
   fi
-  ROOT="$ROOT" DATA_DIR="$DATA_DIR" "$ROOT/deploy/cutover.sh"
+  ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$ROOT/deploy/cutover.sh"
 }
 
 run_rollback() {
   with_lock
-  ROOT="$ROOT" DATA_DIR="$DATA_DIR" "$ROOT/deploy/rollback.sh"
+  ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$ROOT/deploy/rollback.sh"
 }
 
 case "${1:-}" in

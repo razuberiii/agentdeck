@@ -5,6 +5,8 @@ import test from 'node:test';
 const indexSource = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 const deploySource = readFileSync(new URL('../scripts/deploy.sh', import.meta.url), 'utf8');
+const installUnitsSource = readFileSync(new URL('../deploy/install-units.sh', import.meta.url), 'utf8');
+const cutoverSource = readFileSync(new URL('../deploy/cutover.sh', import.meta.url), 'utf8');
 
 test('diagnostics endpoint and page expose safe runtime ownership fields', () => {
   assert.match(indexSource, /app\.get\('\/api\/diagnostics'/);
@@ -27,6 +29,15 @@ test('deploy entrypoint supports check deploy rollback without restarting on che
   assert.match(deploySource, /npm run test:e2e/);
   const checkBody = deploySource.slice(deploySource.indexOf('run_check()'), deploySource.indexOf('with_lock()'));
   assert.doesNotMatch(checkBody, /systemctl restart|systemctl stop|cutover\.sh|rollback\.sh/);
+});
+
+test('deploy preserves the external production env dir and does not remount /etc', () => {
+  assert.match(deploySource, /ENV_DIR="\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}"/);
+  assert.match(deploySource, /check_env_dir\(\)/);
+  assert.match(installUnitsSource, /ENV_DIR=\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}/);
+  assert.match(cutoverSource, /env dir is not writable before cutover/);
+  assert.doesNotMatch(installUnitsSource, /mount -o remount/);
+  assert.doesNotMatch(cutoverSource, /mount -o remount/);
 });
 
 test('architecture docs and ADRs are present', () => {

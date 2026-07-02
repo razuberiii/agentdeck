@@ -15,7 +15,7 @@ Environment=DATA_DIR=/opt/data/agentdeck
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852
 Environment=CODEX_APP_SERVER_PORT_BASE=4620
-EnvironmentFile=/etc/agentdeck/runtime.env
+EnvironmentFile=@AGENTDECK_ENV_DIR@/runtime.env
 ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/agentdeck-runtime.js
 Restart=on-failure
 RestartSec=5
