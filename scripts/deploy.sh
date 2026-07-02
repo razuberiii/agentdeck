@@ -133,7 +133,12 @@ with_lock() {
 
 run_deploy() {
   with_lock
-  check_active_turns fail
+  if [ "${AGENTDECK_ALLOW_ACTIVE_TURN:-0}" = "1" ]; then
+    log "active turn override enabled"
+    check_active_turns warn
+  else
+    check_active_turns fail
+  fi
   "$ROOT/deploy/cutover.sh"
 }
 
