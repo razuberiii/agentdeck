@@ -45,7 +45,6 @@ const IMAGE_TYPES: Record<string, string> = { 'image/png': '.png', 'image/jpeg':
 const ARTIFACT_TYPES: Record<string, string> = { '.txt':'text/plain; charset=utf-8', '.log':'text/plain; charset=utf-8', '.json':'application/json; charset=utf-8', '.csv':'text/csv; charset=utf-8', '.patch':'text/plain; charset=utf-8', '.diff':'text/plain; charset=utf-8', '.zip':'application/zip', '.tar.gz':'application/gzip', '.conf':'application/x-wireguard-profile', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp' };
 const ARTIFACT_SKIP_DIRS = new Set(['.git','node_modules','dist','build','.next','.vite','coverage','vendor']);
 const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
-const artifactScanStarts = new Map<string, number>();
 const COOKIE_NAME = 'agentdeck_session';
 const CSRF_COOKIE = 'agentdeck_csrf';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3842,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
@@ -145,6 +144,10 @@ await db.run('UPDATE sessions SET model_id=model WHERE model_id IS NULL AND mode
 await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
 await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE artifacts ADD COLUMN turn_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE artifacts ADD COLUMN relative_path TEXT').catch(()=>{});
+await db.run('ALTER TABLE artifacts ADD COLUMN content_hash TEXT').catch(()=>{});
+await db.run('ALTER TABLE artifacts ADD COLUMN modified_at INTEGER').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, profile_id TEXT, temp_home TEXT, method_id TEXT, status TEXT NOT NULL, error TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
@@ -156,6 +159,13 @@ await db.run("ALTER TABLE gemini_profiles ADD COLUMN default_model TEXT").catch(
 await db.run("UPDATE gemini_profiles SET status='bootstrap' WHERE id='default' AND auth_type IS NULL AND status='configured'").catch(()=>{});
 await db.run("UPDATE gemini_profiles SET status='bootstrap', active=0 WHERE auth_type IS NULL AND name='Gemini Account' AND status='configured'").catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS agent_messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL)').catch(()=>{});
+await db.run('ALTER TABLE agent_messages ADD COLUMN client_message_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE agent_messages ADD COLUMN turn_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE agent_messages ADD COLUMN original_text TEXT').catch(()=>{});
+await db.run('ALTER TABLE agent_messages ADD COLUMN attachments_json TEXT').catch(()=>{});
+await db.run('ALTER TABLE agent_messages ADD COLUMN status TEXT').catch(()=>{});
+await db.run('CREATE TABLE IF NOT EXISTS artifact_baselines (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, project_dir TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(session_id, turn_id))').catch(()=>{});
+await db.run('CREATE UNIQUE INDEX IF NOT EXISTS artifacts_turn_path_hash ON artifacts(session_id, turn_id, relative_path, content_hash)').catch(()=>{});
 await db.run('UPDATE sessions SET status=?1 WHERE status=?2', ['interrupted', 'running']).catch(()=>{});
 await ensureProfiles();
 await ensureGeminiProfiles();
@@ -924,7 +934,6 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     decorateThreadImages(thread, threadId, String(runtimeRow.project_dir || row.project_dir));
     const [branch] = await Promise.all([
       gitBranch(String(runtimeRow.project_dir || row.project_dir)).catch(()=>null),
-      injectGeneratedImages(thread, threadId).catch(()=>{}),
       injectArtifacts(thread, threadId).catch(()=>{}),
     ]);
     sanitizeThreadForMobile(thread);
@@ -938,7 +947,6 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
   if (!pathAllowed(read.thread.cwd)) return reply.code(403).send({error:'workspace not allowed'});
   await upsertThread(read.thread, { status: statusName(read.thread.status) });
   decorateThreadImages(read.thread, threadId, String(row?.project_dir || read.thread.cwd));
-  await injectGeneratedImages(read.thread, threadId);
   await injectArtifacts(read.thread, threadId);
   sanitizeThreadForMobile(read.thread);
   return { session: await indexedSession(read.thread), thread: read.thread, branch: await gitBranch(read.thread.cwd), interrupted: (row?.status === 'interrupted') };
@@ -1136,8 +1144,7 @@ codex.on('notification', async (msg:any) => {
       activeTurns.delete(sid);
       const row = await findSession(sid);
       const anchorItemId = row ? await latestAgentItemId(sid, String(row.project_dir)).catch(()=>null) : null;
-      const found = row ? await scanArtifacts(sid, String(row.project_dir), artifactScanStarts.get(sid) || Date.now(), anchorItemId) : [];
-      artifactScanStarts.delete(sid);
+      const found = row ? await scanArtifactsForTurn(sid, String(row.project_dir), null, anchorItemId) : [];
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       if (found.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) } });
       maybeExitAfterDrain();
@@ -3007,7 +3014,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
       const input = Array.isArray(payload?.input) ? payload.input : [];
       const content = input
         .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
-        .map((item:any) => ({ type:'text', text:String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '').trim() }))
+        .map((item:any) => ({ type:'text', text:stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '')).trim() }))
         .filter((item:any) => item.text);
       if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', content });
       continue;
@@ -3052,9 +3059,14 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
 function compactSnapshotItem(item:any) {
   if (!item || typeof item !== 'object') return item;
   const next = { ...item };
+  if (typeof next.text === 'string') next.text = stripInternalAttachmentPrompt(next.text);
   if (typeof next.text === 'string' && next.text.length > 80_000) next.text = `${next.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]`;
   if (Array.isArray(next.content)) {
-    next.content = next.content.map((part:any) => typeof part?.text === 'string' && part.text.length > 80_000 ? { ...part, text:`${part.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]` } : part);
+    next.content = next.content.map((part:any) => {
+      if (typeof part?.text !== 'string') return part;
+      const text = stripInternalAttachmentPrompt(part.text);
+      return text.length > 80_000 ? { ...part, text:`${text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]` } : { ...part, text };
+    });
   }
   return next;
 }
@@ -3068,7 +3080,7 @@ function rowSessionDto(row:any) {
 async function antigravityThread(row:any) {
   const messages = await db.all('SELECT * FROM agent_messages WHERE session_id=?1 ORDER BY created_at ASC', [String(row.id)]);
   const items = messages.map((m:any)=>m.role === 'user'
-    ? { id:m.id, type:'userMessage', content:[{ type:'text', text:String(m.text || '') }] }
+    ? { id:m.id, type:'userMessage', content:userMessageContentFromRow(m) }
     : { id:m.id, type:'agentMessage', text:String(m.text || ''), phase:'final_answer' });
   return {
     id:String(row.id),
@@ -3081,6 +3093,24 @@ async function antigravityThread(row:any) {
     turns: items.length ? [{ id:`turn-${row.id}`, items }] : [],
     path:null,
   };
+}
+function userMessageContentFromRow(m:any) {
+  const content:any[] = [];
+  const text = stripInternalAttachmentPrompt(String(m.original_text || m.text || '')).trim();
+  if (text) content.push({ type:'text', text });
+  try {
+    const attachments = JSON.parse(String(m.attachments_json || '[]'));
+    for (const a of Array.isArray(attachments) ? attachments : []) {
+      if (String(a.type || '').startsWith('image/')) content.push({ type:'image', url:a.url, viewerUrl:a.url, path:a.id });
+    }
+  } catch {}
+  return content;
+}
+function stripInternalAttachmentPrompt(text:string) {
+  let out = String(text || '');
+  out = out.replace(/\n{0,2}Attachments are available as local files:\n(?:- .+ \| .+ \| \d+ bytes \| \/[^\n]+\n?)+/g, '').trim();
+  out = out.replace(/\n{0,2}Attachment:\s*[^\n]*\nMIME:\s*[^\n]*\nSize:\s*[^\n]*\nLocal path:\s*\/[^\n]+\nRead this file from the local path if needed\.?/g, '').trim();
+  return out;
 }
 async function listIndexedThreads(archived:boolean){
   if (USE_AGENT_RUNTIME) {
@@ -3244,8 +3274,9 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     if (clientMessageId) broadcast(threadId, { type:'messageStatus', clientMessageId, status, error });
   };
   ack('received');
+  const turnId = clientMessageId || crypto.randomUUID();
   if (normalizeProvider(row.provider_id) === 'antigravity') {
-    await sendAntigravityTurn(row, text, attachments);
+    await sendAntigravityTurn(row, text, attachments, turnId, clientMessageId);
     ack('accepted');
     return;
   }
@@ -3257,6 +3288,8 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['submitting',Date.now(),threadId]).catch(()=>{});
+    await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
+    await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     ack('persisted');
     try {
@@ -3301,9 +3334,10 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
       [execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
     ).catch(()=>{});
     activeCodexSessions.add(threadId);
+    await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
     broadcast(threadId, userMessage);
     ack('persisted');
-    artifactScanStarts.set(threadId, Date.now());
+    await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     try {
       app.log.info({
         localSessionId:threadId,
@@ -3323,7 +3357,6 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     } catch(e:any) {
       const message = e?.message || String(e);
       activeCodexSessions.delete(threadId);
-      artifactScanStarts.delete(threadId);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
       ack('failed', message);
       broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
@@ -3338,12 +3371,13 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     await codex.setName(threadId, title).catch(()=>{});
     broadcast(threadId,{type:'sessionTitle', title});
   }
-  artifactScanStarts.set(threadId, Date.now());
   await db.run(
     'UPDATE sessions SET status=?1,selected_profile_id=?2,executing_profile_id=?2,last_execution_account_id=?2,account_snapshot_json=?3,updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',
     ['running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
   );
   activeCodexSessions.add(threadId);
+  await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
+  await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
   broadcast(threadId, userMessage);
   ack('persisted');
   try {
@@ -3351,7 +3385,6 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     ack('accepted');
   } catch(e:any) {
     activeCodexSessions.delete(threadId);
-    artifactScanStarts.delete(threadId);
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
     ack('failed', e?.message || String(e));
     maybeExitAfterDrain();
@@ -3359,12 +3392,11 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   }
 }
 async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const child = activeAntigravityTurns.get(threadId); if (child) { try { child.kill('SIGTERM'); } catch {} activeAntigravityTurns.delete(threadId); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
-async function sendAntigravityTurn(row:any, text:string, attachments:any[] = []) {
+async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [], turnId:string = crypto.randomUUID(), clientMessageId = '') {
   const threadId = String(row.codex_thread_id || row.id);
   const message = String(text || '').trim();
   if (!message && !attachments.length) throw new Error('empty message');
-  const attachmentText = attachments.length ? await attachmentPromptText(threadId, attachments) : '';
-  const prompt = [message, attachmentText].filter(Boolean).join('\n\n');
+  const providerInput = await providerInputText(threadId, message, attachments);
   const profile:any = await getActiveAntigravityProfile();
   if (!profile?.home_dir) throw new Error('请先登录 Antigravity');
   const login = await antigravityLoginStatus(String(profile.home_dir));
@@ -3372,19 +3404,22 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [])
   const now = Date.now();
   const userId = crypto.randomUUID();
   const title = autoTitle(message, String(row.project_dir), String(row.title || ''));
-  await db.run('INSERT INTO agent_messages (id,session_id,role,text,created_at) VALUES (?1,?2,?3,?4,?5)', [userId, threadId, 'user', prompt, now]);
+  await saveCanonicalUserMessage(threadId, message, attachments, clientMessageId, turnId, userId, now);
   if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[title, now, threadId]); broadcast(threadId,{type:'sessionTitle', title}); }
   await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['running', now, threadId]);
+  await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
   broadcast(threadId,{type:'user', text:message, attachments:attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))});
   broadcast(threadId,{type:'codex', method:'turn/started', params:{}});
   const assistantId = crypto.randomUUID();
   const model = cleanAgentModel(row.model);
   broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:`${assistantId}-progress`, type:'plan', text:`Antigravity 已接收请求，正在用 ${model || '默认模型'} 分析。` } }});
   try {
-    const output = await runAntigravityPrint(profile, row, prompt, threadId, assistantId);
+    const output = await runAntigravityPrint(profile, row, providerInput, threadId, assistantId);
     await db.run('INSERT INTO agent_messages (id,session_id,role,text,created_at) VALUES (?1,?2,?3,?4,?5)', [assistantId, threadId, 'assistant', output, Date.now()]);
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
     broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:assistantId, type:'agentMessage', text:output, phase:'final_answer' } }});
+    const found = await scanArtifactsForTurn(threadId, String(row.project_dir), turnId, assistantId);
+    if (found.length) broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }});
     broadcast(threadId,{type:'codex', method:'turn/completed', params:{}});
   } catch (e:any) {
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
@@ -3392,13 +3427,24 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [])
     throw e;
   }
 }
-async function attachmentPromptText(threadId:string, attachments:any[]) {
-  const lines = ['Attachments are available as local files:'];
+async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', id = crypto.randomUUID(), createdAt = Date.now()) {
+  const safeAttachments = attachments.map((a:any)=>({ id:String(a.id), name:String(a.name || 'attachment'), type:String(a.type || ''), size:Number(a.size || 0), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }));
+  await db.run(
+    `INSERT OR IGNORE INTO agent_messages (id,session_id,role,text,created_at,client_message_id,turn_id,original_text,attachments_json,status)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`,
+    [id, threadId, 'user', String(text || ''), createdAt, clientMessageId || null, turnId || null, String(text || ''), JSON.stringify(safeAttachments), 'persisted']
+  );
+}
+async function providerInputText(threadId:string, text:string, attachments:any[]) {
+  const lines = [String(text || '')].filter(Boolean);
+  if (!attachments.length) return lines.join('\n\n');
+  const attachmentLines = ['Attachments are available to the provider as server-side resources. Use them only when needed:'];
   for (const a of attachments) {
     const meta = await readAttachmentMeta(threadId, String(a.id));
-    lines.push(`- ${meta.name} | ${meta.type || meta.mime} | ${meta.size} bytes | ${meta.path}`);
+    attachmentLines.push(`- ${meta.name} | ${meta.type || meta.mime} | ${meta.size} bytes | resource:${meta.id}`);
   }
-  return lines.join('\n');
+  lines.push(attachmentLines.join('\n'));
+  return lines.join('\n\n');
 }
 async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId:string, itemId:string) {
   await ensureAntigravityBinary();
@@ -3568,7 +3614,6 @@ async function runtimeEventMessages(threadId:string, event:any) {
     const thread = payload?.thread;
     if (thread && row) {
       decorateThreadImages(thread, threadId, String(row.project_dir));
-      await injectGeneratedImages(thread, threadId).catch(()=>{});
       await injectArtifacts(thread, threadId).catch(()=>{});
       sanitizeThreadForMobile(thread);
     }
@@ -3584,7 +3629,7 @@ async function runtimeEventMessages(threadId:string, event:any) {
     const input = Array.isArray(payload?.input) ? payload.input : [];
     const text = input
       .filter((item:any) => item?.type === 'text')
-      .map((item:any) => String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '').trim())
+      .map((item:any) => stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '')).trim())
       .filter(Boolean)
       .join('\n');
     if (text) out.push({ type:'user', text, attachments:[], ...base });
@@ -3607,8 +3652,7 @@ async function runtimeEventMessages(threadId:string, event:any) {
       const row = await findSession(threadId);
       const read = msg.method === 'turn/completed' && row ? await runtime.readSession(threadId).catch(()=>null) : null;
       const anchorItemId = read?.thread ? latestAgentItemIdFromThread(read.thread) : null;
-      const found = msg.method === 'turn/completed' && row ? await scanArtifacts(threadId, String(row.project_dir), artifactScanStarts.get(threadId) || Date.now(), anchorItemId) : [];
-      artifactScanStarts.delete(threadId);
+      const found = msg.method === 'turn/completed' && row ? await scanArtifactsForTurn(threadId, String(row.project_dir), null, anchorItemId) : [];
       const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? 'idle' : 'interrupted';
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
       if (found.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }, ...base });
@@ -3617,7 +3661,6 @@ async function runtimeEventMessages(threadId:string, event:any) {
     if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
       activeCodexSessions.delete(threadId);
       activeTurns.delete(threadId);
-      artifactScanStarts.delete(threadId);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),threadId]);
       maybeExitAfterDrain();
     }
@@ -3935,16 +3978,47 @@ async function injectGeneratedImages(thread:any, threadId:string){
     else thread.turns.push(turn);
   }
 }
-async function scanArtifacts(threadId:string, projectDir:string, sinceMs:number, anchorItemId?:string|null){
-  const out:any[] = [];
-  if (!anchorItemId) return [];
+async function recordArtifactBaseline(threadId:string, projectDir:string, turnId:string) {
+  if (!turnId || !pathAllowed(projectDir)) return;
   const root = realpathSync(projectDir);
-  await walkArtifacts(root, root, sinceMs, out);
+  const manifest = await artifactManifest(root);
+  await db.run(
+    'INSERT OR REPLACE INTO artifact_baselines (session_id,turn_id,project_dir,manifest_json,created_at) VALUES (?1,?2,?3,?4,?5)',
+    [threadId, turnId, root, JSON.stringify(manifest), Date.now()]
+  );
+}
+async function latestArtifactBaseline(threadId:string) {
+  const row = await db.get('SELECT * FROM artifact_baselines WHERE session_id=?1 ORDER BY created_at DESC LIMIT 1', [threadId]);
+  if (!row) return null;
+  let manifest:any = {};
+  try { manifest = JSON.parse(String(row.manifest_json || '{}')); } catch {}
+  return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest };
+}
+async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:string|null, anchorItemId?:string|null){
+  if (!anchorItemId) return [];
+  const baseline = turnId ? await db.get('SELECT * FROM artifact_baselines WHERE session_id=?1 AND turn_id=?2', [threadId, turnId]).then((row:any)=>{
+    if (!row) return null;
+    let manifest:any = {};
+    try { manifest = JSON.parse(String(row.manifest_json || '{}')); } catch {}
+    return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest };
+  }) : await latestArtifactBaseline(threadId);
+  if (!baseline) return [];
+  const root = realpathSync(projectDir);
+  const before = baseline.manifest || {};
+  const after = await artifactManifest(root);
   const saved:any[] = [];
-  for (const f of out.sort((a,b)=>a.createdAt-b.createdAt).slice(-12)) {
-    const id = crypto.createHash('sha256').update(`${threadId}\0${f.path}`).digest('base64url').slice(0, 24);
+  const changed = Object.values(after).filter((f:any) => {
+    const old = before[f.relativePath];
+    return !old || old.size !== f.size || old.contentHash !== f.contentHash;
+  }).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
+  for (const f of changed as any[]) {
+    const id = crypto.createHash('sha256').update(`${threadId}\0${baseline.turnId}\0${f.relativePath}\0${f.contentHash}`).digest('base64url').slice(0, 32);
     const existed = await db.get('SELECT id FROM artifacts WHERE id=?1 AND session_id=?2', [id, threadId]);
-    await db.run('INSERT OR IGNORE INTO artifacts (id, session_id, path, name, mime, size, created_at, anchor_item_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)', [id, threadId, f.path, f.name, f.mime, f.size, f.createdAt, anchorItemId || null]);
+    await db.run(
+      `INSERT OR IGNORE INTO artifacts (id, session_id, path, name, mime, size, created_at, anchor_item_id, turn_id, relative_path, content_hash, modified_at)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
+      [id, threadId, f.path, f.name, f.mime, f.size, Date.now(), anchorItemId || null, baseline.turnId, f.relativePath, f.contentHash, f.modifiedAt]
+    );
     if (anchorItemId) await db.run('UPDATE artifacts SET anchor_item_id=?1 WHERE id=?2 AND anchor_item_id IS NULL', [anchorItemId, id]);
     if (existed) continue;
     const row = await artifactForSession(threadId, id);
@@ -3952,14 +4026,19 @@ async function scanArtifacts(threadId:string, projectDir:string, sinceMs:number,
   }
   return saved;
 }
-async function walkArtifacts(root:string, dir:string, sinceMs:number, out:any[], depth = 0){
-  if (depth > 5 || out.length > 80) return;
+async function artifactManifest(root:string) {
+  const out:any[] = [];
+  await walkArtifacts(root, root, out);
+  return Object.fromEntries(out.map(f=>[f.relativePath, f]));
+}
+async function walkArtifacts(root:string, dir:string, out:any[], depth = 0){
+  if (depth > 5 || out.length > 200) return;
   let entries:any[] = [];
   try { entries = await readdir(dir, { withFileTypes:true }); } catch { return; }
   for (const entry of entries) {
     if (entry.name.startsWith('.') && entry.name !== '.codex') continue;
     if (entry.isDirectory()) {
-      if (!ARTIFACT_SKIP_DIRS.has(entry.name)) await walkArtifacts(root, path.join(dir, entry.name), sinceMs, out, depth + 1);
+      if (!ARTIFACT_SKIP_DIRS.has(entry.name)) await walkArtifacts(root, path.join(dir, entry.name), out, depth + 1);
       continue;
     }
     if (!entry.isFile()) continue;
@@ -3969,10 +4048,11 @@ async function walkArtifacts(root:string, dir:string, sinceMs:number, out:any[],
     if (!mime) continue;
     let st:any;
     try { st = await stat(filePath); } catch { continue; }
-    if (st.mtimeMs <= sinceMs || st.size <= 0 || st.size > 25 * 1024 * 1024) continue;
+    if (st.size <= 0 || st.size > 25 * 1024 * 1024) continue;
     const rp = realpathSync(filePath);
     if (!rp.startsWith(root + path.sep)) continue;
-    out.push({ path:rp, name:path.basename(rp), mime, size:st.size, createdAt:Math.floor(st.mtimeMs) });
+    const contentHash = crypto.createHash('sha256').update(await readFile(rp)).digest('hex');
+    out.push({ path:rp, relativePath:path.relative(root, rp), name:path.basename(rp), mime, size:st.size, contentHash, modifiedAt:Math.floor(st.mtimeMs) });
   }
 }
 async function injectArtifacts(thread:any, threadId:string){
@@ -3983,8 +4063,8 @@ async function injectArtifacts(thread:any, threadId:string){
   for (const group of groups) {
     const newest = Math.max(...group.map((row:any)=>Number(row.created_at || Date.now())));
     const turn = { items:[artifactMessageItem(group.map(artifactDto), newest)], startedAt:Math.floor(newest/1000), completedAt:Math.floor(newest/1000), durationMs:null };
-    const insertAfter = turnIndexForAnchor(thread.turns, group[0]?.anchor_item_id) ?? turnIndexMentioningArtifacts(thread.turns, group) ?? lastAgentTurnIndex(thread.turns) ?? lastFiniteTurnIndexAtOrBefore(thread.turns, newest);
-    if (insertAfter >= 0) thread.turns.splice(insertAfter + 1, 0, turn);
+    const insertAfter = turnIndexForAnchor(thread.turns, group[0]?.anchor_item_id);
+    if (insertAfter !== null && insertAfter >= 0) thread.turns.splice(insertAfter + 1, 0, turn);
     else thread.turns.push(turn);
   }
 }
@@ -4002,10 +4082,9 @@ async function artifactForSession(threadId:string, artifactId:string): Promise<a
   if (!mime || mime !== row.mime) return null;
   return { ...row, path:rp };
 }
-function artifactDto(row:any){ return { id:String(row.id), name:String(row.name), type:String(row.mime), size:Number(row.size || 0), url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}` }; }
+function artifactDto(row:any){ return { id:String(row.id), name:String(row.name), type:String(row.mime), size:Number(row.size || 0), turnId:row.turn_id || null, anchorItemId:row.anchor_item_id || null, contentHash:row.content_hash || null, url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}` }; }
 function artifactMessageItem(artifacts:any[], stamp:number){
-  const lines = artifacts.map(a => String(a.type || '').startsWith('image/') ? `![${a.name}](${a.url})` : `[${a.name}](${a.url})`);
-  return { type:'agentMessage', id:`artifacts-${stamp}`, phase:'final_answer', text:['已生成文件：', ...lines].join('\n\n'), artifacts };
+  return { type:'agentMessage', id:`artifacts-${stamp}`, phase:'final_answer', text:'已生成文件', artifacts };
 }
 function groupArtifacts(rows:any[]){
   const groups:any[][] = [];

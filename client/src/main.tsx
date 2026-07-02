@@ -323,15 +323,23 @@ function SessionView({id}:{id:string}){
 
 function threadEvents(thread:any):DisplayEvent[]{ const out:DisplayEvent[]=[]; const turns=thread?.turns||[]; for(let ti=0; ti<turns.length; ti++){ const turn=turns[ti]; const syntheticImageTail=!turn?.startedAt&&!turn?.completedAt&&ti===turns.length-1&&(turn.items||[]).every((item:any)=>item?.type==='imageGeneration'&&String(item.id||'').startsWith('generated-')); if(syntheticImageTail) continue; for(const item of turn.items||[]){const ev=itemToEvent(item); if(ev) out.push(ev)} } return out; }
 function userContent(content:any[]){ const text:string[]=[]; const attachments:Attachment[]=[]; for(const c of content||[]){ if(c.type==='text' && String(c.text||'').trim() && !String(c.text||'').includes(MOBILE_CONTEXT_MARKER)) text.push(c.text); if((c.type==='localImage'||c.type==='image')&&(c.viewerUrl||c.url)) attachments.push({id:c.path||c.url,name:'image',type:'image',size:0,url:c.viewerUrl||c.url}); } return {text:text.join('\n'),attachments}; }
+function stripInternalAttachmentPrompt(text:string){
+  return String(text||'')
+    .replace(/\n{0,2}Attachments are available as local files:\n(?:- .+ \| .+ \| \d+ bytes \| \/[^\n]+\n?)+/g, '')
+    .replace(/\n{0,2}Attachment:\s*[^\n]*\nMIME:\s*[^\n]*\nSize:\s*[^\n]*\nLocal path:\s*\/[^\n]+\nRead this file from the local path if needed\.?/g, '')
+    .trim();
+}
 function itemToEvent(item:any):DisplayEvent|null{
-  if(item.type==='userMessage'){ const c=userContent(item.content); return (c.text.trim() || c.attachments.length) ? {key:item.id,role:'user',text:c.text,attachments:c.attachments} : null; }
+  if(item.type==='userMessage'){ const c=userContent(item.content); const text=stripInternalAttachmentPrompt(c.text); return (text.trim() || c.attachments.length) ? {key:item.id,role:'user',text,attachments:c.attachments} : null; }
   if(item.type==='agentMessage') {
     const text = String(item.text || '').trim();
     if (!text) return null;
     const artifacts = Array.isArray(item.artifacts) ? item.artifacts : [];
     const artifactImages = artifacts.filter((a:any)=>String(a.type||'').startsWith('image/'));
     const artifactFiles = artifacts.filter((a:any)=>!String(a.type||'').startsWith('image/'));
-    return {key:item.id,role:'assistant',text,meta:item.phase==='final_answer'?'最终回答':'回复',images:[...extractMarkdownImages(text),...artifactImages],files:[...extractFileLinks(text),...artifactFiles]};
+    const parsedImages = artifacts.length ? [] : extractMarkdownImages(text);
+    const parsedFiles = artifacts.length ? [] : extractFileLinks(text);
+    return {key:item.id,role:'assistant',text,meta:item.phase==='final_answer'?'最终回答':'回复',images:[...parsedImages,...artifactImages],files:[...parsedFiles,...artifactFiles]};
   }
   if(item.type==='reasoning') return {key:item.id,role:'reasoning',title:'思考',text:[...(item.summary||[]),...(item.content||[])].join('\n')||'正在思考',open:false};
   if(item.type==='plan') return {key:item.id,role:'reasoning',title:'计划',text:item.text||'',open:true};
@@ -377,7 +385,7 @@ function liveEvents(items:any[]):DisplayEvent[]{
     if(m.type==='system' && String(m.text||'').trim()) out.push({key:'s'+out.length,role:'system',text:m.text});
     if(m.type==='user' && (String(m.text||'').trim() || m.attachments?.length)) {
       const status=m.clientMessageId ? messageStatuses.get(String(m.clientMessageId))?.status || m.status : m.status;
-      out.push({key:m.clientMessageId||'u'+out.length,role:'user',text:m.text||'',attachments:m.attachments||[],meta:messageStatusLabel(status)});
+      out.push({key:m.clientMessageId||'u'+out.length,role:'user',text:stripInternalAttachmentPrompt(m.text||''),attachments:m.attachments||[],meta:messageStatusLabel(status)});
     }
     if(m.type==='artifact' && m.artifact) {
       const target = String(m.artifact.type || '').startsWith('image/') ? 'images' : 'files';
