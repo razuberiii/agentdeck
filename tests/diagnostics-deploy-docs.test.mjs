@@ -22,12 +22,12 @@ test('diagnostics endpoint and page expose safe runtime ownership fields', () =>
 test('deploy entrypoint supports check deploy rollback without restarting on check', () => {
   const mode = statSync(new URL('../scripts/deploy.sh', import.meta.url)).mode;
   assert.ok(mode & 0o111, 'scripts/deploy.sh must be executable');
-  assert.match(deploySource, /--check\|--deploy\|--rollback/);
+  assert.match(deploySource, /--check\|--deploy \[--components web,runtime\|--changed\]\|--rollback/);
   assert.match(deploySource, /npm run typecheck/);
   assert.match(deploySource, /npm run build/);
   assert.match(deploySource, /npm test/);
   assert.match(deploySource, /npm run test:e2e/);
-  const checkBody = deploySource.slice(deploySource.indexOf('run_check()'), deploySource.indexOf('with_lock()'));
+  const checkBody = deploySource.slice(deploySource.indexOf('run_check()'), deploySource.indexOf('health_web()'));
   assert.doesNotMatch(checkBody, /systemctl restart|systemctl stop|cutover\.sh|rollback\.sh/);
 });
 

@@ -313,6 +313,10 @@ const diagnostics = {
   sseReconnectCount: 0,
   runtimePendingPushCount: 0,
 };
+type RuntimeLifecycle = 'starting' | 'accepting' | 'draining' | 'stopping';
+let runtimeLifecycle:RuntimeLifecycle = 'starting';
+let drainStartedAt:number | null = null;
+const DRAIN_TIMEOUT_MS = Number(process.env.RUNTIME_DRAIN_TIMEOUT_MS || 10 * 60 * 1000);
 const STALE_RUNNING_MS = Number(process.env.STALE_RUNNING_MS || 30 * 60 * 1000);
 const RUNTIME_GENERATION = INSTANCE_ID;
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
@@ -339,9 +343,13 @@ app.addHook('preHandler', async (req, reply) => {
   if (authorization !== `Bearer ${RUNTIME_TOKEN}`) return reply.code(401).send({ error:'unauthorized' });
 });
 
-app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now() }));
+app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle }));
 app.get('/diagnostics', async () => ({
   ...diagnostics,
+  lifecycle:runtimeLifecycle,
+  drainStartedAt,
+  drainTimeoutMs:DRAIN_TIMEOUT_MS,
+  drainState:await drainState(),
   activeSseSubscribers:[...subscriptions.entries()].map(([sessionId,set]) => ({ sessionId, count:set.size })),
   activeSseSubscriberTotal:[...subscriptions.values()].reduce((sum,set)=>sum+set.size,0),
   activeRuntimeRpcCount:diagnostics.activeRuntimeRpcCount,
@@ -356,6 +364,19 @@ app.get('/diagnostics', async () => ({
     p99:eventLoopDelay.percentile(99) / 1e6,
   },
 }));
+app.post('/drain/start', async () => {
+  if (runtimeLifecycle === 'stopping') return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+  runtimeLifecycle = 'draining';
+  drainStartedAt = drainStartedAt || Date.now();
+  app.log.info({ lifecycle:runtimeLifecycle, drainStartedAt }, 'runtime draining started');
+  return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+});
+app.get('/drain/status', async () => ({ lifecycle:runtimeLifecycle, drainStartedAt, drainTimeoutMs:DRAIN_TIMEOUT_MS, ...(await drainState()) }));
+app.post('/drain/cancel', async () => {
+  if (runtimeLifecycle === 'draining') runtimeLifecycle = 'accepting';
+  drainStartedAt = null;
+  return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+});
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
 app.get('/gemini/status', async (req:any) => geminiManager.status(String(req.query?.profileId || 'default')));
 app.get('/gemini/profiles/:id/status', async (req:any) => geminiManager.status(String(req.params.id)));
@@ -430,7 +451,8 @@ app.get('/codex/models', async (req:any) => {
   };
 });
 
-app.post('/codex/sessions', async (req:any) => {
+app.post('/codex/sessions', async (req:any, reply) => {
+  if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const account = await ensureAccount(String(body.accountId || 'default'), String(body.codexHome || DEFAULT_CODEX_HOME));
   const runtime = await runtimeForAccount(account.id);
@@ -461,6 +483,7 @@ app.post('/codex/sessions', async (req:any) => {
 });
 
 app.post('/gemini/sessions', async (req:any, reply) => {
+  if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const cwd = String(body.cwd || DEFAULT_WORKDIR);
   const localSessionId = String(body.sessionId || crypto.randomUUID());
@@ -518,6 +541,7 @@ app.post('/gemini/sessions/:id/model', async (req:any, reply) => {
 });
 
 app.post('/codex/sessions/resume', async (req:any, reply) => {
+  if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const threadId = String(body.threadId || '').trim();
   if (!threadId) return reply.code(400).send({ error:'threadId required' });
@@ -612,6 +636,7 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
 });
 
 app.post('/sessions/:id/turns', async (req:any, reply) => {
+  if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
@@ -751,7 +776,10 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
 });
 
 await app.listen({ host:HOST, port:PORT });
-app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID }, 'agentdeck-runtime listening');
+runtimeLifecycle = 'accepting';
+app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID, lifecycle:runtimeLifecycle }, 'agentdeck-runtime listening');
+process.once('SIGTERM', () => { shutdownGracefully('SIGTERM').catch(e => { app.log.error({ err:e }, 'runtime graceful shutdown failed'); process.exit(1); }); });
+process.once('SIGINT', () => { shutdownGracefully('SIGINT').catch(e => { app.log.error({ err:e }, 'runtime graceful shutdown failed'); process.exit(1); }); });
 if (process.env.SKIP_RUNTIME_BOOTSTRAP !== '1') {
   setTimeout(() => bootstrapRuntimeRecovery().catch(e => app.log.error({ err:e }, 'runtime bootstrap recovery failed')), 50);
 }
@@ -1619,6 +1647,58 @@ function redactRuntimeError(message:string) {
   return String(message || 'Gemini request failed')
     .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]')
     .replace(/(access_token|refresh_token|id_token|client_secret|authorization code)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
+}
+function isDraining() {
+  return runtimeLifecycle === 'draining' || runtimeLifecycle === 'stopping';
+}
+function runtimeDrainingBody(req:any) {
+  return {
+    error:'runtime_draining',
+    code:'runtime_draining',
+    retryable:true,
+    lifecycle:runtimeLifecycle,
+    message:'Runtime 正在准备重启，请稍后重试。',
+    requestId:String(req?.id || ''),
+  };
+}
+async function drainState() {
+  const row = await db.get(
+    `SELECT
+       SUM(CASE WHEN status IN ('running','active') OR active_turn_id IS NOT NULL THEN 1 ELSE 0 END) AS activeTurnCount,
+       SUM(CASE WHEN status='submitting' THEN 1 ELSE 0 END) AS submittingTurnCount
+     FROM sessions`
+  ).catch(()=>null);
+  return {
+    activeTurnCount:Number(row?.activeTurnCount || 0),
+    submittingTurnCount:Number(row?.submittingTurnCount || 0),
+    pendingEventWriteCount:diagnostics.runtimePendingPushCount,
+    accepting:runtimeLifecycle === 'accepting',
+    drained:Number(row?.activeTurnCount || 0) === 0 && Number(row?.submittingTurnCount || 0) === 0 && diagnostics.runtimePendingPushCount === 0,
+  };
+}
+async function waitForDrain(timeoutMs = DRAIN_TIMEOUT_MS) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const state = await drainState();
+    if (state.drained) return state;
+    await sleep(500);
+  }
+  throw new Error('runtime drain timed out');
+}
+async function shutdownGracefully(signal:string) {
+  if (runtimeLifecycle === 'stopping') return;
+  runtimeLifecycle = 'draining';
+  drainStartedAt = drainStartedAt || Date.now();
+  app.log.info({ signal, lifecycle:runtimeLifecycle }, 'runtime graceful shutdown requested');
+  try {
+    await waitForDrain(DRAIN_TIMEOUT_MS);
+  } catch (e:any) {
+    app.log.warn({ signal, error:e?.message || String(e), drainState:await drainState().catch(()=>null) }, 'runtime drain timed out before shutdown');
+  }
+  runtimeLifecycle = 'stopping';
+  await app.close().catch(()=>{});
+  db.close();
+  process.exit(0);
 }
 
 async function ensureCodexAppServer(account:Account, port:number, db:Db) {
