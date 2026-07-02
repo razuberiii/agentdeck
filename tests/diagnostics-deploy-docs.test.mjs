@@ -7,6 +7,7 @@ const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.
 const deploySource = readFileSync(new URL('../scripts/deploy.sh', import.meta.url), 'utf8');
 const installUnitsSource = readFileSync(new URL('../deploy/install-units.sh', import.meta.url), 'utf8');
 const cutoverSource = readFileSync(new URL('../deploy/cutover.sh', import.meta.url), 'utf8');
+const gitignoreSource = readFileSync(new URL('../.gitignore', import.meta.url), 'utf8');
 
 test('diagnostics endpoint and page expose safe runtime ownership fields', () => {
   assert.match(indexSource, /app\.get\('\/api\/diagnostics'/);
@@ -56,4 +57,10 @@ test('architecture docs and ADRs are present', () => {
   assert.match(architecture, /Runtime-owned/);
   assert.match(architecture, /Web-owned/);
   assert.match(architecture, /Deprecated duplicate/);
+  assert.match(architecture, /Canonical user messages/);
+  assert.match(architecture, /Artifacts are owned by the turn/);
+  assert.match(architecture, /Runtime draining/);
+  assert.match(architecture, /gemini_client_unsupported/);
+  assert.match(architecture, /\/opt\/data\/agentdeck\/backups\//);
+  assert.match(gitignoreSource, /^\.backups\/$/m);
 });

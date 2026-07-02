@@ -3,6 +3,7 @@ server/dist/
 server/public/
 test-artifacts/
 .tools/
+.backups/
 
 .env
 *.log
