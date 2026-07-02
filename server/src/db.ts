@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT PRIMARY KEY, count INTEGER NO
     return this.open().transaction(fn)();
   }
 
+  transactionRun(statements:Array<{ sql:string; params?:unknown[] }>) {
+    const db = this.open();
+    return db.transaction(() => {
+      for (const statement of statements) {
+        db.prepare(statement.sql).run(this.bind(statement.sql, statement.params || []));
+      }
+    })();
+  }
+
   close() {
     if (!this.conn) return;
     this.conn.pragma('wal_checkpoint(TRUNCATE)');

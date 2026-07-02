@@ -37,7 +37,7 @@ async function api(url:string, opts:any = {}) {
   return r.json();
 }
 function haptic(){ navigator.vibrate?.(10); }
-function statusLabel(s?:string){ return ({idle:'空闲',submitting:'提交中',running:'执行中',completed:'已完成',active:'空闲',interrupted:'已中断',unknown:'未知',notLoaded:'可继续'} as any)[s||''] || s || '空闲'; }
+function statusLabel(s?:string){ return ({idle:'空闲',submitting:'提交中',running:'执行中',output_draining:'正在收尾',completed:'已完成',active:'空闲',failed:'失败',interrupted:'已中断',unknown:'未知',notLoaded:'可继续'} as any)[s||''] || s || '空闲'; }
 function connectionLabel(s?:string){ return ({connected:'已连接',reconnecting:'重连中',offline:'离线',checking:'检查中',recovering:'恢复中',unavailable:'不可用',disconnected:'已断开',unknown:'未知'} as any)[s||''] || s || '未知'; }
 function formatTime(ms?:number){ if(!ms) return '未知时间'; return new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(ms)); }
 function formatSize(bytes:number){ if(bytes<1024) return `${bytes} B`; if(bytes<1024*1024) return `${(bytes/1024).toFixed(1)} KB`; return `${(bytes/1024/1024).toFixed(2)} MB`; }
@@ -440,7 +440,7 @@ function liveStatus(items:any[], fallback?:string){
 }
 function normalizeTurnStatus(value:any):'idle'|'running'|'completed'|'interrupted'|'unknown'{
   const s=String(value||'');
-  if(s==='running'||s==='active') return 'running';
+  if(s==='running'||s==='output_draining'||s==='active') return 'running';
   if(s==='completed') return 'completed';
   if(s==='interrupted'||s==='failed') return 'interrupted';
   if(s==='idle'||s==='notLoaded') return 'idle';

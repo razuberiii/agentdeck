@@ -24,6 +24,8 @@ import { AntigravityProvider, GeminiProvider, type AgentProviderId } from './pro
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
+import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
+import { AntigravityProcessError, finalizeAntigravityTurn, runAntigravityChild, safeAntigravitySummary, stableAntigravityAssistantId, type AntigravityTurnState } from './antigravity-turn.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
@@ -62,7 +64,7 @@ const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
 type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
-const activeAntigravityTurns = new Map<string, any>();
+const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTurnState; assistantId:string; turnId:string }>();
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
 const runtimeDiagnostics = { subscribeStarts:0, subscribeReconnects:0, subscribeEvents:0, broadcasts:0, replayCalls:0 };
@@ -430,19 +432,15 @@ app.post('/api/profiles', { preHandler: ensureAuth }, async (req:any) => {
 app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any) => {
   const profile = await getProfile(String(req.params.id));
   if (!profile) throw new Error('profile not found');
-  await activateProfile(String(profile.id));
-  let warning:string|null = null;
-  if (USE_AGENT_RUNTIME) {
-    await syncDefaultCodexAppServerEnv(String(profile.codex_home));
-    await runtime.restartDefaultCodexAccount({ codexHome:String(profile.codex_home) }).catch((e:any) => { warning = e?.message || String(e); });
-  } else {
-    try { await codex.switchCodexHome(String(profile.codex_home)); }
-    catch (e:any) { warning = e?.message || String(e); await codex.ensure().catch(()=>{}); }
+  try {
+    await activateProfile(String(profile.id));
+  } catch (error:any) {
+    throw new Error(`Codex 账户切换失败：${safeAntigravitySummary(String(error?.message || error))}`);
   }
   await updateProfileEmailName(String(profile.id), String(profile.codex_home)).catch(()=>{});
   codexStatusCache = { expiresAt:0 };
   invalidateUnifiedProviderStatuses();
-  return { ok:!warning, warning, activeProfile: await getActiveProfile() };
+  return { ok:true, activeProfile: await getActiveProfile() };
 });
 app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getProfile(String(req.params.id));
@@ -649,25 +647,36 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
   };
   child.stdout.on('data', d=>push(d.toString()));
   child.stderr.on('data', d=>push(d.toString()));
-  child.on('exit', async code => {
+  child.on('close', async code => {
     loginChildren.delete(jobId);
     job.code = code;
-    job.status = code === 0 ? 'done' : 'error';
+    job.status = code === 0 ? 'running' : 'error';
     if (attempt && code === 0) await updateProviderLoginAttempt(String(attempt.id), { status:'verifying' }).catch(()=>{});
     if (code !== 0) (job as any).error = `codex login exited ${code}`;
     if (code !== 0 && job.newProfile && profile) await db.run("UPDATE codex_profiles SET status='failed', active=0, updated_at=?1 WHERE id=?2", [Date.now(), String(profile.id)]).catch(()=>{});
     if (code !== 0 && attempt) await updateProviderLoginAttempt(String(attempt.id), { status:'failed', error:`codex login exited ${code}` }).catch(()=>{});
     if (code === 0) {
-      const finalProfile = attempt
-        ? await completeCodexLoginAttempt(String(attempt.id), codexHome)
-        : profile;
-      await ensureSharedCodexDirs(String(finalProfile.codex_home)).catch(()=>{});
-      await updateProfileEmailName(String(finalProfile.id), String(finalProfile.codex_home)).catch(()=>{});
-      await db.run("UPDATE codex_profiles SET status='authenticated', updated_at=?1 WHERE id=?2", [Date.now(), String(finalProfile.id)]).catch(()=>{});
-      await activateProfile(String(finalProfile.id)).catch(()=>{});
-      if (!USE_AGENT_RUNTIME) await codex.switchCodexHome(String(finalProfile.codex_home)).catch(()=>{});
-      codexStatusCache = { expiresAt:0 };
-      invalidateUnifiedProviderStatuses();
+      try {
+        const candidate = attempt
+          ? await prepareCodexLoginCandidate(String(attempt.id), codexHome)
+          : profile;
+        if (!candidate) throw new Error('profile not found');
+        await activateProfileCandidate(candidate);
+        if (attempt) await updateProviderLoginAttempt(String(attempt.id), { status:'done', error:null, profileId:String(candidate.id), metadata:{ email:candidate.email || null } });
+        await ensureSharedCodexDirs(String(candidate.codex_home)).catch(()=>{});
+        await updateProfileEmailName(String(candidate.id), String(candidate.codex_home)).catch(()=>{});
+        job.profileId = String(candidate.id);
+        job.status = 'done';
+        job.error = undefined;
+        codexStatusCache = { expiresAt:0 };
+        invalidateUnifiedProviderStatuses();
+      } catch (error:any) {
+        const message = safeAntigravitySummary(String(error?.message || error));
+        job.status = 'error';
+        job.error = message;
+        if (attempt) await updateProviderLoginAttempt(String(attempt.id), { status:'failed', error:message }).catch(()=>{});
+        app.log.error({ jobId, profileId:job.profileId, error:message }, 'codex login runtime activation failed');
+      }
     }
   });
   return { jobId, job };
@@ -887,9 +896,9 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     return rowSessionDto(created.session);
   }
   const model = cleanModel(req.body?.model) || cleanModel(settings.defaultModels?.codex);
-  const activeProfile:any = await getActiveProfile();
-  const codexPreflight = await codexCreateSessionPreflight(activeProfile);
+  const codexPreflight = await codexCreateSessionPreflight();
   if (!codexPreflight.ok) return reply.code(codexPreflight.statusCode).send(codexPreflight.body);
+  const activeProfile:any = codexPreflight.profile;
   const accountId = activeProfile?.id || null;
   const opts = modeOptions(mode, model);
   if (USE_AGENT_RUNTIME) {
@@ -1683,21 +1692,22 @@ async function listProviderLoginAttempts(provider:AgentProviderId) {
   const attempts = await Promise.all(rows.map((row:any) => getProviderLoginAttempt(String(row.id))));
   return attempts.filter(Boolean).map((attempt:any) => providerLoginAttemptDto(attempt));
 }
-async function completeCodexLoginAttempt(attemptId:string, codexHome:string) {
+async function prepareCodexLoginCandidate(attemptId:string, codexHome:string) {
   const attempt = await getProviderLoginAttempt(attemptId);
   if (!attempt) throw new Error('login attempt not found');
   await updateProviderLoginAttempt(attemptId, { status:'verifying' });
   const email = await readProfileEmail(codexHome).catch(()=>null);
   const existing = email ? await findCodexProfileByEmail(email) : null;
-  const now = Date.now();
   const id = existing?.id ? String(existing.id) : attemptId;
-  if (existing?.id) {
-    await db.run("UPDATE codex_profiles SET name=?1,codex_home=?2,status='authenticated',updated_at=?3 WHERE id=?4", [email || existing.name || 'Codex Account', codexHome, now, id]);
-  } else {
-    await db.run("INSERT INTO codex_profiles (id,name,codex_home,active,status,created_at,updated_at) VALUES (?1,?2,?3,0,'authenticated',?4,?4)", [id, email || 'Codex Account', codexHome, now]);
-  }
-  await updateProviderLoginAttempt(attemptId, { status:'done', error:null, profileId:id, metadata:{ email:email || null } });
-  return getProfile(id) as Promise<any>;
+  return {
+    id,
+    name:email || existing?.name || String(attempt.metadata?.displayName || 'Codex Account'),
+    codex_home:codexHome,
+    status:'verifying',
+    active:0,
+    email,
+    created_at:Number(existing?.created_at || Date.now()),
+  };
 }
 async function findCodexProfileByEmail(email:string) {
   const normalized = email.trim().toLowerCase();
@@ -1710,51 +1720,21 @@ async function findCodexProfileByEmail(email:string) {
   }
   return null;
 }
-async function codexCreateSessionPreflight(activeProfile:any) {
-  if (!activeProfile?.id) {
-    return {
-      ok:false,
-      statusCode:409,
-      body:{ code:'codex_no_active_profile', message:'请先登录 Codex', safeDetail:'没有可用于创建会话的 active Codex Profile', layer:'web_session_api' },
-    };
-  }
-  const raw = await getProfile(String(activeProfile.id));
-  const status = String(raw?.status || activeProfile.status || 'authenticated');
-  if (status === 'unresolved_identity') {
-    return {
-      ok:false,
-      statusCode:409,
-      body:{ code:'codex_profile_identity_unresolved', message:'Codex 账户信息尚未读取完成', safeDetail:'当前 active Codex Profile 的账户身份未解析', layer:'web_session_api' },
-    };
-  }
-  if (['draft','authenticating','verifying','failed','disabled'].includes(status) || activeProfile.isLoginAttempt) {
-    return {
-      ok:false,
-      statusCode:409,
-      body:{ code:'codex_profile_not_authenticated', message:'请先完成 Codex 登录', safeDetail:`当前 Codex Profile 状态为 ${status}`, layer:'web_session_api' },
-    };
-  }
-  if (String(raw?.name || activeProfile.name || '') === 'Codex Account' && !activeProfile.email && !activeProfile.login?.email) {
-    return {
-      ok:false,
-      statusCode:409,
-      body:{ code:'codex_profile_identity_unresolved', message:'Codex 账户信息尚未读取完成', safeDetail:'当前 Codex Profile 仍是占位身份 Codex Account', layer:'web_session_api' },
-    };
-  }
-  if (!activeProfile.login?.ok) {
-    return {
-      ok:false,
-      statusCode:409,
-      body:{ code:'codex_profile_not_authenticated', message:'请先登录 Codex', safeDetail:'当前 Codex Profile 没有可用登录凭据', layer:'web_session_api' },
-    };
-  }
-  return { ok:true as const };
-}
-async function codexContinueSessionPreflight(activeProfile:any) {
-  const result = await codexCreateSessionPreflight(activeProfile);
-  if (result.ok) return { ok:true as const };
+async function codexCreateSessionPreflight() {
+  const canonical:any = await getActiveProfile();
+  const result = evaluateCodexProfileReadiness(canonical);
+  if (result.ok) return { ok:true as const, profile:canonical };
   return {
-    ok:false,
+    ok:false as const,
+    statusCode:409,
+    body:{ code:result.code, message:result.message, safeDetail:result.safeDetail, layer:'web_session_api' },
+  };
+}
+async function codexContinueSessionPreflight() {
+  const result = await codexCreateSessionPreflight();
+  if (result.ok) return result;
+  return {
+    ok:false as const,
     statusCode:result.statusCode,
     body:{
       ...result.body,
@@ -1846,9 +1826,44 @@ async function getActiveProfile() {
   return { ...p, provider:'codex', name: login.email || profileDisplayName(p.name), email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
 }
 async function activateProfile(id:string) {
-  await db.run('UPDATE codex_profiles SET active=0');
-  await db.run("UPDATE codex_profiles SET active=1, updated_at=?1 WHERE id=?2 AND COALESCE(status,'authenticated')='authenticated'", [Date.now(), id]);
+  const profile:any = await getProfile(id);
+  if (!profile) throw new Error('profile not found');
+  if (String(profile.status || 'authenticated') !== 'authenticated') throw new Error(`Codex profile is not authenticated: ${profile.status || 'unknown'}`);
+  await activateProfileCandidate(profile);
+}
+async function activateProfileCandidate(candidate:any) {
+  const previous:any = await db.get("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  const now = Date.now();
+  await activateCodexProfileAtomically({
+    target:candidate as CodexProfileState,
+    previous:previous as CodexProfileState | null,
+    verifyCredentials:async target => (await profileLoginStatus(String(target.codex_home))).ok,
+    activateRuntime:activateCodexRuntimeProfile,
+    restoreRuntime:activateCodexRuntimeProfile,
+    commit:async () => {
+      db.transactionRun([
+        { sql:'UPDATE codex_profiles SET active=0' },
+        {
+          sql:`INSERT INTO codex_profiles (id,name,codex_home,active,status,created_at,updated_at)
+               VALUES (?1,?2,?3,1,'authenticated',?4,?5)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name,codex_home=excluded.codex_home,active=1,status='authenticated',updated_at=excluded.updated_at`,
+          params:[String(candidate.id), String(candidate.name || 'Codex Account'), String(candidate.codex_home), Number(candidate.created_at || now), now],
+        },
+      ]);
+    },
+  });
   invalidateUnifiedProviderStatuses();
+}
+async function activateCodexRuntimeProfile(profile:CodexProfileState) {
+  const codexHome = String(profile.codex_home);
+  if (USE_AGENT_RUNTIME) {
+    await syncDefaultCodexAppServerEnv(codexHome);
+    const activated:any = await runtime.restartDefaultCodexAccount({ codexHome });
+    if (activated?.read?.error) throw new Error(String(activated.read.error));
+    if (String(activated?.account?.codex_home || '') !== codexHome) throw new Error('runtime activated an unexpected CODEX_HOME');
+    return;
+  }
+  await codex.switchCodexHome(codexHome);
 }
 async function ensureCodexActiveProfile() {
   const active = await db.get("SELECT id FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' LIMIT 1");
@@ -3327,12 +3342,12 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const input = await buildTurnInput(threadId, text, attachments);
   const title = autoTitle(text, String(row.project_dir), String(row.title || ''));
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
-  const activeProfile:any = await getActiveProfile();
-  const continuePreflight = await codexContinueSessionPreflight(activeProfile);
+  const continuePreflight = await codexContinueSessionPreflight();
   if (!continuePreflight.ok) {
     ack('failed', continuePreflight.body.message);
     throw Object.assign(new Error(continuePreflight.body.message), { statusCode:continuePreflight.statusCode, body:continuePreflight.body });
   }
+  const activeProfile:any = continuePreflight.profile;
   const execution = codexExecutionContext(activeProfile);
   const executionSnapshotJson = JSON.stringify(execution.accountSnapshot || null);
   const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
@@ -3409,7 +3424,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     throw e;
   }
 }
-async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const child = activeAntigravityTurns.get(threadId); if (child) { try { child.kill('SIGTERM'); } catch {} activeAntigravityTurns.delete(threadId); } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
+async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const active = activeAntigravityTurns.get(threadId); if (active) { active.state='interrupted'; try { active.child.kill('SIGTERM'); } catch {} } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [], turnId:string = crypto.randomUUID(), clientMessageId = '') {
   const threadId = String(row.codex_thread_id || row.id);
   const message = String(text || '').trim();
@@ -3428,22 +3443,57 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [],
   await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
   broadcast(threadId,{type:'user', text:message, attachments:attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))});
   broadcast(threadId,{type:'codex', method:'turn/started', params:{}});
-  const assistantId = crypto.randomUUID();
+  const assistantId = stableAntigravityAssistantId(threadId, turnId);
   const model = cleanAgentModel(row.model);
   broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:`${assistantId}-progress`, type:'plan', text:`Antigravity 已接收请求，正在用 ${model || '默认模型'} 分析。` } }});
   try {
     const output = await runAntigravityPrint(profile, row, providerInput, threadId, assistantId);
-    await db.run('INSERT INTO agent_messages (id,session_id,role,text,created_at) VALUES (?1,?2,?3,?4,?5)', [assistantId, threadId, 'assistant', output, Date.now()]);
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
-    broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:assistantId, type:'agentMessage', text:output, phase:'final_answer' } }});
-    const found = await scanArtifactsForTurn(threadId, String(row.project_dir), turnId, assistantId);
-    if (found.length) broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }});
-    broadcast(threadId,{type:'codex', method:'turn/completed', params:{}});
+    await finalizeAntigravityTurn({
+      assistantId,
+      text:output,
+      status:'completed',
+      persistAssistant:(id, value)=>persistAntigravityAssistant(id, threadId, value),
+      updateSession:status=>db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[status, Date.now(), threadId]).then(()=>{}),
+      notify:message=>broadcast(threadId, message),
+      beforeTerminal:async () => {
+        const found = await scanArtifactsForTurn(threadId, String(row.project_dir), turnId, assistantId)
+          .catch((error:any) => {
+            app.log.warn({ sessionId:threadId, error:safeAntigravitySummary(String(error?.message || error)) }, 'antigravity artifact scan failed');
+            return [];
+          });
+        if (found.length) broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }});
+      },
+    });
   } catch (e:any) {
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
-    broadcast(threadId,{type:'codex', method:'turn/completed', params:{}});
+    const active = activeAntigravityTurns.get(threadId);
+    const interrupted = active?.state === 'interrupted';
+    const result = e instanceof AntigravityProcessError ? e.result : null;
+    const safeError = safeAntigravitySummary(String(e?.message || e || 'Antigravity failed'));
+    const failureText = result?.output
+      ? `${result.output}\n\nAntigravity 执行${interrupted ? '已中断' : '失败'}：${safeError}`
+      : `Antigravity 执行${interrupted ? '已中断' : '失败'}：${safeError}`;
+    await finalizeAntigravityTurn({
+      assistantId,
+      text:failureText,
+      status:interrupted ? 'interrupted' : 'failed',
+      error:safeError,
+      persistAssistant:(id, value)=>persistAntigravityAssistant(id, threadId, value),
+      updateSession:status=>db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[status, Date.now(), threadId]).then(()=>{}),
+      notify:message=>broadcast(threadId, message),
+    });
     throw e;
+  } finally {
+    activeAntigravityTurns.delete(threadId);
+    maybeExitAfterDrain();
   }
+}
+async function persistAntigravityAssistant(id:string, threadId:string, text:string) {
+  await db.run(
+    `INSERT INTO agent_messages (id,session_id,role,text,created_at)
+     VALUES (?1,?2,'assistant',?3,?4)
+     ON CONFLICT(id) DO UPDATE SET text=excluded.text`,
+    [id, threadId, text, Date.now()]
+  );
 }
 async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', id = crypto.randomUUID(), createdAt = Date.now()) {
   const safeAttachments = attachments.map((a:any)=>({ id:String(a.id), name:String(a.name || 'attachment'), type:String(a.type || ''), size:Number(a.size || 0), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }));
@@ -3466,51 +3516,33 @@ async function providerInputText(threadId:string, text:string, attachments:any[]
 }
 async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId:string, itemId:string) {
   await ensureAntigravityBinary();
-  return new Promise<string>((resolve, reject) => {
-    const args:string[] = [];
-    const model = cleanAgentModel(row.model);
-    if (model) args.push('--model', model);
-    if (sessionMode(row) === 'yolo') args.push('--dangerously-skip-permissions');
-    args.push('--print', prompt);
-    const homeDir = String(profile.home_dir);
-    const child = spawn(ANTIGRAVITY_BIN, args, {
-      cwd:String(row.project_dir),
-      env:{ ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
-      stdio:['ignore','pipe','pipe'],
-    });
-    activeAntigravityTurns.set(threadId, child);
-    let out = '';
-    let err = '';
-    let streamed = '';
-    const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch {}
-      reject(new Error('Antigravity 响应超时'));
-    }, 5 * 60 * 1000);
-    child.stdout.on('data', d => {
-      out += d.toString();
-      const cleaned = cleanAgentOutput(out);
-      if (cleaned.length > streamed.length && cleaned.startsWith(streamed)) {
-        const delta = cleaned.slice(streamed.length);
-        streamed = cleaned;
-        if (delta.trim()) broadcast(threadId,{type:'codex', method:'item/agentMessage/delta', params:{ itemId, delta }});
-      }
-    });
-    child.stderr.on('data', d => { err += d.toString(); });
-    child.on('error', e => {
-      clearTimeout(timer);
-      activeAntigravityTurns.delete(threadId);
-      const detail = (e as any)?.code === 'ENOENT' ? `ANTIGRAVITY_BIN=${ANTIGRAVITY_BIN}` : String((e as any)?.message || e);
-      reject(structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary could not be started', detail));
-    });
-    child.on('close', code => {
-      clearTimeout(timer);
-      activeAntigravityTurns.delete(threadId);
-      maybeExitAfterDrain();
-      const text = cleanAgentOutput(out || err);
-      if (code === 0 && text) resolve(text);
-      else reject(new Error(text || `Antigravity exited ${code}`));
-    });
+  const args:string[] = [];
+  const model = cleanAgentModel(row.model);
+  if (model) args.push('--model', model);
+  if (sessionMode(row) === 'yolo') args.push('--dangerously-skip-permissions');
+  args.push('--print', prompt);
+  const homeDir = String(profile.home_dir);
+  const child = spawn(ANTIGRAVITY_BIN, args, {
+    cwd:String(row.project_dir),
+    env:{ ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
+    stdio:['ignore','pipe','pipe'],
   });
+  const active = { child, state:'running' as AntigravityTurnState, assistantId:itemId, turnId:String(row.active_turn_id || '') };
+  activeAntigravityTurns.set(threadId, active);
+  const result = await runAntigravityChild(child, {
+    timeoutMs:Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS || 30 * 60 * 1000),
+    cleanOutput:cleanAgentOutput,
+    onDelta:delta => {
+      if (delta.trim()) broadcast(threadId,{type:'codex', method:'item/agentMessage/delta', params:{ itemId, delta }});
+    },
+    onState:state => {
+      if (active.state !== 'interrupted') active.state = state;
+      if (state === 'output_draining') {
+        db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['output_draining', Date.now(), threadId]).catch(()=>{});
+      }
+    },
+  });
+  return result.output;
 }
 async function replayRuntimeEventsToWs(threadId:string, ws:any, after:number) {
   if (!USE_AGENT_RUNTIME || ws.readyState !== 1) return;

@@ -4,13 +4,14 @@ import test from 'node:test';
 
 const webSource = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const runtimeSource = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
+const lifecycleSource = readFileSync(new URL('../server/src/codex-profile-lifecycle.ts', import.meta.url), 'utf8');
 
 test('Codex session creation validates active profile before runtime create', () => {
-  assert.match(webSource, /codexCreateSessionPreflight\(activeProfile\)/);
-  assert.match(webSource, /codex_no_active_profile/);
-  assert.match(webSource, /codex_profile_identity_unresolved/);
-  assert.match(webSource, /codex_profile_not_authenticated/);
-  assert.match(webSource, /当前 Codex Profile 仍是占位身份 Codex Account/);
+  assert.match(webSource, /codexCreateSessionPreflight\(\)/);
+  assert.match(webSource, /const canonical:any = await getActiveProfile\(\)/);
+  assert.match(lifecycleSource, /codex_no_active_profile/);
+  assert.match(lifecycleSource, /codex_profile_not_authenticated/);
+  assert.doesNotMatch(lifecycleSource, /codex_profile_identity_unresolved/);
 });
 
 test('Codex runtime create errors are structured and sanitized', () => {
@@ -33,7 +34,8 @@ test('Codex session creation does not fall back to default account after preflig
 });
 
 test('Codex turns use the current active profile as the explicit execution profile', () => {
-  assert.match(webSource, /codexContinueSessionPreflight\(activeProfile\)/);
+  assert.match(webSource, /codexContinueSessionPreflight\(\)/);
+  assert.match(webSource, /const activeProfile:any = continuePreflight\.profile/);
   assert.match(webSource, /codexExecutionContext\(activeProfile\)/);
   assert.match(webSource, /accountId:execution\.executingProfileId/);
   assert.match(webSource, /codexHome:execution\.runtime\.codexHome/);

@@ -86,6 +86,10 @@ class CodexAccountRuntime extends EventEmitter {
 
   constructor(private account:Account, private port:number, private db:Db) { super(); }
 
+  updateAccount(account:Account) {
+    this.account = account;
+  }
+
   async ensureConnected() {
     await ensureCodexAppServer(this.account, this.port, this.db);
     if (this.client?.isConnected() && this.initialized) return;
@@ -414,10 +418,12 @@ app.post('/codex/accounts/default', async () => {
 
 app.post('/codex/accounts/default/restart', async (req:any) => {
   const codexHome = String(req.body?.codexHome || DEFAULT_CODEX_HOME);
-  const account = await ensureAccount('default', codexHome);
-  const runtime = await runtimeForAccount(account.id);
+  const previous = await getAccount('default') || await ensureAccount('default', DEFAULT_CODEX_HOME);
+  const runtime = await runtimeForAccount(previous.id);
   await runtime.restartAppServer();
-  const read = await runtime.request('account/read', { refreshToken:false }).catch((e:any) => ({ error:e?.message || String(e) }));
+  const read = await runtime.request('account/read', { refreshToken:false });
+  const account = await ensureAccount('default', codexHome);
+  runtime.updateAccount(account);
   return { account, port:portForAccount(account.id), runtimeInstanceId:runtimeInstanceId(account.id), read };
 });
 
