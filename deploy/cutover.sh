@@ -22,19 +22,19 @@ trap rollback ERR
 cd "$ROOT"
 npm run build
 
-if [ -f /etc/systemd/system/agentdeck-web.service ] && [ -f /etc/systemd/system/agentdeck-runtime.service ] && [ -f /etc/systemd/system/agentdeck-app-server@.service ]; then
+if [ -f /etc/systemd/system/agentdeck-web.service ] && [ -f /etc/systemd/system/agentdeck-runtime.service ] && [ -f /etc/systemd/system/agentdeck-app-server@.service ] && [ -f "$ENV_DIR/runtime.env" ] && [ -f "$ENV_DIR/web.env" ] && [ -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
   echo "units already installed; skipping /etc writes"
 else
-  LOG="$ROOT/.tools/install-units.log" "$ROOT/deploy/install-units.sh"
+  ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" LOG="$ROOT/.tools/install-units.log" "$ROOT/deploy/install-units.sh"
 fi
 
-sudo sed -i 's/^CODEX_APP_SERVER_PORT_BASE=.*/CODEX_APP_SERVER_PORT_BASE=4620/' "$ENV_DIR/runtime.env"
-sudo sed -i 's#^CODEX_APP_SERVER_LISTEN=.*#CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668#' "$ENV_DIR/agentdeck-app-server-default.env"
+sudo grep -q '^CODEX_APP_SERVER_PORT_BASE=' "$ENV_DIR/runtime.env" && sudo sed -i 's/^CODEX_APP_SERVER_PORT_BASE=.*/CODEX_APP_SERVER_PORT_BASE=4620/' "$ENV_DIR/runtime.env" || echo 'CODEX_APP_SERVER_PORT_BASE=4620' | sudo tee -a "$ENV_DIR/runtime.env" >/dev/null
+sudo grep -q '^CODEX_APP_SERVER_LISTEN=' "$ENV_DIR/agentdeck-app-server-default.env" && sudo sed -i 's#^CODEX_APP_SERVER_LISTEN=.*#CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668#' "$ENV_DIR/agentdeck-app-server-default.env" || echo 'CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668' | sudo tee -a "$ENV_DIR/agentdeck-app-server-default.env" >/dev/null
 
 echo "stopping legacy service"
 sudo systemctl stop agentdeck.service || true
 sleep 2
-pkill -f 'codex app-server --listen stdio://' || true
+ps -eo pid=,args= | awk '/codex app-server --listen stdio:\/\// && !/awk/ { print $1 }' | xargs -r kill || true
 
 echo "starting independent codex app-server"
 sudo systemctl restart agentdeck-app-server@default.service
@@ -61,7 +61,11 @@ test "$web_pid" != "0"
 
 curl -fsS http://127.0.0.1:3842/api/status
 node "$ROOT/deploy/verify-runtime.mjs"
-node "$ROOT/deploy/e2e-runtime.mjs"
+if [ "${RUN_PRODUCTION_E2E:-0}" = "1" ]; then
+  node "$ROOT/deploy/e2e-runtime.mjs"
+else
+  echo "skipping production e2e; set RUN_PRODUCTION_E2E=1 to enable real provider turn"
+fi
 
 app_pid_after=$(pgrep -f 'codex app-server --listen ws://127.0.0.1:4668' | head -1 || true)
 echo "app_pid_after=$app_pid_after"
