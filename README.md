@@ -189,7 +189,9 @@ EnvironmentFile=/etc/agentdeck/*.env
 
 ## 数据与备份
 
-请备份配置的 `DATA_DIR`。重要文件和目录包括：
+AgentDeck 不会因为你 clone 仓库、`npm start` 或启动 Web/runtime 就自动备份。仓库里的 `scripts/backup.sh` 只是一个手动工具；想备份的时候自己跑，不想备份可以完全不管它。
+
+如果你要备份，备份配置的 `DATA_DIR` 就够了。重要文件和目录包括：
 
 - `agentdeck.sqlite3`
 - `agentdeck-runtime.sqlite3`
@@ -201,7 +203,17 @@ EnvironmentFile=/etc/agentdeck/*.env
 - `shared/generated_images/`
 - `attachments/`
 
-备份数据库时建议使用 SQLite 的 `.backup` 命令，或先停止相关服务再复制数据库文件。环境文件和密钥不要提交到公开仓库。
+手动备份当前数据目录的例子：
+
+```bash
+DATA_DIR=/opt/data/agentdeck \
+BACKUP_DIR=/opt/data/agentdeck/backups \
+/opt/stacks/agentdeck/scripts/backup.sh
+```
+
+这个脚本会生成一个 `agentdeck-YYYYMMDD.tar.gz`，里面放 SQLite 备份和 Codex session 文件，并只保留最近 7 个 `agentdeck-*.tar.gz`。
+
+如果你想定时备份，需要自己额外装 cron 或 systemd timer。项目默认不会安装或启动任何备份定时器。备份数据库时建议使用 SQLite 的 `.backup` 命令，或先停止相关服务再复制数据库文件。环境文件和密钥不要提交到公开仓库。
 
 ## 安全
 
