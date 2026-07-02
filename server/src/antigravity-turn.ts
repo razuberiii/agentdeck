@@ -2,6 +2,7 @@ import type { ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 
 export type AntigravityTurnState = 'running' | 'output_draining' | 'completed' | 'failed' | 'interrupted';
+export const DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 export type AntigravityProcessResult = {
   output:string;

@@ -16,6 +16,7 @@ const authenticated = {
 test('authenticated Codex profile without email or display identity is ready', () => {
   assert.deepEqual(evaluateCodexProfileReadiness(authenticated), { ok:true, profile:authenticated });
   assert.equal(evaluateCodexProfileReadiness({ ...authenticated, name:'Codex Account' }).ok, true);
+  assert.equal(evaluateCodexProfileReadiness({ ...authenticated, metadataStatus:'failed', metadataError:'retryable' }).ok, true);
 });
 
 test('non-authenticated Codex states cannot create sessions', () => {

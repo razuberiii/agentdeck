@@ -22,7 +22,7 @@ test('new Codex login starts as LoginAttempt instead of inserting a formal profi
   assert.doesNotMatch(codexCreateRoute, /INSERT INTO codex_profiles/);
   assert.match(serverSource, /prepareCodexLoginCandidate/);
   assert.match(serverSource, /await activateProfileCandidate\(candidate\)/);
-  assert.match(serverSource, /INSERT INTO codex_profiles \(id,name,codex_home,active,status,created_at,updated_at\)[\s\S]*'authenticated'/);
+  assert.match(serverSource, /INSERT INTO codex_profiles \(id,name,codex_home,active,status,email,display_name,metadata_status,metadata_error,metadata_updated_at,created_at,updated_at\)[\s\S]*'authenticated'/);
 });
 
 test('pending UI presents login jobs as tasks, not accounts', () => {

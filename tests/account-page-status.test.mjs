@@ -21,7 +21,8 @@ test('current account summary is not polluted by login attempts', () => {
     source.indexOf('function currentAccountSummary'),
     source.indexOf('function pendingLoginTitle')
   );
-  assert.match(helperBlock, /账户信息读取中/);
+  assert.match(helperBlock, /正在读取账户信息/);
+  assert.match(helperBlock, /账户信息读取失败，可重试/);
   assert.match(helperBlock, /已登录/);
   assert.match(helperBlock, /尚未登录/);
   assert.doesNotMatch(helperBlock, /正在登录/);

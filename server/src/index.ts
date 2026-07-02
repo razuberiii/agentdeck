@@ -25,7 +25,8 @@ import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from '
 import { providerCapabilitiesFor } from './provider-adapter.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
-import { AntigravityProcessError, finalizeAntigravityTurn, runAntigravityChild, safeAntigravitySummary, stableAntigravityAssistantId, type AntigravityTurnState } from './antigravity-turn.js';
+import { resolveCodexProfileMetadataFromAuth } from './codex-profile-metadata.js';
+import { AntigravityProcessError, DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS, finalizeAntigravityTurn, runAntigravityChild, safeAntigravitySummary, stableAntigravityAssistantId, type AntigravityTurnState } from './antigravity-turn.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
@@ -38,6 +39,7 @@ const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
+const CODEX_PROFILE_COLUMNS = 'id,name,codex_home,active,status,email,display_name,metadata_status,metadata_error,metadata_updated_at,created_at,updated_at';
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 32 * 1024 * 1024);
 const MAX_ATTACHMENTS_PER_MESSAGE = Number(process.env.MAX_ATTACHMENTS_PER_MESSAGE || 10);
 const MAX_TOTAL_ATTACHMENT_BYTES = Number(process.env.MAX_TOTAL_ATTACHMENT_BYTES || 64 * 1024 * 1024);
@@ -68,7 +70,7 @@ const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTur
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
 const runtimeDiagnostics = { subscribeStarts:0, subscribeReconnects:0, subscribeEvents:0, broadcasts:0, replayCalls:0 };
-type LoginJob = { id:string; profileId:string; output:string[]; status:'running'|'done'|'error'; code?:number|null; error?:string; startedAt:number; newProfile?:boolean; loginUrl?:string; deviceCode?:string };
+type LoginJob = { id:string; profileId:string; output:string[]; status:'running'|'done'|'error'; code?:number|null; error?:string; startedAt:number; newProfile?:boolean; loginUrl?:string; deviceCode?:string; metadataStatus?:'pending'|'ready'|'failed'; metadataError?:string };
 const loginJobs = new Map<string, LoginJob>();
 const loginChildren = new Map<string, any>();
 type ProviderLoginAttemptStatus = 'starting'|'waiting_authorization'|'waiting_code'|'verifying'|'failed'|'cancelled'|'done';
@@ -154,6 +156,11 @@ await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY K
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, profile_id TEXT, temp_home TEXT, method_id TEXT, status TEXT NOT NULL, error TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run("ALTER TABLE codex_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
+await db.run("ALTER TABLE codex_profiles ADD COLUMN email TEXT").catch(()=>{});
+await db.run("ALTER TABLE codex_profiles ADD COLUMN display_name TEXT").catch(()=>{});
+await db.run("ALTER TABLE codex_profiles ADD COLUMN metadata_status TEXT NOT NULL DEFAULT 'pending'").catch(()=>{});
+await db.run("ALTER TABLE codex_profiles ADD COLUMN metadata_error TEXT").catch(()=>{});
+await db.run("ALTER TABLE codex_profiles ADD COLUMN metadata_updated_at INTEGER").catch(()=>{});
 await db.run("ALTER TABLE antigravity_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE gemini_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'configured'").catch(()=>{});
 await db.run("ALTER TABLE gemini_profiles ADD COLUMN default_model_mode TEXT NOT NULL DEFAULT 'auto'").catch(()=>{});
@@ -422,6 +429,12 @@ app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
 });
 app.get('/api/models', { preHandler: ensureAuth }, async (req:any) => modelCatalog(req.query?.hidden === '1', normalizeProvider(req.query?.provider) || (await appSettings()).activeProvider));
 app.get('/api/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listProfiles(), pendingProfiles: await listPendingProfiles(), activeProfile: await getActiveProfile() }));
+app.post('/api/profiles/:id/metadata/refresh', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile:any = await getProfile(String(req.params.id));
+  if (!profile) return reply.code(404).send({error:'profile not found'});
+  const metadata = await refreshCodexProfileMetadata(String(profile.id), String(profile.codex_home));
+  return { ok:metadata.status === 'ready', metadata, profile:await getProfileDto(String(profile.id)) };
+});
 app.post('/api/profiles', { preHandler: ensureAuth }, async (req:any) => {
   const name = cleanProfileName(String(req.body?.name || 'Codex Account'));
   const attempt = await createProviderLoginAttempt('codex', { displayName:name });
@@ -437,7 +450,7 @@ app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any)
   } catch (error:any) {
     throw new Error(`Codex 账户切换失败：${safeAntigravitySummary(String(error?.message || error))}`);
   }
-  await updateProfileEmailName(String(profile.id), String(profile.codex_home)).catch(()=>{});
+  await refreshCodexProfileMetadata(String(profile.id), String(profile.codex_home));
   codexStatusCache = { expiresAt:0 };
   invalidateUnifiedProviderStatuses();
   return { ok:true, activeProfile: await getActiveProfile() };
@@ -664,8 +677,9 @@ app.post('/api/profiles/:id/login/device', { preHandler: ensureAuth }, async (re
         await activateProfileCandidate(candidate);
         if (attempt) await updateProviderLoginAttempt(String(attempt.id), { status:'done', error:null, profileId:String(candidate.id), metadata:{ email:candidate.email || null } });
         await ensureSharedCodexDirs(String(candidate.codex_home)).catch(()=>{});
-        await updateProfileEmailName(String(candidate.id), String(candidate.codex_home)).catch(()=>{});
         job.profileId = String(candidate.id);
+        job.metadataStatus = ['pending','ready','failed'].includes(String(candidate.metadata_status)) ? String(candidate.metadata_status) as LoginJob['metadataStatus'] : 'pending';
+        job.metadataError = candidate.metadata_error ? String(candidate.metadata_error) : undefined;
         job.status = 'done';
         job.error = undefined;
         codexStatusCache = { expiresAt:0 };
@@ -1437,16 +1451,22 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
   };
 }
 async function activeCodexProfileSummary() {
-  const p = await db.get("SELECT id,name,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  const p = await db.get(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1`);
   if (!p) return null;
+  const email = String(p.email || '').trim() || undefined;
+  const displayName = String(p.display_name || '').trim() || undefined;
   return {
     id:String(p.id),
     provider:'codex',
-    name:profileDisplayName(String(p.name || 'Codex Account')),
+    name:email || displayName || codexMetadataLabel(p),
+    email,
+    displayName,
+    metadataStatus:String(p.metadata_status || 'pending'),
+    metadataError:p.metadata_error || undefined,
     state:'authenticated',
     status:String(p.status || 'authenticated'),
     active:Number(p.active || 0),
-    login:{ ok:true, text:'Cached account summary' },
+    login:{ ok:true, email, displayName, text:'Cached account summary' },
     created_at:Number(p.created_at || 0),
     updated_at:Number(p.updated_at || 0),
   };
@@ -1496,11 +1516,13 @@ async function ensureProfiles() {
     const email = await readProfileEmail(DEFAULT_CODEX_HOME).catch(()=>null);
     await db.run('INSERT INTO codex_profiles (id,name,codex_home,active,created_at,updated_at) VALUES (?1,?2,?3,1,?4,?4)', ['default', email || 'Codex Account', DEFAULT_CODEX_HOME, Date.now()]);
   }
-  const profiles = await db.all('SELECT codex_home FROM codex_profiles');
-  for (const profile of profiles) await ensureSharedCodexDirs(String(profile.codex_home)).catch(err => console.warn('shared session setup failed', profile.codex_home, err?.message || err));
+  const profiles = await db.all('SELECT id,codex_home FROM codex_profiles');
+  for (const profile of profiles) {
+    await ensureSharedCodexDirs(String(profile.codex_home)).catch(err => console.warn('shared session setup failed', profile.codex_home, err?.message || err));
+    await refreshCodexProfileMetadata(String(profile.id), String(profile.codex_home));
+  }
   const active:any = await getActiveProfile();
   if (!USE_AGENT_RUNTIME && active?.codex_home) await codex.switchCodexHome(String(active.codex_home));
-  if (active?.id && active?.codex_home) await updateProfileEmailName(String(active.id), String(active.codex_home)).catch(()=>{});
   const settings = await appSettings();
   if (!settings.defaultMode) await setSetting('defaultMode', 'yolo');
 }
@@ -1696,24 +1718,29 @@ async function prepareCodexLoginCandidate(attemptId:string, codexHome:string) {
   const attempt = await getProviderLoginAttempt(attemptId);
   if (!attempt) throw new Error('login attempt not found');
   await updateProviderLoginAttempt(attemptId, { status:'verifying' });
-  const email = await readProfileEmail(codexHome).catch(()=>null);
+  const metadata = await resolveCodexProfileMetadata(codexHome);
+  const email = metadata.email;
   const existing = email ? await findCodexProfileByEmail(email) : null;
   const id = existing?.id ? String(existing.id) : attemptId;
   return {
     id,
-    name:email || existing?.name || String(attempt.metadata?.displayName || 'Codex Account'),
+    name:email || metadata.displayName || existing?.name || String(attempt.metadata?.displayName || 'Codex Account'),
     codex_home:codexHome,
     status:'verifying',
     active:0,
     email,
+    display_name:metadata.displayName,
+    metadata_status:metadata.status,
+    metadata_error:metadata.error,
+    metadata_updated_at:Date.now(),
     created_at:Number(existing?.created_at || Date.now()),
   };
 }
 async function findCodexProfileByEmail(email:string) {
   const normalized = email.trim().toLowerCase();
-  const byName = await db.get('SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE lower(name)=?1 LIMIT 1', [normalized]).catch(()=>null);
+  const byName = await db.get(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE lower(COALESCE(email,name))=?1 LIMIT 1`, [normalized]).catch(()=>null);
   if (byName) return byName;
-  const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated'").catch(()=>[]);
+  const rows = await db.all(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated'`).catch(()=>[]);
   for (const row of rows as any[]) {
     const found = await readProfileEmail(String(row.codex_home)).catch(()=>null);
     if (found && found.trim().toLowerCase() === normalized) return row;
@@ -1806,24 +1833,41 @@ function structuredSessionCreateError(provider:AgentProviderId, e:any, layer:str
   };
 }
 async function listProfiles() {
-  const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY active DESC, updated_at DESC");
-  return Promise.all(rows.map(async (p:any)=>{
-    const login = await profileLoginStatus(String(p.codex_home));
-    return { ...p, provider:'codex', name: login.email || profileDisplayName(p.name), email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
-  }));
+  const rows = await db.all(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE COALESCE(status,'authenticated')='authenticated' ORDER BY active DESC, updated_at DESC`);
+  return Promise.all(rows.map((p:any)=>codexProfileDto(p)));
 }
 async function listPendingProfiles() {
   const attempts = await listProviderLoginAttempts('codex');
-  const rows = await db.all("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE COALESCE(status,'authenticated') IN ('draft','authenticating','verifying','failed') ORDER BY updated_at DESC");
+  const rows = await db.all(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE COALESCE(status,'authenticated') IN ('draft','authenticating','verifying','failed') ORDER BY updated_at DESC`);
   const legacy = rows.map((p:any) => ({ ...p, provider:'codex', name:profileDisplayName(p.name), state:String(p.status || 'draft'), active:false, isLoginAttempt:false, login:{ ok:false, text:'Not logged in' } }));
   return [...attempts, ...legacy.filter((row:any) => !attempts.some((attempt:any) => attempt.id === row.id))];
 }
-async function getProfile(id:string) { return db.get('SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE id=?1', [id]); }
+async function getProfile(id:string) { return db.get(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE id=?1`, [id]); }
+async function getProfileDto(id:string) {
+  const profile = await getProfile(id);
+  return profile ? codexProfileDto(profile) : null;
+}
 async function getActiveProfile() {
-  const p = await db.get("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  const p = await db.get(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1`);
   if (!p) return null;
+  return codexProfileDto(p);
+}
+async function codexProfileDto(p:any) {
   const login = await profileLoginStatus(String(p.codex_home));
-  return { ...p, provider:'codex', name: login.email || profileDisplayName(p.name), email:login.email || undefined, state:'authenticated', active:Number(p.active || 0), login };
+  const email = String(p.email || login.email || '').trim() || undefined;
+  const displayName = String(p.display_name || login.displayName || '').trim() || undefined;
+  return {
+    ...p,
+    provider:'codex',
+    name:email || displayName || codexMetadataLabel(p),
+    email,
+    displayName,
+    metadataStatus:String(p.metadata_status || 'pending'),
+    metadataError:p.metadata_error || undefined,
+    state:'authenticated',
+    active:Number(p.active || 0),
+    login:{ ...login, email, displayName },
+  };
 }
 async function activateProfile(id:string) {
   const profile:any = await getProfile(id);
@@ -1832,7 +1876,7 @@ async function activateProfile(id:string) {
   await activateProfileCandidate(profile);
 }
 async function activateProfileCandidate(candidate:any) {
-  const previous:any = await db.get("SELECT id,name,codex_home,active,status,created_at,updated_at FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1");
+  const previous:any = await db.get(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1`);
   const now = Date.now();
   await activateCodexProfileAtomically({
     target:candidate as CodexProfileState,
@@ -1844,10 +1888,23 @@ async function activateProfileCandidate(candidate:any) {
       db.transactionRun([
         { sql:'UPDATE codex_profiles SET active=0' },
         {
-          sql:`INSERT INTO codex_profiles (id,name,codex_home,active,status,created_at,updated_at)
-               VALUES (?1,?2,?3,1,'authenticated',?4,?5)
-               ON CONFLICT(id) DO UPDATE SET name=excluded.name,codex_home=excluded.codex_home,active=1,status='authenticated',updated_at=excluded.updated_at`,
-          params:[String(candidate.id), String(candidate.name || 'Codex Account'), String(candidate.codex_home), Number(candidate.created_at || now), now],
+          sql:`INSERT INTO codex_profiles (id,name,codex_home,active,status,email,display_name,metadata_status,metadata_error,metadata_updated_at,created_at,updated_at)
+               VALUES (?1,?2,?3,1,'authenticated',?4,?5,?6,?7,?8,?9,?10)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name,codex_home=excluded.codex_home,active=1,status='authenticated',
+                 email=COALESCE(excluded.email,codex_profiles.email),display_name=COALESCE(excluded.display_name,codex_profiles.display_name),
+                 metadata_status=excluded.metadata_status,metadata_error=excluded.metadata_error,metadata_updated_at=excluded.metadata_updated_at,updated_at=excluded.updated_at`,
+          params:[
+            String(candidate.id),
+            String(candidate.name || 'Codex Account'),
+            String(candidate.codex_home),
+            candidate.email || null,
+            candidate.display_name || null,
+            String(candidate.metadata_status || 'pending'),
+            candidate.metadata_error || null,
+            Number(candidate.metadata_updated_at || now),
+            Number(candidate.created_at || now),
+            now,
+          ],
         },
       ]);
     },
@@ -2738,37 +2795,46 @@ async function deleteAntigravityProfileDir(homeDir:string) {
   await rm(parent, { recursive:true, force:true });
 }
 async function profileLoginStatus(codexHome:string) {
-  const email = await readProfileEmail(codexHome).catch(()=>null);
   const ok = existsSync(path.join(codexHome, 'auth.json'));
-  return { ok, email, text: ok ? 'Logged in' : 'Not logged in' };
+  const metadata = ok ? await resolveCodexProfileMetadata(codexHome) : { status:'failed' as const, email:null, displayName:null, error:'未找到 Codex 登录凭据' };
+  return { ok, email:metadata.email, displayName:metadata.displayName, metadataStatus:metadata.status, metadataError:metadata.error || undefined, text:ok ? 'Logged in' : 'Not logged in' };
 }
-async function updateProfileEmailName(id:string, codexHome:string) {
-  const email = await readProfileEmail(codexHome).catch(()=>null);
-  if (!email) return;
-  await setProfileName(id, email);
-}
-async function setProfileName(id:string, name:string) { await db.run('UPDATE codex_profiles SET name=?1, updated_at=?2 WHERE id=?3', [name, Date.now(), id]); }
-async function readProfileEmail(codexHome:string): Promise<string|null> {
-  const raw = await readFile(path.join(codexHome, 'auth.json'), 'utf8');
-  const json = JSON.parse(raw);
-  const found = findEmail(json);
-  return found ? found.slice(0, 120) : null;
-}
-function findEmail(value:any): string|null {
-  if (!value) return null;
-  if (typeof value === 'string') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? value : null;
-  if (Array.isArray(value)) { for (const x of value) { const found = findEmail(x); if (found) return found; } return null; }
-  if (typeof value === 'object') {
-    for (const key of ['email','email_address','account_email','login']) {
-      const found = findEmail(value[key]);
-      if (found) return found;
-    }
-    for (const x of Object.values(value)) {
-      const found = findEmail(x);
-      if (found) return found;
-    }
+async function resolveCodexProfileMetadata(codexHome:string) {
+  try {
+    const raw = await readFile(path.join(codexHome, 'auth.json'), 'utf8');
+    return resolveCodexProfileMetadataFromAuth(JSON.parse(raw));
+  } catch {
+    return { email:null, displayName:null, status:'failed' as const, error:'账户信息读取失败：无法解析本地认证凭据' };
   }
-  return null;
+}
+async function refreshCodexProfileMetadata(id:string, codexHome:string) {
+  await db.run("UPDATE codex_profiles SET metadata_status='pending',metadata_error=NULL,updated_at=?1 WHERE id=?2", [Date.now(), id]);
+  const metadata = await resolveCodexProfileMetadata(codexHome);
+  const now = Date.now();
+  if (metadata.status === 'ready') {
+    await db.run(
+      `UPDATE codex_profiles
+          SET email=?1,display_name=?2,name=?1,metadata_status='ready',metadata_error=NULL,metadata_updated_at=?3,
+              status=CASE WHEN status='unresolved_identity' THEN 'authenticated' ELSE status END,updated_at=?3
+        WHERE id=?4`,
+      [metadata.email, metadata.displayName || null, now, id]
+    );
+  } else {
+    await db.run(
+      "UPDATE codex_profiles SET metadata_status='failed',metadata_error=?1,metadata_updated_at=?2,updated_at=?2 WHERE id=?3",
+      [metadata.error, now, id]
+    );
+  }
+  invalidateUnifiedProviderStatuses();
+  return metadata;
+}
+function codexMetadataLabel(profile:any) {
+  const status = String(profile?.metadata_status || profile?.metadataStatus || 'pending');
+  if (status === 'failed') return '账户信息读取失败，可重试';
+  return '正在读取账户信息';
+}
+async function readProfileEmail(codexHome:string): Promise<string|null> {
+  return (await resolveCodexProfileMetadata(codexHome)).email;
 }
 function cleanProfileName(name:string) { return name.replace(/[^\w .@-]/g, '_').trim().slice(0, 60) || 'Codex Account'; }
 function profileDisplayName(name:any){ const v = String(name || '').trim(); return v && v !== 'Default' ? v : 'ChatGPT'; }
@@ -3530,7 +3596,7 @@ async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId
   const active = { child, state:'running' as AntigravityTurnState, assistantId:itemId, turnId:String(row.active_turn_id || '') };
   activeAntigravityTurns.set(threadId, active);
   const result = await runAntigravityChild(child, {
-    timeoutMs:Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS || 30 * 60 * 1000),
+    timeoutMs:Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS || DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS),
     cleanOutput:cleanAgentOutput,
     onDelta:delta => {
       if (delta.trim()) broadcast(threadId,{type:'codex', method:'item/agentMessage/delta', params:{ itemId, delta }});

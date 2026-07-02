@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import {
   AntigravityProcessError,
+  DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS,
   finalizeAntigravityTurn,
   runAntigravityChild,
   stableAntigravityAssistantId,
@@ -24,6 +25,10 @@ class FakeChild extends EventEmitter {
 }
 
 const clean = value => String(value).trim();
+
+test('default Antigravity turn timeout is two hours', () => {
+  assert.equal(DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS, 2 * 60 * 60 * 1000);
+});
 
 async function processResult(sequence) {
   const child = new FakeChild();
