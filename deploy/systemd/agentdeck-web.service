@@ -2,23 +2,26 @@
 Description=Agent Deck web gateway
 After=network-online.target agentdeck-runtime.service
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-User=agentdeck
-Group=agentdeck
-WorkingDirectory=/opt/agentdeck
-Environment=HOME=/var/lib/agentdeck/home
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/stacks/agentdeck
+Environment=HOME=/home/ubuntu
+Environment=DATA_DIR=/opt/data/agentdeck
 Environment=USE_AGENT_RUNTIME=1
 Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
 EnvironmentFile=/etc/agentdeck/web.env
-ExecStart=/usr/bin/node /opt/agentdeck/server/dist/index.js
-Restart=always
-RestartSec=3
+ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/index.js
+Restart=on-failure
+RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/agentdeck /opt/agentdeck /tmp
+ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /tmp /run
 
 [Install]
 WantedBy=multi-user.target

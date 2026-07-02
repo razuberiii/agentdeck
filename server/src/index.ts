@@ -238,6 +238,55 @@ app.get('/api/providers/status', { preHandler: ensureAuth }, async (req:any) => 
   const providers = await unifiedProviderStatuses(req.query?.refresh === '1');
   return { providers, checkedAt:new Date().toISOString() };
 });
+app.get('/api/diagnostics', { preHandler: ensureAuth }, async () => {
+  const settings = await appSettings();
+  const providerStatuses = await unifiedProviderStatuses(false);
+  const activeProvider = settings.activeProvider;
+  const activeStatus = providerStatuses[activeProvider];
+  const session = await diagnosticSession();
+  const runtimeInfo = await runtime.diagnostics().catch((e:any)=>({ error:e?.message || String(e) }));
+  const profileId = String(activeStatus?.activeProfileId || activeStatus?.accountSummary?.profileId || '');
+  const appServer = activeProvider === 'codex' && profileId ? diagnosticCodexAppServer(profileId) : null;
+  return {
+    commit: await currentCommit(),
+    web: {
+      ok:true,
+      pid:process.pid,
+      status:'ready',
+      runtimeSubscriptions:[...runtimeSubscriptions.entries()].map(([sessionId,state]) => ({
+        sessionId,
+        connected:state.connected,
+        runtimeLatestSequence:state.lastSequence,
+        generation:state.generation || null,
+        subscriberCount:clients.get(sessionId)?.size || 0,
+      })),
+      counters:runtimeDiagnostics,
+    },
+    runtime: runtimeInfo,
+    provider: {
+      activeProvider,
+      activeProfileId:activeStatus?.activeProfileId || null,
+      accountEmail:activeStatus?.accountSummary?.email || activeStatus?.account?.email || null,
+      checkedAt:activeStatus?.checkedAt || null,
+      canCreateSession:!!activeStatus?.canCreateSession,
+      canContinueSession:!!activeStatus?.canContinueSession,
+      status:activeStatus ? {
+        availability:activeStatus.availability,
+        auth:activeStatus.auth,
+        reasonCode:activeStatus.reasonCode || null,
+        message:activeStatus.message || null,
+      } : null,
+    },
+    session,
+    appServer,
+    sequenceTerms: {
+      runtimeLatestSequence:'Runtime persisted event high-water mark.',
+      snapshotCoveredSequence:'Sequence covered by the current HTTP/thread snapshot.',
+      browserAppliedSequence:'Highest sequence the browser has rendered locally.',
+      browserAcknowledgedSequence:'Highest sequence the browser has reported back to the server.',
+    },
+  };
+});
 app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
   local: {
     ...runtimeDiagnostics,
@@ -3402,6 +3451,45 @@ async function replayRuntimeEventsToWs(threadId:string, ws:any, after:number) {
 async function runtimeLatestSequence(threadId:string) {
   const row = await runtimeDb.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1', [threadId]);
   return Number(row?.sequence || 0);
+}
+async function currentCommit() {
+  try {
+    const { stdout } = await execFileAsync('git', ['rev-parse', '--short=12', 'HEAD'], { cwd:process.cwd(), maxBuffer:64 * 1024 });
+    return stdout.trim() || 'unknown';
+  } catch {
+    return process.env.AGENTDECK_COMMIT || 'unknown';
+  }
+}
+async function diagnosticSession() {
+  const row = await runtimeDb.get(
+    `SELECT id,status,active_turn_id,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_sequence,upstream_generation,provider_id,provider,updated_at
+       FROM sessions
+      ORDER BY CASE WHEN status IN ('running','submitting') THEN 0 ELSE 1 END, updated_at DESC
+      LIMIT 1`
+  ).catch(()=>null);
+  if (!row) return null;
+  return {
+    currentSessionId:String(row.id || ''),
+    currentTurnId:row.active_turn_id || null,
+    provider:normalizeProvider(row.provider_id || row.provider) || 'codex',
+    status:String(row.status || 'unknown'),
+    creatorProfileId:row.creator_profile_id || null,
+    selectedProfileId:row.selected_profile_id || null,
+    executingProfileId:row.executing_profile_id || null,
+    upstreamBindingProfileId:row.upstream_binding_profile_id || null,
+    runtimeLatestSequence:Number(row.last_sequence || 0),
+    runtimeGeneration:row.upstream_generation || null,
+  };
+}
+function diagnosticCodexAppServer(profileId:string) {
+  const safe = /^[a-f0-9]{16}$/i.test(profileId) || profileId === 'default' ? profileId : '';
+  if (!safe) return null;
+  return {
+    unit: codexAppServerUnitName(safe),
+    endpoint: codexAppServerEndpoint(safe),
+    health: 'checked_by_runtime',
+    providerProcessPid: null,
+  };
 }
 async function inferredRuntimeStatus(threadId:string, fallback:string) {
   const row = await runtimeDb.get(

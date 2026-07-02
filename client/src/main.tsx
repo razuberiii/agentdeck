@@ -141,6 +141,7 @@ function App(){
   if(!checked) return <main className="boot">{APP_NAME}</main>;
   if(!authed) return <Login onLogin={()=>setAuthed(true)}/>;
   const m=view.match(/^#\/s\/([^/]+)/);
+  if(view==='#/diagnostics') return <DiagnosticsView/>;
   return m ? <SessionView id={m[1]}/> : <Home/>;
 }
 
@@ -148,6 +149,35 @@ function Login({onLogin}:{onLogin:()=>void}){
   const toast=useToast(); const [password,setPassword]=useState(''); const [busy,setBusy]=useState(false);
   async function submit(e:any){ e.preventDefault(); setBusy(true); try{ await api('/api/login',{method:'POST',body:JSON.stringify({username:'admin',password})}); haptic(); onLogin(); } catch { toast('error','登录失败'); } finally { setBusy(false); } }
   return <main className="login"><form onSubmit={submit} className="loginPanel"><div className="mark">AD</div><h1>{APP_NAME}</h1><input autoFocus type="password" placeholder="管理员密码" value={password} onChange={e=>setPassword(e.target.value)}/><button className="btn primary" disabled={busy}>{busy?'登录中':'登录'}</button></form></main>;
+}
+
+function DiagnosticsView(){
+  const toast=useToast();
+  const [data,setData]=useState<any>(null);
+  const [loading,setLoading]=useState(true);
+  const [error,setError]=useState('');
+  useEffect(()=>{ refresh(); },[]);
+  async function refresh(){ setLoading(true); setError(''); try{ setData(await api('/api/diagnostics')); } catch(e:any){ const msg=shortError(e); setError(msg); toast('error','诊断读取失败：'+msg); } finally { setLoading(false); } }
+  const provider=data?.provider||{};
+  const session=data?.session||{};
+  const runtime=data?.runtime||{};
+  const web=data?.web||{};
+  return <main className="appShell diagnosticPage">
+    <header className="homeTop"><div><strong>诊断</strong><span>运行状态、Provider 和事件序列</span></div><div className="iconRow"><button className="iconBtn" aria-label="返回" onClick={()=>{location.hash='#/'}}>‹</button><button className="iconBtn" aria-label="刷新" disabled={loading} onClick={refresh}>↻</button></div></header>
+    {error&&<ErrorState title="诊断读取失败" detail={error} action="重试" onAction={refresh}/>}
+    {loading&&!data&&<LoadingRows count={5}/>}
+    {data&&<div className="diagnosticGrid">
+      <DiagnosticSection title="版本" rows={[['Commit',data.commit],['Web',web.status||'ready'],['Runtime',runtime.error?'异常':'ready'],['PID',String(web.pid||'')]]}/>
+      <DiagnosticSection title="Provider" rows={[['Agent',providerLabel(provider.activeProvider)],['Active Profile',provider.activeProfileId||'无'],['Email',provider.accountEmail||'无'],['Checked At',provider.checkedAt||'无'],['Create',String(!!provider.canCreateSession)],['Continue',String(!!provider.canContinueSession)],['Auth',provider.status?.auth||'unknown'],['Availability',provider.status?.availability||'unknown'],['Reason',provider.status?.reasonCode||'无']]}/>
+      <DiagnosticSection title="Session" rows={[['Session',session.currentSessionId||'无'],['Turn',session.currentTurnId||'无'],['Status',session.status||'无'],['Creator',session.creatorProfileId||'无'],['Selected',session.selectedProfileId||'无'],['Executing',session.executingProfileId||'无'],['Binding',session.upstreamBindingProfileId||'无'],['Runtime Seq',String(session.runtimeLatestSequence||0)],['Generation',session.runtimeGeneration||'无']]}/>
+      <DiagnosticSection title="App Server" rows={[['Unit',data.appServer?.unit||'无'],['Endpoint',data.appServer?.endpoint||'无'],['Health',data.appServer?.health||'无'],['PID',data.appServer?.providerProcessPid||'由 Runtime 检查']]}/>
+      <DiagnosticSection title="Events" rows={[['Runtime subscribers',String(runtime.activeSseSubscriberTotal ?? runtime.activeSseSubscriberCount ?? 0)],['Web subscribers',String((web.runtimeSubscriptions||[]).reduce((sum:number,s:any)=>sum+Number(s.subscriberCount||0),0))],['Replay calls',String(web.counters?.replayCalls||0)],['Browser applied',localStorage.getItem(sequenceKey(session.currentSessionId||'')) || '0'],['Browser acknowledged','WebSocket join lastSequence']]}/>
+      <DiagnosticSection title="Sequence Terms" rows={Object.entries(data.sequenceTerms||{}).map(([k,v])=>[k,String(v)])}/>
+    </div>}
+  </main>;
+}
+function DiagnosticSection({title,rows}:{title:string;rows:[string,string][]}){
+  return <section className="diagnosticSection"><b>{title}</b>{rows.map(([k,v])=><div key={k}><span>{k}</span><strong>{v || '无'}</strong></div>)}</section>;
 }
 
 function Home(){
@@ -183,7 +213,7 @@ function Home(){
   return <main className="appShell">
     <header className="homeTop">
       <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(activeProvider)} · {modeLabel(status?.defaultMode)}</span></div>
-      <div className="iconRow"><button className="iconBtn" aria-label="设置" onClick={()=>showSettings()}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}>↻</button></div>
+      <div className="iconRow"><button className="iconBtn" aria-label="诊断" onClick={()=>{location.hash='#/diagnostics'}}>i</button><button className="iconBtn" aria-label="设置" onClick={()=>showSettings()}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}>↻</button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="statusStrip">
@@ -647,6 +677,7 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
         <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
         <button onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.canListModels ? modelLabel(currentModel) : providerAuthLabel(activeProviderStatus)}</small></span><i>›</i></button>
         <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
+        <button onClick={()=>{location.hash='#/diagnostics'; onClose();}}><span><b>诊断</b><small>Runtime、Provider 和事件序列</small></span><i>›</i></button>
       </div>}
       {page==='agent'&&<section className="agentProviderPage"><div className="providerChoices">
         <button className={activeProvider==='codex'?'active':''} aria-pressed={activeProvider==='codex'} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{providerChoiceStatus(codexProviderStatus)}</small></span><i/></button>
