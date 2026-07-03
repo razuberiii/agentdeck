@@ -13,6 +13,9 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
 import { GeminiAcpRuntime, GeminiModelSwitchUnsupportedError } from './acp/gemini-runtime.js';
+import { ClaudeRuntimeManager } from './claude/claude-runtime-manager.js';
+import { ClaudeProfileStore } from './claude/claude-profile-store.js';
+import type { ClaudeProfile } from './claude/claude-types.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -172,6 +175,7 @@ class CodexAccountRuntime extends EventEmitter {
 const db = new Db(DB_FILE);
 await db.init();
 await initRuntimeSchema();
+const claudeProfileStore = new ClaudeProfileStore(db, DATA_DIR, process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'));
 class GeminiRuntimeManager {
   private runtimes = new Map<string, GeminiAcpRuntime>();
   private inFlight = new Map<string, Promise<GeminiAcpRuntime>>();
@@ -289,6 +293,15 @@ class GeminiRuntimeManager {
 }
 
 const geminiManager = new GeminiRuntimeManager();
+const claudeManager = new ClaudeRuntimeManager(db, claudeProfileStore, {
+  appendEvent,
+  updateSession: updateRuntimeSession,
+  logger: {
+    info: (obj:any, msg?:string) => app.log.info(obj, msg),
+    warn: (obj:any, msg?:string) => app.log.warn(obj, msg),
+    error: (obj:any, msg?:string) => app.log.error(obj, msg),
+  },
+});
 
 const subscriptions = new Map<string, Set<any>>();
 const runtimes = new Map<string, CodexAccountRuntime>();
@@ -397,6 +410,11 @@ app.post('/gemini/profiles/:id/dispose', async (req:any) => geminiManager.dispos
 app.post('/gemini/approvals/:id', async (req:any, reply) => {
   const optionId = typeof req.body?.optionId === 'string' ? req.body.optionId : null;
   if (!geminiManager.answerPermission(String(req.params.id), optionId)) return reply.code(404).send({ error:'approval request not found' });
+  return { ok:true };
+});
+app.post('/claude/approvals/:id', async (req:any, reply) => {
+  const decision = req.body?.decision === 'accept_session' ? 'accept_session' : req.body?.decision === 'decline' ? 'decline' : 'accept';
+  if (!await claudeManager.answerApproval(String(req.params.id), decision)) return reply.code(404).send({ error:'approval request not found' });
   return { ok:true };
 });
 
@@ -521,6 +539,24 @@ app.post('/gemini/sessions', async (req:any, reply) => {
       gemini:await geminiManager.status(accountId),
     });
   }
+});
+
+app.post('/claude/sessions', async (req:any, reply) => {
+  if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
+  const body = req.body || {};
+  const cwd = String(body.cwd || DEFAULT_WORKDIR);
+  const localSessionId = String(body.sessionId || crypto.randomUUID());
+  const profile = validateClaudeProfileForRuntime(body.profile, body.accountId);
+  const now = Date.now();
+  const opts = turnOptions(body);
+  await db.run(
+    `INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id)
+     VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'claude',?9,?7,?2,NULL,'claude',NULL,NULL,0,NULL,?9,?9,?9,?10,?9,?9,?9,?9)
+     ON CONFLICT(id) DO UPDATE SET project_dir=excluded.project_dir,title=excluded.title,provider_id='claude',provider='claude',updated_at=excluded.updated_at`,
+    [localSessionId, cwd, cleanTitle(body.title || path.basename(cwd), cwd), opts.permissionMode, opts.approvalPolicy, opts.sandboxMode, opts.model || null, now, profile.id, JSON.stringify(body.accountSnapshot || null)]
+  );
+  await appendEvent(localSessionId, 'claude/session_created', { provider:'claude', profileId:profile.id, cwd });
+  return { session: await getSession(localSessionId), providerSessionId:null };
 });
 
 app.post('/gemini/sessions/:id/model', async (req:any, reply) => {
@@ -676,6 +712,33 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
       return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId) });
     }
   }
+  if (session.provider_id === 'claude' || session.provider === 'claude') {
+    const body = req.body || {};
+    const profile = validateClaudeProfileForRuntime(body.profile, body.accountId || session.current_upstream_account_id || session.account_id);
+    const previousProfileId = String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || '');
+    const profileSwitched = !!previousProfileId && previousProfileId !== profile.id;
+    const input = Array.isArray(body.input) ? body.input : [{ type:'text', text:String(body.text || '') }];
+    const text = String(body.text || input.map((x:any)=>x?.text || '').filter(Boolean).join('\n\n'));
+    if (!text.trim() && !input.length) return reply.code(400).send({ error:'empty message' });
+    const turnId = String(body.turnId || crypto.randomUUID());
+    await db.run('UPDATE sessions SET selected_profile_id=?1,executing_profile_id=?1,current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [profile.id, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
+    await appendEvent(session.id, 'user', { input, provider:'claude', profileId:profile.id, profileSwitched });
+    if (profileSwitched) await appendEvent(session.id, 'system', { provider:'claude', text:'已切换 Claude Code profile；下一轮使用本地历史在新 profile 下继续。', previousProfileId, profileId:profile.id });
+    const permissionMode = claudePermissionMode(body.permissionMode || session.permission_mode);
+    const task = claudeManager.startTurn({
+      localSessionId:session.id,
+      cwd:String(body.cwd || session.project_dir),
+      text,
+      input,
+      model:body.model || session.model || null,
+      permissionMode,
+      resume:profileSwitched ? null : session.provider_session_id || session.upstream_thread_id || null,
+      profile,
+      turnId,
+    });
+    task.catch(e => app.log.warn({ provider:'claude', sessionId:session.id, error:e?.message || String(e) }, 'claude turn failed'));
+    return { ok:true, provider:'claude' };
+  }
   const body = req.body || {};
   const accountId = String(body.accountId || '').trim();
   if (!accountId) return reply.code(409).send({ code:'codex_executing_profile_required', message:'Codex 继续会话需要明确的 executingProfileId', canContinueSession:false });
@@ -765,6 +828,7 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
   if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || 'default'))).cancel(session.id);
+  if (session.provider_id === 'claude' || session.provider === 'claude') return claudeManager.cancel(session.id);
   if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
   const account = await getAccount(String(session.current_upstream_account_id || session.last_execution_account_id || session.executing_profile_id || session.account_id || ''));
   if (!account) return reply.code(409).send({ error:'account not found' });
@@ -796,6 +860,7 @@ setInterval(() => {
 async function initRuntimeSchema() {
   await db.run('CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, codex_home TEXT, runtime_instance_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
   await db.run('CREATE TABLE IF NOT EXISTS runtime_instances (instance_id TEXT PRIMARY KEY, pid INTEGER, started_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL)');
+  await db.run("CREATE TABLE IF NOT EXISTS claude_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, profile_dir TEXT NOT NULL UNIQUE, config_dir TEXT NOT NULL UNIQUE, type TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'not_configured', credential_summary TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   await db.run('INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at', [INSTANCE_ID, process.pid, Date.now()]);
   await db.run('ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT \'codex\'').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
@@ -830,6 +895,35 @@ async function initRuntimeSchema() {
   await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_key ON events(session_id, event_key)');
   await db.run('CREATE INDEX IF NOT EXISTS idx_events_session_type_sequence ON events(session_id, event_type, sequence)');
   await db.run('CREATE INDEX IF NOT EXISTS idx_sessions_upstream_thread_id ON sessions(upstream_thread_id)');
+}
+
+function validateClaudeProfileForRuntime(raw:any, fallbackId?:any): ClaudeProfile {
+  const id = String(raw?.id || fallbackId || '').trim();
+  const profileDir = String(raw?.profileDir || raw?.profile_dir || '').trim();
+  const configDir = String(raw?.configDir || raw?.config_dir || '').trim();
+  if (!/^[a-f0-9]{16}$/i.test(id) && id !== 'default') throw new Error('bad Claude profile id');
+  if (!profileDir || !configDir) throw new Error('Claude profile details required');
+  return {
+    id,
+    name:String(raw?.name || 'Claude Code Account'),
+    profileDir,
+    configDir,
+    type:['existing_cli','setup_token','api_key'].includes(String(raw?.type)) ? raw.type : 'existing_cli',
+    active:!!raw?.active,
+    status:['not_installed','not_configured','authenticated','invalid_credentials','runtime_unavailable','capability_limited'].includes(String(raw?.status)) ? raw.status : 'authenticated',
+    credentialSummary:raw?.credentialSummary || raw?.credential_summary || null,
+    createdAt:Number(raw?.createdAt || raw?.created_at || 0),
+    updatedAt:Number(raw?.updatedAt || raw?.updated_at || 0),
+  };
+}
+
+function claudePermissionMode(mode:any) {
+  const v = String(mode || '');
+  if (v === 'read-only') return 'default';
+  if (v === 'workspace-write') return 'acceptEdits';
+  if (v === 'plan') return 'plan';
+  if (v === 'yolo') return 'bypassPermissions';
+  return 'default';
 }
 
 function normalizeGeminiProfileId(value:string) {

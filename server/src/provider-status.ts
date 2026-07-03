@@ -1,4 +1,7 @@
-export type ProviderId = 'codex' | 'gemini' | 'antigravity';
+import type { AgentProviderId as ProviderId } from './provider-registry.js';
+import { PROVIDER_DEFINITIONS } from './provider-registry.js';
+
+export type { ProviderId };
 export type ProviderAvailability = 'checking' | 'ready' | 'unavailable' | 'error';
 export type ProviderAuth = 'checking' | 'authenticated' | 'unauthenticated' | 'authenticating' | 'unknown' | 'not_applicable' | 'error';
 
@@ -93,7 +96,7 @@ export function providerStatus(input: ProviderStatusInput): ProviderStatus {
     canContinueSession: input.canContinueSession ?? canCreateSession,
     canManageAccounts: input.canManageAccounts ?? true,
     canLogout: input.canLogout ?? input.auth === 'authenticated',
-    canQueryQuota: input.canQueryQuota ?? input.provider === 'codex',
+    canQueryQuota: input.canQueryQuota ?? !!PROVIDER_DEFINITIONS[input.provider]?.quotaSupport,
     canListModels,
     canSelectModel: input.canSelectModel ?? canListModels,
     capabilities: input.capabilities || {},

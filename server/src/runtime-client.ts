@@ -27,8 +27,10 @@ export class RuntimeClient {
   restartGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/restart`); }
   disposeGeminiProfile(profileId:string) { return this.request('POST', `/gemini/profiles/${encodeURIComponent(profileId)}/dispose`); }
   answerGeminiApproval(requestId:string, body:any) { return this.request('POST', `/gemini/approvals/${encodeURIComponent(requestId)}`, body); }
+  answerClaudeApproval(requestId:string, body:any) { return this.request('POST', `/claude/approvals/${encodeURIComponent(requestId)}`, body); }
   createCodexSession(body:any) { return this.request('POST', '/codex/sessions', body); }
   createGeminiSession(body:any) { return this.request('POST', '/gemini/sessions', body); }
+  createClaudeSession(body:any) { return this.request('POST', '/claude/sessions', body); }
   setGeminiSessionModel(id:string, model:string | null) { return this.request('POST', `/gemini/sessions/${encodeURIComponent(id)}/model`, { model }); }
   resumeCodexSession(body:any) { return this.request('POST', '/codex/sessions/resume', body); }
   listSessions(archived = false) { return this.request('GET', `/sessions?archived=${archived ? '1' : '0'}`); }

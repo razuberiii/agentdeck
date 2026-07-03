@@ -20,9 +20,13 @@ import { pipeline } from 'node:stream/promises';
 import { Db } from './db.js';
 import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
-import { AntigravityProvider, GeminiProvider, type AgentProviderId } from './providers.js';
+import { AntigravityProvider, GeminiProvider } from './providers.js';
+import { ClaudeProvider } from './claude/claude-provider.js';
+import { ClaudeProfileStore } from './claude/claude-profile-store.js';
+import { claudeAuthState } from './claude/claude-auth.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
+import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, type AgentProviderId } from './provider-registry.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
 import { resolveCodexProfileMetadataFromAuth } from './codex-profile-metadata.js';
@@ -35,6 +39,7 @@ const ANTIGRAVITY_BIN = process.env.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const ANTIGRAVITY_PROFILES_DIR = path.join(DATA_DIR, 'antigravity-profiles');
 const GEMINI_PROFILES_DIR = path.join(DATA_DIR, 'gemini', 'profiles');
+const CLAUDE_PROFILES_DIR = path.join(DATA_DIR, 'claude', 'profiles');
 const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
@@ -59,6 +64,8 @@ const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
 const antigravity = new AntigravityProvider();
 const geminiProvider = new GeminiProvider();
+const claudeProvider = new ClaudeProvider();
+const claudeProfileStore = new ClaudeProfileStore(db, DATA_DIR, process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'));
 const clients = new Map<string, Set<any>>();
 let websocketConnectionGeneration = 0;
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
@@ -110,6 +117,7 @@ let projectsCache: { expiresAt:number; promise?:Promise<any[]>; value?:any[] } =
 let codexStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let antigravityStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let geminiStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
+let claudeStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let unifiedProviderStatusCache: { expiresAt:number; promise?:Promise<Record<AgentProviderId, ProviderStatus>>; value?:Record<AgentProviderId, ProviderStatus>; generation:number } = { expiresAt: 0, generation: 0 };
 let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any>; value?:any } = { key:'', expiresAt: 0 };
 let shutdownRequested = false;
@@ -155,6 +163,7 @@ await db.run('ALTER TABLE artifacts ADD COLUMN modified_at INTEGER').catch(()=>{
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, profile_id TEXT, temp_home TEXT, method_id TEXT, status TEXT NOT NULL, error TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
+await claudeProfileStore.initSchema();
 await db.run("ALTER TABLE codex_profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'authenticated'").catch(()=>{});
 await db.run("ALTER TABLE codex_profiles ADD COLUMN email TEXT").catch(()=>{});
 await db.run("ALTER TABLE codex_profiles ADD COLUMN display_name TEXT").catch(()=>{});
@@ -205,7 +214,9 @@ app.get('/api/status', async (req) => {
     activeProfile,
     activeGeminiProfile,
     activeAntigravityProfile,
+    activeClaudeProfile,
     codexStatus,
+    claudeStatus,
     antigravityStatus,
     geminiStatus,
     geminiRuntime,
@@ -215,7 +226,9 @@ app.get('/api/status', async (req) => {
     getActiveProfile(),
     getActiveGeminiProfile(),
     getActiveAntigravityProfile(),
+    activeClaudeProfileSummary(),
     cachedCodexStatus(),
+    cachedClaudeStatus(force),
     cachedAntigravityStatus(force),
     cachedGeminiStatus(force),
     USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
@@ -223,12 +236,13 @@ app.get('/api/status', async (req) => {
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
-  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeGeminiProfile, activeAntigravityProfile, geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
+  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
   const settings = await appSettings();
   const codexStatus = cachedCodexStatusSnapshot();
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
+  const claudeStatus = cachedProviderStatusSnapshot('claude', claudeStatusCache.value);
   const antigravityStatus = cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value);
   const providerStatuses = await unifiedProviderStatuses(false);
   return {
@@ -236,6 +250,7 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     authenticated:true,
     serverTime:Date.now(),
     codex:codexStatus,
+    claude:claudeStatus,
     gemini:geminiStatus,
     antigravity:antigravityStatus,
     providers:providerStatusArray(providerStatuses),
@@ -248,6 +263,7 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     defaultModel:settings.defaultModel,
     defaultModels:settings.defaultModels,
     activeProfile:await activeCodexProfileSummary(),
+    activeClaudeProfile:await activeClaudeProfileSummary(),
     activeGeminiProfile:await activeGeminiProfileSummary(),
     activeAntigravityProfile:await activeAntigravityProfileSummary(),
     capabilities:attachmentCapabilities(null),
@@ -339,6 +355,20 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
       checkedAt: Date.now(),
     };
   }
+  if (provider === 'claude') {
+    const providerStatuses = await unifiedProviderStatuses(false);
+    return {
+      provider:'claude',
+      providerId:'claude',
+      supported:false,
+      providerStatus:providerStatuses.claude,
+      account:providerStatuses.claude?.accountSummary || providerStatuses.claude?.account || null,
+      rateLimits:null,
+      message:'Claude Agent SDK 返回 usage/cost，但没有稳定账户剩余额度接口。',
+      errors:{},
+      checkedAt:Date.now(),
+    };
+  }
   if (provider === 'antigravity') {
     const status = await cachedAntigravityStatus();
     const activeProfile:any = await getActiveAntigravityProfile();
@@ -382,6 +412,8 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const [
     settings,
     profiles,
+    claudeProfiles,
+    activeClaudeProfile,
     pendingProfiles,
     activeProfile,
     geminiProfiles,
@@ -390,6 +422,7 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     antigravityProfiles,
     activeAntigravityProfile,
     codexStatus,
+    claudeStatus,
     antigravityStatus,
     geminiStatus,
     geminiRuntime,
@@ -397,6 +430,8 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   ] = await Promise.all([
     appSettings(),
     listProfiles(),
+    listClaudeProfiles(),
+    activeClaudeProfileSummary(),
     listPendingProfiles(),
     getActiveProfile(),
     listGeminiProfiles(),
@@ -405,13 +440,14 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     listAntigravityProfiles(),
     getActiveAntigravityProfile(),
     light ? Promise.resolve(cachedCodexStatusSnapshot()) : cachedCodexStatus(),
+    light ? Promise.resolve(cachedProviderStatusSnapshot('claude', claudeStatusCache.value)) : cachedClaudeStatus(force),
     light ? Promise.resolve(cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value)) : cachedAntigravityStatus(force),
     light ? Promise.resolve(cachedProviderStatusSnapshot('gemini', geminiStatusCache.value)) : cachedGeminiStatus(force),
     light || !USE_AGENT_RUNTIME ? Promise.resolve({ error: light ? 'not refreshed' : 'persistent runtime disabled' }) : runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })),
     unifiedProviderStatuses(force && !light),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
-  return { settings, profiles, pendingProfiles, activeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses };
+  return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]) };
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
@@ -421,13 +457,49 @@ app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultModel')) {
     const settings = await appSettings();
     const modelProvider = normalizeProvider(req.body?.provider) || provider || settings.activeProvider;
-    const model = modelProvider === 'antigravity' || modelProvider === 'gemini' ? cleanAgentModel(req.body?.defaultModel) : cleanModel(req.body?.defaultModel);
+    const model = modelProvider === 'antigravity' || modelProvider === 'gemini' || modelProvider === 'claude' ? cleanAgentModel(req.body?.defaultModel) : cleanModel(req.body?.defaultModel);
     if (modelProvider === 'gemini') await setActiveGeminiDefaultModel(model || null);
-    else await setSetting(modelProvider === 'antigravity' ? 'defaultModelAntigravity' : 'defaultModelCodex', model || '');
+    else await setSetting(modelProvider === 'antigravity' ? 'defaultModelAntigravity' : modelProvider === 'claude' ? 'defaultModelClaude' : 'defaultModelCodex', model || '');
   }
   return { settings: await appSettings() };
 });
 app.get('/api/models', { preHandler: ensureAuth }, async (req:any) => modelCatalog(req.query?.hidden === '1', normalizeProvider(req.query?.provider) || (await appSettings()).activeProvider));
+app.get('/api/claude/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listClaudeProfiles(), activeClaudeProfile: await activeClaudeProfileSummary() }));
+app.post('/api/claude/profiles', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const type = String(req.body?.type || 'existing_cli');
+  if (!['existing_cli','setup_token','api_key'].includes(type)) return reply.code(400).send({ error:'bad profile type' });
+  const profile = await claudeProfileStore.create({
+    name: cleanProfileName(String(req.body?.name || 'Claude Code Account')),
+    type: type as any,
+    token: typeof req.body?.token === 'string' ? req.body.token : undefined,
+    apiKey: typeof req.body?.apiKey === 'string' ? req.body.apiKey : undefined,
+    existingConfigDir: typeof req.body?.configDir === 'string' ? req.body.configDir : undefined,
+  });
+  invalidateUnifiedProviderStatuses();
+  return { profile };
+});
+app.post('/api/claude/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await claudeProfileStore.switch(String(req.params.id)).catch(()=>null);
+  if (!profile) return reply.code(404).send({ error:'profile not found' });
+  invalidateUnifiedProviderStatuses();
+  return { ok:true, activeClaudeProfile: await activeClaudeProfileSummary() };
+});
+app.patch('/api/claude/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profile = await claudeProfileStore.rename(String(req.params.id), String(req.body?.name || '')).catch(()=>null);
+  if (!profile) return reply.code(404).send({ error:'profile not found' });
+  invalidateUnifiedProviderStatuses();
+  return { ok:true, profile };
+});
+app.delete('/api/claude/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const id = String(req.params.id);
+  const running = await db.get("SELECT id FROM sessions WHERE provider_id='claude' AND (current_upstream_account_id=?1 OR (current_upstream_account_id IS NULL AND account_id=?1)) AND status IN ('running','submitting','recovering') LIMIT 1", [id])
+    || await runtimeDb.get("SELECT id FROM sessions WHERE (provider_id='claude' OR provider='claude') AND (current_upstream_account_id=?1 OR (current_upstream_account_id IS NULL AND account_id=?1)) AND status IN ('running','submitting','recovering') LIMIT 1", [id]).catch(()=>null);
+  if (running) return reply.code(409).send({ error:'该 Claude profile 仍有正在运行的会话，不能删除' });
+  const ok = await claudeProfileStore.delete(id);
+  if (!ok) return reply.code(404).send({ error:'profile not found' });
+  invalidateUnifiedProviderStatuses();
+  return { ok:true };
+});
 app.get('/api/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listProfiles(), pendingProfiles: await listPendingProfiles(), activeProfile: await getActiveProfile() }));
 app.post('/api/profiles/:id/metadata/refresh', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile:any = await getProfile(String(req.params.id));
@@ -909,6 +981,31 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     }
     return rowSessionDto(created.session);
   }
+  if (provider === 'claude') {
+    if (!USE_AGENT_RUNTIME) return reply.code(409).send({ error:'Claude Code 需要 persistent runtime' });
+    const activeProfile:any = await activeClaudeProfileSummary();
+    if (!activeProfile?.id) return reply.code(409).send({ error:'请先配置 Claude Code profile' });
+    const id = crypto.randomUUID();
+    const model = cleanAgentModel(req.body?.model) || cleanAgentModel(settings.defaultModels?.claude) || null;
+    const opts = modeOptions(mode, model || undefined);
+    const created = await runtime.createClaudeSession({
+      sessionId:id,
+      accountId:activeProfile.id,
+      profile:activeProfile,
+      accountSnapshot:claudeAccountSnapshot(activeProfile),
+      cwd:projectDir,
+      title,
+      mode,
+      model,
+      approvalPolicy:opts.approvalPolicy,
+      sandboxMode:opts.sandboxMode,
+    }).catch((e:any) => { throw Object.assign(new Error(e?.message || String(e)), { statusCode:e?.statusCode || 502, body:e?.body }); });
+    await db.run(
+      'INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?9,?10,?11,?8,?2,NULL,?11,?11,?11,?11,?11,?11,?12)',
+      [id, projectDir, title, 'idle', opts.approvalPolicy === 'never' ? 'yolo' : mode, opts.approvalPolicy, opts.sandboxMode, model, Date.now(), 'claude', activeProfile.id, JSON.stringify(claudeAccountSnapshot(activeProfile))]
+    ).catch(()=>{});
+    return rowSessionDto(created.session || await findSession(id));
+  }
   const model = cleanModel(req.body?.model) || cleanModel(settings.defaultModels?.codex);
   const codexPreflight = await codexCreateSessionPreflight();
   if (!codexPreflight.ok) return reply.code(codexPreflight.statusCode).send(codexPreflight.body);
@@ -1139,6 +1236,12 @@ app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any
     await runtime.answerGeminiApproval(requestKey, { optionId: preferred?.optionId || null });
     return {ok:true};
   }
+  const claudeApproval = await runtimeDb.get("SELECT session_id FROM events WHERE event_type='approval/requested' AND payload_json LIKE ?1 ORDER BY sequence DESC LIMIT 1", [`%"approvalId":"${requestKey}"%`]).catch(()=>null);
+  if (claudeApproval) {
+    const decision = req.body?.decision === 'decline' ? 'decline' : req.body?.decision === 'accept_session' ? 'accept_session' : 'accept';
+    await runtime.answerClaudeApproval(requestKey, { decision });
+    return { ok:true };
+  }
   const pending = pendingApprovals.get(requestKey);
   if (!pending) return reply.code(404).send({error:'approval request not found'});
   pendingApprovals.delete(requestKey);
@@ -1274,11 +1377,20 @@ async function cachedGeminiStatus(force = false) {
     () => geminiProvider.status({ forceAcpHelp: force })
   );
 }
+async function cachedClaudeStatus(force = false) {
+  return cachedProviderStatus(
+    claudeStatusCache,
+    cache => { claudeStatusCache = cache; },
+    'claudeProvider.status',
+    force,
+    () => claudeProvider.status()
+  );
+}
 function cachedCodexStatusSnapshot() {
   return codexStatusCache.value || { ok:false, error:'Codex CLI 状态尚未刷新', appServer:true, sessionsPath:path.join(DEFAULT_CODEX_HOME, 'sessions') };
 }
 function cachedProviderStatusSnapshot(id:Exclude<AgentProviderId, 'codex'>, status:any) {
-  const displayName = id === 'gemini' ? 'Gemini' : 'Antigravity';
+  const displayName = registryProviderDisplayName(id);
   return status || { id, displayName, ok:false, installed:false, version:null, error:`${displayName} 状态尚未刷新` };
 }
 async function cachedProviderStatus(
@@ -1311,7 +1423,7 @@ function invalidateUnifiedProviderStatuses() {
   unifiedProviderStatusCache = { expiresAt: 0, generation: unifiedProviderStatusCache.generation + 1 };
 }
 function providerStatusArray(statuses:Record<AgentProviderId, ProviderStatus>) {
-  return [statuses.codex, statuses.gemini, statuses.antigravity];
+  return orderedProviderStatusArray(statuses);
 }
 function codexQuotaLogFields(rateLimits:any) {
   const limit = rateLimits?.rateLimitsByLimitId?.codex || rateLimits?.rateLimits || {};
@@ -1331,7 +1443,7 @@ function codexQuotaLogFields(rateLimits:any) {
   };
 }
 function providerDisplayName(provider:AgentProviderId) {
-  return provider === 'gemini' ? 'Gemini' : provider === 'antigravity' ? 'Antigravity' : 'Codex';
+  return registryProviderDisplayName(provider);
 }
 function isGeminiPersonalUnsupportedProfile(profile:any) {
   return String(profile?.authType || profile?.auth_type || profile?.login?.authType || '').toLowerCase() === 'oauth-personal';
@@ -1358,11 +1470,13 @@ async function unifiedProviderStatuses(force = false):Promise<Record<AgentProvid
 }
 async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentProviderId, ProviderStatus>> {
   const checkedAt = new Date().toISOString();
-  const [codexCli, geminiCli, antigravityCli, codexProfile, geminiProfile, antigravityProfile, geminiPendingProfiles, codexPendingProfiles] = await Promise.all([
+  const [codexCli, claudeCli, geminiCli, antigravityCli, codexProfile, claudeProfile, geminiProfile, antigravityProfile, geminiPendingProfiles, codexPendingProfiles] = await Promise.all([
     force ? codexStatus() : cachedCodexStatus().catch((e:any)=>({ ok:false, error:e?.message || String(e) })),
+    cachedClaudeStatus(force).catch((e:any)=>({ id:'claude', displayName:'Claude Code', ok:false, error:e?.message || String(e) })),
     cachedGeminiStatus(force).catch((e:any)=>({ id:'gemini', displayName:'Gemini', ok:false, error:e?.message || String(e) })),
     cachedAntigravityStatus(force).catch((e:any)=>({ id:'antigravity', displayName:'Antigravity', ok:false, error:e?.message || String(e) })),
     activeCodexProfileSummary(),
+    activeClaudeProfileSummary(),
     activeGeminiProfileSummary(),
     activeAntigravityProfileSummary(),
     listGeminiPendingProfiles().catch(()=>[]),
@@ -1381,8 +1495,21 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
   const antigravityEmail = findEmailInText(String(antigravityProfile?.login?.email || antigravityProfile?.name || '')) || undefined;
   const antigravityAuth = antigravityProfile?.id ? 'unknown' : 'unauthenticated';
   const antigravityCanCreate = !!antigravityCli?.ok && !!antigravityProfile?.id && !!antigravityProfile?.login?.ok;
+  const claudeState = claudeAuthState(claudeProfile ? {
+    id:String(claudeProfile.id),
+    name:String(claudeProfile.name || 'Claude Code Account'),
+    profileDir:String(claudeProfile.profileDir || ''),
+    configDir:String(claudeProfile.configDir || ''),
+    type:['existing_cli','setup_token','api_key'].includes(String(claudeProfile.type)) ? claudeProfile.type : 'existing_cli',
+    active:!!claudeProfile.active,
+    status:['not_installed','not_configured','authenticated','invalid_credentials','runtime_unavailable','capability_limited'].includes(String(claudeProfile.status)) ? claudeProfile.status : 'not_configured',
+    credentialSummary:claudeProfile.credentialSummary || null,
+    createdAt:Number(claudeProfile.createdAt || 0),
+    updatedAt:Number(claudeProfile.updatedAt || 0),
+  } as any : null, claudeCli as any);
   const adapterCapabilities = {
     codex: providerCapabilitiesFor('codex'),
+    claude: providerCapabilitiesFor('claude'),
     gemini: providerCapabilitiesFor('gemini'),
     antigravity: providerCapabilitiesFor('antigravity'),
   };
@@ -1406,6 +1533,27 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       message: codexCli?.ok ? (codexAuth === 'authenticated' ? null : '请先登录 Codex') : (codexCli?.error || 'Codex CLI 不可用'),
       checkedAt,
       command:'codex',
+    }),
+    claude: providerStatus({
+      provider:'claude',
+      displayName:'Claude Code',
+      cliStatus: claudeCli,
+      auth: claudeState.auth,
+      activeProfileId: claudeProfile?.id || null,
+      account: claudeProfile?.id ? { id:claudeProfile.id, profileId:claudeProfile.id, displayName:claudeProfile.name, authType:claudeProfile.type } : null,
+      canCreateSession: !!claudeCli?.ok && claudeState.auth === 'authenticated',
+      canContinueSession: !!claudeCli?.ok && claudeState.auth === 'authenticated',
+      canManageAccounts: true,
+      canLogout: !!claudeProfile?.id,
+      canQueryQuota: false,
+      canListModels: true,
+      canSelectModel: true,
+      capabilities: adapterCapabilities.claude,
+      reasonCode: claudeState.status,
+      message: claudeState.message,
+      checkedAt,
+      command:'claude',
+      installHint:'安装 @anthropic-ai/claude-agent-sdk，或设置 CLAUDE_BIN。',
     }),
     gemini: providerStatus({
       provider:'gemini',
@@ -1504,6 +1652,42 @@ async function activeAntigravityProfileSummary() {
     login:{ ok:String(p.status || '') === 'authenticated', email:findEmailInText(name) || undefined, text:'Cached account summary' },
     created_at:Number(p.created_at || 0),
     updated_at:Number(p.updated_at || 0),
+  };
+}
+async function activeClaudeProfileSummary() {
+  const profile = await claudeProfileStore.active();
+  if (!profile) return null;
+  return claudeProfileDto(profile);
+}
+async function listClaudeProfiles() {
+  const profiles = await claudeProfileStore.list();
+  return profiles.map(claudeProfileDto);
+}
+function claudeProfileDto(profile:any) {
+  return {
+    id:String(profile.id),
+    provider:'claude',
+    name:String(profile.name || 'Claude Code Account'),
+    profileDir:String(profile.profileDir || ''),
+    configDir:String(profile.configDir || ''),
+    type:String(profile.type || 'existing_cli'),
+    authType:String(profile.type || 'existing_cli'),
+    state:String(profile.status || 'not_configured'),
+    status:String(profile.status || 'not_configured'),
+    credentialSummary:profile.credentialSummary || null,
+    active:Number(profile.active || 0),
+    login:{ ok:!['not_installed','not_configured','invalid_credentials','runtime_unavailable'].includes(String(profile.status || '')), text:'Claude Code profile configured' },
+    createdAt:Number(profile.createdAt || 0),
+    updatedAt:Number(profile.updatedAt || 0),
+  };
+}
+function claudeAccountSnapshot(profile:any) {
+  return {
+    id:String(profile.id),
+    provider:'claude',
+    name:String(profile.name || 'Claude Code Account'),
+    authType:String(profile.type || profile.authType || 'existing_cli'),
+    timestamp:Date.now(),
   };
 }
 function findEmailInText(value:string) {
@@ -1606,13 +1790,14 @@ async function appSettings() {
   const geminiDefault = await activeGeminiDefaultModel();
   const defaultModels = {
     codex: cleanModel(map.defaultModelCodex) || legacyCodexModel,
+    claude: cleanAgentModel(map.defaultModelClaude) || '',
     gemini: geminiDefault.model || cleanAgentModel(map.defaultModelGemini) || '',
     antigravity: cleanAgentModel(map.defaultModelAntigravity) || legacyAntigravityModel,
   };
   return {
     activeProvider,
     defaultMode: normalizeMode(map.defaultMode) || 'yolo',
-    defaultModel: activeProvider === 'antigravity' ? defaultModels.antigravity : activeProvider === 'gemini' ? defaultModels.gemini : defaultModels.codex,
+    defaultModel: defaultModels[activeProvider as keyof typeof defaultModels] || defaultModels.codex,
     defaultModels,
     defaultModelModes: { gemini:geminiDefault.mode },
   };
@@ -2877,7 +3062,7 @@ function isUsefulAntigravityUsage(text:string){ return /usage|quota|limit|额度
 function redactLine(line:string){ return line.replace(/(token|secret|password|refresh_token|access_token)[^\n]*/ig, '$1=[redacted]'); }
 function shellQuote(value:string) { return `'${value.replaceAll("'", "'\\''")}'`; }
 function normalizeMode(value:any) { const v = String(value || ''); return ['yolo','workspace-write','read-only'].includes(v) ? v : null; }
-function normalizeProvider(value:any): AgentProviderId | null { const v = String(value || ''); return v === 'codex' || v === 'gemini' || v === 'antigravity' ? v : null; }
+function normalizeProvider(value:any): AgentProviderId | null { return registryNormalizeProvider(value); }
 function cleanModel(value:any) { const v = String(value || '').trim(); return /^[\w./:-]{1,120}$/.test(v) ? v : ''; }
 function cleanAgentModel(value:any) { const v = String(value || '').trim(); return /^[\w ./:()+-]{1,160}$/.test(v) ? v : ''; }
 function modeFields(mode:string) {
@@ -2908,6 +3093,9 @@ function providerModelCatalog(result:any) {
   return { models: normalized, current: String(result?.current || normalized.find((m:any)=>m.isDefault)?.model || normalized[0]?.model || ''), error: result?.error || null };
 }
 async function modelCatalog(includeHidden = false, provider: AgentProviderId = 'codex') {
+  if (provider === 'claude') {
+    return providerModelCatalog(await claudeProvider.listModels());
+  }
   if (provider === 'gemini') {
     const activeProfile:any = await getActiveGeminiProfile();
     const rows = await runtimeDb.all(
@@ -3405,6 +3593,31 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     }
     return;
   }
+  if (normalizeProvider(row.provider_id) === 'claude') {
+    const dto:any = await activeClaudeProfileSummary();
+    if (!dto?.id) throw new Error('请先配置 Claude Code profile');
+    const input = await buildClaudeTurnInput(threadId, text, attachments);
+    const userMessage = { type:'user', clientMessageId, status:'persisted', text, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+    const subscription = ensureSessionSubscription(id, threadId);
+    broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['submitting',Date.now(),threadId]).catch(()=>{});
+    await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
+    await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
+    broadcast(threadId, userMessage);
+    ack('persisted');
+    try {
+      await runtime.startTurn(threadId, { input, text, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:row.approval_policy, sandboxMode:row.sandbox_mode, permissionMode:sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['running',Date.now(),threadId]).catch(()=>{});
+      ack('accepted');
+    } catch (e:any) {
+      const message = e?.message || String(e);
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+      ack('failed', message);
+      broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
+      throw e;
+    }
+    return;
+  }
   const input = await buildTurnInput(threadId, text, attachments);
   const title = autoTitle(text, String(row.project_dir), String(row.title || ''));
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
@@ -3722,7 +3935,40 @@ async function runtimeEventMessages(threadId:string, event:any) {
     return out;
   }
   if (eventType === 'approval/requested') {
-    out.push({ type:'approval', requestId:payload?.requestId, method:'gemini/session/request_permission', params:payload?.request || {}, ...base });
+    if (payload?.provider === 'claude') out.push({ type:'approval', requestId:payload?.approvalId || payload?.requestId, method:'claude/canUseTool', params:payload, ...base });
+    else out.push({ type:'approval', requestId:payload?.requestId, method:'gemini/session/request_permission', params:payload?.request || {}, ...base });
+    return out;
+  }
+  if (eventType === 'assistant/delta') {
+    out.push({ type:'codex', method:'item/agentMessage/delta', params:{ itemId:payload?.itemId || `claude-${threadId}`, delta:String(payload?.delta || '') }, ...base });
+    return out;
+  }
+  if (eventType === 'reasoning/delta') {
+    out.push({ type:'codex', method:'item/agentMessage/delta', params:{ itemId:payload?.itemId || `claude-thinking-${threadId}`, delta:String(payload?.delta || '') }, ...base });
+    return out;
+  }
+  if (eventType === 'assistant/message') {
+    out.push({ type:'codex', method:'item/completed', params:{ item:{ id:payload?.itemId || `claude-message-${runtimeSequence}`, type:'agentMessage', text:String(payload?.text || '') } }, ...base });
+    return out;
+  }
+  if (eventType === 'assistant/final') {
+    out.push({ type:'codex', method:'item/completed', params:{ item:{ id:payload?.itemId || `claude-final-${runtimeSequence}`, type:'agentMessage', phase:'final_answer', text:String(payload?.text || '') } }, ...base });
+    return out;
+  }
+  if (eventType === 'tool/use') {
+    out.push({ type:'codex', method:'item/completed', params:{ item:{ id:payload?.toolCallId || `claude-tool-${runtimeSequence}`, type:'toolCall', title:payload?.toolName || 'Claude tool', text:compactJson(payload?.input || {}) } }, ...base });
+    return out;
+  }
+  if (eventType === 'tool/result') {
+    out.push({ type:'codex', method:'item/completed', params:{ item:{ id:`${payload?.toolCallId || runtimeSequence}-result`, type:'toolResult', title:'Tool result', text:typeof payload?.content === 'string' ? payload.content : compactJson(payload?.content || {}) } }, ...base });
+    return out;
+  }
+  if (eventType === 'claude/session_init') {
+    out.push({ type:'system', text:`Claude Code 已初始化 · ${payload?.model || 'default'} · ${payload?.permissionMode || 'default'}`, ...base });
+    return out;
+  }
+  if (eventType === 'system' && payload?.provider === 'claude') {
+    out.push({ type:'system', text:String(payload?.text || ''), ...base });
     return out;
   }
   if (eventType === 'thread_snapshot') {
@@ -3826,6 +4072,7 @@ function statusName(status:any){ if (!status) return 'idle'; const value = rawSt
 function rawStatusName(status:any){ if (!status) return 'idle'; return typeof status === 'string' ? status : status.type || 'idle'; }
 function isFinalAnswerItem(item:any){ return item?.type === 'agentMessage' && item?.phase === 'final_answer' && String(item?.text || '').trim(); }
 function turnFailed(turn:any){ const status=String(turn?.status || ''); return status === 'failed' || status === 'interrupted'; }
+function compactJson(value:any){ try { return JSON.stringify(value).slice(0, 500); } catch { return String(value).slice(0, 500); } }
 function approvalResponse(method:string, decision:'accept'|'decline' = 'accept'){
   if (method.includes('permissions')) return decision === 'decline'
     ? { permissions:{}, scope:'turn' }
@@ -3939,6 +4186,24 @@ async function buildTurnInput(threadId:string, text:string, attachments:any[]){
     const meta = await readAttachmentMeta(threadId, String(a.id));
     if (String(meta.kind || '').startsWith('image') || String(meta.type || meta.mime || '').startsWith('image/')) input.push({ type:'localImage', path: meta.path, detail:'high' });
     else input.push({ type:'text', text:`Attachment: ${meta.name}\nMIME: ${meta.type || meta.mime}\nSize: ${meta.size} bytes\nLocal path: ${meta.path}\nRead this file from the local path if needed.`, text_elements: [] });
+  }
+  if (!input.length) throw new Error('empty message');
+  return input;
+}
+async function buildClaudeTurnInput(threadId:string, text:string, attachments:any[]){
+  const input:any[] = [];
+  if (text.trim()) input.push({ type:'text', text, text_elements: [] });
+  for (const a of attachments) {
+    const meta = await readAttachmentMeta(threadId, String(a.id));
+    input.push({
+      type:'attachment_path',
+      id:String(meta.id),
+      name:String(meta.name || 'attachment'),
+      mime:String(meta.type || meta.mime || ''),
+      kind:String(meta.kind || ''),
+      size:Number(meta.size || 0),
+      path:String(meta.path),
+    });
   }
   if (!input.length) throw new Error('empty message');
   return input;

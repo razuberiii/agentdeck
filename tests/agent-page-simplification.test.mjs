@@ -10,10 +10,11 @@ test('Agent selection page renders provider name with account-aware status', () 
     source.indexOf("{page==='agent'&&"),
     source.indexOf("{page==='mode'&&")
   );
-  assert.match(agentBlock, /providerChoiceDetail\(codexProviderStatus\)/);
-  assert.match(agentBlock, /providerChoiceDetail\(geminiProviderStatus\)/);
-  assert.match(agentBlock, /providerChoiceDetail\(antigravityProviderStatus\)/);
-  assert.match(agentBlock, /providerChoiceNote\(geminiProviderStatus\)/);
+  assert.match(source, /const PROVIDER_ORDER:ProviderId\[\]\s*=\s*\['codex','claude','antigravity','gemini'\]/);
+  assert.match(agentBlock, /PROVIDER_ORDER\.map/);
+  assert.match(agentBlock, /providerStatusById\[provider\]/);
+  assert.match(agentBlock, /providerChoiceDetail\(providerStatusById\[provider\]\)/);
+  assert.match(agentBlock, /providerChoiceNote\(providerStatusById\[provider\]\)/);
   assert.doesNotMatch(agentBlock, /providerSubtitle/);
   assert.doesNotMatch(agentBlock, /providerNotice/);
   assert.doesNotMatch(agentBlock, /version/);

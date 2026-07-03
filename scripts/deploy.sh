@@ -134,6 +134,8 @@ const checks = [
   ['ANTIGRAVITY_BIN', web.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy'],
   ['GEMINI_BIN', runtime.GEMINI_BIN || web.GEMINI_BIN || '/usr/bin/gemini'],
 ];
+const claudeBin = runtime.CLAUDE_BIN || web.CLAUDE_BIN || '';
+if (claudeBin) checks.push(['CLAUDE_BIN', claudeBin]);
 for (const [name, value] of checks) {
   if (!value.startsWith('/')) {
     console.error(`ERROR: ${name} must be an absolute path: ${value}`);

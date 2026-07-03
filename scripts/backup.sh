@@ -17,6 +17,12 @@ fi
 if [ -f "$DATA_DIR/agentdeck-runtime.sqlite3" ]; then
   sqlite3 "$DATA_DIR/agentdeck-runtime.sqlite3" ".backup '$TMP/agentdeck-runtime.sqlite3'"
 fi
+for dir in profiles claude/profiles gemini/profiles antigravity-profiles shared/sessions shared/generated_images attachments; do
+  if [ -e "$DATA_DIR/$dir" ]; then
+    mkdir -p "$TMP/$(dirname "$dir")"
+    cp -a "$DATA_DIR/$dir" "$TMP/$dir"
+  fi
+done
 tar -C "$TMP" -czf "$BACKUP_DIR/agentdeck-$STAMP.tar.gz" .
 rm -rf "$TMP"
 ls -1t "$BACKUP_DIR"/agentdeck-*.tar.gz 2>/dev/null | tail -n +8 | xargs -r rm -f

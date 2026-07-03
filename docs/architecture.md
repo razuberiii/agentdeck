@@ -15,7 +15,7 @@ Runtime
   |
   | Provider protocol
   v
-Codex app-server / Gemini ACP / Antigravity CLI
+Codex app-server / Claude Agent SDK / Antigravity CLI / Gemini ACP
 ```
 
 The Web server handles login to AgentDeck, CSRF and origin checks, file upload/download, static assets, and forwarding events to the browser. The Runtime owns execution state: sessions, turns, provider thread IDs, event sequence, app-server lifecycle, and the active upstream account used for each turn.
@@ -90,6 +90,13 @@ sessions when the upstream personal CLI client is unsupported. AgentDeck reports
 that as `gemini_client_unsupported` with `canCreateSession=false`, not as an
 unauthenticated account. API Key and enterprise-style profiles are evaluated
 separately.
+
+Claude Code is driven through the official Anthropic Agent SDK `query()` API
+with the `claude_code` preset. Runtime stores the returned Claude session ID and
+uses it for later turns. Runtime crash during an active Claude turn is recorded
+as interrupted; AgentDeck does not claim no-loss continuation for in-flight
+provider work. Claude profile secrets live under `DATA_DIR/claude/profiles/`
+with file permissions, not in ordinary SQLite fields or browser events.
 
 `scripts/deploy.sh --check` performs validation without restarting services.
 `--deploy --components web` restarts only Web. `--deploy --components runtime`

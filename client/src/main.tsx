@@ -4,12 +4,12 @@ import { loginMethodViews, type LoginMethodView } from './login-methods';
 import { apiErrorFromResponse } from './api-error';
 import './styles.css';
 
-type ProviderId = 'codex'|'gemini'|'antigravity';
+type ProviderId = 'codex'|'claude'|'antigravity'|'gemini';
 type ProviderAvailability = 'checking'|'ready'|'unavailable'|'error';
 type ProviderAuth = 'checking'|'authenticated'|'unauthenticated'|'authenticating'|'unknown'|'not_applicable'|'error';
 type AccountSummary = {profileId?:string;providerAccountId?:string;email?:string;displayName?:string;authType?:string};
 type ProviderStatus = { provider?:ProviderId; id:ProviderId; displayName:string; availability?:ProviderAvailability; auth?:ProviderAuth; accountSummary?:AccountSummary|null; account?:{id?:string;email?:string;displayName?:string;profileId?:string;authType?:string}|null; version?:string|null; activeProfileId?:string|null; canCreateSession?:boolean; canContinueSession?:boolean; canManageAccounts?:boolean; canLogout?:boolean; canQueryQuota?:boolean; canListModels?:boolean; canSelectModel?:boolean; capabilities?:Record<string,any>; reasonCode?:string|null; message?:string|null; checkedAt?:string; ok:boolean; installed:boolean; error?:string|null; installHint?:string; runtime?:any };
-type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultWorkspace?:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; providerStatus?:Record<ProviderId,ProviderStatus>; capabilities:Capabilities; activeProfile?:any; activeGeminiProfile?:any; activeAntigravityProfile?:any };
+type Status = { authed:boolean; roots:string[]; mode:string; defaultMode:string; defaultWorkspace?:string; defaultModel?:string; defaultModels?:Record<string,string>; activeProvider?:ProviderId; codex:any; claude?:ProviderStatus; gemini?:ProviderStatus; antigravity?:ProviderStatus; providers?:ProviderStatus[]; providerStatus?:Record<ProviderId,ProviderStatus>; capabilities:Capabilities; activeProfile?:any; activeClaudeProfile?:any; activeGeminiProfile?:any; activeAntigravityProfile?:any };
 type Capabilities = { imageInput:boolean; imageOutput:boolean; fileInput?:boolean; attachmentTypes:string[]; maxAttachmentBytes:number; maxAttachmentsPerMessage?:number; maxTotalAttachmentBytes?:number; providers?:Record<string,any> };
 type Session = { id:string; codex_thread_id:string; provider_id?:ProviderId; providerId?:ProviderId; project_dir:string; title:string; status:string; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number; last_sequence?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
@@ -25,6 +25,7 @@ const APP_NAME = 'Agent Deck';
 const CHUNK_SIZE = 24 * 1024;
 const PUBLIC_UPLOAD_TARGET_BYTES = 650 * 1024;
 const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
+const PROVIDER_ORDER:ProviderId[] = ['codex','claude','antigravity','gemini'];
 const ToastContext = createContext<(kind:Toast['kind'], text:string)=>void>(()=>{});
 
 function getCookie(n:string){ return document.cookie.split('; ').find(x=>x.startsWith(n+'='))?.split('=')[1] || ''; }
@@ -63,7 +64,7 @@ function deleteAccountDetail(only:boolean){
   return `将删除该账户在本机保存的登录凭据。历史会话和消息不会删除；之后继续会话时，将使用当前可用的账户。${only?' 删除后该 Agent 将处于未登录状态，重新登录后仍可继续已有会话。':''}`;
 }
 function cancelLoginDetail(){ return '将停止本次登录并删除临时授权信息。'; }
-function providerLabel(id?:string){ return id==='antigravity' ? 'Antigravity' : id==='gemini' ? 'Gemini' : 'Codex'; }
+function providerLabel(id?:string){ return id==='claude' ? 'Claude Code' : id==='antigravity' ? 'Antigravity' : id==='gemini' ? 'Gemini' : 'Codex'; }
 function providerAuthLabel(status?:ProviderStatus|null){
   if(status?.availability==='unavailable') return '服务不可用';
   if(status?.availability==='error') return '状态异常';
@@ -140,7 +141,7 @@ function pendingLoginTitle(provider:ProviderId, profile:any){
   if(state==='failed' || state==='needs_login') return `${providerLabel(provider)} 登录未完成`;
   return `等待完成 ${providerLabel(provider)} 授权`;
 }
-function authTypeLabel(type:string){ const v=String(type||''); if(v==='api_key') return 'API Key'; if(v==='oauth'||v==='oauth-personal') return 'Google'; if(v==='vertex') return 'Vertex'; return v; }
+function authTypeLabel(type:string){ const v=String(type||''); if(v==='api_key') return 'API Key'; if(v==='setup_token') return 'setup-token'; if(v==='existing_cli') return 'Existing CLI'; if(v==='oauth'||v==='oauth-personal') return 'Google'; if(v==='vertex') return 'Vertex'; return v; }
 function sessionProvider(session:Session){ return session.provider_id || session.providerId || 'codex'; }
 
 function ToastProvider({children}:{children:React.ReactNode}){
@@ -312,7 +313,7 @@ function SessionView({id}:{id:string}){
   async function setSessionMode(mode:string){ setBusy('mode'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({mode})}); setSession(s=>s?{...s,permission_mode:mode}:s); closeMenu(); haptic(); toast('success','已切换为 '+modeLabel(mode)); } catch(e:any){ toast('error','模式切换失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function openModelPicker(){ const provider=session ? sessionProvider(session) : 'codex'; setMenu(false); setModelOpen(true); if(!models || modelsProvider!==provider) try{ setModels(null); setModelsProvider(provider); setModels(await api('/api/models?provider='+encodeURIComponent(provider))); } catch(e:any){ toast('error','模型列表读取失败：'+shortError(e)); } }
   async function setSessionModel(model:string){ setBusy('model'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({model})}); setSession(s=>s?{...s,model}:s); setModelOpen(false); haptic(); toast('success','已切换模型'); } catch(e:any){ toast('error','模型切换失败：'+shortError(e)); } finally{ setBusy(''); } }
-  async function answerApproval(req:ApprovalRequest, decision:'accept'|'decline'){ setBusy('approval:'+req.requestId); try{ await api('/api/approvals/'+encodeURIComponent(req.requestId),{method:'POST',body:JSON.stringify({decision,method:req.method,options:req.params?.options||[]})}); setApprovals(v=>v.filter(a=>a.requestId!==req.requestId)); haptic(); toast(decision==='accept'?'success':'info', decision==='accept'?'已允许':'已拒绝'); } catch(e:any){ toast('error','授权回复失败：'+shortError(e)); } finally{ setBusy(''); } }
+  async function answerApproval(req:ApprovalRequest, decision:'accept'|'decline'|'accept_session'){ setBusy('approval:'+req.requestId); try{ await api('/api/approvals/'+encodeURIComponent(req.requestId),{method:'POST',body:JSON.stringify({decision,method:req.method,options:req.params?.options||[]})}); setApprovals(v=>v.filter(a=>a.requestId!==req.requestId)); haptic(); toast(decision==='decline'?'info':'success', decision==='decline'?'已拒绝':decision==='accept_session'?'本会话已允许':'已允许'); } catch(e:any){ toast('error','授权回复失败：'+shortError(e)); } finally{ setBusy(''); } }
   const rendered=visibleEvents([...events,...liveEvents(live)]); const currentStatus=turnStatus==='unknown'?liveStatus(live,session?.status):turnStatus; const activeModel=session?.model || (modelsProvider===(session ? sessionProvider(session) : '') ? catalogCurrent(models) : '') || status?.defaultModel;
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
     <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · 浏览器 {connectionLabel(browserConnection)} · Runtime {connectionLabel(runtimeConnection)}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
@@ -522,14 +523,14 @@ function EventCard({e,onImage}:{e:DisplayEvent;onImage:(a:Attachment)=>void}){
   }
   return <details className={`event ${e.role}`} open={e.open}><summary><b>{e.title||e.role}</b>{e.meta&&<span>{e.meta}</span>}</summary><CopyButton text={e.text} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制':'复制失败')}/><pre>{e.text}</pre></details>;
 }
-function ApprovalCard({req,busy,onAnswer}:{req:ApprovalRequest;busy:boolean;onAnswer:(req:ApprovalRequest,decision:'accept'|'decline')=>void}){
+function ApprovalCard({req,busy,onAnswer}:{req:ApprovalRequest;busy:boolean;onAnswer:(req:ApprovalRequest,decision:'accept'|'decline'|'accept_session')=>void}){
   const info = approvalInfo(req);
   return <article className="approvalCard" role="group" aria-label="Codex 授权请求">
     <div className="approvalHead"><b>{info.title}</b><span>{info.reason || '等待你确认后继续'}</span></div>
     {info.command&&<pre>{info.command}</pre>}
     {info.cwd&&<small>{info.cwd}</small>}
     {!!info.details.length&&<ul>{info.details.map((d,i)=><li key={i}>{d}</li>)}</ul>}
-    <div className="approvalActions"><button disabled={busy} onClick={()=>onAnswer(req,'decline')}>拒绝</button><button className="primary" disabled={busy} onClick={()=>onAnswer(req,'accept')}>{busy?'处理中':'允许'}</button></div>
+    <div className="approvalActions"><button disabled={busy} onClick={()=>onAnswer(req,'decline')}>拒绝</button>{req.method.includes('claude/')&&<button disabled={busy} onClick={()=>onAnswer(req,'accept_session')}>本会话允许</button>}<button className="primary" disabled={busy} onClick={()=>onAnswer(req,'accept')}>{busy?'处理中':'允许'}</button></div>
   </article>;
 }
 function approvalInfo(req:ApprovalRequest){
@@ -619,15 +620,21 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   const [geminiAuthProfile,setGeminiAuthProfile]=useState<any>(null);
   const [geminiAuthMethods,setGeminiAuthMethods]=useState<any[]>([]);
   const [geminiApiKey,setGeminiApiKey]=useState('');
+  const [claudeProfileType,setClaudeProfileType]=useState<'existing_cli'|'setup_token'|'api_key'>('existing_cli');
+  const [claudeSecret,setClaudeSecret]=useState('');
+  const [claudeName,setClaudeName]=useState('Claude Code Account');
   const [geminiAuthCode,setGeminiAuthCode]=useState('');
   const [profileDeleteBusy,setProfileDeleteBusy]=useState(false);
   const [profileDeleteError,setProfileDeleteError]=useState('');
   const [geminiDeleteBusy,setGeminiDeleteBusy]=useState(false);
   const [geminiDeleteError,setGeminiDeleteError]=useState('');
+  const [claudeDeleteBusy,setClaudeDeleteBusy]=useState(false);
+  const [claudeDeleteError,setClaudeDeleteError]=useState('');
   const [antigravityDeleteBusy,setAntigravityDeleteBusy]=useState(false);
   const [antigravityDeleteError,setAntigravityDeleteError]=useState('');
   const [agCode,setAgCode]=useState('');
   const [deleteProfile,setDeleteProfile]=useState<any>(null);
+  const [deleteClaudeProfile,setDeleteClaudeProfile]=useState<any>(null);
   const [deleteGeminiProfile,setDeleteGeminiProfile]=useState<any>(null);
   const [deleteAntigravityProfile,setDeleteAntigravityProfile]=useState<any>(null);
   const [page,setPage]=useState<'main'|'agent'|'mode'|'model'|'account'|'geminiMethods'|'geminiGoogle'|'geminiApiKey'|'geminiVertex'>(initialPage || 'main');
@@ -652,6 +659,9 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   async function applyCurrentSessionModel(model:string){ if(!currentSessionId){ toast('info','当前没有打开的会话'); return; } try{ await api('/api/sessions/'+encodeURIComponent(currentSessionId),{method:'PATCH',body:JSON.stringify({model})}); haptic(); toast('success','已应用到当前会话'); } catch(e:any){ toast('error','应用失败：'+shortError(e)); } }
   async function saveDefaultAndApply(model:string){ await setDefaultModel(model); if(currentSessionId) await applyCurrentSessionModel(model); }
   async function switchProfile(id:string){ try{ await api(`/api/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id); haptic(); toast('success','切换成功'); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } finally { await syncSettings(); } }
+  async function createClaudeProfile(){ try{ const body:any={name:claudeName,type:claudeProfileType}; if(claudeProfileType==='setup_token') body.token=claudeSecret; if(claudeProfileType==='api_key') body.apiKey=claudeSecret; await api('/api/claude/profiles',{method:'POST',body:JSON.stringify(body)}); setClaudeSecret(''); haptic(); toast('success','Claude profile 已添加'); await syncSettings(); } catch(e:any){ toast('error','添加失败：'+shortError(e)); } }
+  async function switchClaudeProfile(id:string){ try{ await api(`/api/claude/profiles/${id}/switch`,{method:'POST'}); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function removeClaudeProfile(profile:any){ setClaudeDeleteBusy(true); setClaudeDeleteError(''); try{ await api(`/api/claude/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteClaudeProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setClaudeDeleteError(msg); toast('error','删除失败：'+msg); } finally { setClaudeDeleteBusy(false); } }
   async function refreshCodexMetadata(id:string){ try{ const result=await api(`/api/profiles/${id}/metadata/refresh`,{method:'POST'}); await syncSettings(); toast(result.ok?'success':'error',result.ok?'账户信息已更新':'账户信息读取失败，可重试'); } catch(e:any){ toast('error','账户信息读取失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function deviceLogin(id:string, isNew=false){ try{ const r=await api(`/api/profiles/${id}/login/device`,{method:'POST',body:JSON.stringify({newProfile:isNew})}); setLoginJob(r.job); toast('info','登录流程已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function loginNewProfile(){ try{ const r=await api('/api/profiles',{method:'POST',body:JSON.stringify({name:'Codex Account'})}); await deviceLogin(r.profile.id, true); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
@@ -686,18 +696,22 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   async function removeProfile(profile:any){ setProfileDeleteBusy(true); setProfileDeleteError(''); try{ await api(`/api/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setProfileDeleteError(msg); toast('error','删除失败：'+msg); } finally { setProfileDeleteBusy(false); } }
   const currentModel = localData?.settings?.defaultModels ? (localData.settings.defaultModels[activeProvider] || catalogCurrent(models)) : (localData?.settings?.defaultModel || catalogCurrent(models));
   const activeProfile = (localData?.profiles||[]).find((p:any)=>p.active) || localData?.activeProfile;
+  const activeClaudeProfile = (localData?.claudeProfiles||[]).find((p:any)=>p.active) || localData?.activeClaudeProfile;
   const activeGeminiProfile = (localData?.geminiProfiles||[]).find((p:any)=>p.active) || localData?.activeGeminiProfile;
   const activeAntigravityProfile = (localData?.antigravityProfiles||[]).find((p:any)=>p.active) || localData?.activeAntigravityProfile;
   const codexProfiles = (localData?.profiles?.length ? localData.profiles : (localData?.activeProfile ? [localData.activeProfile] : []));
+  const claudeProfiles = (localData?.claudeProfiles?.length ? localData.claudeProfiles : (localData?.activeClaudeProfile ? [localData.activeClaudeProfile] : []));
   const codexPendingProfiles = (localData?.pendingProfiles||[]).filter((p:any)=>['draft','authenticating','verifying','failed'].includes(String(p.state||p.status||'')));
   const geminiProfiles = (localData?.geminiProfiles?.length ? localData.geminiProfiles : (localData?.activeGeminiProfile ? [localData.activeGeminiProfile] : [])).filter((p:any)=>(p.state||p.status)==='authenticated');
   const geminiPendingProfiles = (localData?.geminiPendingProfiles||[]).filter((p:any)=>['draft','authenticating','verifying','failed','needs_login'].includes(String(p.state||p.status||'')));
   const codexProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='codex');
+  const claudeProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='claude') || localData?.claude;
   const geminiProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='gemini') || localData?.gemini;
   const antigravityProviderStatus = (localData?.providers||[]).find((p:any)=>p.id==='antigravity') || localData?.antigravity;
-  const activeProviderStatus = (localData?.providers||[]).find((p:any)=>p.id===activeProvider) || (activeProvider==='gemini' ? geminiProviderStatus : activeProvider==='antigravity' ? antigravityProviderStatus : codexProviderStatus);
+  const activeProviderStatus = (localData?.providers||[]).find((p:any)=>p.id===activeProvider) || (activeProvider==='claude' ? claudeProviderStatus : activeProvider==='gemini' ? geminiProviderStatus : activeProvider==='antigravity' ? antigravityProviderStatus : codexProviderStatus);
   const title = page==='main' ? '设置' : page==='agent' ? 'Agent' : page==='mode' ? '沙盒' : page==='model' ? '模型' : page==='geminiMethods' ? '选择登录方式' : page==='geminiGoogle' ? 'Google 登录' : page==='geminiApiKey' ? 'Gemini API Key' : page==='geminiVertex' ? 'Vertex AI' : `${providerLabel(activeProvider)} 账户`;
   const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? undefined : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProviderStatus?.canListModels?`${providerLabel(activeProvider)} 模型`:providerAuthLabel(activeProviderStatus)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
+  const providerStatusById:any = { codex:codexProviderStatus, claude:claudeProviderStatus, antigravity:antigravityProviderStatus, gemini:geminiProviderStatus };
   const goBack = () => setPage(page==='geminiMethods'?'account':(['geminiGoogle','geminiApiKey','geminiVertex'].includes(page)?'geminiMethods':'main') as any);
   return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button className="settingsBack" onClick={goBack}>返回</button>:undefined}>
     {error&&<ErrorState title="设置读取失败" detail={error} action="重试" onAction={onRetry}/>}
@@ -710,13 +724,12 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
         <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
       </div>}
       {page==='agent'&&<section className="agentProviderPage"><div className="providerChoices">
-        <button className={activeProvider==='codex'?'active':''} aria-pressed={activeProvider==='codex'} onClick={()=>setActiveProvider('codex')}><span><b>Codex</b><small>{providerChoiceDetail(codexProviderStatus)}</small>{providerChoiceNote(codexProviderStatus)&&<em>{providerChoiceNote(codexProviderStatus)}</em>}</span><i/></button>
-        <button className={activeProvider==='gemini'?'active':''} aria-pressed={activeProvider==='gemini'} onClick={()=>setActiveProvider('gemini')}><span><b>Gemini</b><small>{providerChoiceDetail(geminiProviderStatus)}</small>{providerChoiceNote(geminiProviderStatus)&&<em>{providerChoiceNote(geminiProviderStatus)}</em>}</span><i/></button>
-        <button className={activeProvider==='antigravity'?'active':''} aria-pressed={activeProvider==='antigravity'} onClick={()=>setActiveProvider('antigravity')}><span><b>Antigravity</b><small>{providerChoiceDetail(antigravityProviderStatus)}</small>{providerChoiceNote(antigravityProviderStatus)&&<em>{providerChoiceNote(antigravityProviderStatus)}</em>}</span><i/></button>
+        {PROVIDER_ORDER.map(provider=><button key={provider} className={activeProvider===provider?'active':''} aria-pressed={activeProvider===provider} onClick={()=>setActiveProvider(provider)}><span><b>{providerLabel(provider)}</b><small>{providerChoiceDetail(providerStatusById[provider])}</small>{providerChoiceNote(providerStatusById[provider])&&<em>{providerChoiceNote(providerStatusById[provider])}</em>}</span><i/></button>)}
       </div></section>}
       {page==='mode'&&<section><b>沙盒</b><ModeButtons value={localData?.settings?.defaultMode || 'yolo'} onPick={setDefaultMode}/></section>}
       {page==='model'&&<section><b>模型</b>{activeProvider==='gemini'&&<GeminiModelSummary defaultModel={currentModel} currentSessionId={currentSessionId} currentModel={models?.current || currentModel}/>} {models?.error&&<InlineNotice tone="info" text={models.error}/>} {activeProviderStatus?.reasonCode==='gemini_client_unsupported'&&<InlineNotice tone="info" text={activeProviderStatus.message || '个人版 Gemini CLI 客户端已停止支持'}/>}<ModelPicker models={models?.models||[]} value={currentModel} emptyText={models?.error || (models ? '没有可用模型' : `正在读取 ${providerLabel(activeProvider)} 模型列表`)} onPick={setDefaultModel}/>{activeProvider==='gemini'&&<div className="modelActions"><button disabled={!currentSessionId || activeProviderStatus?.reasonCode==='gemini_client_unsupported'} onClick={()=>applyCurrentSessionModel(currentModel)}>仅应用到当前会话</button><button disabled={activeProviderStatus?.reasonCode==='gemini_client_unsupported'} onClick={()=>saveDefaultAndApply(currentModel)}>保存为默认并应用到当前会话</button></div>}</section>}
       {page==='account'&&activeProvider==='codex'&&<><CurrentAccountSummary provider="codex" profile={activeProfile} status={activeProviderStatus}/><section><b>已保存账户</b><div className="profileList">{codexProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={profileLabel(p)} onSwitch={switchProfile} onLogin={deviceLogin} onRefreshMetadata={refreshCodexMetadata} onDelete={setDeleteProfile}/>)}{!codexProfiles.length&&<div className="empty"><b>尚未添加 Codex 账户</b><span>登录后才能创建 Codex 会话。</span></div>}</div></section>{!!codexPendingProfiles.length&&<section><b>登录中的任务</b><div className="profileList">{codexPendingProfiles.map((p:any)=><PendingProfileRow key={p.id} profile={p} label={pendingLoginTitle('codex', p)} onContinue={()=>deviceLogin(p.id)} onDelete={(p:any)=>{setProfileDeleteError('');setDeleteProfile(p)}}/>)}</div></section>}<section><b>添加账户</b><button onClick={loginNewProfile}>登录新账户</button></section>{loginJob&&loginJob.status!=='done'&&<LoginJobPanel job={loginJob}/>}</>}
+      {page==='account'&&activeProvider==='claude'&&<><CurrentAccountSummary provider="claude" profile={activeClaudeProfile} status={activeProviderStatus}/><section><b>已保存账户</b><div className="profileList">{claudeProfiles.map((p:any)=><ClaudeProfileRow key={p.id} profile={p} onSwitch={switchClaudeProfile} onDelete={(p:any)=>{setClaudeDeleteError('');setDeleteClaudeProfile(p)}}/>)}{!claudeProfiles.length&&<div className="empty"><b>尚未添加 Claude Code profile</b><span>添加 profile 后才能创建 Claude 会话。</span></div>}</div></section><ClaudeProfileForm type={claudeProfileType} name={claudeName} secret={claudeSecret} onType={setClaudeProfileType} onName={setClaudeName} onSecret={setClaudeSecret} onSubmit={createClaudeProfile}/></>}
       {page==='account'&&activeProvider==='gemini'&&<><CurrentAccountSummary provider="gemini" profile={activeGeminiProfile} status={activeProviderStatus}/><section><b>已保存账户</b><div className="profileList">{geminiProfiles.map((p:any)=><ProfileRow key={p.id} profile={p} label={geminiProfileLabel(p)} onSwitch={switchGeminiProfile} onLogin={()=>openGeminiLogin(p)} onLogout={logoutGeminiProfile} onDelete={(p:any)=>{setGeminiDeleteError('');setDeleteGeminiProfile(p)}}/>)}{!geminiProfiles.length&&<div className="empty"><b>尚未添加 Gemini 账户</b><span>添加账户后才能创建 Gemini 会话。</span></div>}</div></section>{!!geminiPendingProfiles.length&&<section><b>登录中的任务</b><div className="profileList">{geminiPendingProfiles.map((p:any)=><PendingProfileRow key={p.id} profile={p} label={pendingLoginTitle('gemini', p)} onContinue={()=>openGeminiLogin(p)} onDelete={(p:any)=>{setGeminiDeleteError('');setDeleteGeminiProfile(p)}}/>)}</div></section>}<section><b>添加账户</b><button disabled={activeProviderStatus?.availability==='unavailable'} onClick={loginNewGeminiProfile}>登录新账户</button>{activeProviderStatus?.availability==='unavailable'&&<div className="empty"><b>Gemini 服务不可用</b><span>{activeProviderStatus?.message || '安装 Gemini CLI 后才能登录。'}</span></div>}</section>{geminiLoginJob&&['preparing','waiting_user','verifying','failed'].includes(geminiLoginJob.status)&&<GeminiLoginJobPanel job={geminiLoginJob} onCancel={cancelGeminiLogin}/>}</>}
       {page==='geminiMethods'&&<GeminiMethodList methods={geminiAuthMethods} onPick={(m:any)=>{ setGeminiAuthMethods((list:any[])=>list.map(x=>({...x,selected:x.id===m.id}))); setPage(m.kind==='oauth'?'geminiGoogle':m.kind==='api-key'?'geminiApiKey':m.kind==='vertex'?'geminiVertex':'geminiMethods'); }}/>}
       {page==='geminiGoogle'&&<GeminiGoogleLogin profile={geminiAuthProfile} job={geminiLoginJob} code={geminiAuthCode} onCode={setGeminiAuthCode} onStart={()=>startGeminiLogin((geminiAuthMethods.find((m:any)=>m.selected&&m.kind==='oauth')||geminiAuthMethods.find((m:any)=>m.kind==='oauth'))?.methodId || 'oauth')} onSubmitCode={submitGeminiAuthCode} onCancel={cancelGeminiLogin} onRefresh={syncSettings}/>}
@@ -725,6 +738,7 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
       {page==='account'&&activeProvider==='antigravity'&&<><CurrentAccountSummary provider="antigravity" profile={activeAntigravityProfile} status={activeProviderStatus}/><section><b>已保存账户</b><div className="profileList">{(localData?.antigravityProfiles||[]).map((p:any)=><AntigravityProfileRow key={p.id} profile={p} onSwitch={switchAntigravityProfile} onDelete={(p:any)=>{setAntigravityDeleteError('');setDeleteAntigravityProfile(p)}}/>)}{!(localData?.antigravityProfiles||[]).length&&<div className="empty"><b>尚未添加 Antigravity 账户</b><span>登录后才能创建 Antigravity 会话。</span></div>}</div><button disabled={activeProviderStatus?.availability==='unavailable' || agLoginJob?.status==='running'} onClick={loginAntigravity}>登录新 Google 账户</button>{activeProviderStatus?.availability==='unavailable'&&<div className="empty"><b>Antigravity 服务不可用</b><span>{activeProviderStatus?.message || '安装后才能登录 Google 账户。'}</span></div>}{agLoginJob&&<AntigravityLoginPanel job={agLoginJob} code={agCode} onCode={setAgCode} onSubmit={submitAntigravityCode} onCancel={cancelAntigravityLogin}/>}</section></>}
     </div>}
     {deleteProfile&&<ConfirmDialog title={deleteProfile.isLoginAttempt?'取消登录？':'删除 Codex 账户？'} detail={deleteProfile.isLoginAttempt?cancelLoginDetail():deleteAccountDetail(activeAccountCount(codexProfiles)<=1)} cancel={deleteProfile.isLoginAttempt?'继续登录':'取消'} confirm={deleteProfile.isLoginAttempt?'取消登录':'删除账户'} busy={profileDeleteBusy} error={profileDeleteError} onCancel={()=>!profileDeleteBusy&&setDeleteProfile(null)} onConfirm={()=>removeProfile(deleteProfile)}/>}
+    {deleteClaudeProfile&&<ConfirmDialog title="删除 Claude Code profile？" detail={deleteAccountDetail(activeAccountCount(claudeProfiles)<=1)} confirm="删除账户" busy={claudeDeleteBusy} error={claudeDeleteError} onCancel={()=>!claudeDeleteBusy&&setDeleteClaudeProfile(null)} onConfirm={()=>removeClaudeProfile(deleteClaudeProfile)}/>}
     {deleteGeminiProfile&&<ConfirmDialog title={deleteGeminiProfile.isLoginAttempt?'取消登录？':'删除 Gemini 账户？'} detail={deleteGeminiProfile.isLoginAttempt?cancelLoginDetail():deleteAccountDetail(activeAccountCount(geminiProfiles)<=1)} cancel={deleteGeminiProfile.isLoginAttempt?'继续登录':'取消'} confirm={deleteGeminiProfile.isLoginAttempt?'取消登录':'删除账户'} busy={geminiDeleteBusy} error={geminiDeleteError} onCancel={()=>!geminiDeleteBusy&&setDeleteGeminiProfile(null)} onConfirm={()=>removeGeminiProfile(deleteGeminiProfile)}/>}
     {deleteAntigravityProfile&&<ConfirmDialog title="删除 Antigravity 账户？" detail={deleteAccountDetail(activeAccountCount(localData?.antigravityProfiles||[])<=1)} confirm="删除账户" busy={antigravityDeleteBusy} error={antigravityDeleteError} onCancel={()=>!antigravityDeleteBusy&&setDeleteAntigravityProfile(null)} onConfirm={()=>removeAntigravityProfile(deleteAntigravityProfile)}/>}
   </Sheet>;
@@ -775,6 +789,25 @@ function AntigravityProfileRow({profile,onSwitch,onDelete}:{profile:any;onSwitch
     {!active&&loggedIn&&<button onClick={()=>onSwitch(profile.id)}>切换</button>}
     <button className="dangerText" onClick={()=>onDelete(profile)}>删除</button>
   </div>;
+}
+function ClaudeProfileRow({profile,onSwitch,onDelete}:{profile:any;onSwitch:(id:string)=>void;onDelete:(p:any)=>void}){
+  const active = !!profile.active;
+  const ok = !['not_installed','not_configured','invalid_credentials','runtime_unavailable'].includes(String(profile.status||''));
+  return <div className="profileRow">
+    <div><strong>{profile.name || 'Claude Code Account'}</strong><span className="profileBadges">{active&&<i>当前</i>}<i>{ok?'已配置':'未配置'}</i><i>{authTypeLabel(profile.type||profile.authType)}</i>{profile.credentialSummary&&<em>{profile.credentialSummary}</em>}</span></div>
+    {!active&&ok&&<button onClick={()=>onSwitch(profile.id)}>切换</button>}
+    <button className="dangerText" onClick={()=>onDelete(profile)}>删除</button>
+  </div>;
+}
+function ClaudeProfileForm({type,name,secret,onType,onName,onSecret,onSubmit}:{type:'existing_cli'|'setup_token'|'api_key';name:string;secret:string;onType:(v:any)=>void;onName:(v:string)=>void;onSecret:(v:string)=>void;onSubmit:()=>void}){
+  const needsSecret = type==='setup_token'||type==='api_key';
+  return <section className="loginForm"><b>添加 Claude Code profile</b>
+    <input value={name} onChange={e=>onName(e.target.value)} placeholder="Profile name"/>
+    <div className="modeButtons"><button className={type==='existing_cli'?'active':''} onClick={()=>onType('existing_cli')}>Existing CLI</button><button className={type==='setup_token'?'active':''} onClick={()=>onType('setup_token')}>setup-token</button><button className={type==='api_key'?'active':''} onClick={()=>onType('api_key')}>API Key</button></div>
+    {needsSecret&&<input type="password" value={secret} onChange={e=>onSecret(e.target.value)} placeholder={type==='api_key'?'ANTHROPIC_API_KEY':'CLAUDE_CODE_OAUTH_TOKEN'} autoComplete="off"/>}
+    <span className="formHelp">{type==='existing_cli'?'使用服务器上受信任的 CLAUDE_CONFIG_DIR。':'凭据只写入私有 profile 文件，不会回显。'}</span>
+    <button disabled={needsSecret&&!secret.trim()} onClick={onSubmit}>添加 profile</button>
+  </section>;
 }
 function antigravityProfileLabel(profile:any){
   return profile?.login?.email || (profile?.name && profile.name !== 'Google Account' ? profile.name : 'Antigravity Account');

@@ -2,10 +2,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { constants, existsSync } from 'node:fs';
 import { access } from 'node:fs/promises';
+import { PROVIDER_DEFINITIONS, type AgentProviderId } from './provider-registry.js';
 
 const execFileAsync = promisify(execFile);
-
-export type AgentProviderId = 'codex' | 'gemini' | 'antigravity';
 
 export type AgentModel = {
   id: string;
@@ -37,7 +36,7 @@ export interface AgentProvider {
 
 export class AntigravityProvider implements AgentProvider {
   id: AgentProviderId = 'antigravity';
-  displayName = 'Antigravity';
+  displayName = PROVIDER_DEFINITIONS.antigravity.displayName;
   private command = process.env.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy';
 
   async getVersion(command?: string | null) {
@@ -116,7 +115,7 @@ export class AntigravityProvider implements AgentProvider {
 
 export class GeminiProvider implements AgentProvider {
   id: AgentProviderId = 'gemini';
-  displayName = 'Gemini';
+  displayName = PROVIDER_DEFINITIONS.gemini.displayName;
   private candidates = [process.env.GEMINI_BIN, 'gemini'].filter(Boolean) as string[];
   private acpHelpCache: { command:string; acp:boolean; checkedAt:number } | null = null;
 
