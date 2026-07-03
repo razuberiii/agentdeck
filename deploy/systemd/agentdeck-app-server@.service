@@ -9,7 +9,7 @@ StartLimitBurst=3
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/stacks/agentdeck
+WorkingDirectory=/opt/stacks/agentdeck/current
 Environment=HOME=/home/ubuntu
 EnvironmentFile=@AGENTDECK_ENV_DIR@/agentdeck-app-server-%i.env
 ExecStart=/usr/local/bin/codex app-server --listen ${CODEX_APP_SERVER_LISTEN} -c approval_policy=\"never\" -c sandbox_mode=\"danger-full-access\"

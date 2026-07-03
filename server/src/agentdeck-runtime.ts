@@ -7,7 +7,7 @@ import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { chmod, cp, lstat, mkdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Db } from './db.js';
@@ -24,6 +24,10 @@ const DB_FILE = process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime
 const HOST = process.env.RUNTIME_HOST || '127.0.0.1';
 const PORT = Number(process.env.RUNTIME_PORT || 3852);
 const RUNTIME_TOKEN = process.env.RUNTIME_TOKEN || '';
+const RUNTIME_MODE = process.env.RUNTIME_MODE === 'candidate' ? 'candidate' : 'active';
+const RELEASE_INFO = releaseMetadata();
+const RELEASE_ID = process.env.AGENTDECK_RELEASE_ID || RELEASE_INFO.releaseId;
+const RELEASE_COMMIT = process.env.AGENTDECK_RELEASE_COMMIT || RELEASE_INFO.commit;
 const CODEX_PORT_BASE = Number(process.env.CODEX_APP_SERVER_PORT_BASE || 4520);
 const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAULT_PORT || 4668);
 const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
@@ -31,7 +35,7 @@ const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.c
 const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || process.cwd();
 const APP_SERVER_USER = process.env.CODEX_APP_SERVER_USER || 'ubuntu';
 const APP_SERVER_GROUP = process.env.CODEX_APP_SERVER_GROUP || APP_SERVER_USER;
-const SHARED_CODEX_DIR = path.join(DATA_DIR, 'shared');
+const SHARED_CODEX_DIR = RUNTIME_MODE === 'candidate' ? path.join(DATA_DIR, 'candidate-shared') : path.join(DATA_DIR, 'shared');
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
@@ -41,6 +45,7 @@ function isLoopbackHost(host:string) {
 if (!isLoopbackHost(HOST) && !RUNTIME_TOKEN) {
   throw new Error('RUNTIME_TOKEN is required when RUNTIME_HOST is not loopback');
 }
+if (RUNTIME_MODE === 'active') mkdirSync('/run/agentdeck', { recursive:true });
 
 type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
 type StructuredRuntimeErrorBody = {
@@ -360,7 +365,11 @@ app.addHook('preHandler', async (req, reply) => {
   if (authorization !== `Bearer ${RUNTIME_TOKEN}`) return reply.code(401).send({ error:'unauthorized' });
 });
 
-app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle }));
+app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle, mode:RUNTIME_MODE, releaseId:RELEASE_ID, commit:RELEASE_COMMIT }));
+app.get('/admin/runtime/state', async () => runtimeAdminState());
+app.post('/admin/runtime/drain', async () => startRuntimeDrain());
+app.post('/admin/runtime/undrain', async () => cancelRuntimeDrain());
+app.get('/admin/runtime/active-turns', async () => activeTurnDetails());
 app.get('/diagnostics', async () => ({
   ...diagnostics,
   lifecycle:runtimeLifecycle,
@@ -381,19 +390,9 @@ app.get('/diagnostics', async () => ({
     p99:eventLoopDelay.percentile(99) / 1e6,
   },
 }));
-app.post('/drain/start', async () => {
-  if (runtimeLifecycle === 'stopping') return { lifecycle:runtimeLifecycle, ...(await drainState()) };
-  runtimeLifecycle = 'draining';
-  drainStartedAt = drainStartedAt || Date.now();
-  app.log.info({ lifecycle:runtimeLifecycle, drainStartedAt }, 'runtime draining started');
-  return { lifecycle:runtimeLifecycle, ...(await drainState()) };
-});
+app.post('/drain/start', async () => startRuntimeDrain());
 app.get('/drain/status', async () => ({ lifecycle:runtimeLifecycle, drainStartedAt, drainTimeoutMs:DRAIN_TIMEOUT_MS, ...(await drainState()) }));
-app.post('/drain/cancel', async () => {
-  if (runtimeLifecycle === 'draining') runtimeLifecycle = 'accepting';
-  drainStartedAt = null;
-  return { lifecycle:runtimeLifecycle, ...(await drainState()) };
-});
+app.post('/drain/cancel', async () => cancelRuntimeDrain());
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
 app.get('/gemini/status', async (req:any) => geminiManager.status(String(req.query?.profileId || 'default')));
 app.get('/gemini/profiles/:id/status', async (req:any) => geminiManager.status(String(req.params.id)));
@@ -476,6 +475,7 @@ app.get('/codex/models', async (req:any) => {
 });
 
 app.post('/codex/sessions', async (req:any, reply) => {
+  if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
   if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const account = await ensureAccount(String(body.accountId || 'default'), String(body.codexHome || DEFAULT_CODEX_HOME));
@@ -507,6 +507,7 @@ app.post('/codex/sessions', async (req:any, reply) => {
 });
 
 app.post('/gemini/sessions', async (req:any, reply) => {
+  if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
   if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const cwd = String(body.cwd || DEFAULT_WORKDIR);
@@ -542,6 +543,7 @@ app.post('/gemini/sessions', async (req:any, reply) => {
 });
 
 app.post('/claude/sessions', async (req:any, reply) => {
+  if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
   if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const cwd = String(body.cwd || DEFAULT_WORKDIR);
@@ -583,6 +585,7 @@ app.post('/gemini/sessions/:id/model', async (req:any, reply) => {
 });
 
 app.post('/codex/sessions/resume', async (req:any, reply) => {
+  if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
   if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const body = req.body || {};
   const threadId = String(body.threadId || '').trim();
@@ -678,6 +681,7 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
 });
 
 app.post('/sessions/:id/turns', async (req:any, reply) => {
+  if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
   if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
@@ -1751,6 +1755,9 @@ function redactRuntimeError(message:string) {
 function isDraining() {
   return runtimeLifecycle === 'draining' || runtimeLifecycle === 'stopping';
 }
+function isCandidateMode() {
+  return RUNTIME_MODE === 'candidate';
+}
 function runtimeDrainingBody(req:any) {
   return {
     error:'runtime_draining',
@@ -1759,6 +1766,67 @@ function runtimeDrainingBody(req:any) {
     lifecycle:runtimeLifecycle,
     message:'Runtime 正在准备重启，请稍后重试。',
     requestId:String(req?.id || ''),
+  };
+}
+function runtimeUnavailableBody(req:any, code:string) {
+  return {
+    error:code,
+    code,
+    retryable:true,
+    mode:RUNTIME_MODE,
+    lifecycle:runtimeLifecycle,
+    message:code === 'runtime_candidate' ? '候选 Runtime 不接收真实任务。' : 'Runtime 当前不可接收新任务。',
+    requestId:String(req?.id || ''),
+  };
+}
+async function startRuntimeDrain() {
+  if (runtimeLifecycle === 'stopping') return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+  runtimeLifecycle = 'draining';
+  drainStartedAt = drainStartedAt || Date.now();
+  app.log.info({ lifecycle:runtimeLifecycle, drainStartedAt }, 'runtime draining started');
+  return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+}
+async function cancelRuntimeDrain() {
+  if (runtimeLifecycle === 'draining') runtimeLifecycle = 'accepting';
+  drainStartedAt = null;
+  return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+}
+async function runtimeAdminState() {
+  const drain = await drainState();
+  return {
+    mode:RUNTIME_MODE,
+    state:runtimeLifecycle === 'accepting' ? 'running' : runtimeLifecycle,
+    lifecycle:runtimeLifecycle,
+    acceptingNewTurns:runtimeLifecycle === 'accepting' && RUNTIME_MODE === 'active',
+    activeTurnCount:drain.activeTurnCount,
+    submittingTurnCount:drain.submittingTurnCount,
+    instanceId:INSTANCE_ID,
+    releaseId:RELEASE_ID,
+    commit:RELEASE_COMMIT,
+    pid:process.pid,
+    port:PORT,
+    database:DB_FILE,
+    drainStartedAt,
+    drainTimeoutMs:DRAIN_TIMEOUT_MS,
+  };
+}
+async function activeTurnDetails() {
+  const rows = await db.all(
+    `SELECT id, provider, provider_id, active_turn_id, status, updated_at, created_at
+     FROM sessions
+     WHERE status IN ('running','active','submitting') OR active_turn_id IS NOT NULL
+     ORDER BY updated_at DESC`
+  ).catch(()=>[]);
+  return {
+    activeTurnCount:rows.length,
+    turns:rows.map((row:any) => ({
+      sessionId:String(row.id),
+      turnId:row.active_turn_id ? String(row.active_turn_id) : null,
+      provider:String(row.provider_id || row.provider || 'codex'),
+      status:String(row.status || 'unknown'),
+      runningMs:Date.now() - Number(row.updated_at || row.created_at || Date.now()),
+      updatedAt:Number(row.updated_at || 0),
+    })),
   };
 }
 async function drainState() {
@@ -1775,6 +1843,18 @@ async function drainState() {
     accepting:runtimeLifecycle === 'accepting',
     drained:Number(row?.activeTurnCount || 0) === 0 && Number(row?.submittingTurnCount || 0) === 0 && diagnostics.runtimePendingPushCount === 0,
   };
+}
+function releaseMetadata() {
+  const manifestPath = path.join(process.cwd(), 'deploy-manifest.json');
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    return {
+      releaseId:String(manifest.releaseId || path.basename(process.cwd())),
+      commit:String(manifest.commit || ''),
+    };
+  } catch {
+    return { releaseId:path.basename(process.cwd()), commit:'' };
+  }
 }
 async function waitForDrain(timeoutMs = DRAIN_TIMEOUT_MS) {
   const started = Date.now();

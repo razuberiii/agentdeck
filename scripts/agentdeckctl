@@ -1,0 +1,526 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONTROL_ROOT="${AGENTDECK_ROOT:-/opt/stacks/agentdeck}"
+SOURCE_ROOT="${AGENTDECK_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+DATA_DIR="${DATA_DIR:-/opt/data/agentdeck}"
+ENV_DIR="${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}"
+STATE_DIR="${AGENTDECK_DEPLOY_STATE_DIR:-$CONTROL_ROOT/deploy-state}"
+RELEASES_DIR="$CONTROL_ROOT/releases"
+CURRENT_LINK="$CONTROL_ROOT/current"
+PREVIOUS_LINK="$CONTROL_ROOT/previous"
+CANDIDATE_LINK="$CONTROL_ROOT/candidate"
+JOBS_DIR="$STATE_DIR/jobs"
+LOG_DIR="$STATE_DIR/logs"
+LOCK_FILE="$STATE_DIR/deploy.lock"
+WEB_PORT="${AGENTDECK_WEB_PORT:-3842}"
+WEB_CANDIDATE_PORT="${AGENTDECK_WEB_CANDIDATE_PORT:-3942}"
+RUNTIME_PORT="${AGENTDECK_RUNTIME_PORT:-3852}"
+RUNTIME_CANDIDATE_PORT="${AGENTDECK_RUNTIME_CANDIDATE_PORT:-3952}"
+DRAIN_TIMEOUT_SECONDS="${AGENTDECK_DRAIN_TIMEOUT_SECONDS:-7200}"
+KEEP_RELEASES="${AGENTDECK_KEEP_RELEASES:-5}"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: sudo agentdeckctl <command> [target] [options]
+
+commands:
+  status [--json]
+  check
+  restart web|runtime|all [--force]
+  deploy web|runtime|all [--wait] [--force]
+  rollback web|runtime|all [--wait] [--force]
+  jobs
+  job <job-id>
+  logs deploy
+EOF
+}
+
+log() { printf '[agentdeckctl] %s\n' "$*" >&2; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+json_escape() { node -e 'process.stdout.write(JSON.stringify(process.argv[1] || ""))' "$1"; }
+is_worker() { [ "${AGENTDECK_DEPLOY_WORKER:-0}" = "1" ]; }
+
+ensure_dirs() {
+  mkdir -p "$CONTROL_ROOT" "$DATA_DIR" "$STATE_DIR" "$RELEASES_DIR" "$JOBS_DIR" "$LOG_DIR"
+}
+
+write_job() {
+  local job_id="$1" status="$2" message="${3:-}"
+  node - "$JOBS_DIR/$job_id.json" "$job_id" "$status" "$message" <<'NODE'
+const fs = require('node:fs');
+const file = process.argv[2], jobId = process.argv[3], status = process.argv[4], message = process.argv[5] || '';
+let previous = {};
+try { previous = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+const now = new Date().toISOString();
+const next = { ...previous, id:jobId, status, message, updatedAt:now };
+if (!next.createdAt) next.createdAt = now;
+if (process.env.AGENTDECK_JOB_COMMAND) next.command = process.env.AGENTDECK_JOB_COMMAND;
+if (process.env.AGENTDECK_JOB_TARGET) next.target = process.env.AGENTDECK_JOB_TARGET;
+if (process.env.AGENTDECK_JOB_LOG) next.log = process.env.AGENTDECK_JOB_LOG;
+if (process.env.AGENTDECK_JOB_RELEASE) next.release = process.env.AGENTDECK_JOB_RELEASE;
+fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n');
+NODE
+}
+
+latest_job_file() {
+  ls -1t "$JOBS_DIR"/*.json 2>/dev/null | head -1 || true
+}
+
+show_job() {
+  local id="$1"
+  [ -f "$JOBS_DIR/$id.json" ] || die "job not found: $id"
+  cat "$JOBS_DIR/$id.json"
+}
+
+list_jobs() {
+  ensure_dirs
+  ls -1t "$JOBS_DIR"/*.json 2>/dev/null | while read -r file; do
+    node - "$file" <<'NODE'
+const fs = require('node:fs');
+const j = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+console.log(`${j.id}\t${j.status}\t${j.command || ''}\t${j.target || ''}\t${j.updatedAt || ''}`);
+NODE
+  done
+}
+
+service_state() {
+  local unit="$1"
+  systemctl show "$unit" -p ActiveState -p SubState -p MainPID --value 2>/dev/null | paste -sd ' ' - || true
+}
+
+curl_json() {
+  local url="$1"
+  curl -fsS --max-time 5 "$url"
+}
+
+runtime_state() {
+  curl_json "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/state" 2>/dev/null || echo '{}'
+}
+
+active_turns() {
+  curl_json "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/active-turns" 2>/dev/null || echo '{"activeTurnCount":0,"turns":[]}'
+}
+
+release_target() {
+  local link="$1"
+  [ -L "$link" ] && readlink -f "$link" || true
+}
+
+status_json() {
+  ensure_dirs
+  local current previous candidate web runtime last_job db
+  current="$(release_target "$CURRENT_LINK")"
+  previous="$(release_target "$PREVIOUS_LINK")"
+  candidate="$(release_target "$CANDIDATE_LINK")"
+  web="$(curl_json "http://127.0.0.1:$WEB_PORT/api/status" 2>/dev/null || echo '{}')"
+  runtime="$(runtime_state)"
+  last_job="$(latest_job_file)"
+  db="${RUNTIME_DB:-$DATA_DIR/agentdeck-runtime.sqlite3}"
+  node - "$current" "$previous" "$candidate" "$web" "$runtime" "$last_job" "$db" "$CURRENT_LINK" <<'NODE'
+const fs = require('node:fs');
+const [current, previous, candidate, webRaw, runtimeRaw, lastJobFile, db, currentLink] = process.argv.slice(2);
+const parse = s => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
+let lastJob = null;
+if (lastJobFile) try { lastJob = JSON.parse(fs.readFileSync(lastJobFile, 'utf8')); } catch {}
+const service = unit => {
+  try {
+    const cp = require('node:child_process').execFileSync('systemctl', ['show', unit, '-p', 'ActiveState', '-p', 'SubState', '-p', 'MainPID', '--value'], { encoding:'utf8' }).trim().split(/\n/);
+    return { activeState:cp[0] || 'unknown', subState:cp[1] || '', mainPid:Number(cp[2] || 0) };
+  } catch { return { activeState:'unknown', subState:'', mainPid:0 }; }
+};
+const web = parse(webRaw);
+const runtime = parse(runtimeRaw);
+console.log(JSON.stringify({
+  currentRelease: current || null,
+  previousRelease: previous || null,
+  candidateRelease: candidate || null,
+  currentSymlink: currentLink,
+  gitCommit: runtime.commit || web.release?.commit || null,
+  web: { pid:service('agentdeck-web.service').mainPid, port:Number(process.env.AGENTDECK_WEB_PORT || 3842), version:web.release || null },
+  runtime: { pid:service('agentdeck-runtime.service').mainPid, port:Number(process.env.AGENTDECK_RUNTIME_PORT || 3852), state:runtime },
+  activeTurnCount:Number(runtime.activeTurnCount || 0),
+  draining:runtime.lifecycle === 'draining' || runtime.state === 'draining',
+  providers: { codexAppServerDefault:service('agentdeck-app-server@default.service') },
+  lastJob,
+  lastDeploySucceeded:lastJob ? lastJob.status === 'succeeded' : null,
+  databasePath:db,
+  services: {
+    web:service('agentdeck-web.service'),
+    runtime:service('agentdeck-runtime.service'),
+    codexDefault:service('agentdeck-app-server@default.service'),
+  },
+}, null, 2));
+NODE
+}
+
+status_text() {
+  local json
+  json="$(status_json)"
+  node - "$json" <<'NODE'
+const s = JSON.parse(process.argv[2]);
+console.log(`current:  ${s.currentRelease || '-'}`);
+console.log(`previous: ${s.previousRelease || '-'}`);
+console.log(`candidate:${s.candidateRelease || '-'}`);
+console.log(`commit:   ${s.gitCommit || '-'}`);
+console.log(`web:      pid=${s.web.pid || 0} port=${s.web.port} service=${s.services.web.activeState}/${s.services.web.subState}`);
+console.log(`runtime:  pid=${s.runtime.pid || 0} port=${s.runtime.port} state=${s.runtime.state.state || 'unknown'} activeTurns=${s.activeTurnCount} draining=${s.draining}`);
+console.log(`provider: codex-default pid=${s.providers.codexAppServerDefault.mainPid || 0} service=${s.providers.codexAppServerDefault.activeState}/${s.providers.codexAppServerDefault.subState}`);
+console.log(`db:       ${s.databasePath}`);
+console.log(`symlink:  ${s.currentSymlink}`);
+if (s.lastJob) console.log(`last job: ${s.lastJob.id} ${s.lastJob.status} ${s.lastJob.command || ''} ${s.lastJob.target || ''}`);
+NODE
+}
+
+run_check() {
+  ensure_dirs
+  cd "$SOURCE_ROOT"
+  log "checking Node and npm"
+  node --version
+  npm --version
+  log "checking env dir"
+  [ -d "$ENV_DIR" ] || die "env dir does not exist: $ENV_DIR"
+  for name in web.env runtime.env agentdeck-app-server-default.env; do
+    [ -f "$ENV_DIR/$name" ] || die "missing env file: $ENV_DIR/$name"
+  done
+  log "checking systemd unit files"
+  ROOT="$SOURCE_ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/deploy/install-units.sh"
+  log "running typecheck"
+  npm run typecheck
+  log "running build"
+  npm run build
+  log "running unit tests"
+  npm test
+  log "running mock e2e"
+  npm run test:e2e
+  log "CHECK_OK commit=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+}
+
+make_release() {
+  ensure_dirs
+  local commit short ts release_id release_path
+  cd "$SOURCE_ROOT"
+  commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  short="$(printf '%s' "$commit" | cut -c1-12)"
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  release_id="$ts-$short"
+  release_path="$RELEASES_DIR/$release_id"
+  [ ! -e "$release_path" ] || die "release already exists: $release_id"
+  log "creating release $release_id"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git worktree add --detach "$release_path" "$commit" >/dev/null
+  else
+    mkdir -p "$release_path"
+    tar --exclude='./releases' --exclude='./deploy-state' --exclude='./current' --exclude='./previous' --exclude='./candidate' -C "$SOURCE_ROOT" -cf - . | tar -C "$release_path" -xf -
+  fi
+  cd "$release_path"
+  npm ci
+  npm run typecheck
+  npm run lint
+  npm run build
+  npm test
+  npm run test:e2e
+  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" <<'NODE'
+const fs = require('node:fs');
+fs.writeFileSync(process.argv[2], JSON.stringify({
+  releaseId:process.argv[3],
+  commit:process.argv[4],
+  builtAt:new Date().toISOString(),
+  schemaVersion:1,
+  compatibility:{ web:true, runtime:true },
+}, null, 2) + '\n');
+NODE
+  ln -sfn "releases/$release_id" "$CANDIDATE_LINK.tmp"
+  mv -Tf "$CANDIDATE_LINK.tmp" "$CANDIDATE_LINK"
+  printf '%s\n' "$release_id"
+}
+
+sqlite_backup() {
+  local source_db="${RUNTIME_DB:-$DATA_DIR/agentdeck-runtime.sqlite3}" dest_db="$1"
+  mkdir -p "$(dirname "$dest_db")"
+  if [ ! -f "$source_db" ]; then
+    : > "$dest_db"
+    return
+  fi
+  node - "$source_db" "$dest_db" <<'NODE'
+const Database = require('better-sqlite3');
+const source = process.argv[2], dest = process.argv[3];
+const db = new Database(source, { readonly:true, fileMustExist:true });
+db.backup(dest).then(() => db.close()).catch(err => { console.error(err.message); process.exit(1); });
+NODE
+}
+
+start_candidate_runtime() {
+  local release_path="$1" job_id="$2" candidate_dir="$DATA_DIR/deploy-candidates/$job_id" pid_file="$candidate_dir/runtime.pid"
+  mkdir -p "$candidate_dir"
+  sqlite_backup "$candidate_dir/agentdeck-runtime.sqlite3"
+  (
+    cd "$release_path"
+    RUNTIME_MODE=candidate DATA_DIR="$candidate_dir" RUNTIME_DATA_DIR="$candidate_dir" RUNTIME_DB="$candidate_dir/agentdeck-runtime.sqlite3" RUNTIME_PORT="$RUNTIME_CANDIDATE_PORT" RUNTIME_HOST=127.0.0.1 AGENTDECK_RELEASE_ID="$(basename "$release_path")" node server/dist/agentdeck-runtime.js >>"$LOG_DIR/$job_id.candidate-runtime.log" 2>&1 &
+    echo $! > "$pid_file"
+  )
+  wait_http "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/healthz" 30
+  curl -fsS "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/schema" >/dev/null
+}
+
+start_candidate_web() {
+  local release_path="$1" job_id="$2" candidate_dir="$DATA_DIR/deploy-candidates/$job_id" pid_file="$candidate_dir/web.pid"
+  mkdir -p "$candidate_dir"
+  (
+    cd "$release_path"
+    PORT="$WEB_CANDIDATE_PORT" DATA_DIR="$DATA_DIR" USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="http://127.0.0.1:$RUNTIME_PORT" AGENTDECK_RELEASE_ID="$(basename "$release_path")" node server/dist/index.js >>"$LOG_DIR/$job_id.candidate-web.log" 2>&1 &
+    echo $! > "$pid_file"
+  )
+  wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/api/status" 30
+}
+
+stop_candidate_processes() {
+  local job_id="$1" candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
+  for name in web runtime; do
+    if [ -f "$candidate_dir/$name.pid" ]; then
+      kill "$(cat "$candidate_dir/$name.pid")" 2>/dev/null || true
+    fi
+  done
+}
+
+wait_http() {
+  local url="$1" seconds="$2" start
+  start="$(date +%s)"
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    [ $(( $(date +%s) - start )) -lt "$seconds" ] || die "health check timed out: $url"
+    sleep 1
+  done
+}
+
+switch_current() {
+  local release_id="$1"
+  local current_target
+  current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  if [ -n "$current_target" ]; then
+    ln -sfn "$current_target" "$PREVIOUS_LINK.tmp"
+    mv -Tf "$PREVIOUS_LINK.tmp" "$PREVIOUS_LINK"
+  fi
+  ln -sfn "releases/$release_id" "$CURRENT_LINK.tmp"
+  mv -Tf "$CURRENT_LINK.tmp" "$CURRENT_LINK"
+}
+
+cleanup_releases() {
+  ls -1dt "$RELEASES_DIR"/* 2>/dev/null | tail -n +"$((KEEP_RELEASES + 1))" | while read -r old; do
+    [ "$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)" = "$(readlink -f "$old")" ] && continue
+    [ "$(readlink -f "$PREVIOUS_LINK" 2>/dev/null || true)" = "$(readlink -f "$old")" ] && continue
+    rm -rf "$old"
+  done
+}
+
+drain_runtime() {
+  curl -fsS -X POST "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/drain" >/dev/null
+}
+
+undrain_runtime() {
+  curl -fsS -X POST "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/undrain" >/dev/null || true
+}
+
+wait_drain() {
+  local force="$1" start count
+  start="$(date +%s)"
+  while true; do
+    count="$(active_turns | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).activeTurnCount||0)}catch{console.log(0)}})')"
+    [ "$count" = "0" ] && return
+    if [ $(( $(date +%s) - start )) -ge "$DRAIN_TIMEOUT_SECONDS" ]; then
+      if [ "$force" = "1" ]; then
+        log "drain timed out; --force allows restart with $count active turn(s)"
+        return
+      fi
+      undrain_runtime
+      die "runtime drain timed out with $count active turn(s); deployment cancelled"
+    fi
+    sleep 5
+  done
+}
+
+reject_active_turns() {
+  local turns count
+  turns="$(active_turns)"
+  count="$(printf '%s' "$turns" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).activeTurnCount||0)}catch{console.log(0)}})')"
+  [ "$count" = "0" ] && return 0
+  echo "ERROR: active turn exists ($count)." >&2
+  printf '%s\n' "$turns" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s); for (const t of j.turns||[]) console.error(`session=${t.sessionId} turn=${t.turnId || "-"} provider=${t.provider} runningMs=${t.runningMs}`);})'
+  echo "Use a safe deploy instead: sudo agentdeckctl deploy runtime --wait" >&2
+  return 2
+}
+
+restart_target() {
+  local target="$1" force="${2:-0}"
+  case "$target" in
+    web)
+      systemctl restart agentdeck-web.service
+      wait_http "http://127.0.0.1:$WEB_PORT/api/status" 30
+      ;;
+    runtime)
+      [ "$force" = "1" ] || reject_active_turns
+      [ "$force" = "1" ] && log "forcing runtime restart; active turns may be interrupted"
+      systemctl restart agentdeck-runtime.service
+      wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 30
+      ;;
+    all)
+      drain_runtime
+      if [ "$force" = "1" ]; then log "forcing all restart; active turns may be interrupted"; else wait_drain 0; fi
+      systemctl restart agentdeck-runtime.service
+      wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 30
+      systemctl restart agentdeck-web.service
+      wait_http "http://127.0.0.1:$WEB_PORT/api/status" 30
+      ;;
+    *) die "unknown restart target: $target" ;;
+  esac
+}
+
+worker_deploy() {
+  local job_id="$1" target="$2" force="$3"
+  export AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
+  exec >>"$LOG_DIR/$job_id.log" 2>&1
+  write_job "$job_id" running "deploy started"
+  (
+    flock -n 9 || die "another deploy/rollback job is running"
+    local release_id release_path
+    release_id="$(make_release)"
+    release_path="$RELEASES_DIR/$release_id"
+    export AGENTDECK_JOB_RELEASE="$release_id"
+    write_job "$job_id" running "release built"
+    ROOT="$release_path" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$release_path/deploy/install-units.sh"
+    if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
+      start_candidate_runtime "$release_path" "$job_id"
+    fi
+    if [ "$target" = "web" ] || [ "$target" = "all" ]; then
+      start_candidate_web "$release_path" "$job_id"
+    fi
+    if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
+      drain_runtime
+      wait_drain "$force"
+      switch_current "$release_id"
+      systemctl restart agentdeck-runtime.service
+      wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45
+    else
+      switch_current "$release_id"
+    fi
+    if [ "$target" = "web" ] || [ "$target" = "all" ]; then
+      systemctl restart agentdeck-web.service
+      wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45
+    fi
+    stop_candidate_processes "$job_id"
+    cleanup_releases
+    write_job "$job_id" succeeded "deploy succeeded"
+  ) 9>"$LOCK_FILE" || {
+    local code=$?
+    stop_candidate_processes "$job_id" || true
+    undrain_runtime
+    write_job "$job_id" failed "deploy failed"
+    exit "$code"
+  }
+}
+
+worker_rollback() {
+  local job_id="$1" target="$2" force="$3"
+  export AGENTDECK_JOB_COMMAND=rollback AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
+  exec >>"$LOG_DIR/$job_id.log" 2>&1
+  write_job "$job_id" running "rollback started"
+  (
+    flock -n 9 || die "another deploy/rollback job is running"
+    [ -L "$PREVIOUS_LINK" ] || die "previous release is not set"
+    local previous_target current_target
+    previous_target="$(readlink "$PREVIOUS_LINK")"
+    current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+    if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
+      drain_runtime
+      wait_drain "$force"
+    fi
+    ln -sfn "$previous_target" "$CURRENT_LINK.tmp"
+    mv -Tf "$CURRENT_LINK.tmp" "$CURRENT_LINK"
+    [ -n "$current_target" ] && { ln -sfn "$current_target" "$PREVIOUS_LINK.tmp"; mv -Tf "$PREVIOUS_LINK.tmp" "$PREVIOUS_LINK"; }
+    if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
+      systemctl restart agentdeck-runtime.service
+      wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45
+    fi
+    if [ "$target" = "web" ] || [ "$target" = "all" ]; then
+      systemctl restart agentdeck-web.service
+      wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45
+    fi
+    write_job "$job_id" succeeded "rollback succeeded"
+  ) 9>"$LOCK_FILE" || {
+    local code=$?
+    undrain_runtime
+    write_job "$job_id" failed "rollback failed"
+    exit "$code"
+  }
+}
+
+submit_job() {
+  local command="$1" target="$2" wait="$3" force="$4" job_id log_file
+  ensure_dirs
+  job_id="$command-$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
+  log_file="$LOG_DIR/$job_id.log"
+  export AGENTDECK_JOB_COMMAND="$command" AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$log_file"
+  write_job "$job_id" accepted "$command accepted"
+  local worker_args=("$command" "$target" "--job-id=$job_id")
+  [ "$force" = "1" ] && worker_args+=("--force")
+  if command -v systemd-run >/dev/null 2>&1 && [ "${AGENTDECK_NO_SYSTEMD_RUN:-0}" != "1" ]; then
+    systemd-run --unit="agentdeck-deploy@$job_id" --collect --same-dir --property=WorkingDirectory="$SOURCE_ROOT" --setenv=AGENTDECK_DEPLOY_WORKER=1 --setenv=AGENTDECK_ROOT="$CONTROL_ROOT" --setenv=AGENTDECK_SOURCE_ROOT="$SOURCE_ROOT" --setenv=DATA_DIR="$DATA_DIR" --setenv=AGENTDECK_ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/scripts/agentdeckctl" "${worker_args[@]}" >/dev/null
+  else
+    AGENTDECK_DEPLOY_WORKER=1 "$SOURCE_ROOT/scripts/agentdeckctl" "${worker_args[@]}" >>"$log_file" 2>&1 &
+  fi
+  echo "$command job accepted: $job_id"
+  echo "Track with:"
+  echo "  sudo agentdeckctl job $job_id"
+  echo "  sudo journalctl -fu agentdeck-deploy@$job_id.service"
+  [ "$wait" = "1" ] && wait_job "$job_id"
+}
+
+wait_job() {
+  local job_id="$1" status
+  while true; do
+    [ -f "$JOBS_DIR/$job_id.json" ] || die "job not found: $job_id"
+    status="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).status)' "$JOBS_DIR/$job_id.json")"
+    case "$status" in
+      succeeded) return 0 ;;
+      failed) return 1 ;;
+      *) sleep 3 ;;
+    esac
+  done
+}
+
+COMMAND="${1:-}"
+[ -n "$COMMAND" ] || { usage; exit 2; }
+shift || true
+TARGET="${1:-}"
+case "$COMMAND" in status|check|jobs) ;; *) shift || true ;; esac
+WAIT=0
+FORCE=0
+JSON=0
+JOB_ID=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --wait) WAIT=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --json) JSON=1; shift ;;
+    --job-id=*) JOB_ID="${1#--job-id=}"; shift ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+ensure_dirs
+case "$COMMAND" in
+  status) [ "$JSON" = "1" ] && status_json || status_text ;;
+  check) run_check ;;
+  restart) [ -n "$TARGET" ] || die "restart target required"; restart_target "$TARGET" "$FORCE" ;;
+  deploy)
+    TARGET="${TARGET:-all}"
+    if is_worker; then worker_deploy "$JOB_ID" "$TARGET" "$FORCE"; else submit_job deploy "$TARGET" "$WAIT" "$FORCE"; fi
+    ;;
+  rollback)
+    TARGET="${TARGET:-all}"
+    if is_worker; then worker_rollback "$JOB_ID" "$TARGET" "$FORCE"; else submit_job rollback "$TARGET" "$WAIT" "$FORCE"; fi
+    ;;
+  jobs) list_jobs ;;
+  job) [ -n "$TARGET" ] || die "job id required"; show_job "$TARGET" ;;
+  logs) [ "$TARGET" = "deploy" ] || die "only logs deploy is supported"; tail -n 200 -F "$LOG_DIR"/*.log ;;
+  *) usage; exit 2 ;;
+esac

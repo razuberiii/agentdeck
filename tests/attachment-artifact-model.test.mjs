@@ -46,3 +46,14 @@ test('artifact cards are not duplicated by markdown link parsing', () => {
   assert.match(client, /const parsedImages = artifacts\.length \? \[\] : extractMarkdownImages\(text\)/);
   assert.match(client, /const parsedFiles = artifacts\.length \? \[\] : extractFileLinks\(text\)/);
 });
+
+test('session restore reconciles canonical user messages with attachments', () => {
+  assert.match(server, /CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message/);
+  assert.match(server, /ON CONFLICT\(session_id,client_message_id\) WHERE client_message_id IS NOT NULL DO UPDATE/);
+  assert.match(server, /canonicalUserMessageItem/);
+  assert.match(server, /findCanonicalUserForRuntimeEvent/);
+  assert.match(server, /userMessageAttachmentsFromRow/);
+  assert.match(client, /reconcileTimelineEvents/);
+  assert.match(client, /userIdentityKey/);
+  assert.match(client, /dedupeAttachments/);
+});

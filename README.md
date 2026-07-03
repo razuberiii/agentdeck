@@ -290,7 +290,7 @@ API Key 只写入对应 profile 的 `agentdeck.env`，权限为 `0600`。Google 
 
 ## 生产部署
 
-推荐的生产结构：
+推荐的生产结构仍然是 Web Gateway、Runtime 和 Provider 进程分离：
 
 ```text
 Internet
@@ -314,6 +314,74 @@ Provider processes
 - `ALLOWED_ORIGINS` 只包含实际使用的 HTTPS 域名。
 
 仓库中的 systemd 示例位于 [`deploy/systemd/`](deploy/systemd/)。
+
+### 使用 agentdeckctl
+
+生产环境推荐使用统一控制命令：
+
+```bash
+sudo agentdeckctl status
+sudo agentdeckctl check
+sudo agentdeckctl deploy all
+sudo agentdeckctl rollback all
+```
+
+仓库内也保留同等入口：
+
+```bash
+sudo ./scripts/agentdeckctl status
+```
+
+`agentdeckctl` 会使用 release 目录部署，而不是直接在正在运行的工作树中 build：
+
+```text
+/opt/stacks/agentdeck/
+  current -> releases/<current-release>
+  previous -> releases/<previous-release>
+  candidate -> releases/<candidate-release>
+  releases/
+  deploy-state/
+```
+
+`deploy all` 默认提交 detached systemd job，真实部署 worker 不属于 Web、Runtime 或 Provider app-server 的进程树。命令会立即返回 job id：
+
+```bash
+sudo agentdeckctl deploy all
+sudo agentdeckctl jobs
+sudo agentdeckctl job <job-id>
+sudo agentdeckctl logs deploy
+```
+
+如果需要同步等待结果：
+
+```bash
+sudo agentdeckctl deploy all --wait
+```
+
+部署流程会先构建新 release，并用 candidate 端口预启动 Runtime/Web 做健康检查：
+
+- Web 正式端口默认 `3842`，candidate 端口默认 `3942`；
+- Runtime 正式端口默认 `3852`，candidate 端口默认 `3952`；
+- candidate Runtime 使用生产数据库副本和 `RUNTIME_MODE=candidate`，不会接收真实 turn；
+- Runtime 切换前会进入 draining，等待 active turn 结束；
+- `--force` 才允许在 active turn 存在时强制中断。
+
+单独重启或部署某个组件：
+
+```bash
+sudo agentdeckctl restart web
+sudo agentdeckctl restart runtime
+sudo agentdeckctl deploy web
+sudo agentdeckctl deploy runtime
+```
+
+旧入口仍可用，但只作为兼容 wrapper：
+
+```bash
+sudo ./scripts/deploy.sh --check
+sudo ./scripts/deploy.sh --deploy --components web,runtime --wait
+sudo ./scripts/deploy.sh --rollback --components runtime
+```
 
 如果 Runtime 必须监听非 loopback 地址，请在两侧设置同一个强随机 token：
 
@@ -397,6 +465,4 @@ AgentDeck 仍在快速迭代。Provider CLI / SDK 的协议和行为可能变化
 
 ## License
 
-仓库目前还没有 `LICENSE` 文件。
-
-公开源代码并不自动授予复制、修改或分发权。如果准备让其他人正式使用或参与贡献，建议补充一个明确的开源许可证。
+MIT. See [`LICENSE`](LICENSE).

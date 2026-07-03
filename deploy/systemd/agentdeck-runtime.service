@@ -9,20 +9,21 @@ StartLimitBurst=3
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/stacks/agentdeck
+WorkingDirectory=/opt/stacks/agentdeck/current
 Environment=HOME=/home/ubuntu
 Environment=DATA_DIR=/opt/data/agentdeck
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852
+Environment=RUNTIME_MODE=active
 Environment=CODEX_APP_SERVER_PORT_BASE=4620
 EnvironmentFile=@AGENTDECK_ENV_DIR@/runtime.env
-ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/agentdeck-runtime.js
+ExecStart=/usr/bin/flock -n /run/agentdeck/runtime-production.lock /usr/bin/node /opt/stacks/agentdeck/current/server/dist/agentdeck-runtime.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /tmp /run
+ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /tmp /run /run/agentdeck
 
 [Install]
 WantedBy=multi-user.target

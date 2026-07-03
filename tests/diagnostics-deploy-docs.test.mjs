@@ -5,6 +5,7 @@ import test from 'node:test';
 const indexSource = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 const deploySource = readFileSync(new URL('../scripts/deploy.sh', import.meta.url), 'utf8');
+const ctlSource = readFileSync(new URL('../scripts/agentdeckctl', import.meta.url), 'utf8');
 const installUnitsSource = readFileSync(new URL('../deploy/install-units.sh', import.meta.url), 'utf8');
 const cutoverSource = readFileSync(new URL('../deploy/cutover.sh', import.meta.url), 'utf8');
 const gitignoreSource = readFileSync(new URL('../.gitignore', import.meta.url), 'utf8');
@@ -23,18 +24,19 @@ test('diagnostics endpoint and page expose safe runtime ownership fields', () =>
 test('deploy entrypoint supports check deploy rollback without restarting on check', () => {
   const mode = statSync(new URL('../scripts/deploy.sh', import.meta.url)).mode;
   assert.ok(mode & 0o111, 'scripts/deploy.sh must be executable');
-  assert.match(deploySource, /--check\|--deploy \[--components web,runtime\|--changed\]\|--rollback/);
-  assert.match(deploySource, /npm run typecheck/);
-  assert.match(deploySource, /npm run build/);
-  assert.match(deploySource, /npm test/);
-  assert.match(deploySource, /npm run test:e2e/);
-  const checkBody = deploySource.slice(deploySource.indexOf('run_check()'), deploySource.indexOf('health_web()'));
+  assert.match(deploySource, /--check\|--deploy \[--components web,runtime\|--changed\].*--rollback/);
+  assert.match(deploySource, /exec "\$CTL" check/);
+  assert.match(ctlSource, /npm run typecheck/);
+  assert.match(ctlSource, /npm run build/);
+  assert.match(ctlSource, /npm test/);
+  assert.match(ctlSource, /npm run test:e2e/);
+  const checkBody = ctlSource.slice(ctlSource.indexOf('run_check()'), ctlSource.indexOf('make_release()'));
   assert.doesNotMatch(checkBody, /systemctl restart|systemctl stop|cutover\.sh|rollback\.sh/);
 });
 
 test('deploy preserves the external production env dir and does not remount /etc', () => {
-  assert.match(deploySource, /ENV_DIR="\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}"/);
-  assert.match(deploySource, /check_env_dir\(\)/);
+  assert.match(ctlSource, /ENV_DIR="\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}"/);
+  assert.match(ctlSource, /\[ -d "\$ENV_DIR" \]/);
   assert.match(installUnitsSource, /ENV_DIR=\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}/);
   assert.match(cutoverSource, /env dir is not writable before cutover/);
   assert.doesNotMatch(installUnitsSource, /mount -o remount/);

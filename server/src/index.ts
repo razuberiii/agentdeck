@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import { promisify } from 'node:util';
-import { createWriteStream, realpathSync, existsSync } from 'node:fs';
+import { createWriteStream, realpathSync, existsSync, readFileSync } from 'node:fs';
 import { chmod, cp, lstat, mkdir, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { rm } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
@@ -62,6 +62,9 @@ const runtimeDb = new Db(process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdec
 const codex = new CodexBridge(DEFAULT_HOME, DEFAULT_CODEX_HOME);
 const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
+const RELEASE_INFO = releaseMetadata();
+const RELEASE_ID = process.env.AGENTDECK_RELEASE_ID || RELEASE_INFO.releaseId;
+const RELEASE_COMMIT = process.env.AGENTDECK_RELEASE_COMMIT || RELEASE_INFO.commit;
 const antigravity = new AntigravityProvider();
 const geminiProvider = new GeminiProvider();
 const claudeProvider = new ClaudeProvider();
@@ -182,6 +185,7 @@ await db.run('ALTER TABLE agent_messages ADD COLUMN turn_id TEXT').catch(()=>{})
 await db.run('ALTER TABLE agent_messages ADD COLUMN original_text TEXT').catch(()=>{});
 await db.run('ALTER TABLE agent_messages ADD COLUMN attachments_json TEXT').catch(()=>{});
 await db.run('ALTER TABLE agent_messages ADD COLUMN status TEXT').catch(()=>{});
+await db.run('CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message ON agent_messages(session_id,client_message_id) WHERE client_message_id IS NOT NULL').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS artifact_baselines (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, project_dir TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(session_id, turn_id))').catch(()=>{});
 await db.run('CREATE UNIQUE INDEX IF NOT EXISTS artifacts_turn_path_hash ON artifacts(session_id, turn_id, relative_path, content_hash)').catch(()=>{});
 await db.run('UPDATE sessions SET status=?1 WHERE status=?2', ['interrupted', 'running']).catch(()=>{});
@@ -220,6 +224,7 @@ app.get('/api/status', async (req) => {
     antigravityStatus,
     geminiStatus,
     geminiRuntime,
+    runtimeState,
     providerStatuses,
   ] = await Promise.all([
     appSettings(),
@@ -232,11 +237,12 @@ app.get('/api/status', async (req) => {
     cachedAntigravityStatus(force),
     cachedGeminiStatus(force),
     USE_AGENT_RUNTIME ? runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })) : Promise.resolve({ error:'persistent runtime disabled' }),
+    USE_AGENT_RUNTIME ? runtimeAdminState().catch((e:any)=>({ error:e?.message || String(e), acceptingNewTurns:false })) : Promise.resolve({ error:'persistent runtime disabled', acceptingNewTurns:true }),
     unifiedProviderStatuses(force),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
-  return { authed, authenticated:true, serverTime: Date.now(), codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
+  return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
   const settings = await appSettings();
@@ -1265,7 +1271,7 @@ app.get('/icons/:file', async (req:any, reply) => {
   if (!/^[A-Za-z0-9_.-]+$/.test(file)) return reply.code(404).send({error:'not found'});
   return reply.sendFile(`icons/${file}`);
 });
-app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; ws.agentdeckGeneration = ++websocketConnectionGeneration; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); app.log.info({ connectionGeneration:ws.agentdeckGeneration }, 'websocket connected'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || '')); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e.message})); } }); ws.on('close', () => { for (const [sessionId,set] of clients.entries()) { if (set.delete(ws)) app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers'); } }); });
+app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; ws.agentdeckGeneration = ++websocketConnectionGeneration; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); app.log.info({ connectionGeneration:ws.agentdeckGeneration }, 'websocket connected'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || '')); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable})); } }); ws.on('close', () => { for (const [sessionId,set] of clients.entries()) { if (set.delete(ws)) app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers'); } }); });
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
 codex.on('notification', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id);
@@ -3289,6 +3295,13 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
       ORDER BY sequence ASC`,
     [threadId]
   ).catch(()=>[]);
+  const canonicalUsers = await db.all(
+    `SELECT * FROM agent_messages
+     WHERE session_id=?1 AND role='user'
+     ORDER BY created_at ASC, id ASC`,
+    [threadId]
+  ).catch(()=>[]);
+  let canonicalUserIndex = 0;
   const items:any[] = [];
   const completedItemIds = new Set<string>();
   const deltaText = new Map<string, string>();
@@ -3298,6 +3311,11 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
     let payload:any = {};
     try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
     if (eventType === 'user') {
+      const canonical = canonicalUsers[canonicalUserIndex++] as any;
+      if (canonical) {
+        items.push(canonicalUserMessageItem(canonical));
+        continue;
+      }
       const input = Array.isArray(payload?.input) ? payload.input : [];
       const content = input
         .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
@@ -3325,6 +3343,9 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
       const reason = payload?.reason || payload?.params?.reason || payload?.error?.message || payload?.params?.error?.message || '';
       items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage', text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
     }
+  }
+  while (canonicalUserIndex < canonicalUsers.length) {
+    items.push(canonicalUserMessageItem(canonicalUsers[canonicalUserIndex++]));
   }
   for (const itemId of deltaOrder) {
     const text = String(deltaText.get(itemId) || '').trim();
@@ -3357,6 +3378,16 @@ function compactSnapshotItem(item:any) {
   }
   return next;
 }
+function canonicalUserMessageItem(m:any) {
+  return {
+    id:String(m.id),
+    type:'userMessage',
+    clientMessageId:m.client_message_id || null,
+    status:m.status || 'persisted',
+    attachments:userMessageAttachmentsFromRow(m),
+    content:userMessageContentFromRow(m),
+  };
+}
 function rowSessionDto(row:any) {
   const fields = modeFields(sessionMode(row));
   const providerId = normalizeProvider(row.provider_id) || 'codex';
@@ -3367,7 +3398,7 @@ function rowSessionDto(row:any) {
 async function antigravityThread(row:any) {
   const messages = await db.all('SELECT * FROM agent_messages WHERE session_id=?1 ORDER BY created_at ASC', [String(row.id)]);
   const items = messages.map((m:any)=>m.role === 'user'
-    ? { id:m.id, type:'userMessage', content:userMessageContentFromRow(m) }
+    ? canonicalUserMessageItem(m)
     : { id:m.id, type:'agentMessage', text:String(m.text || ''), phase:'final_answer' });
   return {
     id:String(row.id),
@@ -3385,13 +3416,20 @@ function userMessageContentFromRow(m:any) {
   const content:any[] = [];
   const text = stripInternalAttachmentPrompt(String(m.original_text || m.text || '')).trim();
   if (text) content.push({ type:'text', text });
+  for (const a of userMessageAttachmentsFromRow(m)) if (String(a.type || '').startsWith('image/')) content.push({ type:'image', url:a.url, viewerUrl:a.url, path:a.id, name:a.name });
+  return content;
+}
+function userMessageAttachmentsFromRow(m:any) {
   try {
     const attachments = JSON.parse(String(m.attachments_json || '[]'));
-    for (const a of Array.isArray(attachments) ? attachments : []) {
-      if (String(a.type || '').startsWith('image/')) content.push({ type:'image', url:a.url, viewerUrl:a.url, path:a.id });
-    }
-  } catch {}
-  return content;
+    return (Array.isArray(attachments) ? attachments : []).map((a:any)=>({
+      id:String(a.id || a.url || crypto.randomUUID()),
+      name:String(a.name || 'attachment'),
+      type:String(a.type || ''),
+      size:Number(a.size || 0),
+      url:String(a.url || ''),
+    })).filter((a:any)=>a.url);
+  } catch { return []; }
 }
 function stripInternalAttachmentPrompt(text:string) {
   let out = String(text || '');
@@ -3445,6 +3483,27 @@ function isHiddenGeminiUtilitySession(row:any) {
   return id.startsWith('gemini-login-verify-') || id.startsWith('gemini-smoke-') || title === 'Gemini login verification' || title === 'Gemini smoke test';
 }
 function projectNameFromPath(p:string){ return p.split(path.sep).filter(Boolean).pop() || p; }
+async function runtimeAdminState() {
+  const url = `${process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852'}/admin/runtime/state`;
+  const res = await fetch(url, { headers:runtimeAuthHeaders() });
+  if (!res.ok) throw new Error(`runtime admin state failed: ${res.status}`);
+  return res.json();
+}
+function runtimeAuthHeaders(): Record<string, string> {
+  return process.env.RUNTIME_TOKEN ? { authorization:`Bearer ${process.env.RUNTIME_TOKEN}` } : {};
+}
+function releaseMetadata() {
+  const manifestPath = path.join(process.cwd(), 'deploy-manifest.json');
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    return {
+      releaseId:String(manifest.releaseId || path.basename(process.cwd())),
+      commit:String(manifest.commit || ''),
+    };
+  } catch {
+    return { releaseId:path.basename(process.cwd()), commit:'' };
+  }
+}
 async function joinAndResume(id:string, ws:any, lastSequence = 0){
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
@@ -3777,9 +3836,34 @@ async function persistAntigravityAssistant(id:string, threadId:string, text:stri
 async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', id = crypto.randomUUID(), createdAt = Date.now()) {
   const safeAttachments = attachments.map((a:any)=>({ id:String(a.id), name:String(a.name || 'attachment'), type:String(a.type || ''), size:Number(a.size || 0), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }));
   await db.run(
-    `INSERT OR IGNORE INTO agent_messages (id,session_id,role,text,created_at,client_message_id,turn_id,original_text,attachments_json,status)
-     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`,
+    `INSERT INTO agent_messages (id,session_id,role,text,created_at,client_message_id,turn_id,original_text,attachments_json,status)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+     ON CONFLICT(session_id,client_message_id) WHERE client_message_id IS NOT NULL DO UPDATE SET
+       text=excluded.text,
+       original_text=excluded.original_text,
+       attachments_json=excluded.attachments_json,
+       turn_id=COALESCE(agent_messages.turn_id, excluded.turn_id),
+       status=excluded.status`,
     [id, threadId, 'user', String(text || ''), createdAt, clientMessageId || null, turnId || null, String(text || ''), JSON.stringify(safeAttachments), 'persisted']
+  );
+}
+async function findCanonicalUserForRuntimeEvent(threadId:string, payload:any, text:string) {
+  const clientMessageId = String(payload?.clientMessageId || payload?.client_message_id || '').trim();
+  if (clientMessageId) {
+    const byClient = await db.get(
+      `SELECT * FROM agent_messages WHERE session_id=?1 AND role='user' AND client_message_id=?2`,
+      [threadId, clientMessageId]
+    );
+    if (byClient) return byClient;
+  }
+  const cleanText = stripInternalAttachmentPrompt(String(text || '')).trim();
+  if (!cleanText) return null;
+  return db.get(
+    `SELECT * FROM agent_messages
+     WHERE session_id=?1 AND role='user' AND TRIM(COALESCE(original_text,text,''))=?2
+     ORDER BY created_at ASC
+     LIMIT 1`,
+    [threadId, cleanText]
   );
 }
 async function providerInputText(threadId:string, text:string, attachments:any[]) {
@@ -3994,7 +4078,10 @@ async function runtimeEventMessages(threadId:string, event:any) {
       .map((item:any) => stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '')).trim())
       .filter(Boolean)
       .join('\n');
-    if (text) out.push({ type:'user', text, attachments:[], ...base });
+    const canonical = await findCanonicalUserForRuntimeEvent(threadId, payload, text).catch(()=>null);
+    if (canonical) {
+      out.push({ type:'user', messageId:String(canonical.id), clientMessageId:canonical.client_message_id || '', status:canonical.status || 'persisted', text:stripInternalAttachmentPrompt(String(canonical.original_text || canonical.text || '')), attachments:userMessageAttachmentsFromRow(canonical), ...base });
+    } else if (text) out.push({ type:'user', text, attachments:[], ...base });
     return out;
   }
   if (eventType === 'thread/read') return out;

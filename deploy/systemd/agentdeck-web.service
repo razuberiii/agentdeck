@@ -9,13 +9,13 @@ StartLimitBurst=3
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/opt/stacks/agentdeck
+WorkingDirectory=/opt/stacks/agentdeck/current
 Environment=HOME=/home/ubuntu
 Environment=DATA_DIR=/opt/data/agentdeck
 Environment=USE_AGENT_RUNTIME=1
 Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
 EnvironmentFile=@AGENTDECK_ENV_DIR@/web.env
-ExecStart=/usr/bin/node /opt/stacks/agentdeck/server/dist/index.js
+ExecStart=/usr/bin/node /opt/stacks/agentdeck/current/server/dist/index.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=false

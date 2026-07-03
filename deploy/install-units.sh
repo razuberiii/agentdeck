@@ -13,6 +13,7 @@ exec >>"$LOG" 2>&1
 
 echo "== install-units $(date -Is) =="
 echo "env_dir=$ENV_DIR"
+sudo install -d -m 0755 /run/agentdeck
 
 if ! getent passwd "$RUN_USER" >/dev/null; then
   echo "ERROR: configured service user does not exist: $RUN_USER" >&2
@@ -61,4 +62,5 @@ if [ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
 fi
 
 sudo systemctl daemon-reload
+sudo install -m 0755 "$ROOT/scripts/agentdeckctl" /usr/local/bin/agentdeckctl
 echo "installed units"
