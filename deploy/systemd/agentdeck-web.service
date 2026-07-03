@@ -12,6 +12,8 @@ Group=ubuntu
 WorkingDirectory=/opt/stacks/agentdeck/current
 Environment=HOME=/home/ubuntu
 Environment=DATA_DIR=/opt/data/agentdeck
+Environment=PATH=/opt/data/agentdeck/provider-tools/bin:/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/data/agentdeck/cache/ms-playwright
 Environment=USE_AGENT_RUNTIME=1
 Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
 EnvironmentFile=@AGENTDECK_ENV_DIR@/web.env

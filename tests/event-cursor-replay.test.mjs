@@ -21,9 +21,13 @@ class ClientCursorHarness {
     return true;
   }
   apply(msg) {
+    const seq = Number(msg.runtimeSequence || 0);
+    if (seq && seq <= this.snapshotCoveredSequence) {
+      if (seq > this.clientAppliedSequence) this.clientAppliedSequence = seq;
+      return false;
+    }
     if (!this.accept(msg)) return false;
     this.live.push(msg);
-    const seq = Number(msg.runtimeSequence || 0);
     if (seq > this.clientAppliedSequence) this.clientAppliedSequence = seq;
     return true;
   }
@@ -61,24 +65,25 @@ class SubscriptionHarness {
   }
 }
 
-test('HTTP snapshot coveredSequence does not advance browser acknowledgement cursor', () => {
+test('HTTP snapshot coveredSequence advances browser acknowledgement cursor', () => {
   const h = new ClientCursorHarness(222);
 
   assert.equal(h.loadSnapshot(517), 222);
-  assert.equal(h.clientAppliedSequence, 222);
+  h.clientAppliedSequence = Math.max(h.clientAppliedSequence, h.snapshotCoveredSequence);
+  assert.equal(h.clientAppliedSequence, 517);
 
-  assert.equal(h.apply({ type: 'codex', method: 'item/agentMessage/delta', runtimeSequence: 223, runtimeGeneration: 'g1' }), true);
-  assert.equal(h.clientAppliedSequence, 223);
+  assert.equal(h.apply({ type: 'codex', method: 'item/agentMessage/delta', runtimeSequence: 223, runtimeGeneration: 'g1' }), false);
+  assert.equal(h.clientAppliedSequence, 517);
 });
 
-test('replayed events at or below snapshot coveredSequence are still accepted once', () => {
+test('replayed events at or below snapshot coveredSequence are discarded', () => {
   const h = new ClientCursorHarness(222);
   h.loadSnapshot(517);
 
   const msg = { type: 'codex', method: 'item/agentMessage/delta', runtimeSequence: 246, runtimeGeneration: 'g1' };
-  assert.equal(h.apply(msg), true);
   assert.equal(h.apply(msg), false);
-  assert.equal(h.live.length, 1);
+  assert.equal(h.apply(msg), false);
+  assert.equal(h.live.length, 0);
 });
 
 test('lost ACK causes duplicate replay, not permanent event loss', () => {

@@ -2,10 +2,10 @@
 
 # AgentDeck
 
-**把服务器上的 Coding Agent，装进一个随时能打开的控制台。**
+**在浏览器和手机上，继续运行在服务器里的 Coding Agent。**
 
-在浏览器或手机上使用 Codex、Claude Code、Antigravity 和 Gemini CLI。  
-Agent 继续运行在你的服务器上，页面关掉了也没关系。
+统一使用 Codex、Claude Code 和其他 CLI Agent。
+关掉页面、换台设备，任务和会话仍然留在自己的服务器上。
 
 ![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
@@ -16,96 +16,48 @@ Agent 继续运行在你的服务器上，页面关掉了也没关系。
 
 ---
 
-## 为什么做 AgentDeck
+## 它是做什么的？
 
-Coding Agent 很好用，但终端不适合一直带在身边。
+Coding Agent 很适合放在服务器里工作，但终端并不适合一直带在身边。
 
-我想在电脑上发起任务，离开以后还能从手机查看进度、补一句话、处理审批；也不想为了切换 Codex、Claude 或 Gemini，来回找不同的命令和配置目录。
+AgentDeck 给这些 CLI 加了一个适合电脑和手机使用的控制台。你可以在电脑上发起任务，离开以后从手机查看进度、补充附件、处理审批，再回到电脑继续。
 
-所以有了 AgentDeck：
+Agent 仍然运行在你自己的服务器上。AgentDeck 不托管你的代码，也不会把项目变成某个平台里的副本。
 
-> CLI 负责真正干活，AgentDeck 负责把它们放到同一个界面里，并记住正在发生的事情。
+## 主要功能
 
-## 它能做什么
-
-- 在电脑和手机之间继续同一个任务；
-- 管理多个 Provider、账户和项目；
+- 在桌面和手机之间继续同一个会话；
+- 统一管理多个 Agent、账户和工作区；
 - 上传图片、源码、PDF 和其他附件；
-- 查看运行过程、审批工具调用、停止任务；
-- 页面刷新或短暂断线后恢复已经保存的内容；
-- 所有代码、凭据和运行数据都留在自己的服务器上。
+- 查看运行过程，处理审批或随时停止任务；
+- 页面刷新、断线或 Web 服务重启后恢复已经保存的内容；
+- 通过 PWA 像普通应用一样打开；
+- 所有项目、凭据和运行数据都留在自己的机器上。
 
 ## Provider
 
-界面中的顺序固定为：
+| Provider | 说明 |
+| --- | --- |
+| **Codex** | 当前最完整的接入，支持持久会话、审批、附件和多账户。 |
+| **Claude Code** | 通过官方 CLI 登录和 Claude Agent SDK 运行。 |
+| **Antigravity** | 提供基础 CLI Agent 支持，能力取决于上游。 |
+| **Gemini CLI** | 实验性支持；个人账户目前可能受上游限制，不建议作为主要 Provider。 |
 
-**Codex → Claude Code → Antigravity → Gemini**
-
-| Provider | 接入方式 | 状态 |
-| --- | --- | --- |
-| **Codex** | Codex app-server | 完整的会话、流式事件、审批、附件和多账户支持 |
-| **Claude Code** | Claude Agent SDK + 官方 CLI 登录 | 流式输出、工具调用、审批、附件、停止和 session resume |
-| **Antigravity** | CLI | 基础 Agent 能力，具体边界取决于上游 CLI |
-| **Gemini** | Gemini CLI ACP | OAuth / API Key、独立 profile 和 ACP 会话 |
-
-不同 Provider 不一定拥有完全相同的能力。AgentDeck 会显示真实状态，而不是为了界面整齐假装都支持。
-
-## 安装与登录
-
-AgentDeck 的目标流程很简单：
-
-```text
-安装 AgentDeck
-→ 打开 Provider 设置
-→ 没有 CLI 就点安装
-→ 没登录就点登录
-→ 开始创建任务
-```
-
-登录仍然由各家的官方 CLI 完成。AgentDeck 负责启动登录流程、保存独立 profile，并让 Runtime 使用同一份配置。
+打开 AgentDeck 后，可以在 Provider 设置中查看 CLI 状态、安装受支持的 CLI，并完成登录。
 
 ## 快速开始
 
-需要 Node.js 22 或更高版本。
+需要一台 Linux 服务器，以及 Node.js 22 或更高版本。
 
 ```bash
 git clone https://github.com/razuberiii/agentdeck.git
 cd agentdeck
-
-npm ci
-npm run start:local
-```
-
-启动后终端会打印：
-
-- 访问地址；
-- 本地管理员密码；
-- Runtime 和 Web 状态。
-
-打开 AgentDeck 后，在 **设置 → Provider** 中安装或登录需要的 CLI。
-
-`start:local` 只监听本机地址，适合先体验项目。
-
-## 正式部署
-
-Linux + systemd 环境可以使用：
-
-```bash
 sudo ./scripts/setup.sh
 ```
 
-之后的日常操作统一通过：
+安装完成后，脚本会打印访问地址和下一步操作。
 
-```bash
-sudo agentdeckctl status
-sudo agentdeckctl check
-sudo agentdeckctl deploy all
-sudo agentdeckctl rollback all
-```
-
-涉及 Runtime 的部署会先等待当前任务结束，再切换到新版本。部署任务在独立的 systemd job 中运行，不会因为 Agent 重启自己而中途消失。
-
-完整的 HTTPS、反向代理、备份和回滚说明见 [`docs/deployment.md`](docs/deployment.md)。
+打开 AgentDeck，进入 **设置 → Provider**，登录你要使用的 Agent，然后就可以创建任务。
 
 ## 架构
 
@@ -125,29 +77,41 @@ flowchart LR
 
 浏览器只是控制界面。
 
-真正的会话、Provider session、活动任务和事件序列保存在 Runtime 中。页面重新连接时，会根据 sequence 补回缺失的事件，而不是把当前页面当作唯一状态。
+真正的会话、活动任务、Provider session 和事件序列保存在 Runtime 中。页面重新连接时，会补回已经持久化的事件，而不是从头开始。
 
-## 数据
-
-默认需要长期保留的是：
-
-```text
-SQLite 数据库
-Provider profiles
-attachments/
-generated artifacts
-```
-
-不要只备份数据库而忽略附件和账号配置。
+## 常用命令
 
 ```bash
-sudo /opt/stacks/agentdeck/scripts/backup.sh
+# 查看状态
+sudo agentdeckctl status
+
+# 检查环境
+sudo agentdeckctl check
+
+# 部署当前代码
+sudo agentdeckctl deploy all
+
+# 查看部署任务
+sudo agentdeckctl jobs
+
+# 回滚
+sudo agentdeckctl rollback all
 ```
 
-## 开发
+涉及 Runtime 的部署会等待正在运行的任务结束，再安全切换版本。
+
+更详细的部署、备份和排错说明见 [`docs/`](docs/)。
+
+## 本地开发
 
 ```bash
 npm ci
+npm run start:local
+```
+
+检查项目：
+
+```bash
 npm run typecheck
 npm run lint
 npm run build
@@ -155,18 +119,11 @@ npm test
 npm run test:e2e
 ```
 
-开发模式：
-
-```bash
-npm run dev:runtime
-npm run dev
-```
-
 ## 项目状态
 
-AgentDeck 仍在快速迭代。
+AgentDeck 仍在持续开发中。不同 Provider 的 CLI 和协议可能变化，部分能力也并不完全一致。
 
-Provider CLI 和 SDK 的协议可能变化。升级 Codex、Claude Code、Antigravity 或 Gemini 后，建议先检查登录、会话恢复、审批和附件流程。
+发现问题可以直接提交 Issue。
 
 ## License
 

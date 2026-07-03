@@ -135,11 +135,14 @@ test('Antigravity binary resolution is deterministic and reports ENOENT explicit
     providersSource.indexOf('export class AntigravityProvider'),
     providersSource.indexOf('export class GeminiProvider'),
   );
-  assert.match(antigravityClass, /process\.env\.ANTIGRAVITY_BIN \|\| '\/home\/ubuntu\/\.local\/bin\/agy'/);
+  assert.match(antigravityClass, /process\.env\.ANTIGRAVITY_BIN \|\| ''/);
+  assert.match(antigravityClass, /detectProviderCommand\(this\.command, 'agy'\)/);
   assert.doesNotMatch(antigravityClass, /'gemini'/);
   assert.match(antigravityClass, /provider_binary_not_found/);
-  assert.match(indexSource, /const ANTIGRAVITY_BIN = process\.env\.ANTIGRAVITY_BIN \|\| '\/home\/ubuntu\/\.local\/bin\/agy'/);
+  assert.doesNotMatch(indexSource, /\/home\/ubuntu\/\.local\/bin\/agy/);
   assert.match(indexSource, /ensureAntigravityBinary/);
+  assert.match(indexSource, /resolveAntigravityBinary/);
+  assert.match(indexSource, /detectManagedCommand\(process\.env\.ANTIGRAVITY_BIN \|\| '', 'agy'\)/);
   assert.match(indexSource, /structuredProviderError\('provider_binary_not_found'/);
 });
 

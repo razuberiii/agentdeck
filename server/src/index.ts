@@ -35,8 +35,10 @@ import { AntigravityProcessError, DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS, finalizeA
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
+const PROVIDER_TOOLS_DIR = path.join(DATA_DIR, 'provider-tools');
+const MANAGED_PROVIDER_BIN_DIR = path.join(PROVIDER_TOOLS_DIR, 'bin');
+process.env.PATH = `${MANAGED_PROVIDER_BIN_DIR}${path.delimiter}${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.codex');
-const ANTIGRAVITY_BIN = process.env.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy';
 const PROFILES_DIR = path.join(DATA_DIR, 'profiles');
 const ANTIGRAVITY_PROFILES_DIR = path.join(DATA_DIR, 'antigravity-profiles');
 const GEMINI_PROFILES_DIR = path.join(DATA_DIR, 'gemini', 'profiles');
@@ -111,6 +113,60 @@ type GeminiLoginJob = {
 const geminiLoginJobs = new Map<string, GeminiLoginJob>();
 const geminiLoginProfiles = new Map<string, string>();
 const geminiLoginWorkers = new Map<string, any>();
+type ProviderInstallStatus = 'queued'|'downloading'|'installing'|'verifying'|'succeeded'|'failed'|'cancelled';
+type ProviderInstallJob = {
+  id:string;
+  provider:AgentProviderId;
+  action:'install'|'update';
+  status:ProviderInstallStatus;
+  output:string[];
+  error?:string;
+  version?:string|null;
+  startedAt:number;
+  updatedAt:number;
+};
+const providerInstallJobs = new Map<string, ProviderInstallJob>();
+const providerInstallChildren = new Map<string, any>();
+const providerInstallByProvider = new Map<AgentProviderId, string>();
+const PROVIDER_INSTALLERS:Record<AgentProviderId, {
+  automatic:boolean;
+  packageName?:string;
+  binary:string;
+  manual:string;
+  source:string;
+  reason:string;
+}> = {
+  codex: {
+    automatic:true,
+    packageName:'@openai/codex',
+    binary:'codex',
+    source:'OpenAI Codex CLI npm package @openai/codex',
+    reason:'OpenAI documents npm install -g @openai/codex as an official Codex CLI install path.',
+    manual:'安装 Codex CLI：npm install -g @openai/codex，或使用 OpenAI 官方安装脚本。AgentDeck 会优先使用管理员配置，其次使用托管安装。',
+  },
+  claude: {
+    automatic:true,
+    packageName:'@anthropic-ai/claude-code',
+    binary:'claude',
+    source:'Anthropic Claude Code npm package @anthropic-ai/claude-code',
+    reason:'Anthropic documents Claude Code npm installation as a supported CLI install path; native package-manager install can still be managed manually.',
+    manual:'安装 Claude Code：curl -fsSL https://claude.ai/install.sh | bash，或使用 Anthropic 文档中的 apt/dnf/apk/npm 方法。',
+  },
+  antigravity: {
+    automatic:false,
+    binary:'agy',
+    source:'manual administrator install',
+    reason:'没有稳定、公开且可验证的统一自动安装源；AgentDeck 不编造安装命令。',
+    manual:'请按上游官方说明安装 Antigravity CLI，并将 ANTIGRAVITY_BIN 指向 agy 可执行文件。',
+  },
+  gemini: {
+    automatic:false,
+    binary:'gemini',
+    source:'manual administrator install',
+    reason:'Gemini CLI 在 AgentDeck 中仍是低优先级/受限 Provider，本版本只显示手动安装方法。',
+    manual:'如需使用 Gemini CLI，请按 Google 官方说明安装并确保 gemini --acp 可用；个人账户可能受上游限制。',
+  },
+};
 const GEMINI_LOGIN_TIMEOUT_MS = Number(process.env.GEMINI_LOGIN_TIMEOUT_MS || 5 * 60 * 1000);
 const GEMINI_LOGIN_VERIFY_TIMEOUT_MS = Number(process.env.GEMINI_LOGIN_VERIFY_TIMEOUT_MS || 60 * 1000);
 const GEMINI_GOOGLE_AUTH_TYPE = 'oauth-personal';
@@ -266,6 +322,8 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     antigravity:antigravityStatus,
     providers:providerStatusArray(providerStatuses),
     providerStatus:providerStatuses,
+    providerInstallers:providerInstallerSummaries(),
+    providerInstallJobs:providerInstallJobSummaries(),
     activeProvider:settings.activeProvider,
     roots,
     defaultWorkspace:DEFAULT_WORKSPACE_DIR,
@@ -283,6 +341,48 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
 app.get('/api/providers/status', { preHandler: ensureAuth }, async (req:any) => {
   const providers = await unifiedProviderStatuses(req.query?.refresh === '1');
   return { providers, checkedAt:new Date().toISOString() };
+});
+app.get('/api/providers/installers', { preHandler: ensureAuth }, async () => ({
+  installers: providerInstallerSummaries(),
+  jobs: providerInstallJobSummaries(),
+}));
+app.post('/api/providers/:provider/install', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const provider = normalizeProvider(req.params.provider);
+  if (!provider) return reply.code(400).send({ error:'unknown provider' });
+  const action = String(req.body?.action || 'install');
+  if (!['install','update'].includes(action)) return reply.code(400).send({ error:'unsupported installer action' });
+  const installer = PROVIDER_INSTALLERS[provider];
+  if (!installer.automatic) return reply.code(409).send({ error:'automatic install is not supported for this provider', installer:providerInstallerSummary(provider) });
+  const existingId = providerInstallByProvider.get(provider);
+  const existing = existingId ? providerInstallJobs.get(existingId) : null;
+  if (existing && !['succeeded','failed','cancelled'].includes(existing.status)) return { job:providerInstallJobSummary(existing) };
+  const job:ProviderInstallJob = { id:`install-${provider}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`, provider, action:action as any, status:'queued', output:[], startedAt:Date.now(), updatedAt:Date.now() };
+  providerInstallJobs.set(job.id, job);
+  providerInstallByProvider.set(provider, job.id);
+  runProviderInstallJob(job).catch((e:any) => failProviderInstallJob(job, e?.message || String(e)));
+  return { job:providerInstallJobSummary(job) };
+});
+app.get('/api/provider-install/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const job = providerInstallJobs.get(String(req.params.id));
+  if (!job) return reply.code(404).send({ error:'install job not found' });
+  return { job:providerInstallJobSummary(job) };
+});
+app.delete('/api/provider-install/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const id = String(req.params.id);
+  const job = providerInstallJobs.get(id);
+  if (!job) return reply.code(404).send({ error:'install job not found' });
+  const child = providerInstallChildren.get(id);
+  if (child) {
+    try { child.kill('SIGTERM'); } catch {}
+    providerInstallChildren.delete(id);
+  }
+  if (!['succeeded','failed','cancelled'].includes(job.status)) {
+    job.status = 'cancelled';
+    job.error = '安装已取消';
+    job.updatedAt = Date.now();
+    providerInstallByProvider.delete(job.provider);
+  }
+  return { job:providerInstallJobSummary(job) };
 });
 app.get('/api/diagnostics', { preHandler: ensureAuth }, async () => {
   const settings = await appSettings();
@@ -458,7 +558,7 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     unifiedProviderStatuses(force && !light),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
-  return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]) };
+  return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]), providerInstallers:providerInstallerSummaries(), providerInstallJobs:providerInstallJobSummaries() };
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
@@ -849,6 +949,7 @@ app.get('/api/profile-login/:jobId', { preHandler: ensureAuth }, async (req:any,
   return { job };
 });
 app.post('/api/antigravity/profiles/login', { preHandler: ensureAuth }, async () => {
+  const antigravityBin = await resolveAntigravityBinary();
   const id = crypto.randomBytes(8).toString('hex');
   const homeDir = path.join(ANTIGRAVITY_PROFILES_DIR, id, 'home');
   await mkdir(homeDir, { recursive:true });
@@ -857,7 +958,7 @@ app.post('/api/antigravity/profiles/login', { preHandler: ensureAuth }, async ()
   const jobId = crypto.randomBytes(12).toString('base64url');
   const job: AntigravityLoginJob = { id:jobId, providerId:'antigravity', profileId:id, output:[], status:'running', code:null, startedAt:Date.now(), newProfile:true };
   antigravityLoginJobs.set(jobId, job);
-  const child = pty.spawn(ANTIGRAVITY_BIN, [], {
+  const child = pty.spawn(antigravityBin, [], {
     name: 'xterm-256color',
     cols: 96,
     rows: 32,
@@ -1144,7 +1245,8 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
       injectArtifacts(thread, threadId).catch(()=>{}),
     ]);
     sanitizeThreadForMobile(thread);
-    const snapshot = { coveredSequence:Number(runtimeRow?.last_sequence || 0), generation:String(runtimeRow?.upstream_generation || '') || null };
+    const coveredSequence = Number(runtimeRow?.last_sequence || 0);
+    const snapshot = { coveredSequence, throughSequence:coveredSequence, latestSequence:coveredSequence, generation:String(runtimeRow?.upstream_generation || '') || null };
     app.log.info({ requestId, localSessionId:threadId, upstreamThreadId:String(runtimeRow?.upstream_thread_id || threadId), status:runtimeRow.status, latestSequence:Number(runtimeRow?.last_sequence || 0), operation:'GET /api/sessions/:id', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'web session snapshot returned');
     return { session: rowSessionDto(runtimeRow), thread, snapshot, branch, interrupted: (runtimeRow?.status === 'interrupted') };
   }
@@ -1608,7 +1710,7 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       reasonCode: codexCli?.ok ? (codexAuth === 'authenticated' ? null : 'codex_not_logged_in') : 'codex_unavailable',
       message: codexCli?.ok ? (codexAuth === 'authenticated' ? null : '请先登录 Codex') : (codexCli?.error || 'Codex CLI 不可用'),
       checkedAt,
-      command:'codex',
+      command:codexCli?.command || 'codex',
     }),
     claude: providerStatus({
       provider:'claude',
@@ -1673,6 +1775,113 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       installHint:'需要先安装官方 CLI 后才能登录和创建 Antigravity 会话。',
     }),
   };
+}
+function providerInstallerSummary(provider:AgentProviderId) {
+  const installer = PROVIDER_INSTALLERS[provider];
+  const latestJobId = providerInstallByProvider.get(provider);
+  const latestJob = latestJobId ? providerInstallJobs.get(latestJobId) : null;
+  return {
+    provider,
+    automatic: installer.automatic,
+    binary: installer.binary,
+    packageName: installer.packageName || null,
+    source: installer.source,
+    reason: installer.reason,
+    manual: installer.manual,
+    latestJob: latestJob ? providerInstallJobSummary(latestJob) : null,
+  };
+}
+function providerInstallerSummaries() {
+  return Object.fromEntries(PROVIDER_ORDER.map(provider => [provider, providerInstallerSummary(provider)]));
+}
+function providerInstallJobSummary(job:ProviderInstallJob) {
+  return {
+    id:job.id,
+    provider:job.provider,
+    action:job.action,
+    status:job.status,
+    output:job.output.slice(-80),
+    error:job.error || null,
+    version:job.version || null,
+    startedAt:job.startedAt,
+    updatedAt:job.updatedAt,
+  };
+}
+function providerInstallJobSummaries() {
+  return [...providerInstallJobs.values()].sort((a,b)=>b.startedAt-a.startedAt).slice(0, 20).map(providerInstallJobSummary);
+}
+async function runProviderInstallJob(job:ProviderInstallJob) {
+  const installer = PROVIDER_INSTALLERS[job.provider];
+  if (!installer.automatic || !installer.packageName) throw new Error('automatic install is not supported');
+  const providerDir = path.join(PROVIDER_TOOLS_DIR, job.provider);
+  const candidateDir = path.join(providerDir, `candidate-${job.id}`);
+  const currentLink = path.join(providerDir, 'current');
+  const binLink = path.join(MANAGED_PROVIDER_BIN_DIR, installer.binary);
+  const binaryPath = path.join(candidateDir, 'node_modules', '.bin', installer.binary);
+  await mkdir(MANAGED_PROVIDER_BIN_DIR, { recursive:true });
+  await rm(candidateDir, { recursive:true, force:true });
+  await mkdir(candidateDir, { recursive:true, mode:0o755 });
+  updateProviderInstallJob(job, 'downloading', `Using ${installer.source}`);
+  updateProviderInstallJob(job, 'installing', `npm install ${installer.packageName}@latest`);
+  await spawnProviderInstall(job, 'npm', ['--prefix', candidateDir, 'install', '--omit=dev', `${installer.packageName}@latest`], {
+    ...process.env,
+    HOME: DEFAULT_HOME,
+    npm_config_cache: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
+    NPM_CONFIG_CACHE: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
+    PATH: process.env.PATH,
+  });
+  updateProviderInstallJob(job, 'verifying', `${installer.binary} --version`);
+  const version = await execFileAsync(binaryPath, ['--version'], { timeout:10_000, env:{ ...process.env, PATH:process.env.PATH } }).then(r => (r.stdout || r.stderr).trim()).catch((e:any) => {
+    throw new Error(String(e?.stderr || e?.stdout || e?.message || e));
+  });
+  await rm(currentLink, { recursive:true, force:true });
+  await symlink(candidateDir, currentLink);
+  await rm(binLink, { force:true });
+  await symlink(binaryPath, binLink);
+  job.version = version || null;
+  updateProviderInstallJob(job, 'succeeded', `Installed ${installer.binary} ${version || ''}`.trim());
+  invalidateProviderCaches(job.provider);
+}
+function updateProviderInstallJob(job:ProviderInstallJob, status:ProviderInstallStatus, line?:string) {
+  job.status = status;
+  job.updatedAt = Date.now();
+  if (line) job.output.push(`[${new Date().toISOString()}] ${line}`);
+}
+function failProviderInstallJob(job:ProviderInstallJob, message:string) {
+  if (job.status === 'cancelled') return;
+  job.status = 'failed';
+  job.error = safeAntigravitySummary(message);
+  job.updatedAt = Date.now();
+  job.output.push(`[${new Date().toISOString()}] ERROR ${job.error}`);
+  providerInstallChildren.delete(job.id);
+  providerInstallByProvider.delete(job.provider);
+}
+function spawnProviderInstall(job:ProviderInstallJob, command:string, args:string[], env:NodeJS.ProcessEnv) {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, { env, cwd:PROVIDER_TOOLS_DIR, stdio:['ignore','pipe','pipe'] });
+    providerInstallChildren.set(job.id, child);
+    const append = (chunk:Buffer) => {
+      const text = chunk.toString('utf8');
+      for (const line of text.split(/\r?\n/).filter(Boolean)) job.output.push(line.slice(0, 1000));
+      job.output = job.output.slice(-200);
+      job.updatedAt = Date.now();
+    };
+    child.stdout?.on('data', append);
+    child.stderr?.on('data', append);
+    child.on('error', reject);
+    child.on('close', code => {
+      providerInstallChildren.delete(job.id);
+      if (job.status === 'cancelled') return resolve();
+      code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`));
+    });
+  });
+}
+function invalidateProviderCaches(provider:AgentProviderId) {
+  if (provider === 'codex') codexStatusCache = { expiresAt:0 };
+  if (provider === 'claude') claudeStatusCache = { expiresAt:0 };
+  if (provider === 'gemini') geminiStatusCache = { expiresAt:0 };
+  if (provider === 'antigravity') antigravityStatusCache = { expiresAt:0 };
+  invalidateUnifiedProviderStatuses();
 }
 async function activeCodexProfileSummary() {
   const p = await db.get(`SELECT ${CODEX_PROFILE_COLUMNS} FROM codex_profiles WHERE active=1 AND COALESCE(status,'authenticated')='authenticated' ORDER BY updated_at DESC LIMIT 1`);
@@ -3108,12 +3317,17 @@ async function antigravityLoginStatus(homeDir:string) {
   }
 }
 async function ensureAntigravityBinary() {
-  if (!ANTIGRAVITY_BIN.includes('/')) throw structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary must be configured as an absolute path', `ANTIGRAVITY_BIN=${ANTIGRAVITY_BIN}`);
+  await resolveAntigravityBinary();
+}
+async function resolveAntigravityBinary() {
+  const found = await detectManagedCommand(process.env.ANTIGRAVITY_BIN || '', 'agy');
+  if (!found) throw structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary was not found', `ANTIGRAVITY_BIN=${process.env.ANTIGRAVITY_BIN || 'agy'}`);
   try {
-    await stat(ANTIGRAVITY_BIN);
+    if (found.includes('/')) await stat(found);
   } catch {
-    throw structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary was not found', `ANTIGRAVITY_BIN=${ANTIGRAVITY_BIN}`);
+    throw structuredProviderError('provider_binary_not_found', 'antigravity_runtime', 'Antigravity binary was not found', `ANTIGRAVITY_BIN=${found}`);
   }
+  return found;
 }
 function structuredProviderError(code:string, layer:string, message:string, safeDetail:string) {
   const err:any = new Error(message);
@@ -3130,30 +3344,33 @@ function antigravityUsage(homeDir:string): Promise<string|null> {
     let output = '';
     let sent = false;
     let done = false;
-    const child = pty.spawn(ANTIGRAVITY_BIN, [], {
-      name: 'xterm-256color',
-      cols: 100,
-      rows: 36,
-      cwd: homeDir,
-      env: { ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
-    });
+    let child:any = null;
     const finish = () => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      try { child.kill(); } catch {}
+      try { child?.kill(); } catch {}
       const text = cleanAgentOutput(output).split(/\r?\n/).map(s=>s.trim()).filter(Boolean).filter(s=>!isTerminalControlNoise(s)).slice(-80).join('\n');
       resolve(isUsefulAntigravityUsage(text) ? text : null);
     };
     const timer = setTimeout(finish, 8000);
-    child.onData((d:string) => {
-      output += d;
-      if (!sent && /send a message|Type|Welcome|Antigravity/i.test(stripAnsi(output))) {
-        sent = true;
-        setTimeout(() => child.write('/usage\r'), 500);
-      }
-    });
-    child.onExit(() => finish());
+    resolveAntigravityBinary().then(antigravityBin => {
+      child = pty.spawn(antigravityBin, [], {
+        name: 'xterm-256color',
+        cols: 100,
+        rows: 36,
+        cwd: homeDir,
+        env: { ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
+      });
+      child.onData((d:string) => {
+        output += d;
+        if (!sent && /send a message|Type|Welcome|Antigravity/i.test(stripAnsi(output))) {
+          sent = true;
+          setTimeout(() => child.write('/usage\r'), 500);
+        }
+      });
+      child.onExit(() => finish());
+    }).catch(() => finish());
   });
 }
 async function scanEmail(dir:string, depth = 0): Promise<string|null> {
@@ -3393,7 +3610,29 @@ function collectUsage(value:any, out:any[]) {
   if (value.tokenUsage && typeof value.tokenUsage === 'object') out.push(value.tokenUsage);
   for (const v of Array.isArray(value) ? value : Object.values(value)) collectUsage(v, out);
 }
-async function codexStatus(){ try { const codexHome = codex.getCodexHome(); const {stdout}=await execFileAsync('codex',['--version'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:codexHome} }); return { ok:true, version:stdout.trim(), appServer:true, sessionsPath:path.join(codexHome,'sessions') }; } catch(e:any) { return { ok:false, error:e.message }; } }
+async function codexStatus(){
+  const command = await detectManagedCommand(process.env.CODEX_BIN || '', 'codex');
+  if (!command) return { ok:false, installed:false, command:'codex', error:'Codex CLI 未安装' };
+  try {
+    const codexHome = codex.getCodexHome();
+    const {stdout}=await execFileAsync(command,['--version'], { env:{...process.env, HOME:DEFAULT_HOME, CODEX_HOME:codexHome} });
+    return { ok:true, installed:true, command, version:stdout.trim(), appServer:true, sessionsPath:path.join(codexHome,'sessions') };
+  } catch(e:any) {
+    return { ok:false, installed:true, command, error:e.message };
+  }
+}
+async function detectManagedCommand(configured:string, binary:string) {
+  for (const candidate of [configured, path.join(MANAGED_PROVIDER_BIN_DIR, binary), binary].filter(Boolean)) {
+    if (String(candidate).includes('/') && existsSync(String(candidate))) return String(candidate);
+    if (!String(candidate).includes('/')) {
+      try {
+        const { stdout } = await execFileAsync('sh', ['-lc', `command -v '${String(candidate).replaceAll("'", "'\\''")}'`], { timeout:5000, env:process.env });
+        if (stdout.trim()) return stdout.trim();
+      } catch {}
+    }
+  }
+  return null;
+}
 function codexProviderStatus(status:any) {
   return {
     id: 'codex',
@@ -3442,7 +3681,7 @@ async function findSession(id:string){
 }
 async function upsertThread(thread:any, extra:any = {}) { if (!thread?.id || !pathAllowed(thread.cwd)) return; const existing:any = await findSession(String(thread.id)); const title = cleanTitle(extra.title || existing?.title || thread.name || thread.preview, thread.cwd); const now = Date.now(); const mode = normalizeMode(extra.permission_mode) || 'yolo'; const fields = { ...modeFields(mode), ...extra }; const model = cleanModel(fields.model); await db.run("INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'codex',?12,?8,?2,?1,?13,?14,?15,?16,?15,?16,?17) ON CONFLICT(id) DO UPDATE SET codex_thread_id=excluded.codex_thread_id, project_dir=excluded.project_dir, title=excluded.title, status=excluded.status, archived=excluded.archived, provider_id=COALESCE(sessions.provider_id,'codex'), account_id=COALESCE(sessions.account_id,excluded.account_id), model_id=excluded.model_id, workspace_path=excluded.workspace_path, provider_session_id=excluded.provider_session_id, creator_profile_id=COALESCE(sessions.creator_profile_id,excluded.creator_profile_id), selected_profile_id=COALESCE(excluded.selected_profile_id,sessions.selected_profile_id), executing_profile_id=COALESCE(excluded.executing_profile_id,sessions.executing_profile_id), upstream_binding_profile_id=COALESCE(excluded.upstream_binding_profile_id,sessions.upstream_binding_profile_id), last_execution_account_id=COALESCE(excluded.last_execution_account_id,sessions.last_execution_account_id), current_upstream_account_id=COALESCE(excluded.current_upstream_account_id,sessions.current_upstream_account_id), account_snapshot_json=COALESCE(excluded.account_snapshot_json,sessions.account_snapshot_json), updated_at=excluded.updated_at", [thread.id, thread.cwd, title, extra.status || statusName(thread.status), fields.permission_mode, fields.approval_policy, fields.sandbox_mode, model || null, extra.archived ?? 0, (thread.createdAt || Math.floor(now/1000))*1000, (thread.updatedAt || Math.floor(now/1000))*1000, fields.account_id || null, fields.creator_profile_id || fields.account_id || null, fields.selected_profile_id || fields.account_id || null, fields.executing_profile_id || fields.account_id || null, fields.upstream_binding_profile_id || fields.account_id || null, fields.account_snapshot_json || null]); }
 async function indexedSession(thread:any){ const row = await findSession(thread.id); return sessionDto(thread, row || undefined); }
-function sessionDto(thread:any, row:any = {}) { const fields = modeFields(sessionMode(row)); const providerId = normalizeProvider(row.provider_id) || 'codex'; const model = providerId === 'codex' ? cleanModel(row.model) : cleanAgentModel(row.model); const modelId = providerId === 'codex' ? cleanModel(row.model_id) || model : cleanAgentModel(row.model_id) || model; return { id: thread.id, codex_thread_id: thread.id, provider_id: providerId, providerId, provider_session_id: row.provider_session_id || thread.id, account_id: row.account_id || null, creatorProfileId:row.creator_profile_id || row.account_id || null, selectedProfileId:row.selected_profile_id || null, executingProfileId:row.executing_profile_id || row.last_execution_account_id || null, upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path: row.workspace_path || thread.cwd, project_dir: thread.cwd, title: cleanTitle(row.title || thread.name || thread.preview, thread.cwd), status: row.status || statusName(thread.status), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived: Number(row.archived || 0), created_at: (thread.createdAt || 0)*1000, updated_at: (thread.updatedAt || 0)*1000, last_sequence:Number(row.last_sequence || 0), canCreateSession:providerId === 'codex' ? true : undefined, canContinueSession:providerId === 'codex' ? !!(row.executing_profile_id || row.last_execution_account_id || row.account_id) : undefined, path: thread.path || null }; }
+function sessionDto(thread:any, row:any = {}) { const fields = modeFields(sessionMode(row)); const providerId = normalizeProvider(row.provider_id) || 'codex'; const model = providerId === 'codex' ? cleanModel(row.model) : cleanAgentModel(row.model); const modelId = providerId === 'codex' ? cleanModel(row.model_id) || model : cleanAgentModel(row.model_id) || model; return { id: thread.id, codex_thread_id: thread.id, provider_id: providerId, providerId, provider_session_id: row.provider_session_id || thread.id, account_id: row.account_id || null, creatorProfileId:row.creator_profile_id || row.account_id || null, selectedProfileId:row.selected_profile_id || null, executingProfileId:row.executing_profile_id || row.last_execution_account_id || null, upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path: row.workspace_path || thread.cwd, project_dir: thread.cwd, title: cleanTitle(row.title || thread.name || thread.preview, thread.cwd), status: row.status || statusName(thread.status), activeTurn:sessionActiveTurn(row), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived: Number(row.archived || 0), created_at: (thread.createdAt || 0)*1000, updated_at: (thread.updatedAt || 0)*1000, last_sequence:Number(row.last_sequence || 0), canCreateSession:providerId === 'codex' ? true : undefined, canContinueSession:providerId === 'codex' ? !!(row.executing_profile_id || row.last_execution_account_id || row.account_id) : undefined, path: thread.path || null }; }
 function threadFromRow(row:any) {
   const now = Date.now();
   return {
@@ -3588,7 +3827,14 @@ function rowSessionDto(row:any) {
   const providerId = normalizeProvider(row.provider_id) || 'codex';
   const model = providerId === 'antigravity' || providerId === 'gemini' ? cleanAgentModel(row.model) : cleanModel(row.model);
   const modelId = providerId === 'antigravity' || providerId === 'gemini' ? cleanAgentModel(row.model_id) || model : cleanModel(row.model_id) || model;
-  return { id:String(row.codex_thread_id || row.id), codex_thread_id:String(row.codex_thread_id || row.id), provider_id:providerId, providerId, provider_session_id:String(row.provider_session_id || row.codex_thread_id || row.id), account_id:row.account_id || null, creatorProfileId:row.creator_profile_id || row.account_id || null, selectedProfileId:row.selected_profile_id || null, executingProfileId:row.executing_profile_id || row.last_execution_account_id || null, upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path:String(row.workspace_path || row.project_dir), project_dir:String(row.project_dir), title:String(row.title || projectNameFromPath(String(row.project_dir))), status:String(row.status || 'idle'), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived:Number(row.archived || 0), created_at:Number(row.created_at || 0), updated_at:Number(row.updated_at || 0), last_sequence:Number(row.last_sequence || 0), canCreateSession:providerId === 'codex' ? true : undefined, canContinueSession:providerId === 'codex' ? !!(row.executing_profile_id || row.last_execution_account_id || row.account_id) : undefined, path:null };
+  return { id:String(row.codex_thread_id || row.id), codex_thread_id:String(row.codex_thread_id || row.id), provider_id:providerId, providerId, provider_session_id:String(row.provider_session_id || row.codex_thread_id || row.id), account_id:row.account_id || null, creatorProfileId:row.creator_profile_id || row.account_id || null, selectedProfileId:row.selected_profile_id || null, executingProfileId:row.executing_profile_id || row.last_execution_account_id || null, upstreamBindingProfileId:row.upstream_binding_profile_id || row.current_upstream_account_id || null, last_execution_account_id:row.last_execution_account_id || null, current_upstream_account_id:row.current_upstream_account_id || null, account_snapshot_json:row.account_snapshot_json || null, workspace_path:String(row.workspace_path || row.project_dir), project_dir:String(row.project_dir), title:String(row.title || projectNameFromPath(String(row.project_dir))), status:String(row.status || 'idle'), activeTurn:sessionActiveTurn(row), permission_mode:row.permission_mode || fields.permission_mode, approval_policy:row.approval_policy || fields.approval_policy, sandbox_mode:row.sandbox_mode || fields.sandbox_mode, model, model_id:modelId, archived:Number(row.archived || 0), created_at:Number(row.created_at || 0), updated_at:Number(row.updated_at || 0), last_sequence:Number(row.last_sequence || 0), canCreateSession:providerId === 'codex' ? true : undefined, canContinueSession:providerId === 'codex' ? !!(row.executing_profile_id || row.last_execution_account_id || row.account_id) : undefined, path:null };
+}
+function sessionActiveTurn(row:any) {
+  const turnId = row?.active_turn_id ? String(row.active_turn_id) : null;
+  const status = String(row?.status || 'idle');
+  if (!turnId && !['running','submitting','output_draining','waiting_approval','waiting_input','cancelling'].includes(status)) return null;
+  const waitingKind = status === 'waiting_approval' ? 'approval' : status === 'waiting_input' ? 'input' : null;
+  return { turnId, status:status === 'active' && turnId ? 'running' : status, startedAt:null, waitingKind };
 }
 async function antigravityThread(row:any) {
   const messages = await db.all('SELECT * FROM agent_messages WHERE session_id=?1 ORDER BY created_at ASC', [String(row.id)]);
@@ -4073,14 +4319,14 @@ async function providerInputText(threadId:string, text:string, attachments:any[]
   return lines.join('\n\n');
 }
 async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId:string, itemId:string) {
-  await ensureAntigravityBinary();
+  const antigravityBin = await resolveAntigravityBinary();
   const args:string[] = [];
   const model = cleanAgentModel(row.model);
   if (model) args.push('--model', model);
   if (sessionMode(row) === 'yolo') args.push('--dangerously-skip-permissions');
   args.push('--print', prompt);
   const homeDir = String(profile.home_dir);
-  const child = spawn(ANTIGRAVITY_BIN, args, {
+  const child = spawn(antigravityBin, args, {
     cwd:String(row.project_dir),
     env:{ ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
     stdio:['ignore','pipe','pipe'],
@@ -4106,26 +4352,36 @@ async function replayRuntimeEventsToWs(threadId:string, ws:any, after:number) {
   if (!USE_AGENT_RUNTIME || ws.readyState !== 1) return;
   runtimeDiagnostics.replayCalls++;
   const replayFrom = Number(after || 0);
+  let cursor = replayFrom;
   let replayTo = replayFrom;
   let replayMessages = 0;
-  const res = await runtime.events(threadId, replayFrom).catch((e:any)=>{
-    app.log.error({ sessionId:threadId, threadId, replayFrom, error:e?.message || String(e) }, 'runtime replay query failed');
-    return {events:[]};
-  });
-  for (const event of res.events || []) {
-    replayTo = Math.max(replayTo, Number(event.sequence || 0));
-    const messages = await runtimeEventMessages(threadId, event);
-    if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'unmapped_replay_event' }, 'runtime replay event ignored');
-    for (const msg of messages) {
-      if (ws.readyState === 1) {
-        ws.send(JSON.stringify(msg));
-        replayMessages++;
-      } else {
-        app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', connectionGeneration:ws.agentdeckGeneration || null, pushResult:'socket_closed' }, 'runtime replay found closed websocket');
+  let replayEvents = 0;
+  for (let page = 0; page < 100 && ws.readyState === 1; page++) {
+    const pageFrom = cursor;
+    const res = await runtime.events(threadId, pageFrom).catch((e:any)=>{
+      app.log.error({ sessionId:threadId, threadId, replayFrom:pageFrom, error:e?.message || String(e) }, 'runtime replay query failed');
+      return {events:[], hasMore:false, nextSequence:pageFrom, latestSequence:pageFrom};
+    });
+    const events = res.events || [];
+    replayEvents += events.length;
+    for (const event of events) {
+      replayTo = Math.max(replayTo, Number(event.sequence || 0));
+      const messages = await runtimeEventMessages(threadId, event);
+      if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'unmapped_replay_event' }, 'runtime replay event ignored');
+      for (const msg of messages) {
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify(msg));
+          replayMessages++;
+        } else {
+          app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', connectionGeneration:ws.agentdeckGeneration || null, pushResult:'socket_closed' }, 'runtime replay found closed websocket');
+        }
       }
     }
+    const nextSequence = Math.max(Number(res.nextSequence || 0), replayTo);
+    if (!res.hasMore || !events.length || nextSequence <= cursor) break;
+    cursor = nextSequence;
   }
-  app.log.info({ sessionId:threadId, threadId, connectionGeneration:ws.agentdeckGeneration || null, replayFrom, replayTo, replayEvents:(res.events || []).length, replayMessages }, 'runtime replay completed');
+  app.log.info({ sessionId:threadId, threadId, connectionGeneration:ws.agentdeckGeneration || null, replayFrom, replayTo, replayEvents, replayMessages }, 'runtime replay completed');
 }
 async function runtimeLatestSequence(threadId:string) {
   const row = await runtimeDb.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1', [threadId]);
@@ -4258,7 +4514,7 @@ async function runtimeEventMessages(threadId:string, event:any) {
       await injectArtifacts(thread, threadId).catch(()=>{});
       sanitizeThreadForMobile(thread);
     }
-    out.push({ type:'thread_snapshot', thread, status:payload?.status, activeTurnId:payload?.activeTurnId || null, snapshot:{ generation:runtimeGeneration, coveredSequence:runtimeSequence }, ...base });
+    out.push({ type:'thread_snapshot', thread, status:payload?.status, activeTurnId:payload?.activeTurnId || null, activeTurn:payload?.activeTurn || (payload?.activeTurnId ? { turnId:payload.activeTurnId, status:payload?.status || 'running' } : null), snapshot:{ generation:runtimeGeneration, coveredSequence:runtimeSequence, throughSequence:runtimeSequence, latestSequence:runtimeSequence }, ...base });
     out.push({ type:'runtimeConnection', status:'connected', ...base });
     return out;
   }

@@ -37,7 +37,7 @@ export interface AgentProvider {
 export class AntigravityProvider implements AgentProvider {
   id: AgentProviderId = 'antigravity';
   displayName = PROVIDER_DEFINITIONS.antigravity.displayName;
-  private command = process.env.ANTIGRAVITY_BIN || '/home/ubuntu/.local/bin/agy';
+  private command = process.env.ANTIGRAVITY_BIN || '';
 
   async getVersion(command?: string | null) {
     const found = command === undefined ? await this.detectCommand() : command;
@@ -91,7 +91,7 @@ export class AntigravityProvider implements AgentProvider {
         ok: false,
         installed: false,
         version: null,
-        command: this.command,
+        command: this.command || 'agy',
         error: 'provider_binary_not_found: configured Antigravity binary is missing or not executable',
         installHint: '设置 ANTIGRAVITY_BIN 为实际 agy 可执行文件的绝对路径。',
       };
@@ -109,14 +109,14 @@ export class AntigravityProvider implements AgentProvider {
   }
 
   private async detectCommand() {
-    return await executablePath(this.command);
+    return await detectProviderCommand(this.command, 'agy');
   }
 }
 
 export class GeminiProvider implements AgentProvider {
   id: AgentProviderId = 'gemini';
   displayName = PROVIDER_DEFINITIONS.gemini.displayName;
-  private candidates = [process.env.GEMINI_BIN, 'gemini'].filter(Boolean) as string[];
+  private candidates = [process.env.GEMINI_BIN, managedProviderBinary('gemini'), 'gemini'].filter(Boolean) as string[];
   private acpHelpCache: { command:string; acp:boolean; checkedAt:number } | null = null;
 
   async getVersion(command?: string | null) {
@@ -198,6 +198,19 @@ async function commandPath(name: string) {
   } catch {
     return null;
   }
+}
+
+function managedProviderBinary(binary: string) {
+  const dataDir = process.env.DATA_DIR || '/var/lib/agentdeck';
+  return `${dataDir}/provider-tools/bin/${binary}`;
+}
+
+async function detectProviderCommand(configured: string, binary: string) {
+  for (const candidate of [configured, managedProviderBinary(binary), binary].filter(Boolean)) {
+    const found = await executablePath(candidate);
+    if (found) return found;
+  }
+  return null;
 }
 
 async function executablePath(name: string) {

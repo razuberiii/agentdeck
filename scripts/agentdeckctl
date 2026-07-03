@@ -19,6 +19,11 @@ RUNTIME_PORT="${AGENTDECK_RUNTIME_PORT:-3852}"
 RUNTIME_CANDIDATE_PORT="${AGENTDECK_RUNTIME_CANDIDATE_PORT:-3952}"
 DRAIN_TIMEOUT_SECONDS="${AGENTDECK_DRAIN_TIMEOUT_SECONDS:-7200}"
 KEEP_RELEASES="${AGENTDECK_KEEP_RELEASES:-5}"
+SERVICE_USER=""
+SERVICE_HOME=""
+CREATED_RELEASE_ID=""
+PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$DATA_DIR/cache/ms-playwright}"
+NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$DATA_DIR/cache/npm}"
 
 usage() {
   cat >&2 <<'EOF'
@@ -40,6 +45,82 @@ log() { printf '[agentdeckctl] %s\n' "$*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 json_escape() { node -e 'process.stdout.write(JSON.stringify(process.argv[1] || ""))' "$1"; }
 is_worker() { [ "${AGENTDECK_DEPLOY_WORKER:-0}" = "1" ]; }
+
+resolve_service_user() {
+  if [ -n "$SERVICE_USER" ]; then return 0; fi
+  SERVICE_USER="${AGENTDECK_SERVICE_USER:-${AGENTDECK_RUN_USER:-}}"
+  if [ -z "$SERVICE_USER" ] && command -v systemctl >/dev/null 2>&1; then
+    SERVICE_USER="$(systemctl show agentdeck-runtime.service -p User --value 2>/dev/null || true)"
+  fi
+  if [ -z "$SERVICE_USER" ] && [ -f "$ENV_DIR/runtime.env" ]; then
+    SERVICE_USER="$(node - "$ENV_DIR/runtime.env" <<'NODE'
+const fs = require('node:fs');
+const file = process.argv[2];
+for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+  const m = line.match(/^\s*AGENTDECK_SERVICE_USER\s*=\s*([^#\s]+)/);
+  if (m) { console.log(m[1].replace(/^['"]|['"]$/g, '')); process.exit(0); }
+}
+NODE
+)"
+  fi
+  [ -n "$SERVICE_USER" ] || die "cannot determine AgentDeck service user; set AGENTDECK_SERVICE_USER or install systemd units first"
+  SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6 || true)"
+  [ -n "$SERVICE_HOME" ] || die "service user does not exist: $SERVICE_USER"
+}
+
+service_env() {
+  resolve_service_user
+  printf 'HOME=%s\nUSER=%s\nLOGNAME=%s\nPATH=%s\nnpm_config_cache=%s\nNPM_CONFIG_CACHE=%s\nPLAYWRIGHT_BROWSERS_PATH=%s\nDATA_DIR=%s\n' \
+    "$SERVICE_HOME" "$SERVICE_USER" "$SERVICE_USER" "$DATA_DIR/provider-tools/bin:/usr/local/bin:/usr/bin:/bin:$SERVICE_HOME/.local/bin" \
+    "$NPM_CONFIG_CACHE" "$NPM_CONFIG_CACHE" "$PLAYWRIGHT_BROWSERS_PATH" "$DATA_DIR"
+}
+
+run_as_service_user() {
+  resolve_service_user
+  if [ "$(id -un)" = "$SERVICE_USER" ]; then
+    env $(service_env) "$@"
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u "$SERVICE_USER" -- env $(service_env) "$@"
+  else
+    sudo -H -u "$SERVICE_USER" env $(service_env) "$@"
+  fi
+}
+
+ensure_service_owned_dirs() {
+  resolve_service_user
+  mkdir -p "$DATA_DIR/cache" "$PLAYWRIGHT_BROWSERS_PATH" "$NPM_CONFIG_CACHE" "$DATA_DIR/provider-tools/bin" "$DATA_DIR/deploy-candidates" "$RELEASES_DIR" "$LOG_DIR"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools" "$DATA_DIR/deploy-candidates" "$RELEASES_DIR" "$LOG_DIR"
+}
+
+valid_release_id() {
+  [[ "$1" =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9._-]{7,40}$ ]]
+}
+
+release_path_for() {
+  local release_id="$1" path real_parent
+  valid_release_id "$release_id" || die "invalid release id: $release_id"
+  path="$RELEASES_DIR/$release_id"
+  real_parent="$(realpath -m "$RELEASES_DIR")"
+  case "$(realpath -m "$path")" in "$real_parent"/*) printf '%s\n' "$path" ;; *) die "release path escapes releases dir: $path" ;; esac
+}
+
+safe_rm_tree() {
+  local path="$1" root="$2" real_path real_root
+  [ -n "$path" ] || return 0
+  real_path="$(realpath -m "$path")"
+  real_root="$(realpath -m "$root")"
+  case "$real_path" in "$real_root"/*) rm -rf "$real_path" ;; *) log "refusing cleanup outside $real_root: $real_path" ;; esac
+}
+
+ensure_playwright_browsers() {
+  ensure_service_owned_dirs
+  if find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 2 -type d -name 'chromium-*' 2>/dev/null | grep -q .; then
+    log "Playwright Chromium already present in $PLAYWRIGHT_BROWSERS_PATH"
+    return
+  fi
+  log "installing Playwright Chromium into $PLAYWRIGHT_BROWSERS_PATH as $SERVICE_USER"
+  run_as_service_user npx playwright install chromium
+}
 
 ensure_dirs() {
   mkdir -p "$CONTROL_ROOT" "$DATA_DIR" "$STATE_DIR" "$RELEASES_DIR" "$JOBS_DIR" "$LOG_DIR"
@@ -99,7 +180,11 @@ runtime_state() {
 }
 
 active_turns() {
-  curl_json "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/active-turns" 2>/dev/null || echo '{"activeTurnCount":0,"turns":[]}'
+  curl_json "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/active-turns"
+}
+
+active_turn_count_from_json() {
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s); if(!Number.isFinite(Number(j.activeTurnCount))) throw new Error("missing activeTurnCount"); console.log(Number(j.activeTurnCount));}catch(e){console.error(`active-turn query parse failed: ${e.message}`); process.exit(1);}})'
 }
 
 release_target() {
@@ -174,10 +259,12 @@ NODE
 
 run_check() {
   ensure_dirs
+  resolve_service_user
+  ensure_service_owned_dirs
   cd "$SOURCE_ROOT"
   log "checking Node and npm"
-  node --version
-  npm --version
+  run_as_service_user node --version
+  run_as_service_user npm --version
   log "checking env dir"
   [ -d "$ENV_DIR" ] || die "env dir does not exist: $ENV_DIR"
   for name in web.env runtime.env agentdeck-app-server-default.env; do
@@ -185,41 +272,48 @@ run_check() {
   done
   log "checking systemd unit files"
   ROOT="$SOURCE_ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/deploy/install-units.sh"
+  ensure_playwright_browsers
   log "running typecheck"
-  npm run typecheck
+  run_as_service_user npm run typecheck
+  log "running lint"
+  run_as_service_user npm run lint
   log "running build"
-  npm run build
+  run_as_service_user npm run build
   log "running unit tests"
-  npm test
+  run_as_service_user npm test
   log "running mock e2e"
-  npm run test:e2e
+  run_as_service_user npm run test:e2e
   log "CHECK_OK commit=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 }
 
 make_release() {
   ensure_dirs
+  ensure_service_owned_dirs
   local commit short ts release_id release_path
   cd "$SOURCE_ROOT"
   commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
   short="$(printf '%s' "$commit" | cut -c1-12)"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   release_id="$ts-$short"
-  release_path="$RELEASES_DIR/$release_id"
+  valid_release_id "$release_id" || die "generated invalid release id: $release_id"
+  release_path="$(release_path_for "$release_id")"
   [ ! -e "$release_path" ] || die "release already exists: $release_id"
   log "creating release $release_id"
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git worktree add --detach "$release_path" "$commit" >/dev/null
+    run_as_service_user git worktree add --detach "$release_path" "$commit" >/dev/null
   else
-    mkdir -p "$release_path"
+    run_as_service_user mkdir -p "$release_path"
     tar --exclude='./releases' --exclude='./deploy-state' --exclude='./current' --exclude='./previous' --exclude='./candidate' -C "$SOURCE_ROOT" -cf - . | tar -C "$release_path" -xf -
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$release_path"
   fi
   cd "$release_path"
-  npm ci >&2
-  npm run typecheck >&2
-  npm run lint >&2
-  npm run build >&2
-  npm test >&2
-  npm run test:e2e >&2
+  ensure_playwright_browsers
+  run_as_service_user npm ci
+  run_as_service_user npm run typecheck
+  run_as_service_user npm run lint
+  run_as_service_user npm run build
+  run_as_service_user npm test
+  run_as_service_user npm run test:e2e
   node - "$release_path/deploy-manifest.json" "$release_id" "$commit" <<'NODE'
 const fs = require('node:fs');
 fs.writeFileSync(process.argv[2], JSON.stringify({
@@ -232,7 +326,7 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
 NODE
   ln -sfn "releases/$release_id" "$CANDIDATE_LINK.tmp"
   mv -Tf "$CANDIDATE_LINK.tmp" "$CANDIDATE_LINK"
-  printf '%s\n' "$release_id"
+  CREATED_RELEASE_ID="$release_id"
 }
 
 sqlite_backup() {
@@ -255,12 +349,10 @@ start_candidate_runtime() {
   candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
   pid_file="$candidate_dir/runtime.pid"
   mkdir -p "$candidate_dir"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
   sqlite_backup "$candidate_dir/agentdeck-runtime.sqlite3"
-  (
-    cd "$release_path"
-    RUNTIME_MODE=candidate DATA_DIR="$candidate_dir" RUNTIME_DATA_DIR="$candidate_dir" RUNTIME_DB="$candidate_dir/agentdeck-runtime.sqlite3" RUNTIME_PORT="$RUNTIME_CANDIDATE_PORT" RUNTIME_HOST=127.0.0.1 AGENTDECK_RELEASE_ID="$(basename "$release_path")" node server/dist/agentdeck-runtime.js >>"$LOG_DIR/$job_id.candidate-runtime.log" 2>&1 &
-    echo $! > "$pid_file"
-  )
+  chown "$SERVICE_USER:$SERVICE_USER" "$candidate_dir/agentdeck-runtime.sqlite3" 2>/dev/null || true
+  run_as_service_user bash -c 'cd "$1"; RUNTIME_MODE=candidate DATA_DIR="$2" RUNTIME_DATA_DIR="$2" RUNTIME_DB="$2/agentdeck-runtime.sqlite3" RUNTIME_PORT="$3" RUNTIME_HOST=127.0.0.1 AGENTDECK_RELEASE_ID="$4" node server/dist/agentdeck-runtime.js >>"$5" 2>&1 & echo $! > "$6"' _ "$release_path" "$candidate_dir" "$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-runtime.log" "$pid_file"
   wait_http "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/healthz" 30
   curl -fsS "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/schema" >/dev/null
 }
@@ -270,11 +362,8 @@ start_candidate_web() {
   candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
   pid_file="$candidate_dir/web.pid"
   mkdir -p "$candidate_dir"
-  (
-    cd "$release_path"
-    PORT="$WEB_CANDIDATE_PORT" DATA_DIR="$DATA_DIR" USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="http://127.0.0.1:$RUNTIME_PORT" AGENTDECK_RELEASE_ID="$(basename "$release_path")" node server/dist/index.js >>"$LOG_DIR/$job_id.candidate-web.log" 2>&1 &
-    echo $! > "$pid_file"
-  )
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
+  run_as_service_user bash -c 'cd "$1"; PORT="$2" DATA_DIR="$3" USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$DATA_DIR" "http://127.0.0.1:$RUNTIME_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file"
   wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/api/status" 30
 }
 
@@ -313,7 +402,7 @@ cleanup_releases() {
   ls -1dt "$RELEASES_DIR"/* 2>/dev/null | tail -n +"$((KEEP_RELEASES + 1))" | while read -r old; do
     [ "$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)" = "$(readlink -f "$old")" ] && continue
     [ "$(readlink -f "$PREVIOUS_LINK" 2>/dev/null || true)" = "$(readlink -f "$old")" ] && continue
-    rm -rf "$old"
+    safe_rm_tree "$old" "$RELEASES_DIR"
   done
 }
 
@@ -326,10 +415,17 @@ undrain_runtime() {
 }
 
 wait_drain() {
-  local force="$1" start count
+  local force="$1" start count turns
   start="$(date +%s)"
   while true; do
-    count="$(active_turns | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).activeTurnCount||0)}catch{console.log(0)}})')"
+    if ! turns="$(active_turns 2>&1)"; then
+      undrain_runtime
+      die "runtime active-turn query failed during drain: $turns"
+    fi
+    if ! count="$(printf '%s' "$turns" | active_turn_count_from_json)"; then
+      undrain_runtime
+      die "runtime active-turn response was invalid during drain"
+    fi
     [ "$count" = "0" ] && return
     if [ $(( $(date +%s) - start )) -ge "$DRAIN_TIMEOUT_SECONDS" ]; then
       if [ "$force" = "1" ]; then
@@ -345,8 +441,12 @@ wait_drain() {
 
 reject_active_turns() {
   local turns count
-  turns="$(active_turns)"
-  count="$(printf '%s' "$turns" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).activeTurnCount||0)}catch{console.log(0)}})')"
+  if ! turns="$(active_turns 2>&1)"; then
+    die "runtime active-turn query failed; refusing unsafe restart: $turns"
+  fi
+  if ! count="$(printf '%s' "$turns" | active_turn_count_from_json)"; then
+    die "runtime active-turn response was invalid; refusing unsafe restart"
+  fi
   [ "$count" = "0" ] && return 0
   echo "ERROR: active turn exists ($count)." >&2
   printf '%s\n' "$turns" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s); for (const t of j.turns||[]) console.error(`session=${t.sessionId} turn=${t.turnId || "-"} provider=${t.provider} runningMs=${t.runningMs}`);})'
@@ -387,8 +487,9 @@ worker_deploy() {
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path
-    release_id="$(make_release)"
-    release_path="$RELEASES_DIR/$release_id"
+    make_release
+    release_id="$CREATED_RELEASE_ID"
+    release_path="$(release_path_for "$release_id")"
     export AGENTDECK_JOB_RELEASE="$release_id"
     write_job "$job_id" running "release built"
     ROOT="$release_path" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$release_path/deploy/install-units.sh"
@@ -418,6 +519,9 @@ worker_deploy() {
     local code=$?
     stop_candidate_processes "$job_id" || true
     undrain_runtime
+    if [ -n "${CREATED_RELEASE_ID:-}" ] && valid_release_id "$CREATED_RELEASE_ID"; then
+      safe_rm_tree "$RELEASES_DIR/$CREATED_RELEASE_ID" "$RELEASES_DIR" || true
+    fi
     write_job "$job_id" failed "deploy failed"
     exit "$code"
   }

@@ -29,6 +29,10 @@ test('draining waits for active turns, submitting turns, and pending event pushe
   assert.match(runtime, /pendingEventWriteCount:diagnostics\.runtimePendingPushCount/);
   assert.match(runtime, /waitForDrain/);
   assert.match(runtime, /process\.once\('SIGTERM'/);
+  assert.match(ctl, /active_turn_count_from_json/);
+  assert.match(ctl, /runtime active-turn query failed during drain/);
+  assert.match(ctl, /refusing unsafe restart/);
+  assert.doesNotMatch(ctl, /active-turns" 2>\/dev\/null \|\| echo '\{"activeTurnCount":0/);
 });
 
 test('deploy supports component scoped web runtime provider and changed modes', () => {

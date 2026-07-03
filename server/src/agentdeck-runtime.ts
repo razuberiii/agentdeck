@@ -653,7 +653,11 @@ app.patch('/sessions/:id', async (req:any, reply) => {
 
 app.get('/sessions/:id/events', async (req:any) => {
   const after = Number(req.query?.after || 0);
-  return { events: await eventsAfter(String(req.params.id), after, String(req.query?.includeDeltas || '') === '1') };
+  const sessionId = String(req.params.id);
+  const events = await eventsAfter(sessionId, after, String(req.query?.includeDeltas || '') === '1');
+  const latestSequence = await latestEventSequence(sessionId);
+  const nextSequence = events.reduce((max:number, event:any) => Math.max(max, Number(event.sequence || 0)), after);
+  return { events, latestSequence, nextSequence, hasMore:nextSequence < latestSequence };
 });
 
 app.get('/sessions/:id/subscribe', async (req:any, reply) => {
@@ -1623,6 +1627,10 @@ async function eventsAfter(sessionId:string, after:number, includeDeltas = false
      LIMIT 1000`,
     [sessionId, after]
   ));
+}
+async function latestEventSequence(sessionId:string) {
+  const row = await db.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1', [sessionId]);
+  return Number(row?.sequence || 0);
 }
 
 function turnOptions(body:any) {

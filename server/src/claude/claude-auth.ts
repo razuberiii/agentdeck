@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 
 export async function claudeCliStatus(): Promise<AgentStatus> {
   const command = process.env.CLAUDE_BIN || 'claude';
-  const found = await commandPath(command);
+  const found = await detectClaudeCommand();
   if (!found) {
     const sdkVersion = claudeSdkVersion();
     return {
@@ -37,6 +37,14 @@ export async function claudeCliStatus(): Promise<AgentStatus> {
     command:found,
     error:version ? null : 'Claude CLI 已发现，但 --version 未返回可用版本',
   };
+}
+
+async function detectClaudeCommand() {
+  for (const candidate of [process.env.CLAUDE_BIN, `${process.env.DATA_DIR || '/var/lib/agentdeck'}/provider-tools/bin/claude`, 'claude'].filter(Boolean) as string[]) {
+    const found = await commandPath(candidate);
+    if (found) return found;
+  }
+  return null;
 }
 
 export async function claudeAuthStatus(profile: ClaudeProfile): Promise<{ ok:boolean; output:string; error:string | null }> {
