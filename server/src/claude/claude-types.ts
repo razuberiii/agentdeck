@@ -1,6 +1,6 @@
 import type { PermissionMode, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
-export type ClaudeProfileType = 'existing_cli' | 'setup_token' | 'api_key';
+export type ClaudeProfileType = 'official_cli' | 'existing_cli' | 'setup_token' | 'api_key';
 export type ClaudeProfileStatus =
   | 'not_installed'
   | 'not_configured'
@@ -39,4 +39,3 @@ export type ClaudeCanonicalEvent =
   | null;
 
 export type ClaudeSdkMessage = SDKMessage;
-

@@ -2,15 +2,15 @@
 
 # AgentDeck
 
-**把运行在服务器上的 Coding Agent，带到浏览器和手机上。**
+**把服务器上的 Coding Agent，装进一个随时能打开的控制台。**
 
-一个自托管、移动端优先的 Agent 控制台。<br>
-集中管理 Codex、Claude Code、Antigravity 和 Gemini CLI，会话不会因为刷新页面或临时断线就消失。
+在浏览器或手机上使用 Codex、Claude Code、Antigravity 和 Gemini CLI。  
+Agent 继续运行在你的服务器上，页面关掉了也没关系。
 
-![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
 ![PWA](https://img.shields.io/badge/PWA-mobile--first-5A0FC8?logo=pwa&logoColor=white)
-![Self-hosted](https://img.shields.io/badge/deployment-self--hosted-2F855A)
+![License](https://img.shields.io/badge/license-MIT-2F855A)
 
 </div>
 
@@ -18,60 +18,94 @@
 
 ## 为什么做 AgentDeck
 
-Codex 和 Gemini CLI 很适合在服务器上长期工作，但它们天然更偏向终端：
+Coding Agent 很好用，但终端不适合一直带在身边。
 
-- 离开电脑后，不方便查看任务进度或继续对话；
-- 浏览器刷新、网络切换或 Web 服务重启后，流式内容容易中断；
-- 多个 Provider、多个账户和多个项目分散在不同命令与配置目录中；
-- 手机上临时处理审批、补充文件或继续任务并不顺手。
+我想在电脑上发起任务，离开以后还能从手机查看进度、补一句话、处理审批；也不想为了切换 Codex、Claude 或 Gemini，来回找不同的命令和配置目录。
 
-AgentDeck 在 CLI 和浏览器之间增加了一层持久运行时。
+所以有了 AgentDeck：
 
-Agent 真正运行在服务器上，浏览器只是控制界面。你可以在电脑上创建任务，关掉页面，之后再从手机继续；页面断线重连时，AgentDeck 会根据已持久化的事件序列补发缺失内容。
+> CLI 负责真正干活，AgentDeck 负责把它们放到同一个界面里，并记住正在发生的事情。
 
-## 能做什么
+## 它能做什么
 
-### 从任何设备继续任务
+- 在电脑和手机之间继续同一个任务；
+- 管理多个 Provider、账户和项目；
+- 上传图片、源码、PDF 和其他附件；
+- 查看运行过程、审批工具调用、停止任务；
+- 页面刷新或短暂断线后恢复已经保存的内容；
+- 所有代码、凭据和运行数据都留在自己的服务器上。
 
-- 桌面与移动浏览器共用同一套 Web 界面；
-- 支持安装为 PWA；
-- 会话列表、搜索、重命名、归档、Fork 和删除；
-- 页面刷新、浏览器重连或 Web gateway 重启后继续已有会话。
+## Provider
 
-### 管理多个 Agent 和账户
+界面中的顺序固定为：
 
-- Codex app-server；
-- Claude Code；
-- 可选的 Antigravity CLI；
-- Gemini CLI ACP；
-- 每个 Provider 可维护独立 profile；
-- 切换账户只影响下一轮任务，不会删除现有会话历史。
+**Codex → Claude Code → Antigravity → Gemini**
 
-### 围绕真实项目工作
-
-- 从允许的工作区中选择项目；
-- 支持 Read Only、Workspace Write 和 YOLO 等执行模式；
-- 上传图片、源码、PDF、Office 文档和压缩包；
-- 查看项目 diff；
-- 下载 Agent 生成的文件与其他产物。
-
-### 保留执行状态
-
-- Runtime 持有会话、turn、Provider thread 和事件序列；
-- SQLite 持久化会话元数据与事件；
-- 浏览器按 sequence 恢复缺失事件，而不是把当前页面当作事实来源；
-- Provider 上游会话丢失时，可使用本地可见历史重建上下文。
-
-## Provider 支持情况
-
-| Provider | 接入方式 | 当前定位 |
+| Provider | 接入方式 | 状态 |
 | --- | --- | --- |
-| **Codex** | `codex app-server` | AgentDeck 的主要 Provider。支持持久会话、多 profile、附件、审批和项目工作流。 |
-| **Claude Code** | Anthropic Claude Agent SDK / Claude Code | 使用官方 SDK `query()` 和 `claude_code` preset。支持流式输出、工具审批、profile、附件、停止和上游 session resume；不提供额度查询或动态模型发现。 |
-| **Antigravity** | CLI | 适合基础文本任务。它不是 Codex runtime 的等价替代，目前不保证结构化流式事件、图片输入或长任务恢复。 |
-| **Gemini CLI** | ACP over stdio | 由 Runtime 维护长期 ACP 进程，支持独立 profile、API Key 与 Google OAuth。上游 session 能否恢复取决于 Gemini CLI 暴露的能力。 |
+| **Codex** | Codex app-server | 完整的会话、流式事件、审批、附件和多账户支持 |
+| **Claude Code** | Claude Agent SDK + 官方 CLI 登录 | 流式输出、工具调用、审批、附件、停止和 session resume |
+| **Antigravity** | CLI | 基础 Agent 能力，具体边界取决于上游 CLI |
+| **Gemini** | Gemini CLI ACP | OAuth / API Key、独立 profile 和 ACP 会话 |
 
-AgentDeck 不会为 Provider 不具备的能力伪造状态。例如上游没有稳定的可机读额度接口时，界面会明确显示为不支持。
+不同 Provider 不一定拥有完全相同的能力。AgentDeck 会显示真实状态，而不是为了界面整齐假装都支持。
+
+## 安装与登录
+
+AgentDeck 的目标流程很简单：
+
+```text
+安装 AgentDeck
+→ 打开 Provider 设置
+→ 没有 CLI 就点安装
+→ 没登录就点登录
+→ 开始创建任务
+```
+
+登录仍然由各家的官方 CLI 完成。AgentDeck 负责启动登录流程、保存独立 profile，并让 Runtime 使用同一份配置。
+
+## 快速开始
+
+需要 Node.js 22 或更高版本。
+
+```bash
+git clone https://github.com/razuberiii/agentdeck.git
+cd agentdeck
+
+npm ci
+npm run start:local
+```
+
+启动后终端会打印：
+
+- 访问地址；
+- 本地管理员密码；
+- Runtime 和 Web 状态。
+
+打开 AgentDeck 后，在 **设置 → Provider** 中安装或登录需要的 CLI。
+
+`start:local` 只监听本机地址，适合先体验项目。
+
+## 正式部署
+
+Linux + systemd 环境可以使用：
+
+```bash
+sudo ./scripts/setup.sh
+```
+
+之后的日常操作统一通过：
+
+```bash
+sudo agentdeckctl status
+sudo agentdeckctl check
+sudo agentdeckctl deploy all
+sudo agentdeckctl rollback all
+```
+
+涉及 Runtime 的部署会先等待当前任务结束，再切换到新版本。部署任务在独立的 systemd job 中运行，不会因为 Agent 重启自己而中途消失。
+
+完整的 HTTPS、反向代理、备份和回滚说明见 [`docs/deployment.md`](docs/deployment.md)。
 
 ## 架构
 
@@ -79,262 +113,44 @@ AgentDeck 不会为 Provider 不具备的能力伪造状态。例如上游没有
 flowchart LR
     A[Browser / PWA] -->|HTTP + WebSocket| B[Web Gateway]
     B -->|HTTP + SSE| C[AgentDeck Runtime]
+
     C --> D[Codex app-server]
-    C --> E[Claude Agent SDK / Claude Code]
+    C --> E[Claude Agent SDK]
     C --> F[Antigravity CLI]
-    C --> I[Gemini CLI ACP]
+    C --> G[Gemini CLI ACP]
 
-    C --> G[(SQLite)]
-    B --> H[Attachments / Artifacts]
+    C --> H[(SQLite)]
+    B --> I[Attachments / Artifacts]
 ```
 
-### Browser / PWA
+浏览器只是控制界面。
 
-负责加载会话快照、发送消息、订阅流式事件并渲染界面。浏览器保存自己已经应用到的事件 sequence，重连时用它请求缺失部分。
+真正的会话、Provider session、活动任务和事件序列保存在 Runtime 中。页面重新连接时，会根据 sequence 补回缺失的事件，而不是把当前页面当作唯一状态。
 
-### Web Gateway
+## 数据
 
-基于 Fastify，负责：
-
-- AgentDeck 登录；
-- CSRF 与 Origin 校验；
-- HTTP API 与 WebSocket；
-- 附件上传和下载；
-- 静态资源；
-- 把浏览器请求转发给 Runtime。
-
-### AgentDeck Runtime
-
-Runtime 是执行状态的事实来源，负责：
-
-- 会话和 active turn；
-- Provider session / thread ID；
-- Provider profile 与本轮实际执行账户；
-- 事件持久化和 sequence；
-- Codex app-server、Claude SDK query 与 Gemini ACP 进程生命周期；
-- 向 Web Gateway 提供事件流。
-
-更详细的设计见 [`docs/architecture.md`](docs/architecture.md)。
-
-## 快速开始
-
-准备代码目录、数据目录和配置目录：
-
-```bash
-sudo mkdir -p /opt/stacks/agentdeck /opt/data/agentdeck /etc/agentdeck
-sudo chown -R "$USER":"$USER" /opt/stacks/agentdeck /opt/data/agentdeck
-
-git clone https://github.com/razuberiii/agentdeck.git /opt/stacks/agentdeck
-cd /opt/stacks/agentdeck
-```
-
-准备生产环境文件：
-
-```bash
-sudo install -m 0600 deploy/systemd/env/web.env.example /etc/agentdeck/web.env
-sudo install -m 0600 deploy/systemd/env/runtime.env.example /etc/agentdeck/runtime.env
-sudo install -m 0600 deploy/systemd/env/codex-app-server-default.env.example /etc/agentdeck/agentdeck-app-server-default.env
-```
-
-至少修改 `/etc/agentdeck/web.env` 里的 `ADMIN_PASSWORD`、`COOKIE_SECRET` 和 `ALLOWED_ORIGINS`。如果 Runtime 不只监听 loopback，还要同时设置 `RUNTIME_TOKEN` 和 `AGENT_RUNTIME_TOKEN`。
-
-安装 systemd 单元和稳定命令入口：
-
-```bash
-sudo ROOT=/opt/stacks/agentdeck DATA_DIR=/opt/data/agentdeck ENV_DIR=/etc/agentdeck ./deploy/install-units.sh
-```
-
-执行检查和首次部署：
-
-```bash
-sudo agentdeckctl check
-sudo agentdeckctl deploy all --wait
-sudo agentdeckctl status
-```
-
-之后升级只需要：
-
-```bash
-cd /opt/stacks/agentdeck
-git fetch origin main
-git reset --hard origin/main
-sudo agentdeckctl deploy all --wait
-```
-
-回滚：
-
-```bash
-sudo agentdeckctl rollback all --wait
-```
-
-## 配置
-
-最常用的配置：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `HOST` | `127.0.0.1` | Web Gateway 监听地址。 |
-| `PORT` | `3842` | Web Gateway 监听端口。 |
-| `DATA_DIR` | `/var/lib/agentdeck` | SQLite、profiles、附件和其他运行数据的根目录。 |
-| `ADMIN_PASSWORD` | 无 | AgentDeck 管理员密码，生产环境必须设置。 |
-| `COOKIE_SECRET` | 启动时临时生成 | Cookie 签名密钥；生产环境必须使用稳定随机值。 |
-| `ALLOWED_ORIGINS` | 本机地址 | 允许建立 WebSocket 的浏览器 Origin。 |
-| `ALLOWED_WORKSPACES` | 当前目录、`/opt/projects` | UI 可选择的工作区根目录，多个路径用逗号分隔。 |
-| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | Web Gateway 访问 Runtime 的地址。 |
-
-<details>
-<summary><strong>完整环境变量</strong></summary>
-
-### Web Gateway
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `HOST` | `127.0.0.1` | Web Gateway 监听地址。 |
-| `PORT` | `3842` | Web Gateway 监听端口。 |
-| `DATA_DIR` | `/var/lib/agentdeck` | 主数据目录。 |
-| `ADMIN_PASSWORD` | 无 | 初始管理员密码。 |
-| `COOKIE_SECRET` | 启动时生成 | Cookie 签名密钥。生产环境应固定。 |
-| `ALLOWED_ORIGINS` | `http://localhost:3842,http://127.0.0.1:3842` | WebSocket Origin 白名单。 |
-| `ALLOWED_WORKSPACES` | 当前目录、`/opt/projects` | 可访问的工作区根目录。 |
-| `USE_AGENT_RUNTIME` | 未启用 | 设为 `1` 后通过持久 Runtime 执行会话。 |
-| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | Runtime 地址。 |
-| `AGENT_RUNTIME_TOKEN` | 未设置 | Web Gateway 调用 Runtime 时使用的 Bearer token。 |
-
-### Runtime
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `RUNTIME_HOST` | `127.0.0.1` | Runtime 监听地址。 |
-| `RUNTIME_PORT` | `3852` | Runtime 监听端口。 |
-| `RUNTIME_TOKEN` | 未设置 | Runtime 非 loopback 监听时必须设置。 |
-| `RUNTIME_DB` | `$DATA_DIR/agentdeck-runtime.sqlite3` | Runtime SQLite 数据库。 |
-
-### Provider
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `CODEX_HOME` | `$HOME/.codex` | Codex profile 与配置目录。 |
-| `CLAUDE_PROFILE_ROOT` | `$DATA_DIR/claude/profiles` | AgentDeck 管理的 Claude profile 根目录。 |
-| `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | 允许复用的现有 Claude CLI 配置目录根。 |
-| `CLAUDE_BIN` | SDK 默认 | 可选的 Claude Code 可执行文件绝对路径 override。 |
-| `GEMINI_BIN` | `/usr/bin/gemini` | Gemini CLI 路径。 |
-| `GEMINI_ACP_ARGS` | `--acp` | Gemini ACP 启动参数。 |
-| `GEMINI_PROFILE_ROOT` | `$DATA_DIR/gemini/profiles/default` | Gemini 默认 profile 根目录。 |
-| `ANTIGRAVITY_BIN` | `agy` | Antigravity CLI 命令或路径。 |
-
-## Claude Code
-
-Claude Code 通过 Anthropic 官方 TypeScript Agent SDK 接入。AgentDeck 显式使用 Claude Code system prompt preset，并把每轮的工作区、模型、权限模式、profile 环境、附件引用、取消信号和审批 callback 传给 SDK。
-
-支持的登录方式：
-
-- Existing CLI Profile：复用服务器上已存在、位于允许根目录内的 Claude CLI 配置；
-- setup-token：在服务器外部或终端运行 `claude setup-token` 后，把 `CLAUDE_CODE_OAUTH_TOKEN` 保存到 AgentDeck profile；
-- Anthropic API Key：保存 `ANTHROPIC_API_KEY` 到 AgentDeck profile。
-
-Claude 凭据只写入 `$DATA_DIR/claude/profiles/<profile-id>/` 下权限为 `0600` 的文件；profile 目录权限为 `0700`。token 和 API key 不写入普通 SQLite 字段、消息、事件或浏览器响应。
-
-需要注意：
-
-- Provider 菜单固定顺序为 Codex、Claude Code、Antigravity、Gemini；
-- Claude usage/cost 只作为本轮 metadata，不显示为账户剩余额度；
-- 当前没有稳定官方模型发现接口，设置页提供 `default`、稳定 alias 和自定义 model ID；
-- Web Gateway 重启后会继续使用 Runtime 中保存的 Claude session ID；
-- Runtime active turn 崩溃时会标记 interrupted，下一轮优先尝试原 session ID resume；如果上游恢复失败，会用 AgentDeck 本地可见历史继续并记录上游 session replacement。
-
-### 附件
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MAX_ATTACHMENT_BYTES` | `33554432` | 单个附件大小上限。 |
-| `MAX_ATTACHMENTS_PER_MESSAGE` | `10` | 单条消息附件数量上限。 |
-| `MAX_TOTAL_ATTACHMENT_BYTES` | `67108864` | 单条消息附件总大小建议上限。 |
-
-</details>
-
-## Gemini CLI
-
-AgentDeck Runtime 使用 ACP 管理长期 Gemini CLI 子进程。每个 Gemini profile 使用独立的 `HOME` 与 `GEMINI_CONFIG_DIR`，凭据不会写进浏览器或消息正文。
-
-Web 登录目前支持：
-
-- Gemini API Key；
-- Google OAuth。
-
-API Key 只写入对应 profile 的 `agentdeck.env`，权限为 `0600`。Google OAuth 通过独立 PTY 完成授权，并在凭据落盘后初始化该 profile 的 ACP runtime。
-
-需要注意：
-
-- Web Gateway 重启不会主动终止 Runtime 中的 Gemini ACP 进程；
-- Runtime 整体重启时，不承诺无损恢复正在执行的 turn；
-- Gemini CLI 支持 `session/load` 时，AgentDeck 会尝试恢复上游 session；
-- 加载失败时会新建上游 session，并使用 AgentDeck 本地历史继续；
-- 切换默认 Gemini profile 后，现有 AgentDeck 会话仍然保留，但下一轮由新 profile 执行。
-
-## 附件与产物
-
-附件通过 `multipart/form-data` 上传到 Web root 之外的 `attachments/` 目录。
-
-服务端不会信任浏览器传入的文件路径、MIME、大小或文件名，而是使用内部随机 ID 和独立 metadata。图片可以显示缩略图，PDF 和安全文本可预览；Office、压缩包和未知二进制默认下载，并设置 `X-Content-Type-Options: nosniff`。
-
-不同 Provider 的传递方式不同：
-
-- **Codex**：图片使用原生本地图片输入，普通文件以受控本地路径和 metadata 提供；
-- **Claude Code**：图片和文件通过 SDK 支持的内容或受控本地路径 metadata 提供，Provider 派生输入不会回写到用户消息正文；
-- **Gemini**：优先使用 ACP resource link 或 image block，取决于初始化能力；
-- **Antigravity**：以本地路径提供给 CLI。
-
-备份时不要只复制 SQLite，还需要保留 `attachments/` 和生成产物目录。
-
-## 数据与备份
-
-需要备份整个 `DATA_DIR`。关键内容包括：
+默认需要长期保留的是：
 
 ```text
-agentdeck.sqlite3
-agentdeck-runtime.sqlite3
-profiles/
-claude/profiles/
-gemini/profiles/
-antigravity-profiles/
-shared/sessions/
-shared/generated_images/
+SQLite 数据库
+Provider profiles
 attachments/
+generated artifacts
 ```
 
-SQLite 服务运行期间可能存在 `-wal` 和 `-shm` 文件。建议使用 SQLite 的 `.backup` 命令，或者停止相关服务后再复制数据库。
+不要只备份数据库而忽略附件和账号配置。
 
-环境文件、Cookie secret、Provider token 和登录凭据不要提交到公开仓库。
-
-## 恢复边界
-
-AgentDeck 的目标是让浏览器断线不等于任务丢失，但它不是分布式事务系统。
-
-可以恢复的情况：
-
-- 页面刷新；
-- 浏览器临时断网；
-- WebSocket 重连；
-- Web Gateway 重启；
-- 已经持久化的事件补发。
-
-不能完全保证的情况：
-
-- Runtime 在 active turn 中崩溃；
-- Provider 进程被系统强制终止；
-- 高频 delta 尚未写入 SQLite 时发生极端故障；
-- 上游 CLI 删除或不再识别原 session / thread。
-
-当上游 thread 不存在时，AgentDeck 可以创建替代 thread，并使用本地可见历史继续，但 Provider 内部未展示的隐藏状态无法保证恢复。
+```bash
+sudo /opt/stacks/agentdeck/scripts/backup.sh
+```
 
 ## 开发
 
 ```bash
-npm install
-
-npm run build
+npm ci
 npm run typecheck
 npm run lint
+npm run build
 npm test
 npm run test:e2e
 ```
@@ -342,21 +158,16 @@ npm run test:e2e
 开发模式：
 
 ```bash
-npm run dev
 npm run dev:runtime
-```
-
-单独构建：
-
-```bash
-npm run build:server
-npm run build:client
+npm run dev
 ```
 
 ## 项目状态
 
-AgentDeck 仍在快速迭代。Provider CLI / SDK 的协议和行为可能变化，升级 Codex CLI、Claude Agent SDK、Claude Code 或 Gemini CLI 后，建议先在非生产环境验证登录、创建会话、继续会话、附件和恢复流程。
+AgentDeck 仍在快速迭代。
+
+Provider CLI 和 SDK 的协议可能变化。升级 Codex、Claude Code、Antigravity 或 Gemini 后，建议先检查登录、会话恢复、审批和附件流程。
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+[MIT](LICENSE)

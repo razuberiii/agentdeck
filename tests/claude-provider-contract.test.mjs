@@ -6,6 +6,8 @@ const registrySource = readFileSync(new URL('../server/src/provider-registry.ts'
 const profileStoreSource = readFileSync(new URL('../server/src/claude/claude-profile-store.ts', import.meta.url), 'utf8');
 const mapperSource = readFileSync(new URL('../server/src/claude/claude-event-mapper.ts', import.meta.url), 'utf8');
 const runtimeManagerSource = readFileSync(new URL('../server/src/claude/claude-runtime-manager.ts', import.meta.url), 'utf8');
+const profileEnvSource = readFileSync(new URL('../server/src/claude/claude-profile-env.ts', import.meta.url), 'utf8');
+const authSource = readFileSync(new URL('../server/src/claude/claude-auth.ts', import.meta.url), 'utf8');
 const runtimeSource = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const serverSource = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
@@ -22,6 +24,7 @@ test('Claude capabilities are explicit and do not invent quota or model discover
   }
   assert.match(registrySource, /quota:unsupported\('quota_not_supported'/);
   assert.match(registrySource, /modelDiscovery:unsupported\('model_discovery_not_supported'/);
+  assert.match(registrySource, /methods:\['official_cli','existing_cli_profile','setup_token','api_key'\]/);
 });
 
 test('Claude profile store keeps secrets out of SQLite and enforces file permissions', () => {
@@ -43,9 +46,23 @@ test('Claude runtime uses official SDK query with Claude Code preset and guarded
   assert.match(runtimeManagerSource, /canUseTool/);
   assert.match(runtimeManagerSource, /AbortController/);
   assert.match(runtimeManagerSource, /allowDangerouslySkipPermissions:\s*input\.permissionMode === 'bypassPermissions'/);
+  assert.match(runtimeManagerSource, /claudeProfileEnv\(input\.profile, env\)/);
   assert.match(runtimeSource, /v === 'yolo'\) return 'bypassPermissions'/);
   assert.match(runtimeSource, /v === 'workspace-write'\) return 'acceptEdits'/);
   assert.match(runtimeSource, /v === 'plan'\) return 'plan'/);
+});
+
+test('Claude official CLI login uses one isolated profile environment for login, status, logout, and SDK query', () => {
+  assert.match(profileEnvSource, /export function claudeProfileEnv/);
+  assert.match(profileEnvSource, /env\.HOME = profile\.profileDir/);
+  assert.match(profileEnvSource, /env\.CLAUDE_CONFIG_DIR = profile\.configDir/);
+  assert.match(authSource, /\['auth', 'status'\], claudeProfileEnv\(profile\)/);
+  assert.match(authSource, /\['auth', 'logout'\], claudeProfileEnv\(profile\)/);
+  assert.match(serverSource, /pty\.spawn\(String\(cli\.command\), \['auth', 'login'\]/);
+  assert.match(serverSource, /env:claudeProfileEnv\(profile, \{\}, process\.env\)/);
+  assert.match(serverSource, /await claudeProfileStore\.markStatus\(profile\.id, 'authenticated'\)/);
+  assert.match(clientSource, /使用 Claude CLI 登录/);
+  assert.match(clientSource, /其他登录方式/);
 });
 
 test('Claude SDK mapper emits canonical events and redacts before persistence', () => {

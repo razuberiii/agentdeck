@@ -5,6 +5,7 @@ import type { ClaudeProfileStore } from './claude-profile-store.js';
 import type { ClaudeProfile, ClaudeTurnInput } from './claude-types.js';
 import { mapClaudeSdkMessage } from './claude-event-mapper.js';
 import { redactClaudeSecrets, redactClaudeText } from './claude-redaction.js';
+import { claudeProfileEnv } from './claude-profile-env.js';
 
 type PendingApproval = {
   approvalId: string;
@@ -39,6 +40,7 @@ export class ClaudeRuntimeManager {
     await this.options.updateSession(input.localSessionId, { status:'running', active_turn_id:input.turnId, executing_profile_id:input.profile.id, current_upstream_account_id:input.profile.id, last_execution_account_id:input.profile.id, updated_at:Date.now() });
     await this.options.appendEvent(input.localSessionId, 'turn/started', { provider:'claude', turnId:input.turnId, profileId:input.profile.id });
     const env = await this.profileStore.readEnv(input.profile);
+    const runtimeEnv = claudeProfileEnv(input.profile, env);
     const prompt = this.prompt(input);
     const canUseTool = this.canUseTool(input);
     try {
@@ -54,12 +56,7 @@ export class ClaudeRuntimeManager {
           abortController: controller,
           canUseTool,
           pathToClaudeCodeExecutable: process.env.CLAUDE_BIN || undefined,
-          env: {
-            ...process.env,
-            ...env,
-            CLAUDE_CONFIG_DIR: input.profile.configDir,
-            HOME: input.profile.configDir,
-          },
+          env: runtimeEnv,
         } as any,
       })) {
         const providerSessionId = (message as any)?.session_id;

@@ -70,7 +70,7 @@ export class ClaudeProfileStore {
     if (Object.keys(env).length) await this.writeEnv(profileDir, env);
     const now = Date.now();
     const active = (await this.list()).length ? 0 : 1;
-    const status = input.type === 'existing_cli' ? 'not_configured' : 'authenticated';
+    const status = input.type === 'existing_cli' || input.type === 'official_cli' ? 'not_configured' : 'authenticated';
     await this.db.run(
       "INSERT INTO claude_profiles (id,name,profile_dir,config_dir,type,active,status,credential_summary,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
       [id, input.name || 'Claude Code Account', profileDir, configDir, input.type, active, status, summary || null, now]

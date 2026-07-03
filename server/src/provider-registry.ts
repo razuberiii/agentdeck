@@ -66,7 +66,7 @@ const codexCapabilities: ProviderCapabilities = {
 };
 
 const claudeCapabilities: ProviderCapabilities = {
-  authentication:supported({ methods:['existing_cli_profile','setup_token','api_key'] }),
+  authentication:supported({ methods:['official_cli','existing_cli_profile','setup_token','api_key'] }),
   accountManagement:supported(),
   persistentSessions:supported(),
   streaming:supported(),

@@ -69,8 +69,8 @@ type ProviderStatusInput = {
 
 export function providerStatus(input: ProviderStatusInput): ProviderStatus {
   const cli = input.cliStatus || {};
-  const installed = !!cli.ok;
-  const availability: ProviderAvailability = cli.ok ? 'ready' : cli.error ? 'unavailable' : 'checking';
+  const installed = cli.installed !== undefined ? !!cli.installed : !!cli.ok;
+  const availability: ProviderAvailability = cli.ok ? 'ready' : installed ? 'error' : cli.error ? 'unavailable' : 'checking';
   const message = input.message ?? (availability === 'ready' ? null : String(cli.error || `${input.displayName} CLI 不可用`));
   const version = cli.version ? String(cli.version) : null;
   const canCreateSession = input.canCreateSession ?? (availability === 'ready' && input.auth === 'authenticated');

@@ -23,7 +23,8 @@ import { RuntimeClient } from './runtime-client.js';
 import { AntigravityProvider, GeminiProvider } from './providers.js';
 import { ClaudeProvider } from './claude/claude-provider.js';
 import { ClaudeProfileStore } from './claude/claude-profile-store.js';
-import { claudeAuthState } from './claude/claude-auth.js';
+import { claudeAuthLogout, claudeAuthState, claudeAuthStatus } from './claude/claude-auth.js';
+import { claudeProfileEnv, claudeSafeEnvSummary } from './claude/claude-profile-env.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
 import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, type AgentProviderId } from './provider-registry.js';
@@ -88,6 +89,10 @@ type ProviderLoginAttempt = { id:string; provider:AgentProviderId; profileId:str
 type AntigravityLoginJob = LoginJob & { providerId:'antigravity'; authCodePrompt?:boolean; codeSubmitted?:boolean };
 const antigravityLoginJobs = new Map<string, AntigravityLoginJob>();
 const antigravityLoginChildren = new Map<string, any>();
+type ClaudeLoginJob = Omit<LoginJob, 'status'> & { providerId:'claude'; status:'running'|'waiting_user'|'verifying'|'done'|'error'|'cancelled'; requiresInput?:boolean };
+const claudeLoginJobs = new Map<string, ClaudeLoginJob>();
+const claudeLoginProfiles = new Map<string, string>();
+const claudeLoginChildren = new Map<string, any>();
 type GeminiLoginJob = {
   id:string;
   profileId:string;
@@ -472,8 +477,8 @@ app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
 app.get('/api/models', { preHandler: ensureAuth }, async (req:any) => modelCatalog(req.query?.hidden === '1', normalizeProvider(req.query?.provider) || (await appSettings()).activeProvider));
 app.get('/api/claude/profiles', { preHandler: ensureAuth }, async () => ({ profiles: await listClaudeProfiles(), activeClaudeProfile: await activeClaudeProfileSummary() }));
 app.post('/api/claude/profiles', { preHandler: ensureAuth }, async (req:any, reply) => {
-  const type = String(req.body?.type || 'existing_cli');
-  if (!['existing_cli','setup_token','api_key'].includes(type)) return reply.code(400).send({ error:'bad profile type' });
+  const type = String(req.body?.type || 'official_cli');
+  if (!['official_cli','existing_cli','setup_token','api_key'].includes(type)) return reply.code(400).send({ error:'bad profile type' });
   const profile = await claudeProfileStore.create({
     name: cleanProfileName(String(req.body?.name || 'Claude Code Account')),
     type: type as any,
@@ -484,11 +489,76 @@ app.post('/api/claude/profiles', { preHandler: ensureAuth }, async (req:any, rep
   invalidateUnifiedProviderStatuses();
   return { profile };
 });
+app.post('/api/claude/profiles/login', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const profileId = typeof req.body?.profileId === 'string' ? req.body.profileId : '';
+  let profile = profileId ? await claudeProfileStore.get(profileId) : null;
+  if (!profile) {
+    profile = await claudeProfileStore.create({
+      name: cleanProfileName(String(req.body?.name || 'Claude Code Account')),
+      type: 'official_cli' as any,
+    });
+  }
+  if (!profile) return reply.code(500).send({ error:'profile create failed' });
+  const existingJobId = claudeLoginProfiles.get(profile.id);
+  if (existingJobId) {
+    const existing = claudeLoginJobs.get(existingJobId);
+    if (existing && !['done','error','cancelled'].includes(existing.status)) return { job:existing };
+  }
+  const job:ClaudeLoginJob = { id:`claude-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`, providerId:'claude', profileId:profile.id, output:[], status:'running', startedAt:Date.now(), newProfile:!profileId };
+  claudeLoginJobs.set(job.id, job);
+  claudeLoginProfiles.set(profile.id, job.id);
+  await claudeProfileStore.switch(profile.id).catch(()=>{});
+  await claudeProfileStore.markStatus(profile.id, 'not_configured').catch(()=>{});
+  runClaudeCliLoginJob(job).catch((e:any)=>failClaudeLoginJob(job, safeClaudeError(e)));
+  invalidateUnifiedProviderStatuses();
+  return { job };
+});
+app.get('/api/claude-login/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const job = claudeLoginJobs.get(String(req.params.id));
+  if (!job) return reply.code(404).send({ error:'login job not found' });
+  return { job };
+});
+app.post('/api/claude-login/:id/input', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const id = String(req.params.id);
+  const job = claudeLoginJobs.get(id);
+  const child = claudeLoginChildren.get(id);
+  if (!job || !child) return reply.code(404).send({ error:'login job not running' });
+  const text = String(req.body?.text || '');
+  if (!text || text.length > 4096) return reply.code(400).send({ error:'input required' });
+  child.write(text.endsWith('\n') || text.endsWith('\r') ? text : `${text}\r`);
+  return { ok:true };
+});
+app.delete('/api/claude-login/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const id = String(req.params.id);
+  const job = claudeLoginJobs.get(id);
+  const child = claudeLoginChildren.get(id);
+  if (child) {
+    try { child.kill(); } catch {}
+    claudeLoginChildren.delete(id);
+  }
+  if (job && job.status !== 'done') {
+    job.status = 'cancelled';
+    job.error = '登录已取消';
+    claudeLoginProfiles.delete(job.profileId);
+    await claudeProfileStore.markStatus(job.profileId, 'not_configured').catch(()=>{});
+    invalidateUnifiedProviderStatuses();
+  }
+  return { ok:true };
+});
 app.post('/api/claude/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await claudeProfileStore.switch(String(req.params.id)).catch(()=>null);
   if (!profile) return reply.code(404).send({ error:'profile not found' });
   invalidateUnifiedProviderStatuses();
   return { ok:true, activeClaudeProfile: await activeClaudeProfileSummary() };
+});
+app.post('/api/claude/profiles/:id/logout', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const id = String(req.params.id);
+  const profile = await claudeProfileStore.get(id);
+  if (!profile) return reply.code(404).send({ error:'profile not found' });
+  const result = await claudeAuthLogout(profile);
+  await claudeProfileStore.markStatus(id, 'not_configured').catch(()=>{});
+  invalidateUnifiedProviderStatuses();
+  return { ok:result.ok, result };
 });
 app.patch('/api/claude/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await claudeProfileStore.rename(String(req.params.id), String(req.body?.name || '')).catch(()=>null);
@@ -1506,7 +1576,7 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
     name:String(claudeProfile.name || 'Claude Code Account'),
     profileDir:String(claudeProfile.profileDir || ''),
     configDir:String(claudeProfile.configDir || ''),
-    type:['existing_cli','setup_token','api_key'].includes(String(claudeProfile.type)) ? claudeProfile.type : 'existing_cli',
+    type:['official_cli','existing_cli','setup_token','api_key'].includes(String(claudeProfile.type)) ? claudeProfile.type : 'official_cli',
     active:!!claudeProfile.active,
     status:['not_installed','not_configured','authenticated','invalid_credentials','runtime_unavailable','capability_limited'].includes(String(claudeProfile.status)) ? claudeProfile.status : 'not_configured',
     credentialSummary:claudeProfile.credentialSummary || null,
@@ -1558,8 +1628,8 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       reasonCode: claudeState.status,
       message: claudeState.message,
       checkedAt,
-      command:'claude',
-      installHint:'安装 @anthropic-ai/claude-agent-sdk，或设置 CLAUDE_BIN。',
+      command:claudeCli?.command || 'claude',
+      installHint:'安装 Claude Code CLI，或设置 CLAUDE_BIN。',
     }),
     gemini: providerStatus({
       provider:'gemini',
@@ -1695,6 +1765,131 @@ function claudeAccountSnapshot(profile:any) {
     authType:String(profile.type || profile.authType || 'existing_cli'),
     timestamp:Date.now(),
   };
+}
+async function runClaudeCliLoginJob(job:ClaudeLoginJob) {
+  const profile = await claudeProfileStore.get(job.profileId);
+  if (!profile) throw new Error('Claude profile not found');
+  const cli = await cachedClaudeStatus(true);
+  if (!cli?.command) throw new Error(cli?.error || 'Claude Code CLI 未安装，无法启动官方登录');
+  await mkdir(profile.profileDir, { recursive:true, mode:0o700 });
+  await mkdir(profile.configDir, { recursive:true, mode:0o700 });
+  await chmod(profile.profileDir, 0o700).catch(()=>{});
+  await chmod(profile.configDir, 0o700).catch(()=>{});
+  job.output = [];
+  let child:any = null;
+  let rawOutput = '';
+  let finalized = false;
+  let timeout:NodeJS.Timeout|null = null;
+  let completeResolve:(()=>void)|null = null;
+  const complete = new Promise<void>(resolve => { completeResolve = resolve; });
+  const finalize = async (fn:()=>Promise<void>|void) => {
+    if (finalized) return;
+    finalized = true;
+    if (timeout) clearTimeout(timeout);
+    claudeLoginChildren.delete(job.id);
+    await fn();
+    completeResolve?.();
+  };
+  try {
+    child = pty.spawn(String(cli.command), ['auth', 'login'], {
+      name:'xterm-256color',
+      cols:96,
+      rows:32,
+      cwd:profile.profileDir,
+      env:claudeProfileEnv(profile, {}, process.env),
+    });
+    claudeLoginChildren.set(job.id, child);
+    app.log.info({ provider:'claude', jobId:job.id, profileId:job.profileId, env:claudeSafeEnvSummary(profile), command:cli.command }, 'claude cli login pty started');
+  } catch (e:any) {
+    await failClaudeLoginJob(job, `无法启动 Claude Code 登录进程：${safeClaudeError(e)}`);
+    return;
+  }
+  timeout = setTimeout(() => {
+    finalize(async () => {
+      try { child?.kill(); } catch {}
+      if (job.status === 'done' || job.status === 'cancelled') return;
+      await failClaudeLoginJob(job, 'Claude 登录验证超时');
+    }).catch(()=>{});
+  }, 10 * 60_000);
+  const handleOutput = (chunk:string) => {
+    rawOutput = (rawOutput + String(chunk || '')).slice(-12000);
+    const sanitized = redactClaudeLoginOutput(chunk);
+    for (const line of stripAnsi(sanitized).split(/\r?\n/).map(x=>x.trim()).filter(Boolean)) job.output.push(line);
+    job.output = job.output.slice(-120);
+    const parsed = parseClaudeLogin(rawOutput);
+    if (parsed.loginUrl) {
+      job.loginUrl = parsed.loginUrl;
+      job.status = 'waiting_user';
+      job.error = undefined;
+    }
+    if (parsed.requiresInput) job.requiresInput = true;
+    if (parsed.failure && job.status !== 'cancelled') failClaudeLoginJob(job, parsed.failure).catch(()=>{});
+    if (parsed.success && job.status !== 'done' && job.status !== 'cancelled') {
+      verifyClaudeLoginJob(job).catch((e:any)=>failClaudeLoginJob(job, safeClaudeError(e)));
+    }
+  };
+  child.onData((d:string)=>handleOutput(d));
+  child.onExit(async ({ exitCode }:any) => {
+    await finalize(async () => {
+      if (job.status === 'done' || job.status === 'cancelled') return;
+      if (exitCode === 0) await verifyClaudeLoginJob(job);
+      else await failClaudeLoginJob(job, `Claude 登录进程退出，code=${exitCode}`);
+    });
+  });
+  await complete;
+}
+async function verifyClaudeLoginJob(job:ClaudeLoginJob) {
+  const profile = await claudeProfileStore.get(job.profileId);
+  if (!profile) throw new Error('Claude profile not found');
+  job.status = 'verifying';
+  const result = await claudeAuthStatus(profile);
+  if (!result.ok) throw new Error(result.error || 'Claude auth status 未通过');
+  await claudeProfileStore.markStatus(profile.id, 'authenticated');
+  await claudeProfileStore.switch(profile.id).catch(()=>{});
+  job.status = 'done';
+  job.error = undefined;
+  claudeLoginProfiles.delete(profile.id);
+  try { claudeLoginChildren.get(job.id)?.kill(); } catch {}
+  claudeLoginChildren.delete(job.id);
+  invalidateUnifiedProviderStatuses();
+}
+async function failClaudeLoginJob(job:ClaudeLoginJob, message:string) {
+  if (job.status === 'done' || job.status === 'cancelled') return;
+  job.status = 'error';
+  job.error = message || 'Claude 登录失败';
+  claudeLoginProfiles.delete(job.profileId);
+  claudeLoginChildren.delete(job.id);
+  await claudeProfileStore.markStatus(job.profileId, 'invalid_credentials').catch(()=>{});
+  invalidateUnifiedProviderStatuses();
+}
+function parseClaudeLogin(output:string) {
+  const text = stripAnsi(output).replace(/\r/g, '').replace(/[^\S\n]+/g, ' ');
+  const loginUrl = extractClaudeLoginUrl(text);
+  const requiresInput = /authorization code|paste .*code|press enter|select|continue/i.test(text);
+  const failureMatch = text.match(/(authentication failed[^\n]*|login failed[^\n]*|invalid[_ -]?grant[^\n]*|error:[^\n]*)/i);
+  const success = /authenticated|login successful|successfully logged in/i.test(text);
+  return { loginUrl, requiresInput, success, failure: failureMatch?.[1] ? redactClaudeLoginOutput(failureMatch[1]).slice(0, 500) : null };
+}
+function extractClaudeLoginUrl(text:string) {
+  const match = text.match(/https:\/\/[^\s)]+/i)?.[0]?.replace(/[),.]+$/, '');
+  if (!match) return undefined;
+  try {
+    const url = new URL(match);
+    if (url.protocol !== 'https:') return undefined;
+    if (!/(anthropic\.com|claude\.ai)$/i.test(url.hostname) && !url.hostname.endsWith('.anthropic.com') && !url.hostname.endsWith('.claude.ai')) return undefined;
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+function redactClaudeLoginOutput(text:string) {
+  return String(text || '')
+    .replace(/([?&](?:code|client_secret|token|refresh_token|access_token|id_token)=)[^&\s]+/ig, '$1[redacted]')
+    .replace(/(authorization code\s*:?\s*)[A-Za-z0-9_./~+=-]{4,}/ig, '$1[redacted]')
+    .replace(/(access_token|refresh_token|id_token|client_secret|api[_ -]?key|token)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
+}
+function safeClaudeError(e:any) {
+  return redactClaudeLoginOutput(String(e?.message || e || 'Claude request failed'));
 }
 function findEmailInText(value:string) {
   return value.match(/[^\s@]+@[^\s@]+\.[^\s@]+/)?.[0] || null;
