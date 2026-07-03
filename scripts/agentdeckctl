@@ -251,7 +251,9 @@ NODE
 }
 
 start_candidate_runtime() {
-  local release_path="$1" job_id="$2" candidate_dir="$DATA_DIR/deploy-candidates/$job_id" pid_file="$candidate_dir/runtime.pid"
+  local release_path="$1" job_id="$2" candidate_dir pid_file
+  candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
+  pid_file="$candidate_dir/runtime.pid"
   mkdir -p "$candidate_dir"
   sqlite_backup "$candidate_dir/agentdeck-runtime.sqlite3"
   (
@@ -264,7 +266,9 @@ start_candidate_runtime() {
 }
 
 start_candidate_web() {
-  local release_path="$1" job_id="$2" candidate_dir="$DATA_DIR/deploy-candidates/$job_id" pid_file="$candidate_dir/web.pid"
+  local release_path="$1" job_id="$2" candidate_dir pid_file
+  candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
+  pid_file="$candidate_dir/web.pid"
   mkdir -p "$candidate_dir"
   (
     cd "$release_path"
@@ -275,7 +279,8 @@ start_candidate_web() {
 }
 
 stop_candidate_processes() {
-  local job_id="$1" candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
+  local job_id="$1" candidate_dir
+  candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
   for name in web runtime; do
     if [ -f "$candidate_dir/$name.pid" ]; then
       kill "$(cat "$candidate_dir/$name.pid")" 2>/dev/null || true
