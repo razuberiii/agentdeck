@@ -116,6 +116,57 @@ Runtime 是执行状态的事实来源，负责：
 
 更详细的设计见 [`docs/architecture.md`](docs/architecture.md)。
 
+## 快速开始（生产部署）
+
+准备代码目录、数据目录和配置目录：
+
+```bash
+sudo mkdir -p /opt/stacks/agentdeck /opt/data/agentdeck /etc/agentdeck
+sudo chown -R "$USER":"$USER" /opt/stacks/agentdeck /opt/data/agentdeck
+
+git clone https://github.com/razuberiii/agentdeck.git /opt/stacks/agentdeck
+cd /opt/stacks/agentdeck
+```
+
+准备生产环境文件：
+
+```bash
+sudo install -m 0600 deploy/systemd/env/web.env.example /etc/agentdeck/web.env
+sudo install -m 0600 deploy/systemd/env/runtime.env.example /etc/agentdeck/runtime.env
+sudo install -m 0600 deploy/systemd/env/codex-app-server-default.env.example /etc/agentdeck/agentdeck-app-server-default.env
+```
+
+至少修改 `/etc/agentdeck/web.env` 里的 `ADMIN_PASSWORD`、`COOKIE_SECRET` 和 `ALLOWED_ORIGINS`。如果 Runtime 不只监听 loopback，还要同时设置 `RUNTIME_TOKEN` 和 `AGENT_RUNTIME_TOKEN`。
+
+安装 systemd 单元和稳定命令入口：
+
+```bash
+sudo ROOT=/opt/stacks/agentdeck DATA_DIR=/opt/data/agentdeck ENV_DIR=/etc/agentdeck ./deploy/install-units.sh
+```
+
+执行检查和首次部署：
+
+```bash
+sudo agentdeckctl check
+sudo agentdeckctl deploy all --wait
+sudo agentdeckctl status
+```
+
+之后升级只需要：
+
+```bash
+cd /opt/stacks/agentdeck
+git fetch origin main
+git reset --hard origin/main
+sudo agentdeckctl deploy all --wait
+```
+
+回滚：
+
+```bash
+sudo agentdeckctl rollback all --wait
+```
+
 ## 配置
 
 最常用的配置：
