@@ -18,7 +18,7 @@ type ActiveTurn = {turnId:string|null; status:string; startedAt?:number|null; wa
 type Session = { id:string; codex_thread_id:string; provider_id?:ProviderId; providerId?:ProviderId; project_dir:string; title:string; status:string; activeTurn?:ActiveTurn|null; permission_mode?:string; approval_policy?:string; sandbox_mode?:string; model?:string; archived?:number; created_at?:number; updated_at?:number; last_sequence?:number };
 type Project = { name:string; path:string; branch:string|null; updatedAt:number };
 type ModelOption = { id:string; model:string; actualModel?:string; displayName:string; description?:string; hidden?:boolean; isDefault?:boolean; inputModalities?:string[]; upgrade?:string|null };
-type Attachment = { id:string; name:string; type:string; size:number; url:string; previewUrl?:string; uploading?:boolean; error?:string };
+type Attachment = { id:string; name:string; type:string; size:number; url:string; previewUrl?:string; uploading?:boolean; error?:string; operation?:'created'|'modified'|string; relativePath?:string|null };
 type DisplayEvent = { key:string; role:'user'|'assistant'|'system'|'command'|'file'|'reasoning'|'image'; title?:string; text:string; meta?:string; open?:boolean; clientMessageId?:string; messageId?:string; attachments?:Attachment[]; images?:Attachment[]; files?:Attachment[] };
 type RuntimeConnection = 'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected';
 type Toast = { id:string; kind:'success'|'error'|'info'; text:string };
@@ -583,7 +583,19 @@ function extractFileLinks(text:string):Attachment[]{
   return [...links].map(([url,label],i)=>({id:url+i,name:fileNameFromUrl(url) || label || 'download',type:fileTypeFromUrl(url),size:0,url}));
 }
 function ImageGrid({images,onOpen}:{images:Attachment[];onOpen:(a:Attachment)=>void}){ if(!images.length)return null; return <div className="imageGrid">{images.map(img=><button className="thumb" key={img.id} onClick={()=>onOpen(img)}><img src={img.previewUrl||img.url} alt={img.name}/></button>)}</div>; }
-function FileGrid({files}:{files:Attachment[]}){ if(!files.length)return null; return <div className="fileGrid">{files.map(f=><a className="fileCard" key={f.id} href={f.url} download={f.name} target="_blank" rel="noreferrer"><span className="fileIcon">↓</span><span><b>{f.name}</b><small>{f.type || 'download'}</small></span></a>)}</div>; }
+function FileGrid({files}:{files:Attachment[]}){
+  if(!files.length)return null;
+  const hasArtifactOps=files.some(f=>f.operation==='created'||f.operation==='modified');
+  if(!hasArtifactOps) return <div className="fileGrid">{files.map(f=><FileCard key={f.id} file={f}/>)}</div>;
+  const created=files.filter(f=>String(f.operation||'created')==='created');
+  const modified=files.filter(f=>String(f.operation||'')==='modified');
+  return <div className="artifactGroups">
+    {!!created.length&&<ArtifactGroup title="已生成文件" files={created}/>}
+    {!!modified.length&&<ArtifactGroup title="已修改文件" files={modified}/>}
+  </div>;
+}
+function ArtifactGroup({title,files}:{title:string;files:Attachment[]}){ return <div className="artifactGroup"><b>{title}</b><div className="fileGrid">{files.map(f=><FileCard key={f.id} file={f}/>)}</div></div>; }
+function FileCard({file:f}:{file:Attachment}){ return <a className="fileCard" href={f.url} download={f.name} target="_blank" rel="noreferrer"><span className="fileIcon">↓</span><span><b>{f.relativePath || f.name}</b><small>{f.operation==='modified'?'已修改':(f.type || 'download')}</small></span></a>; }
 function isDownloadUrl(url:string){ try { const u=new URL(url, location.origin); if(u.origin!==location.origin) return false; return /^\/api\/(?:wireguard\/config|files|sessions\/[^/]+\/(?:attachments|files))\//.test(u.pathname) || /\.(conf|zip|txt|log|patch|diff|json|csv|tar\.gz)$/i.test(u.pathname); } catch { return false; } }
 function fileNameFromUrl(url:string){ try { const u=new URL(url, location.origin); return decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || 'download'); } catch { return 'download'; } }
 function fileTypeFromUrl(url:string){ const name=fileNameFromUrl(url); const ext=name.includes('.')?name.split('.').slice(1).join('.').toLowerCase():'file'; return ext==='conf'?'WireGuard 配置':ext.toUpperCase(); }

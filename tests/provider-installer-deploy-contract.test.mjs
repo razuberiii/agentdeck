@@ -13,19 +13,23 @@ const webUnit = readFileSync(new URL('../deploy/systemd/agentdeck-web.service', 
 test('provider installer is server-side allowlisted and does not accept browser commands', () => {
   assert.match(indexSource, /const PROVIDER_INSTALLERS:Record<AgentProviderId/);
   assert.match(indexSource, /codex:[\s\S]*packageName:'@openai\/codex'/);
-  assert.match(indexSource, /claude:[\s\S]*packageName:'@anthropic-ai\/claude-code'/);
+  assert.match(indexSource, /claude:[\s\S]*installScriptUrl:'https:\/\/claude\.ai\/install\.sh'/);
   assert.match(indexSource, /antigravity:[\s\S]*automatic:false/);
   assert.match(indexSource, /gemini:[\s\S]*automatic:false/);
   assert.match(indexSource, /app\.post\('\/api\/providers\/:provider\/install'/);
   assert.match(indexSource, /const action = String\(req\.body\?\.action \|\| 'install'\)/);
   assert.doesNotMatch(indexSource, /req\.body\?\.command|req\.body\?\.url|req\.body\?\.packageName|req\.body\?\.path/);
-  assert.match(indexSource, /npm', \['--prefix', candidateDir, 'install', '--omit=dev', `\$\{installer\.packageName\}@latest`\]/);
+  assert.match(indexSource, /if \(!\['install','retry'\]\.includes\(action\)\)/);
+  assert.match(indexSource, /downloadProviderInstallScript\(job, String\(installer\.installScriptUrl\), scriptPath\)/);
+  assert.match(indexSource, /parsed\.protocol !== 'https:' \|\| parsed\.hostname !== 'claude\.ai' \|\| parsed\.pathname !== '\/install\.sh'/);
+  assert.doesNotMatch(indexSource, /sudo npm install -g/);
 });
 
 test('provider tools install into DATA_DIR and managed bin participates in detection', () => {
   assert.match(indexSource, /const PROVIDER_TOOLS_DIR = path\.join\(DATA_DIR, 'provider-tools'\)/);
   assert.match(indexSource, /const MANAGED_PROVIDER_BIN_DIR = path\.join\(PROVIDER_TOOLS_DIR, 'bin'\)/);
-  assert.match(indexSource, /await symlink\(binaryPath, binLink\)/);
+  assert.match(indexSource, /await symlink\(managedBinaryPath, binLink\)/);
+  assert.match(indexSource, /const PROVIDER_INSTALL_JOBS_FILE = path\.join\(PROVIDER_TOOLS_DIR, 'jobs', 'install-jobs\.json'\)/);
   assert.match(indexSource, /detectManagedCommand\(process\.env\.CODEX_BIN \|\| '', 'codex'\)/);
   assert.match(providersSource, /managedProviderBinary\('gemini'\)/);
   assert.match(providersSource, /detectProviderCommand\(this\.command, 'agy'\)/);

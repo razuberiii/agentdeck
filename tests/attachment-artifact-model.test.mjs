@@ -23,11 +23,15 @@ test('legacy internal attachment prompts are hidden from snapshots and UI', () =
 
 test('artifacts are registered from persisted turn baselines', () => {
   assert.match(server, /CREATE TABLE IF NOT EXISTS artifact_baselines/);
+  assert.match(server, /ALTER TABLE artifacts ADD COLUMN operation TEXT NOT NULL DEFAULT 'created'/);
   assert.match(server, /recordArtifactBaseline/);
   assert.match(server, /scanArtifactsForTurn/);
   assert.match(server, /content_hash/);
   assert.match(server, /relative_path/);
   assert.match(server, /turn_id/);
+  assert.match(server, /if \(!anchorItemId \|\| !turnId\) return \[\]/);
+  assert.match(server, /const operation = !old \? 'created' : \(old\.size !== f\.size \|\| old\.contentHash !== f\.contentHash \? 'modified' : ''\)/);
+  assert.match(server, /ON CONFLICT\(session_id, turn_id, relative_path, operation\) DO UPDATE/);
   assert.doesNotMatch(server, /artifactScanStarts/);
 });
 
@@ -42,9 +46,21 @@ test('session snapshots only inject persisted artifacts and keep anchors stable'
 });
 
 test('artifact cards are not duplicated by markdown link parsing', () => {
-  assert.match(server, /text:'已生成文件'/);
+  assert.match(server, /modified \? '已修改文件' : '已生成文件'/);
+  assert.match(client, /ArtifactGroup title="已生成文件"/);
+  assert.match(client, /ArtifactGroup title="已修改文件"/);
   assert.match(client, /const parsedImages = artifacts\.length \? \[\] : extractMarkdownImages\(text\)/);
   assert.match(client, /const parsedFiles = artifacts\.length \? \[\] : extractFileLinks\(text\)/);
+});
+
+test('artifact ownership excludes internal files and does not scan with missing turn id', () => {
+  assert.match(server, /const activeArtifactTurns = new Map<string, string>\(\)/);
+  assert.match(server, /activeArtifactTurns\.set\(threadId, turnId\)/);
+  assert.match(server, /scanArtifactsForTurn\(threadId, String\(row\.project_dir\), artifactTurnId, anchorItemId\)/);
+  assert.doesNotMatch(server, /scanArtifactsForTurn\(threadId, String\(row\.project_dir\), null, anchorItemId\)/);
+  assert.match(server, /function artifactPathIsInternal/);
+  assert.match(server, /deploy-manifest\.json/);
+  assert.match(server, /client\/public\/test-assets\/image-test\.png/);
 });
 
 test('session restore reconciles canonical user messages with attachments', () => {

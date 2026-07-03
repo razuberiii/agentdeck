@@ -13,8 +13,9 @@ import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import { promisify } from 'node:util';
-import { createWriteStream, realpathSync, existsSync, readFileSync } from 'node:fs';
+import { constants, createWriteStream, realpathSync, existsSync, readFileSync } from 'node:fs';
 import { chmod, cp, lstat, mkdir, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises';
+import { access } from 'node:fs/promises';
 import { rm } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { Db } from './db.js';
@@ -128,9 +129,12 @@ type ProviderInstallJob = {
 const providerInstallJobs = new Map<string, ProviderInstallJob>();
 const providerInstallChildren = new Map<string, any>();
 const providerInstallByProvider = new Map<AgentProviderId, string>();
+const activeArtifactTurns = new Map<string, string>();
+const PROVIDER_INSTALL_JOBS_FILE = path.join(PROVIDER_TOOLS_DIR, 'jobs', 'install-jobs.json');
 const PROVIDER_INSTALLERS:Record<AgentProviderId, {
   automatic:boolean;
   packageName?:string;
+  installScriptUrl?:string;
   binary:string;
   manual:string;
   source:string;
@@ -146,10 +150,10 @@ const PROVIDER_INSTALLERS:Record<AgentProviderId, {
   },
   claude: {
     automatic:true,
-    packageName:'@anthropic-ai/claude-code',
+    installScriptUrl:'https://claude.ai/install.sh',
     binary:'claude',
-    source:'Anthropic Claude Code npm package @anthropic-ai/claude-code',
-    reason:'Anthropic documents Claude Code npm installation as a supported CLI install path; native package-manager install can still be managed manually.',
+    source:'Anthropic official Claude Code installer https://claude.ai/install.sh',
+    reason:'Anthropic recommends the native Claude Code installer for Linux/macOS; AgentDeck runs it in an isolated managed tools directory.',
     manual:'安装 Claude Code：curl -fsSL https://claude.ai/install.sh | bash，或使用 Anthropic 文档中的 apt/dnf/apk/npm 方法。',
   },
   antigravity: {
@@ -224,6 +228,7 @@ await db.run('ALTER TABLE artifacts ADD COLUMN turn_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN relative_path TEXT').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN content_hash TEXT').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN modified_at INTEGER').catch(()=>{});
+await db.run("ALTER TABLE artifacts ADD COLUMN operation TEXT NOT NULL DEFAULT 'created'").catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS antigravity_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, home_dir TEXT NOT NULL UNIQUE, auth_type TEXT, active INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, profile_id TEXT, temp_home TEXT, method_id TEXT, status TEXT NOT NULL, error TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)').catch(()=>{});
@@ -249,10 +254,12 @@ await db.run('ALTER TABLE agent_messages ADD COLUMN status TEXT').catch(()=>{});
 await db.run('CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message ON agent_messages(session_id,client_message_id) WHERE client_message_id IS NOT NULL').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS artifact_baselines (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, project_dir TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(session_id, turn_id))').catch(()=>{});
 await db.run('CREATE UNIQUE INDEX IF NOT EXISTS artifacts_turn_path_hash ON artifacts(session_id, turn_id, relative_path, content_hash)').catch(()=>{});
+await db.run('CREATE UNIQUE INDEX IF NOT EXISTS artifacts_turn_path_operation ON artifacts(session_id, turn_id, relative_path, operation)').catch(()=>{});
 await db.run('UPDATE sessions SET status=?1 WHERE status=?2', ['interrupted', 'running']).catch(()=>{});
 await ensureProfiles();
 await ensureGeminiProfiles();
 await ensureAdmin();
+await loadProviderInstallJobs();
 const app = Fastify({ bodyLimit: Number(process.env.BODY_LIMIT_BYTES || 25 * 1024 * 1024), logger: { redact: ['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','token','secret'] } });
 await app.register(cookie, { secret: process.env.COOKIE_SECRET || crypto.randomBytes(32).toString('hex') });
 await app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
@@ -350,15 +357,16 @@ app.post('/api/providers/:provider/install', { preHandler: ensureAuth }, async (
   const provider = normalizeProvider(req.params.provider);
   if (!provider) return reply.code(400).send({ error:'unknown provider' });
   const action = String(req.body?.action || 'install');
-  if (!['install','update'].includes(action)) return reply.code(400).send({ error:'unsupported installer action' });
+  if (!['install','retry'].includes(action)) return reply.code(400).send({ error:'unsupported installer action' });
   const installer = PROVIDER_INSTALLERS[provider];
   if (!installer.automatic) return reply.code(409).send({ error:'automatic install is not supported for this provider', installer:providerInstallerSummary(provider) });
   const existingId = providerInstallByProvider.get(provider);
   const existing = existingId ? providerInstallJobs.get(existingId) : null;
   if (existing && !['succeeded','failed','cancelled'].includes(existing.status)) return { job:providerInstallJobSummary(existing) };
-  const job:ProviderInstallJob = { id:`install-${provider}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`, provider, action:action as any, status:'queued', output:[], startedAt:Date.now(), updatedAt:Date.now() };
+  const job:ProviderInstallJob = { id:`install-${provider}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`, provider, action:'install', status:'queued', output:[], startedAt:Date.now(), updatedAt:Date.now() };
   providerInstallJobs.set(job.id, job);
   providerInstallByProvider.set(provider, job.id);
+  await persistProviderInstallJobs().catch(()=>{});
   runProviderInstallJob(job).catch((e:any) => failProviderInstallJob(job, e?.message || String(e)));
   return { job:providerInstallJobSummary(job) };
 });
@@ -381,6 +389,7 @@ app.delete('/api/provider-install/:id', { preHandler: ensureAuth }, async (req:a
     job.error = '安装已取消';
     job.updatedAt = Date.now();
     providerInstallByProvider.delete(job.provider);
+    await persistProviderInstallJobs().catch(()=>{});
   }
   return { job:providerInstallJobSummary(job) };
 });
@@ -1450,16 +1459,18 @@ codex.on('notification', async (msg:any) => {
   if (sid) {
     if (msg.method === 'turn/started') {
       activeCodexSessions.add(sid);
-      if (msg.params?.turn?.id) activeTurns.set(sid, String(msg.params.turn.id));
+      if (msg.params?.turn?.id && !activeTurns.has(sid)) activeTurns.set(sid, String(msg.params.turn.id));
     }
     if (msg.method === 'thread/tokenUsage/updated') threadTokenUsage.set(sid, msg.params?.tokenUsage);
     if (shouldBroadcastCodexNotification(msg)) broadcast(sid, { type:'codex', method:msg.method, params:msg.params });
     if (msg.method === 'turn/completed') {
+      const artifactTurnId = activeArtifactTurns.get(sid) || activeTurns.get(sid) || '';
       activeCodexSessions.delete(sid);
       activeTurns.delete(sid);
+      activeArtifactTurns.delete(sid);
       const row = await findSession(sid);
       const anchorItemId = row ? await latestAgentItemId(sid, String(row.project_dir)).catch(()=>null) : null;
-      const found = row ? await scanArtifactsForTurn(sid, String(row.project_dir), null, anchorItemId) : [];
+      const found = row ? await scanArtifactsForTurn(sid, String(row.project_dir), artifactTurnId, anchorItemId) : [];
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       if (found.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) } });
       maybeExitAfterDrain();
@@ -1812,40 +1823,74 @@ function providerInstallJobSummaries() {
 }
 async function runProviderInstallJob(job:ProviderInstallJob) {
   const installer = PROVIDER_INSTALLERS[job.provider];
-  if (!installer.automatic || !installer.packageName) throw new Error('automatic install is not supported');
+  if (!installer.automatic) throw new Error('automatic install is not supported');
   const providerDir = path.join(PROVIDER_TOOLS_DIR, job.provider);
   const candidateDir = path.join(providerDir, `candidate-${job.id}`);
   const currentLink = path.join(providerDir, 'current');
   const binLink = path.join(MANAGED_PROVIDER_BIN_DIR, installer.binary);
-  const binaryPath = path.join(candidateDir, 'node_modules', '.bin', installer.binary);
+  const binaryPath = job.provider === 'claude'
+    ? path.join(candidateDir, '.local', 'bin', installer.binary)
+    : path.join(candidateDir, 'node_modules', '.bin', installer.binary);
   await mkdir(MANAGED_PROVIDER_BIN_DIR, { recursive:true });
+  await mkdir(path.dirname(PROVIDER_INSTALL_JOBS_FILE), { recursive:true });
   await rm(candidateDir, { recursive:true, force:true });
   await mkdir(candidateDir, { recursive:true, mode:0o755 });
   updateProviderInstallJob(job, 'downloading', `Using ${installer.source}`);
-  updateProviderInstallJob(job, 'installing', `npm install ${installer.packageName}@latest`);
-  await spawnProviderInstall(job, 'npm', ['--prefix', candidateDir, 'install', '--omit=dev', `${installer.packageName}@latest`], {
-    ...process.env,
-    HOME: DEFAULT_HOME,
-    npm_config_cache: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
-    NPM_CONFIG_CACHE: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
-    PATH: process.env.PATH,
-  });
+  if (job.provider === 'claude') {
+    const scriptPath = path.join(candidateDir, 'install.sh');
+    updateProviderInstallJob(job, 'downloading', `Downloading ${installer.installScriptUrl}`);
+    await downloadProviderInstallScript(job, String(installer.installScriptUrl), scriptPath);
+    await chmod(scriptPath, 0o755);
+    updateProviderInstallJob(job, 'installing', 'Running official Claude Code installer in managed candidate HOME');
+    await spawnProviderInstall(job, 'bash', [scriptPath], providerInstallEnv(candidateDir));
+  } else {
+    if (!installer.packageName) throw new Error('automatic install source is missing');
+    updateProviderInstallJob(job, 'installing', `npm install ${installer.packageName}@latest`);
+    await spawnProviderInstall(job, 'npm', ['--prefix', candidateDir, 'install', '--omit=dev', `${installer.packageName}@latest`], providerInstallEnv(DEFAULT_HOME, {
+      npm_config_cache: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
+      NPM_CONFIG_CACHE: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
+    }));
+  }
   updateProviderInstallJob(job, 'verifying', `${installer.binary} --version`);
+  await access(binaryPath, constants.X_OK).catch(() => { throw new Error(`${installer.binary} binary was not installed at ${binaryPath}`); });
   const version = await execFileAsync(binaryPath, ['--version'], { timeout:10_000, env:{ ...process.env, PATH:process.env.PATH } }).then(r => (r.stdout || r.stderr).trim()).catch((e:any) => {
     throw new Error(String(e?.stderr || e?.stdout || e?.message || e));
   });
+  const previousLink = path.join(providerDir, 'previous');
+  await rm(previousLink, { recursive:true, force:true });
+  if (existsSync(currentLink)) await rename(currentLink, previousLink).catch(()=>{});
   await rm(currentLink, { recursive:true, force:true });
   await symlink(candidateDir, currentLink);
   await rm(binLink, { force:true });
-  await symlink(binaryPath, binLink);
+  const managedBinaryPath = job.provider === 'claude'
+    ? path.join(currentLink, '.local', 'bin', installer.binary)
+    : path.join(currentLink, 'node_modules', '.bin', installer.binary);
+  await symlink(managedBinaryPath, binLink);
   job.version = version || null;
   updateProviderInstallJob(job, 'succeeded', `Installed ${installer.binary} ${version || ''}`.trim());
+  providerInstallByProvider.delete(job.provider);
   invalidateProviderCaches(job.provider);
+}
+function providerInstallEnv(home:string, extra:Record<string,string> = {}) {
+  return {
+    ...process.env,
+    HOME: home,
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    XDG_CACHE_HOME: path.join(home, '.cache'),
+    PATH: process.env.PATH,
+    ...extra,
+  };
+}
+async function downloadProviderInstallScript(job:ProviderInstallJob, url:string, dest:string) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'claude.ai' || parsed.pathname !== '/install.sh') throw new Error('installer source is not allowlisted');
+  await spawnProviderInstall(job, 'curl', ['-fsSL', '-o', dest, url], providerInstallEnv(DEFAULT_HOME));
 }
 function updateProviderInstallJob(job:ProviderInstallJob, status:ProviderInstallStatus, line?:string) {
   job.status = status;
   job.updatedAt = Date.now();
   if (line) job.output.push(`[${new Date().toISOString()}] ${line}`);
+  persistProviderInstallJobs().catch(()=>{});
 }
 function failProviderInstallJob(job:ProviderInstallJob, message:string) {
   if (job.status === 'cancelled') return;
@@ -1855,6 +1900,7 @@ function failProviderInstallJob(job:ProviderInstallJob, message:string) {
   job.output.push(`[${new Date().toISOString()}] ERROR ${job.error}`);
   providerInstallChildren.delete(job.id);
   providerInstallByProvider.delete(job.provider);
+  persistProviderInstallJobs().catch(()=>{});
 }
 function spawnProviderInstall(job:ProviderInstallJob, command:string, args:string[], env:NodeJS.ProcessEnv) {
   return new Promise<void>((resolve, reject) => {
@@ -1862,9 +1908,10 @@ function spawnProviderInstall(job:ProviderInstallJob, command:string, args:strin
     providerInstallChildren.set(job.id, child);
     const append = (chunk:Buffer) => {
       const text = chunk.toString('utf8');
-      for (const line of text.split(/\r?\n/).filter(Boolean)) job.output.push(line.slice(0, 1000));
+      for (const line of text.split(/\r?\n/).filter(Boolean)) job.output.push(redactLine(line).slice(0, 1000));
       job.output = job.output.slice(-200);
       job.updatedAt = Date.now();
+      persistProviderInstallJobs().catch(()=>{});
     };
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
@@ -1875,6 +1922,34 @@ function spawnProviderInstall(job:ProviderInstallJob, command:string, args:strin
       code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`));
     });
   });
+}
+async function persistProviderInstallJobs() {
+  await mkdir(path.dirname(PROVIDER_INSTALL_JOBS_FILE), { recursive:true, mode:0o755 });
+  const jobs = [...providerInstallJobs.values()].sort((a,b)=>b.startedAt-a.startedAt).slice(0, 50);
+  await writeFile(PROVIDER_INSTALL_JOBS_FILE, JSON.stringify({ jobs }, null, 2) + '\n', { mode:0o600 });
+}
+async function loadProviderInstallJobs() {
+  let parsed:any = null;
+  try { parsed = JSON.parse(await readFile(PROVIDER_INSTALL_JOBS_FILE, 'utf8')); } catch { return; }
+  for (const raw of Array.isArray(parsed?.jobs) ? parsed.jobs : []) {
+    const provider = normalizeProvider(raw?.provider);
+    if (!provider) continue;
+    const status = ['queued','downloading','installing','verifying'].includes(String(raw?.status)) ? 'failed' : String(raw?.status || 'failed');
+    const job:ProviderInstallJob = {
+      id:String(raw.id || ''),
+      provider,
+      action:'install',
+      status: ['succeeded','failed','cancelled'].includes(status) ? status as ProviderInstallStatus : 'failed',
+      output:Array.isArray(raw.output) ? raw.output.map((line:any)=>String(line).slice(0, 1000)).slice(-200) : [],
+      error:raw.error ? String(raw.error) : (['queued','downloading','installing','verifying'].includes(String(raw?.status)) ? '安装任务因服务重启而中断' : undefined),
+      version:raw.version ? String(raw.version) : null,
+      startedAt:Number(raw.startedAt || Date.now()),
+      updatedAt:Number(raw.updatedAt || Date.now()),
+    };
+    if (!job.id) continue;
+    providerInstallJobs.set(job.id, job);
+    if (!['succeeded','failed','cancelled'].includes(job.status)) providerInstallByProvider.set(provider, job.id);
+  }
 }
 function invalidateProviderCaches(provider:AgentProviderId) {
   if (provider === 'codex') codexStatusCache = { expiresAt:0 };
@@ -4062,6 +4137,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   };
   ack('received');
   const turnId = clientMessageId || crypto.randomUUID();
+  activeArtifactTurns.set(threadId, turnId);
   if (normalizeProvider(row.provider_id) === 'antigravity') {
     await sendAntigravityTurn(row, text, attachments, turnId, clientMessageId);
     ack('accepted');
@@ -4203,7 +4279,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     throw e;
   }
 }
-async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const active = activeAntigravityTurns.get(threadId); if (active) { active.state='interrupted'; try { active.child.kill('SIGTERM'); } catch {} } await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
+async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const active = activeAntigravityTurns.get(threadId); if (active) { active.state='interrupted'; try { active.child.kill('SIGTERM'); } catch {} } activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [], turnId:string = crypto.randomUUID(), clientMessageId = '') {
   const threadId = String(row.codex_thread_id || row.id);
   const message = String(text || '').trim();
@@ -4263,6 +4339,7 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [],
     throw e;
   } finally {
     activeAntigravityTurns.delete(threadId);
+    activeArtifactTurns.delete(threadId);
     maybeExitAfterDrain();
   }
 }
@@ -4547,12 +4624,14 @@ async function runtimeEventMessages(threadId:string, event:any) {
     if (shouldBroadcastCodexNotification(msg)) out.push({ type:'codex', method:msg.method, params:msg.params, ...base });
     if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(threadId, String(msg.params.turn.id));
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
+      const artifactTurnId = activeArtifactTurns.get(threadId) || activeTurns.get(threadId) || '';
       activeCodexSessions.delete(threadId);
       activeTurns.delete(threadId);
+      activeArtifactTurns.delete(threadId);
       const row = await findSession(threadId);
       const read = msg.method === 'turn/completed' && row ? await runtime.readSession(threadId).catch(()=>null) : null;
       const anchorItemId = read?.thread ? latestAgentItemIdFromThread(read.thread) : null;
-      const found = msg.method === 'turn/completed' && row ? await scanArtifactsForTurn(threadId, String(row.project_dir), null, anchorItemId) : [];
+      const found = msg.method === 'turn/completed' && row ? await scanArtifactsForTurn(threadId, String(row.project_dir), artifactTurnId, anchorItemId) : [];
       const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? 'idle' : 'interrupted';
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
       if (found.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }, ...base });
@@ -4914,29 +4993,41 @@ async function latestArtifactBaseline(threadId:string) {
   return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest };
 }
 async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:string|null, anchorItemId?:string|null){
-  if (!anchorItemId) return [];
+  if (!anchorItemId || !turnId) return [];
   const baseline = turnId ? await db.get('SELECT * FROM artifact_baselines WHERE session_id=?1 AND turn_id=?2', [threadId, turnId]).then((row:any)=>{
     if (!row) return null;
     let manifest:any = {};
     try { manifest = JSON.parse(String(row.manifest_json || '{}')); } catch {}
     return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest };
-  }) : await latestArtifactBaseline(threadId);
+  }) : null;
   if (!baseline) return [];
   const root = realpathSync(projectDir);
   const before = baseline.manifest || {};
   const after = await artifactManifest(root);
   const saved:any[] = [];
-  const changed = Object.values(after).filter((f:any) => {
+  const changed = Object.values(after).map((f:any) => {
     const old = before[f.relativePath];
-    return !old || old.size !== f.size || old.contentHash !== f.contentHash;
-  }).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
+    const operation = !old ? 'created' : (old.size !== f.size || old.contentHash !== f.contentHash ? 'modified' : '');
+    return operation ? { ...f, operation } : null;
+  }).filter(Boolean).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
   for (const f of changed as any[]) {
-    const id = crypto.createHash('sha256').update(`${threadId}\0${baseline.turnId}\0${f.relativePath}\0${f.contentHash}`).digest('base64url').slice(0, 32);
+    if (artifactPathIsInternal(f.relativePath)) continue;
+    const id = crypto.createHash('sha256').update(`${threadId}\0${baseline.turnId}\0${f.relativePath}\0${f.operation}`).digest('base64url').slice(0, 32);
     const existed = await db.get('SELECT id FROM artifacts WHERE id=?1 AND session_id=?2', [id, threadId]);
     await db.run(
-      `INSERT OR IGNORE INTO artifacts (id, session_id, path, name, mime, size, created_at, anchor_item_id, turn_id, relative_path, content_hash, modified_at)
-       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
-      [id, threadId, f.path, f.name, f.mime, f.size, Date.now(), anchorItemId || null, baseline.turnId, f.relativePath, f.contentHash, f.modifiedAt]
+      `INSERT INTO artifacts (id, session_id, path, name, mime, size, created_at, anchor_item_id, turn_id, relative_path, content_hash, modified_at, operation)
+       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+       ON CONFLICT(session_id, turn_id, relative_path, operation) DO UPDATE SET
+         id=excluded.id,
+         path=excluded.path,
+         name=excluded.name,
+         mime=excluded.mime,
+         size=excluded.size,
+         created_at=excluded.created_at,
+         anchor_item_id=COALESCE(excluded.anchor_item_id, artifacts.anchor_item_id),
+         content_hash=excluded.content_hash,
+         modified_at=excluded.modified_at`,
+      [id, threadId, f.path, f.name, f.mime, f.size, Date.now(), anchorItemId || null, baseline.turnId, f.relativePath, f.contentHash, f.modifiedAt, f.operation]
     );
     if (anchorItemId) await db.run('UPDATE artifacts SET anchor_item_id=?1 WHERE id=?2 AND anchor_item_id IS NULL', [anchorItemId, id]);
     if (existed) continue;
@@ -4965,6 +5056,8 @@ async function walkArtifacts(root:string, dir:string, out:any[], depth = 0){
     const ext = artifactExt(filePath);
     const mime = ARTIFACT_TYPES[ext];
     if (!mime) continue;
+    const relativePath = path.relative(root, filePath);
+    if (artifactPathIsInternal(relativePath)) continue;
     let st:any;
     try { st = await stat(filePath); } catch { continue; }
     if (st.size <= 0 || st.size > 25 * 1024 * 1024) continue;
@@ -4973,6 +5066,17 @@ async function walkArtifacts(root:string, dir:string, out:any[], depth = 0){
     const contentHash = crypto.createHash('sha256').update(await readFile(rp)).digest('hex');
     out.push({ path:rp, relativePath:path.relative(root, rp), name:path.basename(rp), mime, size:st.size, contentHash, modifiedAt:Math.floor(st.mtimeMs) });
   }
+}
+function artifactPathIsInternal(relativePath:string) {
+  const parts = String(relativePath || '').split(path.sep).filter(Boolean);
+  const base = parts[parts.length - 1] || '';
+  if (!parts.length) return true;
+  if (parts.includes('deploy-state') || parts.includes('releases') || parts.includes('candidate') || parts.includes('current') || parts.includes('previous')) return true;
+  if (parts.includes('node_modules') || parts.includes('.git') || parts.includes('coverage') || parts.includes('dist') || parts.includes('build')) return true;
+  if (parts.join('/') === 'client/public/test-assets/image-test.png' || parts.join('/') === 'client/public/test-assets/image-test.svg' || parts.join('/') === 'client/public/test-assets/agentdeck-test.txt') return true;
+  if (/^deploy-.*\.(log|json)$/i.test(base) || base === 'deploy-manifest.json') return true;
+  if (/\.(sqlite|sqlite3|db|db-wal|db-shm|sqlite-wal|sqlite-shm)$/i.test(base)) return true;
+  return false;
 }
 async function injectArtifacts(thread:any, threadId:string){
   const rows = await db.all('SELECT * FROM artifacts WHERE session_id=?1 AND anchor_item_id IS NOT NULL ORDER BY created_at ASC LIMIT 100', [threadId]);
@@ -5001,9 +5105,12 @@ async function artifactForSession(threadId:string, artifactId:string): Promise<a
   if (!mime || mime !== row.mime) return null;
   return { ...row, path:rp };
 }
-function artifactDto(row:any){ return { id:String(row.id), name:String(row.name), type:String(row.mime), size:Number(row.size || 0), turnId:row.turn_id || null, anchorItemId:row.anchor_item_id || null, contentHash:row.content_hash || null, url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}` }; }
+function artifactDto(row:any){ return { id:String(row.id), name:String(row.name), type:String(row.mime), size:Number(row.size || 0), operation:String(row.operation || 'created'), relativePath:row.relative_path || null, turnId:row.turn_id || null, anchorItemId:row.anchor_item_id || null, contentHash:row.content_hash || null, url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}` }; }
 function artifactMessageItem(artifacts:any[], stamp:number){
-  return { type:'agentMessage', id:`artifacts-${stamp}`, phase:'final_answer', text:'已生成文件', artifacts };
+  const created = artifacts.filter((a:any)=>String(a.operation || 'created') === 'created').length;
+  const modified = artifacts.filter((a:any)=>String(a.operation || '') === 'modified').length;
+  const text = created && modified ? '文件变更' : modified ? '已修改文件' : '已生成文件';
+  return { type:'agentMessage', id:`artifacts-${stamp}`, phase:'final_answer', text, artifacts };
 }
 function groupArtifacts(rows:any[]){
   const groups:any[][] = [];
