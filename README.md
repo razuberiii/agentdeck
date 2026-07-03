@@ -116,7 +116,7 @@ Runtime 是执行状态的事实来源，负责：
 
 更详细的设计见 [`docs/architecture.md`](docs/architecture.md)。
 
-## 快速开始（生产部署）
+## 快速开始
 
 准备代码目录、数据目录和配置目录：
 
@@ -285,125 +285,6 @@ API Key 只写入对应 profile 的 `agentdeck.env`，权限为 `0600`。Google 
 - **Antigravity**：以本地路径提供给 CLI。
 
 备份时不要只复制 SQLite，还需要保留 `attachments/` 和生成产物目录。
-
-## 生产部署
-
-推荐的生产结构仍然是 Web Gateway、Runtime 和 Provider 进程分离：
-
-```text
-Internet
-   |
-HTTPS reverse proxy
-   |
-AgentDeck Web Gateway (127.0.0.1:3842)
-   |
-AgentDeck Runtime (127.0.0.1:3852)
-   |
-Provider processes
-```
-
-至少应做到：
-
-- 使用 Nginx、Caddy 或 Traefik 提供 HTTPS；
-- Web Gateway 与 Runtime 默认只监听 loopback；
-- 环境变量文件放在 Git 工作树之外；
-- 使用 systemd 或其他进程管理器；
-- 反向代理正确转发 WebSocket upgrade；
-- `ALLOWED_ORIGINS` 只包含实际使用的 HTTPS 域名。
-
-仓库中的 systemd 示例位于 [`deploy/systemd/`](deploy/systemd/)。
-
-### 使用 agentdeckctl
-
-首次安装 systemd 单元和稳定命令入口：
-
-```bash
-cd /opt/stacks/agentdeck
-sudo ROOT=/opt/stacks/agentdeck DATA_DIR=/opt/data/agentdeck ENV_DIR=/etc/agentdeck ./deploy/install-units.sh
-```
-
-生产环境至少准备这些环境文件：
-
-```text
-/etc/agentdeck/web.env
-/etc/agentdeck/runtime.env
-/etc/agentdeck/agentdeck-app-server-default.env
-```
-
-生产环境推荐使用统一控制命令：
-
-```bash
-sudo agentdeckctl status
-sudo agentdeckctl check
-sudo agentdeckctl deploy all --wait
-sudo agentdeckctl rollback all
-```
-
-仓库内也保留同等入口：
-
-```bash
-sudo ./scripts/agentdeckctl status
-```
-
-`agentdeckctl` 会使用 release 目录部署，而不是直接在正在运行的工作树中 build：
-
-```text
-/opt/stacks/agentdeck/
-  current -> releases/<current-release>
-  previous -> releases/<previous-release>
-  candidate -> releases/<candidate-release>
-  releases/
-  deploy-state/
-```
-
-`deploy all` 默认提交 detached systemd job，真实部署 worker 不属于 Web、Runtime 或 Provider app-server 的进程树。命令会立即返回 job id：
-
-```bash
-sudo agentdeckctl deploy all
-sudo agentdeckctl jobs
-sudo agentdeckctl job <job-id>
-sudo agentdeckctl logs deploy
-```
-
-如果需要同步等待结果：
-
-```bash
-sudo agentdeckctl deploy all --wait
-```
-
-部署流程会先构建新 release，并用 candidate 端口预启动 Runtime/Web 做健康检查：
-
-- Web 正式端口默认 `3842`，candidate 端口默认 `3942`；
-- Runtime 正式端口默认 `3852`，candidate 端口默认 `3952`；
-- candidate Runtime 使用生产数据库副本和 `RUNTIME_MODE=candidate`，不会接收真实 turn；
-- Runtime 切换前会进入 draining，等待 active turn 结束；
-- `--force` 才允许在 active turn 存在时强制中断。
-
-单独重启或部署某个组件：
-
-```bash
-sudo agentdeckctl restart web
-sudo agentdeckctl restart runtime
-sudo agentdeckctl deploy web
-sudo agentdeckctl deploy runtime
-```
-
-旧入口仍可用，但只作为兼容 wrapper：
-
-```bash
-sudo ./scripts/deploy.sh --check
-sudo ./scripts/deploy.sh --deploy --components web,runtime --wait
-sudo ./scripts/deploy.sh --rollback --components runtime
-```
-
-如果 Runtime 必须监听非 loopback 地址，请在两侧设置同一个强随机 token：
-
-```bash
-RUNTIME_TOKEN=replace-with-random-token
-AGENT_RUNTIME_TOKEN=replace-with-random-token
-```
-
-不要把 Codex app-server 直接暴露到公网。
 
 ## 数据与备份
 
