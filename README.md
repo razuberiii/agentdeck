@@ -116,59 +116,6 @@ Runtime 是执行状态的事实来源，负责：
 
 更详细的设计见 [`docs/architecture.md`](docs/architecture.md)。
 
-## 快速开始
-
-### 环境要求
-
-- Node.js 20 或更高版本，推荐 Node.js 22 LTS；
-- npm；
-- SQLite；
-- OpenAI Codex CLI，并且 `codex app-server` 可用；
-- 可选：`@anthropic-ai/claude-agent-sdk` 和 Claude Code 可用配置；
-- 可选：支持 `--acp` 的 Gemini CLI；
-- Linux 可直接使用仓库中的 systemd 示例。
-
-### 1. 安装并构建
-
-```bash
-git clone https://github.com/razuberiii/agentdeck.git
-cd agentdeck
-
-npm install
-npm run build
-```
-
-### 2. 启动 Runtime
-
-```bash
-DATA_DIR="$PWD/.data" \
-RUNTIME_HOST=127.0.0.1 \
-RUNTIME_PORT=3852 \
-npm run runtime
-```
-
-### 3. 启动 Web Gateway
-
-另开一个终端：
-
-```bash
-DATA_DIR="$PWD/.data" \
-USE_AGENT_RUNTIME=1 \
-AGENT_RUNTIME_URL=http://127.0.0.1:3852 \
-ALLOWED_ORIGINS=http://localhost:3842,http://127.0.0.1:3842 \
-ADMIN_PASSWORD='change-me-at-least-12-chars' \
-COOKIE_SECRET='replace-with-a-stable-random-secret' \
-npm start
-```
-
-打开：
-
-```text
-http://127.0.0.1:3842
-```
-
-这套命令适合本机验证。生产环境应使用独立服务账户、稳定的环境变量文件、HTTPS 和进程管理器。
-
 ## 配置
 
 最常用的配置：
@@ -317,12 +264,27 @@ Provider processes
 
 ### 使用 agentdeckctl
 
+首次安装 systemd 单元和稳定命令入口：
+
+```bash
+cd /opt/stacks/agentdeck
+sudo ROOT=/opt/stacks/agentdeck DATA_DIR=/opt/data/agentdeck ENV_DIR=/etc/agentdeck ./deploy/install-units.sh
+```
+
+生产环境至少准备这些环境文件：
+
+```text
+/etc/agentdeck/web.env
+/etc/agentdeck/runtime.env
+/etc/agentdeck/agentdeck-app-server-default.env
+```
+
 生产环境推荐使用统一控制命令：
 
 ```bash
 sudo agentdeckctl status
 sudo agentdeckctl check
-sudo agentdeckctl deploy all
+sudo agentdeckctl deploy all --wait
 sudo agentdeckctl rollback all
 ```
 
