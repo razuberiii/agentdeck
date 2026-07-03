@@ -1,93 +1,159 @@
+<div align="center">
+
 # AgentDeck
 
-AgentDeck 是一个自托管的 agent workbench，用来在浏览器里持续使用 Codex、Gemini 和 Antigravity。
+**把运行在服务器上的 Coding Agent，带到浏览器和手机上。**
 
-它不是单纯的 ChatGPT 皮肤。AgentDeck 关心的是 coding agent 真正在本机项目里工作时会遇到的那些事：会话要能继续，事件要能回放，账户和 profile 要分清，附件和生成文件要能落盘，Web 服务重启也不应该轻易打断正在跑的任务。
+一个自托管、移动端优先的 Agent 控制台。<br>
+集中管理 Codex、Gemini CLI 和 Antigravity，会话不会因为刷新页面或临时断线就消失。
 
-你可以把它放在自己的机器或服务器上，然后用桌面浏览器、手机浏览器或 PWA 接进去，继续同一个 session。
+![Node.js](https://img.shields.io/badge/Node.js-20%2B-339933?logo=nodedotjs&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
+![PWA](https://img.shields.io/badge/PWA-mobile--first-5A0FC8?logo=pwa&logoColor=white)
+![Self-hosted](https://img.shields.io/badge/deployment-self--hosted-2F855A)
 
-## 为什么会有它
+</div>
 
-普通 AI Chat UI 通常更关注模型列表、聊天记录和知识库。AgentDeck 更偏向“把 coding agent 跑稳”：
+---
 
-- 在浏览器或 PWA 里使用本机 Codex app-server。
-- 用一个长期运行的 runtime 管住 provider 进程、会话状态和事件序列。
-- 把会话绑定到项目目录，查看 diff，下载本轮生成的产物。
-- 管理多个 Codex、Gemini、Antigravity 账户和 profile，避免下一轮任务用错身份。
-- 页面刷新、网络断开或 Web gateway 重启后，补发已经持久化的事件。
-- 上传图片和文件附件，并按不同 provider 的能力转给上游 agent。
-- 通过 Web 入口远程查看和继续任务，而不是把 provider 进程直接暴露到公网。
+## 为什么做 AgentDeck
 
-## 当前能力
+Codex 和 Gemini CLI 很适合在服务器上长期工作，但它们天然更偏向终端：
 
-AgentDeck 现在包含三类 provider：
+- 离开电脑后，不方便查看任务进度或继续对话；
+- 浏览器刷新、网络切换或 Web 服务重启后，流式内容容易中断；
+- 多个 Provider、多个账户和多个项目分散在不同命令与配置目录中；
+- 手机上临时处理审批、补充文件或继续任务并不顺手。
 
-- **Codex**：通过 `codex app-server` 运行，支持多 profile、模型选择、沙盒/审批模式、会话恢复、图片输入、项目 diff 和产物下载。
-- **Gemini**：通过 Gemini CLI 的 ACP 模式运行，支持多 Gemini profile、Google OAuth、API Key、模型发现、附件 resource link，以及 runtime 内的长期 ACP 进程。
-- **Antigravity**：可选 provider，用本地 `agy` CLI 执行基础文本任务。它目前不是完整的结构化 runtime provider，不承诺图片输入、长任务恢复或完整上游连续会话。
+AgentDeck 在 CLI 和浏览器之间增加了一层持久运行时。
 
-其他核心功能：
+Agent 真正运行在服务器上，浏览器只是控制界面。你可以在电脑上创建任务，关掉页面，之后再从手机继续；页面断线重连时，AgentDeck 会根据已持久化的事件序列补发缺失内容。
 
-- 会话列表、重命名、归档、删除。
-- WebSocket 流式事件和 runtime 事件回放。
-- 登录、CSRF、Origin 校验和基础 rate limit。
-- 附件上传、预览、下载和安全 MIME 处理。
-- 生成图片、产物文件和 changed artifact 持久化。
-- PWA manifest、service worker 和移动端优先界面。
-- systemd 示例、检查脚本、部署脚本和手动备份脚本。
+## 能做什么
+
+### 从任何设备继续任务
+
+- 桌面与移动浏览器共用同一套 Web 界面；
+- 支持安装为 PWA；
+- 会话列表、搜索、重命名、归档、Fork 和删除；
+- 页面刷新、浏览器重连或 Web gateway 重启后继续已有会话。
+
+### 管理多个 Agent 和账户
+
+- Codex app-server；
+- Gemini CLI ACP；
+- 可选的 Antigravity CLI；
+- 每个 Provider 可维护独立 profile；
+- 切换账户只影响下一轮任务，不会删除现有会话历史。
+
+### 围绕真实项目工作
+
+- 从允许的工作区中选择项目；
+- 支持 Read Only、Workspace Write 和 YOLO 等执行模式；
+- 上传图片、源码、PDF、Office 文档和压缩包；
+- 查看项目 diff；
+- 下载 Agent 生成的文件与其他产物。
+
+### 保留执行状态
+
+- Runtime 持有会话、turn、Provider thread 和事件序列；
+- SQLite 持久化会话元数据与事件；
+- 浏览器按 sequence 恢复缺失事件，而不是把当前页面当作事实来源；
+- Provider 上游会话丢失时，可使用本地可见历史重建上下文。
+
+## Provider 支持情况
+
+| Provider | 接入方式 | 当前定位 |
+| --- | --- | --- |
+| **Codex** | `codex app-server` | AgentDeck 的主要 Provider。支持持久会话、多 profile、附件、审批和项目工作流。 |
+| **Gemini CLI** | ACP over stdio | 由 Runtime 维护长期 ACP 进程，支持独立 profile、API Key 与 Google OAuth。上游 session 能否恢复取决于 Gemini CLI 暴露的能力。 |
+| **Antigravity** | CLI | 适合基础文本任务。它不是 Codex runtime 的等价替代，目前不保证结构化流式事件、图片输入或长任务恢复。 |
+
+AgentDeck 不会为 Provider 不具备的能力伪造状态。例如上游没有稳定的可机读额度接口时，界面会明确显示为不支持。
 
 ## 架构
 
-```text
-Browser / PWA
-  -> Web gateway
-  -> AgentDeck runtime
-  -> Codex app-server / Gemini ACP / Antigravity CLI
+```mermaid
+flowchart LR
+    A[Browser / PWA] -->|HTTP + WebSocket| B[Web Gateway]
+    B -->|HTTP + SSE| C[AgentDeck Runtime]
+    C --> D[Codex app-server]
+    C --> E[Gemini CLI ACP]
+    C --> F[Antigravity CLI]
+
+    C --> G[(SQLite)]
+    B --> H[Attachments / Artifacts]
 ```
 
-Web gateway 负责浏览器侧的事情：登录、Cookie、CSRF、Origin、静态资源、WebSocket、上传下载和 API。Runtime 负责执行侧的事情：会话状态、turn 状态、provider thread ID、事件序列、Codex app-server 生命周期、Gemini ACP 进程和账户绑定。
+### Browser / PWA
 
-这个边界很重要。浏览器和 Web 可以展示状态，但真正决定一个 session 是否还在跑、下一轮用哪个账户执行、哪些事件已经持久化的是 runtime。
+负责加载会话快照、发送消息、订阅流式事件并渲染界面。浏览器保存自己已经应用到的事件 sequence，重连时用它请求缺失部分。
 
-更多设计背景见 [docs/architecture.md](docs/architecture.md) 和 [docs/adr](docs/adr)。
+### Web Gateway
 
-## 环境要求
+基于 Fastify，负责：
 
-- Node.js 20+，推荐 Node.js 22 LTS。
-- npm。
-- SQLite。
-- OpenAI Codex CLI，并且可用 `codex app-server`。
-- 可选：Gemini CLI `@google/gemini-cli`，并且可用 `gemini --acp`。
-- 可选：Google Antigravity CLI `agy`。
-- 生产环境推荐 Linux + systemd；其他进程管理器也可以，只要分别跑 Web 和 runtime。
+- AgentDeck 登录；
+- CSRF 与 Origin 校验；
+- HTTP API 与 WebSocket；
+- 附件上传和下载；
+- 静态资源；
+- 把浏览器请求转发给 Runtime。
 
-## 本地启动
+### AgentDeck Runtime
 
-安装依赖并构建：
+Runtime 是执行状态的事实来源，负责：
+
+- 会话和 active turn；
+- Provider session / thread ID；
+- Provider profile 与本轮实际执行账户；
+- 事件持久化和 sequence；
+- Codex app-server 与 Gemini ACP 进程生命周期；
+- 向 Web Gateway 提供事件流。
+
+更详细的设计见 [`docs/architecture.md`](docs/architecture.md)。
+
+## 快速开始
+
+### 环境要求
+
+- Node.js 20 或更高版本，推荐 Node.js 22 LTS；
+- npm；
+- SQLite；
+- OpenAI Codex CLI，并且 `codex app-server` 可用；
+- 可选：支持 `--acp` 的 Gemini CLI；
+- Linux 可直接使用仓库中的 systemd 示例。
+
+### 1. 安装并构建
 
 ```bash
+git clone https://github.com/razuberiii/agentdeck.git
+cd agentdeck
+
 npm install
 npm run build
 ```
 
-先启动 runtime：
+### 2. 启动 Runtime
 
 ```bash
-DATA_DIR=.data \
+DATA_DIR="$PWD/.data" \
 RUNTIME_HOST=127.0.0.1 \
 RUNTIME_PORT=3852 \
 npm run runtime
 ```
 
-再开一个终端启动 Web gateway：
+### 3. 启动 Web Gateway
+
+另开一个终端：
 
 ```bash
-DATA_DIR=.data \
+DATA_DIR="$PWD/.data" \
 USE_AGENT_RUNTIME=1 \
 AGENT_RUNTIME_URL=http://127.0.0.1:3852 \
 ALLOWED_ORIGINS=http://localhost:3842,http://127.0.0.1:3842 \
 ADMIN_PASSWORD='change-me-at-least-12-chars' \
-COOKIE_SECRET='change-me-random-32-bytes' \
+COOKIE_SECRET='replace-with-a-stable-random-secret' \
 npm start
 ```
 
@@ -97,186 +163,184 @@ npm start
 http://127.0.0.1:3842
 ```
 
-开发时可以用源码入口：
-
-```bash
-npm run dev
-npm run dev:runtime
-```
+这套命令适合本机验证。生产环境应使用独立服务账户、稳定的环境变量文件、HTTPS 和进程管理器。
 
 ## 配置
 
-常用环境变量如下。生产环境建议把 Web 和 runtime 的 env 分开管理，不要把密钥放进 Git 仓库。
+最常用的配置：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | Web gateway 监听地址。 |
-| `PORT` | `3842` | Web gateway 监听端口。 |
-| `DATA_DIR` | `/var/lib/agentdeck` | 主数据目录，保存 SQLite、profiles、附件和生成文件。 |
-| `ADMIN_PASSWORD` | 无 | 初始管理员密码，生产环境必须设置。 |
-| `COOKIE_SECRET` | 启动时生成 | Cookie 签名密钥，生产环境必须设置为稳定随机值。 |
-| `ALLOWED_ORIGINS` | `http://localhost:3842,http://127.0.0.1:3842` | 允许访问 WebSocket 的浏览器 Origin。 |
-| `USE_AGENT_RUNTIME` | 未启用 | 设置为 `1` 后使用持久 runtime。 |
-| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | Web gateway 调用 runtime 的地址。 |
-| `AGENT_RUNTIME_TOKEN` | 未设置 | runtime 开启 token 时，Web 使用的 Bearer token。 |
-| `RUNTIME_HOST` | `127.0.0.1` | runtime 监听地址。 |
-| `RUNTIME_PORT` | `3852` | runtime 监听端口。 |
-| `RUNTIME_TOKEN` | 未设置 | runtime 监听非 loopback 地址时必须设置。 |
-| `RUNTIME_DB` | `$DATA_DIR/agentdeck-runtime.sqlite3` | runtime SQLite 数据库路径。 |
-| `CODEX_HOME` | `$HOME/.codex` | 默认 Codex 配置目录。 |
-| `ALLOWED_WORKSPACES` | 当前目录和 `/opt/projects` | UI 中允许选择的项目根目录，多个路径用逗号分隔。 |
+| `HOST` | `127.0.0.1` | Web Gateway 监听地址。 |
+| `PORT` | `3842` | Web Gateway 监听端口。 |
+| `DATA_DIR` | `/var/lib/agentdeck` | SQLite、profiles、附件和其他运行数据的根目录。 |
+| `ADMIN_PASSWORD` | 无 | AgentDeck 管理员密码，生产环境必须设置。 |
+| `COOKIE_SECRET` | 启动时临时生成 | Cookie 签名密钥；生产环境必须使用稳定随机值。 |
+| `ALLOWED_ORIGINS` | 本机地址 | 允许建立 WebSocket 的浏览器 Origin。 |
+| `ALLOWED_WORKSPACES` | 当前目录、`/opt/projects` | UI 可选择的工作区根目录，多个路径用逗号分隔。 |
+| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | Web Gateway 访问 Runtime 的地址。 |
+
+<details>
+<summary><strong>完整环境变量</strong></summary>
+
+### Web Gateway
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | Web Gateway 监听地址。 |
+| `PORT` | `3842` | Web Gateway 监听端口。 |
+| `DATA_DIR` | `/var/lib/agentdeck` | 主数据目录。 |
+| `ADMIN_PASSWORD` | 无 | 初始管理员密码。 |
+| `COOKIE_SECRET` | 启动时生成 | Cookie 签名密钥。生产环境应固定。 |
+| `ALLOWED_ORIGINS` | `http://localhost:3842,http://127.0.0.1:3842` | WebSocket Origin 白名单。 |
+| `ALLOWED_WORKSPACES` | 当前目录、`/opt/projects` | 可访问的工作区根目录。 |
+| `USE_AGENT_RUNTIME` | 未启用 | 设为 `1` 后通过持久 Runtime 执行会话。 |
+| `AGENT_RUNTIME_URL` | `http://127.0.0.1:3852` | Runtime 地址。 |
+| `AGENT_RUNTIME_TOKEN` | 未设置 | Web Gateway 调用 Runtime 时使用的 Bearer token。 |
+
+### Runtime
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RUNTIME_HOST` | `127.0.0.1` | Runtime 监听地址。 |
+| `RUNTIME_PORT` | `3852` | Runtime 监听端口。 |
+| `RUNTIME_TOKEN` | 未设置 | Runtime 非 loopback 监听时必须设置。 |
+| `RUNTIME_DB` | `$DATA_DIR/agentdeck-runtime.sqlite3` | Runtime SQLite 数据库。 |
+
+### Provider
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CODEX_HOME` | `$HOME/.codex` | Codex profile 与配置目录。 |
 | `GEMINI_BIN` | `/usr/bin/gemini` | Gemini CLI 路径。 |
 | `GEMINI_ACP_ARGS` | `--acp` | Gemini ACP 启动参数。 |
 | `GEMINI_PROFILE_ROOT` | `$DATA_DIR/gemini/profiles/default` | Gemini 默认 profile 根目录。 |
-| `ANTIGRAVITY_BIN` | `agy` | Antigravity CLI 路径。 |
+| `ANTIGRAVITY_BIN` | `agy` | Antigravity CLI 命令或路径。 |
+
+### 附件
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
 | `MAX_ATTACHMENT_BYTES` | `33554432` | 单个附件大小上限。 |
 | `MAX_ATTACHMENTS_PER_MESSAGE` | `10` | 单条消息附件数量上限。 |
 | `MAX_TOTAL_ATTACHMENT_BYTES` | `67108864` | 单条消息附件总大小建议上限。 |
 
-生产域名示例：
+</details>
 
-```bash
-ALLOWED_ORIGINS=https://agentdeck.example.com
+## Gemini CLI
+
+AgentDeck Runtime 使用 ACP 管理长期 Gemini CLI 子进程。每个 Gemini profile 使用独立的 `HOME` 与 `GEMINI_CONFIG_DIR`，凭据不会写进浏览器或消息正文。
+
+Web 登录目前支持：
+
+- Gemini API Key；
+- Google OAuth。
+
+API Key 只写入对应 profile 的 `agentdeck.env`，权限为 `0600`。Google OAuth 通过独立 PTY 完成授权，并在凭据落盘后初始化该 profile 的 ACP runtime。
+
+需要注意：
+
+- Web Gateway 重启不会主动终止 Runtime 中的 Gemini ACP 进程；
+- Runtime 整体重启时，不承诺无损恢复正在执行的 turn；
+- Gemini CLI 支持 `session/load` 时，AgentDeck 会尝试恢复上游 session；
+- 加载失败时会新建上游 session，并使用 AgentDeck 本地历史继续；
+- 切换默认 Gemini profile 后，现有 AgentDeck 会话仍然保留，但下一轮由新 profile 执行。
+
+## 附件与产物
+
+附件通过 `multipart/form-data` 上传到 Web root 之外的 `attachments/` 目录。
+
+服务端不会信任浏览器传入的文件路径、MIME、大小或文件名，而是使用内部随机 ID 和独立 metadata。图片可以显示缩略图，PDF 和安全文本可预览；Office、压缩包和未知二进制默认下载，并设置 `X-Content-Type-Options: nosniff`。
+
+不同 Provider 的传递方式不同：
+
+- **Codex**：图片使用原生本地图片输入，普通文件以受控本地路径和 metadata 提供；
+- **Gemini**：优先使用 ACP resource link 或 image block，取决于初始化能力；
+- **Antigravity**：以本地路径提供给 CLI。
+
+备份时不要只复制 SQLite，还需要保留 `attachments/` 和生成产物目录。
+
+## 生产部署
+
+推荐的生产结构：
+
+```text
+Internet
+   |
+HTTPS reverse proxy
+   |
+AgentDeck Web Gateway (127.0.0.1:3842)
+   |
+AgentDeck Runtime (127.0.0.1:3852)
+   |
+Provider processes
 ```
 
-如果 runtime 必须监听非本机地址，Web 和 runtime 两侧要配置同一个 token：
+至少应做到：
+
+- 使用 Nginx、Caddy 或 Traefik 提供 HTTPS；
+- Web Gateway 与 Runtime 默认只监听 loopback；
+- 环境变量文件放在 Git 工作树之外；
+- 使用 systemd 或其他进程管理器；
+- 反向代理正确转发 WebSocket upgrade；
+- `ALLOWED_ORIGINS` 只包含实际使用的 HTTPS 域名。
+
+仓库中的 systemd 示例位于 [`deploy/systemd/`](deploy/systemd/)。
+
+如果 Runtime 必须监听非 loopback 地址，请在两侧设置同一个强随机 token：
 
 ```bash
 RUNTIME_TOKEN=replace-with-random-token
 AGENT_RUNTIME_TOKEN=replace-with-random-token
 ```
 
-## Gemini Provider
+不要把 Codex app-server 直接暴露到公网。
 
-安装 Gemini CLI：
+## 数据与备份
 
-```bash
-npm install -g @google/gemini-cli
-gemini --version
-gemini --help
-```
-
-AgentDeck runtime 会用 `gemini --acp` 启动长期子进程。每个 Gemini profile 都有独立的 `HOME` 和 `GEMINI_CONFIG_DIR`，默认目录类似：
+需要备份整个 `DATA_DIR`。关键内容包括：
 
 ```text
-/var/lib/agentdeck/gemini/profiles/default
+agentdeck.sqlite3
+agentdeck-runtime.sqlite3
+profiles/
+gemini/profiles/
+antigravity-profiles/
+shared/sessions/
+shared/generated_images/
+attachments/
 ```
 
-Web 登录支持 Google OAuth 和 Gemini API Key。API Key 只写入当前 profile 的私有 `agentdeck.env`，文件权限为 `0600`。OAuth 会在一个独立 PTY 中启动 Gemini CLI，捕获 Google 授权 URL，用户提交 authorization code 后再等待凭据落盘并初始化该 profile。
+SQLite 服务运行期间可能存在 `-wal` 和 `-shm` 文件。建议使用 SQLite 的 `.backup` 命令，或者停止相关服务后再复制数据库。
 
-AgentDeck session 是本地持久对话；Gemini profile 是下一轮任务使用的执行身份。切换默认 Gemini profile 不会删除已有 session。如果继续旧 session 时上游 ACP session 属于旧 profile，AgentDeck 会在新 profile 下重建上游 session，并用本地可见历史续接。
+环境文件、Cookie secret、Provider token 和登录凭据不要提交到公开仓库。
 
-需要注意的边界：
+## 恢复边界
 
-- Web gateway 重启不会杀死 runtime 里的 Gemini ACP 进程。
-- runtime 整体重启不承诺无损恢复正在运行的 Gemini turn。
-- Gemini CLI 如果声明 `session/load`，AgentDeck 会尝试加载上游 session；失败时会新建 session。
-- Gemini CLI 没有稳定额度接口时，UI 会显示 unsupported，不会伪造额度。
+AgentDeck 的目标是让浏览器断线不等于任务丢失，但它不是分布式事务系统。
 
-## 附件和产物
+可以恢复的情况：
 
-附件通过 `multipart/form-data` 上传到 Web root 之外的 `attachments/` 目录。服务端会生成随机内部 ID，并保存 metadata；它不会信任浏览器传来的路径、MIME、大小或文件名。
+- 页面刷新；
+- 浏览器临时断网；
+- WebSocket 重连；
+- Web Gateway 重启；
+- 已经持久化的事件补发。
 
-支持常见图片、文本、源码、PDF、Office Open XML 文档、ZIP/GZ 和未知二进制文件。图片会显示缩略图；PDF 和安全文本类型可以预览；Office、压缩包和未知二进制默认按下载处理，并设置 `X-Content-Type-Options: nosniff`。
+不能完全保证的情况：
 
-provider 输入策略：
+- Runtime 在 active turn 中崩溃；
+- Provider 进程被系统强制终止；
+- 高频 delta 尚未写入 SQLite 时发生极端故障；
+- 上游 CLI 删除或不再识别原 session / thread。
 
-- Codex：图片保持原生本地图片输入；普通文件以受控本地路径和 metadata 放入 prompt。
-- Gemini：优先通过 ACP resource link / image block 发送，具体取决于 initialize capabilities。
-- Antigravity：作为独立 CLI provider，文件以本地路径说明传入。
-
-产物文件按 turn 记录。Web 会在 turn 前记录项目 manifest，turn 后比较路径、大小和内容 hash，只把变化文件持久化为 artifacts。
-
-## 生产部署
-
-仓库提供 systemd unit 示例：
-
-```text
-deploy/systemd/agentdeck-web.service
-deploy/systemd/agentdeck-runtime.service
-deploy/systemd/agentdeck-app-server@.service
-deploy/systemd/env/*.env.example
-```
-
-典型生产部署包含：
-
-- 反向代理，例如 Nginx、Caddy 或 Traefik。
-- HTTPS。
-- `DATA_DIR` 放在 Git 工作树之外。
-- Web、runtime、provider 使用单独的 env 文件。
-- runtime 默认只监听 `127.0.0.1`；如果跨机器访问必须加 token。
-
-安装或渲染 systemd unit 前，先根据自己的路径、用户和权限模型调整 env。仓库里的默认示例假设：
-
-```text
-WorkingDirectory=/opt/stacks/agentdeck
-EnvironmentFile=/etc/agentdeck/*.env 或 /opt/data/agentdeck/*.env
-```
-
-部署脚本支持先检查、再按组件发布：
-
-```bash
-scripts/deploy.sh --check
-scripts/deploy.sh --deploy --components web
-scripts/deploy.sh --deploy --components runtime
-scripts/deploy.sh --deploy --components web,runtime
-scripts/deploy.sh --deploy --changed
-```
-
-runtime 发布会先进入 draining，拒绝新 turn，等待正在提交和正在运行的 turn 以及事件写入完成后再重启。provider 进程不会因为 Web 或 runtime 发布而默认重启；要重启指定 Codex profile，需要显式指定：
-
-```bash
-scripts/deploy.sh --deploy --components provider:codex:default
-```
-
-## 数据和备份
-
-AgentDeck 不会自动备份。仓库里的 [scripts/backup.sh](scripts/backup.sh) 是手动工具；你想备份时自己跑，不想备份可以不管它。
-
-通常备份整个 `DATA_DIR` 就够了，重点包括：
-
-- `agentdeck.sqlite3`
-- `agentdeck-runtime.sqlite3`
-- SQLite `-wal` 和 `-shm` 文件
-- `profiles/`
-- `gemini/profiles/`
-- `antigravity-profiles/`
-- `shared/sessions/`
-- `shared/generated_images/`
-- `attachments/`
-
-手动备份示例：
-
-```bash
-DATA_DIR=/opt/data/agentdeck \
-BACKUP_DIR=/opt/data/agentdeck/backups \
-/opt/stacks/agentdeck/scripts/backup.sh
-```
-
-脚本会生成 `agentdeck-YYYYMMDD.tar.gz`，并只保留最近 7 个 `agentdeck-*.tar.gz`。如果要定时备份，请自己加 cron 或 systemd timer。备份 SQLite 时建议用 SQLite `.backup`，或者先停相关服务再复制数据库文件。
-
-## 安全建议
-
-- 生产环境使用 HTTPS。
-- 设置强随机、稳定的 `COOKIE_SECRET`。
-- 不要泄露 `ADMIN_PASSWORD`、`COOKIE_SECRET`、`RUNTIME_TOKEN` 或 provider 凭据。
-- 不要把 Codex app-server 直接暴露到公网。
-- runtime 尽量只监听 `127.0.0.1`。
-- 只把确实希望 AgentDeck 访问的目录加入 `ALLOWED_WORKSPACES`。
-- 记住 Codex、Gemini、Antigravity 都可能按各自 sandbox 和 approval 设置读写工作区文件。
-
-## 恢复行为
-
-浏览器断线、页面刷新或 Web gateway 重启后，AgentDeck 会尽量补发已经持久化的 runtime 事件。
-
-runtime 或 provider 进程重启时，AgentDeck 会尝试重新连接并恢复已知 session。如果上游 thread 不存在，它可能创建替代 thread，并使用本地可见历史继续。高频 streaming delta 会批量写入；极端崩溃时，尚未持久化的片段可能丢失。
+当上游 thread 不存在时，AgentDeck 可以创建替代 thread，并使用本地可见历史继续，但 Provider 内部未展示的隐藏状态无法保证恢复。
 
 ## 开发
 
-常用命令：
-
 ```bash
 npm install
+
 npm run build
 npm run typecheck
 npm run lint
@@ -284,52 +348,26 @@ npm test
 npm run test:e2e
 ```
 
-拆开跑：
+开发模式：
 
 ```bash
-npm run build:server
-npm run build:client
 npm run dev
 npm run dev:runtime
 ```
 
-项目主要目录：
-
-```text
-client/      React + Vite PWA
-server/      Fastify Web gateway 和 AgentDeck runtime
-deploy/      systemd、检查、cutover、rollback 脚本
-docs/        架构文档和 ADR
-scripts/     备份、部署和迁移辅助脚本
-tests/       Node test runner 测试
-```
-
-## 常见问题
-
-### WebSocket Origin 被拒绝
-
-把浏览器页面的 Origin 加入 `ALLOWED_ORIGINS`。例如：
+单独构建：
 
 ```bash
-ALLOWED_ORIGINS=https://agentdeck.example.com
+npm run build:server
+npm run build:client
 ```
 
-### runtime 连不上
+## 项目状态
 
-确认 runtime 正在运行，`AGENT_RUNTIME_URL` 指向正确地址。如果配置了 `RUNTIME_TOKEN`，Web gateway 也要配置相同值的 `AGENT_RUNTIME_TOKEN`。
-
-### Codex app-server 没有启动
-
-确认 Codex CLI 已安装，并且 `codex app-server` 可用。如果使用 systemd，请查看 `agentdeck-app-server@<profile>.service` 的日志。
-
-### SQLite 权限错误
-
-确认运行服务的用户可以读写 `DATA_DIR`，包括 SQLite 的 WAL 和 SHM 文件。
-
-### 反向代理后不能连接
-
-确认反向代理转发 WebSocket upgrade，并保留正确的 `Host` 和 `Origin`。生产环境请配置有效 HTTPS 证书。
+AgentDeck 仍在快速迭代。Provider CLI 的协议和行为可能变化，升级 Codex CLI 或 Gemini CLI 后，建议先在非生产环境验证登录、创建会话、继续会话、附件和恢复流程。
 
 ## License
 
-当前仓库尚未包含 license 文件。
+仓库目前还没有 `LICENSE` 文件。
+
+公开源代码并不自动授予复制、修改或分发权。如果准备让其他人正式使用或参与贡献，建议补充一个明确的开源许可证。
