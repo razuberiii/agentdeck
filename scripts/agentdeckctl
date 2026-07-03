@@ -214,12 +214,12 @@ make_release() {
     tar --exclude='./releases' --exclude='./deploy-state' --exclude='./current' --exclude='./previous' --exclude='./candidate' -C "$SOURCE_ROOT" -cf - . | tar -C "$release_path" -xf -
   fi
   cd "$release_path"
-  npm ci
-  npm run typecheck
-  npm run lint
-  npm run build
-  npm test
-  npm run test:e2e
+  npm ci >&2
+  npm run typecheck >&2
+  npm run lint >&2
+  npm run build >&2
+  npm test >&2
+  npm run test:e2e >&2
   node - "$release_path/deploy-manifest.json" "$release_id" "$commit" <<'NODE'
 const fs = require('node:fs');
 fs.writeFileSync(process.argv[2], JSON.stringify({
