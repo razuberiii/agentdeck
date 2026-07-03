@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const server = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
+const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const client = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 
 test('canonical user messages do not persist provider attachment prompts', () => {
@@ -72,4 +73,31 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(client, /reconcileTimelineEvents/);
   assert.match(client, /userIdentityKey/);
   assert.match(client, /dedupeAttachments/);
+});
+
+test('runtime recovery context stays provider-only and out of visible history', () => {
+  assert.match(runtime, /const RECOVERY_CONTEXT_MARKER = '\[\[AGENT_RUNTIME_RECOVERY_CONTEXT\]\]'/);
+  assert.match(runtime, /const codexInput = live\.recovered \? \[await recoveryContextInput\(session\), \.\.\.input\] : input/);
+  assert.match(runtime, /const retryInput = rebuilt\.recovered \? \[await recoveryContextInput\(session\), \.\.\.input\] : input/);
+  assert.match(runtime, /await appendEvent\(session\.id, 'user', \{\s*input,/);
+  assert.match(runtime, /isProviderOnlyRecoveryEvent/);
+  assert.match(runtime, /provider-only recovery context event suppressed/);
+  assert.match(runtime, /visibleInputText\(payload\.input \|\| \[\]\)/);
+
+  const saveCanonicalStart = server.indexOf('async function saveCanonicalUserMessage');
+  const saveCanonicalEnd = server.indexOf('async function findCanonicalUserForRuntimeEvent', saveCanonicalStart);
+  const saveCanonical = server.slice(saveCanonicalStart, saveCanonicalEnd);
+  assert.match(saveCanonical, /text=excluded\.text/);
+  assert.match(saveCanonical, /attachments_json=excluded\.attachments_json/);
+  assert.doesNotMatch(saveCanonical, /RECOVERY_CONTEXT_MARKER|AGENT_RUNTIME_RECOVERY_CONTEXT|provider/i);
+
+  assert.match(server, /inputHasProviderOnlyRecovery\(payload\?\.input\)\) continue/);
+  assert.match(server, /if \(inputHasProviderOnlyRecovery\(input\)\) return out/);
+  assert.match(server, /itemHasProviderOnlyRecovery\(item\)/);
+  assert.match(server, /stripProviderOnlyText\(stripInternalAttachmentPrompt/);
+  assert.match(server, /sanitizeThreadForMobile/);
+
+  assert.match(client, /const RECOVERY_CONTEXT_MARKER = '\[\[AGENT_RUNTIME_RECOVERY_CONTEXT\]\]'/);
+  assert.match(client, /hasInternalProviderText/);
+  assert.match(client, /if \(hasInternalProviderText\(value\)\) return ''/);
 });

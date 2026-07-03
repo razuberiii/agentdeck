@@ -58,6 +58,7 @@ const IMAGE_TYPES: Record<string, string> = { 'image/png': '.png', 'image/jpeg':
 const ARTIFACT_TYPES: Record<string, string> = { '.txt':'text/plain; charset=utf-8', '.log':'text/plain; charset=utf-8', '.json':'application/json; charset=utf-8', '.csv':'text/csv; charset=utf-8', '.patch':'text/plain; charset=utf-8', '.diff':'text/plain; charset=utf-8', '.zip':'application/zip', '.tar.gz':'application/gzip', '.conf':'application/x-wireguard-profile', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp' };
 const ARTIFACT_SKIP_DIRS = new Set(['.git','node_modules','dist','build','.next','.vite','coverage','vendor']);
 const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
+const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 const COOKIE_NAME = 'agentdeck_session';
 const CSRF_COOKIE = 'agentdeck_csrf';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3842,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
@@ -3820,6 +3821,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
     let payload:any = {};
     try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
     if (eventType === 'user') {
+      if (inputHasProviderOnlyRecovery(payload?.input)) continue;
       const canonical = canonicalUsers[canonicalUserIndex++] as any;
       if (canonical) {
         items.push(canonicalUserMessageItem(canonical));
@@ -3828,7 +3830,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
       const input = Array.isArray(payload?.input) ? payload.input : [];
       const content = input
         .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
-        .map((item:any) => ({ type:'text', text:stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '')).trim() }))
+        .map((item:any) => ({ type:'text', text:stripProviderOnlyText(stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, ''))).trim() }))
         .filter((item:any) => item.text);
       if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', content });
       continue;
@@ -3877,13 +3879,14 @@ function compactSnapshotItem(item:any) {
   if (!item || typeof item !== 'object') return item;
   const next = { ...item };
   if (typeof next.text === 'string') next.text = stripInternalAttachmentPrompt(next.text);
+  if (typeof next.text === 'string') next.text = stripProviderOnlyText(next.text);
   if (typeof next.text === 'string' && next.text.length > 80_000) next.text = `${next.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]`;
   if (Array.isArray(next.content)) {
     next.content = next.content.map((part:any) => {
       if (typeof part?.text !== 'string') return part;
-      const text = stripInternalAttachmentPrompt(part.text);
+      const text = stripProviderOnlyText(stripInternalAttachmentPrompt(part.text));
       return text.length > 80_000 ? { ...part, text:`${text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]` } : { ...part, text };
-    });
+    }).filter((part:any) => typeof part?.text !== 'string' || part.text.trim());
   }
   return next;
 }
@@ -3930,7 +3933,7 @@ async function antigravityThread(row:any) {
 }
 function userMessageContentFromRow(m:any) {
   const content:any[] = [];
-  const text = stripInternalAttachmentPrompt(String(m.original_text || m.text || '')).trim();
+  const text = stripProviderOnlyText(stripInternalAttachmentPrompt(String(m.original_text || m.text || ''))).trim();
   if (text) content.push({ type:'text', text });
   for (const a of userMessageAttachmentsFromRow(m)) if (String(a.type || '').startsWith('image/')) content.push({ type:'image', url:a.url, viewerUrl:a.url, path:a.id, name:a.name });
   return content;
@@ -3952,6 +3955,10 @@ function stripInternalAttachmentPrompt(text:string) {
   out = out.replace(/\n{0,2}Attachments are available as local files:\n(?:- .+ \| .+ \| \d+ bytes \| \/[^\n]+\n?)+/g, '').trim();
   out = out.replace(/\n{0,2}Attachment:\s*[^\n]*\nMIME:\s*[^\n]*\nSize:\s*[^\n]*\nLocal path:\s*\/[^\n]+\nRead this file from the local path if needed\.?/g, '').trim();
   return out;
+}
+function stripProviderOnlyText(text:string) {
+  const value = String(text || '');
+  return value.includes(RECOVERY_CONTEXT_MARKER) ? '' : value;
 }
 async function listIndexedThreads(archived:boolean){
   if (USE_AGENT_RUNTIME) {
@@ -4601,9 +4608,10 @@ async function runtimeEventMessages(threadId:string, event:any) {
   }
   if (eventType === 'user') {
     const input = Array.isArray(payload?.input) ? payload.input : [];
+    if (inputHasProviderOnlyRecovery(input)) return out;
     const text = input
       .filter((item:any) => item?.type === 'text')
-      .map((item:any) => stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, '')).trim())
+      .map((item:any) => stripProviderOnlyText(stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, ''))).trim())
       .filter(Boolean)
       .join('\n');
     const canonical = await findCanonicalUserForRuntimeEvent(threadId, payload, text).catch(()=>null);
@@ -4936,7 +4944,7 @@ function sanitizeThreadForMobile(thread:any){
   for (const turn of thread?.turns || []) {
     for (const item of turn.items || []) {
       if (item?.type === 'userMessage') {
-        item.content = (item.content || []).filter((c:any) => !(c.type === 'text' && String(c.text || '').includes('[[CODEX_MOBILE_CLIENT_CONTEXT]]')));
+        item.content = (item.content || []).filter((c:any) => !(c.type === 'text' && (String(c.text || '').includes(MOBILE_CONTEXT_MARKER) || String(c.text || '').includes(RECOVERY_CONTEXT_MARKER))));
       }
     }
     turn.items = (turn.items || []).filter((item:any) => {
@@ -5158,10 +5166,19 @@ function artifactExt(filePath:string){ const lower = filePath.toLowerCase(); ret
 function turnTimeMs(turn:any){ const seconds = turn?.completedAt || turn?.startedAt; return typeof seconds === 'number' ? seconds * 1000 : Number.POSITIVE_INFINITY; }
 function shouldBroadcastCodexNotification(msg:any){
   if (msg.method === 'item/completed') {
-    const type = msg.params?.item?.type;
+    const item = msg.params?.item;
+    const type = item?.type;
     if (!['userMessage','agentMessage','imageView','imageGeneration'].includes(type)) return false;
+    if (type === 'userMessage' && itemHasProviderOnlyRecovery(item)) return false;
     if (type === 'agentMessage' && !String(msg.params?.item?.text || '').trim()) return false;
   }
   if (msg.method && (msg.method.includes('fileChange') || msg.method.includes('command'))) return false;
   return true;
+}
+function itemHasProviderOnlyRecovery(item:any) {
+  if (String(item?.text || '').includes(RECOVERY_CONTEXT_MARKER)) return true;
+  return Array.isArray(item?.content) && item.content.some((part:any) => part?.type === 'text' && String(part.text || '').includes(RECOVERY_CONTEXT_MARKER));
+}
+function inputHasProviderOnlyRecovery(input:any) {
+  return Array.isArray(input) && input.some((item:any) => item?.type === 'text' && String(item.text || '').includes(RECOVERY_CONTEXT_MARKER));
 }

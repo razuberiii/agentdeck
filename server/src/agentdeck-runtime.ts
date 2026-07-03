@@ -1297,7 +1297,7 @@ async function recentConversationSummary(sessionId:string, limit:number) {
     let payload:any = {};
     try { payload = JSON.parse(String(row.payload_json || '{}')); } catch {}
     if (row.event_type === 'user') {
-      const text = (payload.input || []).filter((x:any)=>x?.type === 'text').map((x:any)=>String(x.text || '')).join('\n').trim();
+      const text = visibleInputText(payload.input || []);
       if (text) lines.push(`User: ${text.slice(0, 1200)}`);
     }
     const item = payload?.params?.item;
@@ -1353,7 +1353,7 @@ async function threadFromSnapshot(session:RuntimeSession) {
       const input = Array.isArray(payload?.input) ? payload.input : [];
       const content = input
         .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
-        .map((item:any) => ({ type:'text', text:String(item.text || '').replace(RECOVERY_CONTEXT_MARKER, '').trim() }))
+        .map((item:any) => ({ type:'text', text:stripProviderOnlyRecoveryText(String(item.text || '')).trim() }))
         .filter((item:any) => item.text);
       if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', content });
       continue;
@@ -1378,6 +1378,11 @@ async function threadFromSnapshot(session:RuntimeSession) {
 function compactSnapshotItem(item:any) {
   if (!item || typeof item !== 'object') return item;
   const next = { ...item };
+  if (next.type === 'userMessage' && Array.isArray(next.content)) {
+    next.content = next.content
+      .map((part:any) => typeof part?.text === 'string' ? { ...part, text:stripProviderOnlyRecoveryText(part.text) } : part)
+      .filter((part:any) => typeof part?.text !== 'string' || part.text.trim());
+  }
   if (typeof next.text === 'string' && next.text.length > 80_000) next.text = `${next.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]`;
   if (Array.isArray(next.content)) {
     next.content = next.content.map((part:any) => typeof part?.text === 'string' && part.text.length > 80_000 ? { ...part, text:`${part.text.slice(0, 80_000)}\n\n[output truncated for mobile snapshot]` } : part);
@@ -1417,6 +1422,10 @@ async function appendEvent(sessionId:string, eventType:string, payload:any) {
 
 async function appendEventUnlocked(sessionId:string, eventType:string, payload:any) {
   const startedAt = Date.now();
+  if (isProviderOnlyRecoveryEvent(eventType, payload)) {
+    app.log.warn({ sessionId, eventType }, 'provider-only recovery context event suppressed');
+    return { session_id:sessionId, sequence:Number(sequenceCache.get(sessionId) || 0), event_type:eventType, payload_json:'{}', created_at:Date.now(), suppressed:true };
+  }
   const eventKey = eventKeyFor(eventType, payload);
   if (eventKey) {
     const existing = await db.get('SELECT sequence FROM events WHERE session_id=?1 AND event_key=?2', [sessionId, eventKey]);
@@ -1441,6 +1450,41 @@ async function appendEventUnlocked(sessionId:string, eventType:string, payload:a
   }
   if (!isCriticalEvent(eventType)) persistEvent(event, eventKey).catch(e => app.log.error({ err:e, sessionId, eventType }, 'event persist failed'));
   return event;
+}
+
+function isProviderOnlyRecoveryEvent(eventType:string, payload:any) {
+  if (eventType === 'user') return inputHasProviderOnlyRecovery(payload?.input);
+  if (eventType === 'item/completed') {
+    const item = payload?.params?.item || payload?.item;
+    return item?.type === 'userMessage' && itemHasProviderOnlyRecovery(item);
+  }
+  return false;
+}
+
+function inputHasProviderOnlyRecovery(input:any) {
+  return Array.isArray(input) && input.some((item:any) => item?.type === 'text' && isProviderOnlyRecoveryText(item.text));
+}
+
+function itemHasProviderOnlyRecovery(item:any) {
+  if (isProviderOnlyRecoveryText(item?.text)) return true;
+  return Array.isArray(item?.content) && item.content.some((part:any) => part?.type === 'text' && isProviderOnlyRecoveryText(part.text));
+}
+
+function isProviderOnlyRecoveryText(text:any) {
+  return String(text || '').includes(RECOVERY_CONTEXT_MARKER);
+}
+
+function stripProviderOnlyRecoveryText(text:string) {
+  return isProviderOnlyRecoveryText(text) ? '' : String(text || '');
+}
+
+function visibleInputText(input:any) {
+  return (Array.isArray(input) ? input : [])
+    .filter((x:any)=>x?.type === 'text')
+    .map((x:any)=>stripProviderOnlyRecoveryText(String(x.text || '')).trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 async function nextSequence(sessionId:string) {

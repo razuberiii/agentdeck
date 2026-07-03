@@ -29,6 +29,7 @@ const APP_NAME = 'Agent Deck';
 const CHUNK_SIZE = 24 * 1024;
 const PUBLIC_UPLOAD_TARGET_BYTES = 650 * 1024;
 const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
+const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 const PROVIDER_ORDER:ProviderId[] = ['codex','claude','antigravity','gemini'];
 const ToastContext = createContext<(kind:Toast['kind'], text:string)=>void>(()=>{});
 
@@ -350,13 +351,16 @@ function SessionView({id}:{id:string}){
 }
 
 function threadEvents(thread:any):DisplayEvent[]{ const out:DisplayEvent[]=[]; const turns=thread?.turns||[]; for(let ti=0; ti<turns.length; ti++){ const turn=turns[ti]; const syntheticImageTail=!turn?.startedAt&&!turn?.completedAt&&ti===turns.length-1&&(turn.items||[]).every((item:any)=>item?.type==='imageGeneration'&&String(item.id||'').startsWith('generated-')); if(syntheticImageTail) continue; for(const item of turn.items||[]){const ev=itemToEvent(item); if(ev) out.push(ev)} } return out; }
-function userContent(content:any[]){ const text:string[]=[]; const attachments:Attachment[]=[]; for(const c of content||[]){ if(c.type==='text' && String(c.text||'').trim() && !String(c.text||'').includes(MOBILE_CONTEXT_MARKER)) text.push(c.text); if((c.type==='localImage'||c.type==='image')&&(c.viewerUrl||c.url)) attachments.push({id:c.path||c.url,name:c.name||'image',type:'image',size:0,url:c.viewerUrl||c.url}); } return {text:text.join('\n'),attachments}; }
+function userContent(content:any[]){ const text:string[]=[]; const attachments:Attachment[]=[]; for(const c of content||[]){ if(c.type==='text' && String(c.text||'').trim() && !hasInternalProviderText(c.text)) text.push(c.text); if((c.type==='localImage'||c.type==='image')&&(c.viewerUrl||c.url)) attachments.push({id:c.path||c.url,name:c.name||'image',type:'image',size:0,url:c.viewerUrl||c.url}); } return {text:text.join('\n'),attachments}; }
 function stripInternalAttachmentPrompt(text:string){
-  return String(text||'')
+  const value = String(text||'');
+  if (hasInternalProviderText(value)) return '';
+  return value
     .replace(/\n{0,2}Attachments are available as local files:\n(?:- .+ \| .+ \| \d+ bytes \| \/[^\n]+\n?)+/g, '')
     .replace(/\n{0,2}Attachment:\s*[^\n]*\nMIME:\s*[^\n]*\nSize:\s*[^\n]*\nLocal path:\s*\/[^\n]+\nRead this file from the local path if needed\.?/g, '')
     .trim();
 }
+function hasInternalProviderText(text:any){ const value=String(text||''); return value.includes(MOBILE_CONTEXT_MARKER) || value.includes(RECOVERY_CONTEXT_MARKER); }
 function itemToEvent(item:any):DisplayEvent|null{
   if(item.type==='userMessage'){ const c=userContent(item.content); const text=stripInternalAttachmentPrompt(c.text); const attachments=dedupeAttachments([...(item.attachments||[]),...c.attachments]); return (text.trim() || attachments.length) ? {key:String(item.clientMessageId||item.id),messageId:String(item.id||''),clientMessageId:item.clientMessageId?String(item.clientMessageId):undefined,role:'user',text,attachments,meta:messageStatusLabel(item.status)} : null; }
   if(item.type==='agentMessage') {
