@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONTROL_ROOT="${AGENTDECK_ROOT:-/opt/stacks/agentdeck}"
-SOURCE_ROOT="${AGENTDECK_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SOURCE_ROOT="${AGENTDECK_SOURCE_ROOT:-$CONTROL_ROOT}"
 DATA_DIR="${DATA_DIR:-/opt/data/agentdeck}"
 ENV_DIR="${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}"
 STATE_DIR="${AGENTDECK_DEPLOY_STATE_DIR:-$CONTROL_ROOT/deploy-state}"
