@@ -196,7 +196,7 @@ release_target() {
 require_git_source_root() {
   local git_root
   command -v git >/dev/null 2>&1 || die "git is required to create a release"
-  git_root="$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+  git_root="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
   [ -n "$git_root" ] || die "source root is not a Git repository: $SOURCE_ROOT"
   SOURCE_ROOT="$git_root"
 }
@@ -225,7 +225,7 @@ const manifest = release => {
 };
 const currentManifest = manifest(current);
 const originMain = (() => {
-  try { return cp.execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'origin/main'], { encoding:'utf8', stdio:['ignore','pipe','ignore'] }).trim() || null; } catch { return null; }
+  try { return cp.execFileSync('git', ['-c', `safe.directory=${sourceRoot}`, '-C', sourceRoot, 'rev-parse', 'origin/main'], { encoding:'utf8', stdio:['ignore','pipe','ignore'] }).trim() || null; } catch { return null; }
 })();
 const service = unit => {
   try {
@@ -309,7 +309,7 @@ run_check() {
   run_as_service_user npm test
   log "running mock e2e"
   run_as_service_user npm run test:e2e
-  log "CHECK_OK commit=$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  log "CHECK_OK commit=$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 }
 
 make_release() {
@@ -318,9 +318,9 @@ make_release() {
   require_git_source_root
   local commit short branch ts release_id release_path previous_release built_by node_version npm_version
   cd "$SOURCE_ROOT"
-  commit="$(git rev-parse HEAD)"
+  commit="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse HEAD)"
   short="$(printf '%s' "$commit" | cut -c1-12)"
-  branch="$(git branch --show-current 2>/dev/null || true)"
+  branch="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" branch --show-current 2>/dev/null || true)"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   release_id="$ts-$short"
   valid_release_id "$release_id" || die "generated invalid release id: $release_id"

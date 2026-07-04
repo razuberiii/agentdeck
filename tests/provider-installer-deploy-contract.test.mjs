@@ -70,7 +70,8 @@ test('deploy release id is not captured from noisy build stdout and cleanup is b
   assert.match(ctlSource, /case "\$real_path" in "\$real_root"\/\*/);
   assert.match(ctlSource, /require_git_source_root\(\)/);
   assert.match(ctlSource, /die "source root is not a Git repository: \$SOURCE_ROOT"/);
-  assert.match(ctlSource, /commit="\$\(git rev-parse HEAD\)"/);
+  assert.match(ctlSource, /git -c "safe\.directory=\$SOURCE_ROOT" -C "\$SOURCE_ROOT" rev-parse --show-toplevel/);
+  assert.match(ctlSource, /commit="\$\(git -c "safe\.directory=\$SOURCE_ROOT" -C "\$SOURCE_ROOT" rev-parse HEAD\)"/);
   assert.doesNotMatch(ctlSource, /git rev-parse HEAD 2>\/dev\/null \|\| echo unknown/);
   assert.match(ctlSource, /release_id="\$ts-\$short"/);
   assert.match(ctlSource, /sourceCommit:process\.argv\[4\]/);
