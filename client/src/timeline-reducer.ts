@@ -86,6 +86,9 @@ export function sortRuntimeMessages(items: any[]): any[] {
 export function normalizeTurnStatus(value: any): TurnUiStatus {
   const s = String(value || '');
   if (s === 'waiting_approval' || s === 'waitingApproval') return 'waiting_approval';
+  if (s === 'planning' || s === 'executing_approved_plan') return 'running';
+  if (s === 'waiting_plan_approval') return 'waiting_input';
+  if (s === 'plan_cancelled') return 'completed';
   if (s === 'waiting_input' || s === 'waitingInput' || s === 'ask_user_question') return 'waiting_input';
   if (s === 'cancelling' || s === 'stopping') return 'cancelling';
   if (s === 'running' || s === 'output_draining') return 'running';
@@ -100,6 +103,7 @@ export function resolveTurnUiStatus(session: any, approvals: any[] = [], cancell
   if (cancelling) return 'cancelling';
   const active = session?.activeTurn;
   if (active?.waitingKind === 'approval' || approvals.length) return 'waiting_approval';
+  if (active?.waitingKind === 'plan') return 'waiting_input';
   if (active?.waitingKind === 'input') return 'waiting_input';
   const activeStatus = normalizeTurnStatus(active?.status);
   if (active?.turnId && activeStatus !== 'unknown' && activeStatus !== 'idle' && activeStatus !== 'completed') return activeStatus;

@@ -1866,7 +1866,7 @@ async function activeTurnDetails() {
   const rows = await db.all(
     `SELECT id, provider, provider_id, active_turn_id, status, updated_at, created_at
      FROM sessions
-     WHERE status IN ('running','active','submitting') OR active_turn_id IS NOT NULL
+     WHERE status IN ('running','active','submitting','planning','waiting_plan_approval','executing_approved_plan') OR active_turn_id IS NOT NULL
      ORDER BY updated_at DESC`
   ).catch(()=>[]);
   return {
@@ -1884,7 +1884,7 @@ async function activeTurnDetails() {
 async function drainState() {
   const row = await db.get(
     `SELECT
-       SUM(CASE WHEN status IN ('running','active') OR active_turn_id IS NOT NULL THEN 1 ELSE 0 END) AS activeTurnCount,
+       SUM(CASE WHEN status IN ('running','active','planning','waiting_plan_approval','executing_approved_plan') OR active_turn_id IS NOT NULL THEN 1 ELSE 0 END) AS activeTurnCount,
        SUM(CASE WHEN status='submitting' THEN 1 ELSE 0 END) AS submittingTurnCount
      FROM sessions`
   ).catch(()=>null);

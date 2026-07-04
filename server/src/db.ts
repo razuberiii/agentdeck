@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS gemini_profiles (id TEXT PRIMARY KEY, name TEXT NOT N
 CREATE TABLE IF NOT EXISTS provider_login_attempts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, profile_id TEXT, temp_home TEXT, method_id TEXT, status TEXT NOT NULL, error TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL, client_message_id TEXT, turn_id TEXT, original_text TEXT, attachments_json TEXT, status TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message ON agent_messages(session_id,client_message_id) WHERE client_message_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS interactive_requests (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT, provider_id TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, options_json TEXT NOT NULL, allow_free_text INTEGER NOT NULL DEFAULT 0, default_option_id TEXT, status TEXT NOT NULL, answer_json TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, answered_at INTEGER);
+CREATE INDEX IF NOT EXISTS interactive_requests_session_status ON interactive_requests(session_id,status,created_at);
 CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT PRIMARY KEY, count INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
   }
 
