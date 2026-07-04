@@ -19,6 +19,7 @@ RUNTIME_PORT="${AGENTDECK_RUNTIME_PORT:-3852}"
 RUNTIME_CANDIDATE_PORT="${AGENTDECK_RUNTIME_CANDIDATE_PORT:-3952}"
 DRAIN_TIMEOUT_SECONDS="${AGENTDECK_DRAIN_TIMEOUT_SECONDS:-7200}"
 KEEP_RELEASES="${AGENTDECK_KEEP_RELEASES:-5}"
+SYSTEMD_UNIT_VERSION=1
 SERVICE_USER=""
 SERVICE_HOME=""
 CREATED_RELEASE_ID=""
@@ -33,6 +34,7 @@ usage: sudo agentdeckctl <command> [target] [options]
 commands:
   status [--json]
   check
+  install-units
   restart web|runtime|all [--force]
   deploy web|runtime|all [--wait] [--force]
   rollback web|runtime|all [--wait] [--force]
@@ -296,8 +298,14 @@ run_check() {
   for name in web.env runtime.env agentdeck-app-server-default.env; do
     [ -f "$ENV_DIR/$name" ] || die "missing env file: $ENV_DIR/$name"
   done
-  log "checking systemd unit files"
-  ROOT="$SOURCE_ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/deploy/install-units.sh"
+  log "checking service user and data dirs"
+  [ -d "$DATA_DIR" ] || die "data dir does not exist: $DATA_DIR"
+  [ -d "$RELEASES_DIR" ] || die "releases dir does not exist: $RELEASES_DIR"
+  [ -L "$CURRENT_LINK" ] || die "current symlink is missing: $CURRENT_LINK"
+  check_systemd_units "$SOURCE_ROOT" fail
+  log "checking production health"
+  wait_http "http://127.0.0.1:$WEB_PORT/api/status" 10
+  wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 10
   ensure_playwright_browsers
   log "running typecheck"
   run_as_service_user npm run typecheck
@@ -310,6 +318,45 @@ run_check() {
   log "running mock e2e"
   run_as_service_user npm run test:e2e
   log "CHECK_OK commit=$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+}
+
+render_unit_template() {
+  local root="$1" unit="$2" out="$3"
+  sed "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" "$root/deploy/systemd/$unit" > "$out"
+}
+
+check_systemd_units() {
+  local root="$1" mode="${2:-warn}" tmpdir unit target outdated=0 missing=0
+  log "checking systemd unit files"
+  tmpdir="$(mktemp -d)"
+  for unit in agentdeck-web.service agentdeck-runtime.service agentdeck-app-server@.service; do
+    target="/etc/systemd/system/$unit"
+    render_unit_template "$root" "$unit" "$tmpdir/$unit"
+    if [ ! -f "$target" ]; then
+      echo "ERROR: missing systemd unit: $target" >&2
+      missing=1
+      continue
+    fi
+    if ! cmp -s "$tmpdir/$unit" "$target"; then
+      echo "WARN: systemd unit is outdated: $target" >&2
+      outdated=1
+    fi
+  done
+  if [ "$missing" = "1" ]; then
+    echo "Run: sudo agentdeckctl install-units" >&2
+  fi
+  if [ "$outdated" = "1" ]; then
+    echo "systemd units are outdated. Run:" >&2
+    echo "  sudo agentdeckctl install-units" >&2
+  fi
+  rm -rf "$tmpdir"
+  [ "$missing" = "1" ] && [ "$mode" = "fail" ] && return 1
+  return 0
+}
+
+run_install_units() {
+  ensure_dirs
+  ROOT="$SOURCE_ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/deploy/install-units.sh"
 }
 
 make_release() {
@@ -340,7 +387,7 @@ make_release() {
   run_as_service_user npm run test:e2e
   node_version="$(run_as_service_user node --version)"
   npm_version="$(run_as_service_user npm --version)"
-  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" "$SOURCE_ROOT" "$branch" "$previous_release" "$built_by" "$node_version" "$npm_version" <<'NODE'
+  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" "$SOURCE_ROOT" "$branch" "$previous_release" "$built_by" "$node_version" "$npm_version" "$SYSTEMD_UNIT_VERSION" <<'NODE'
 const fs = require('node:fs');
 fs.writeFileSync(process.argv[2], JSON.stringify({
   releaseId:process.argv[3],
@@ -354,6 +401,8 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
   builtBy:process.argv[8] || null,
   nodeVersion:process.argv[9] || null,
   npmVersion:process.argv[10] || null,
+  systemdUnitVersion:Number(process.argv[11] || 0),
+  requiredSystemdUnitVersion:Number(process.argv[11] || 0),
   testResultSummary:{
     typecheck:'passed',
     lint:'passed',
@@ -368,6 +417,19 @@ NODE
   ln -sfn "releases/$release_id" "$CANDIDATE_LINK.tmp"
   mv -Tf "$CANDIDATE_LINK.tmp" "$CANDIDATE_LINK"
   CREATED_RELEASE_ID="$release_id"
+}
+
+assert_release_unit_requirement() {
+  local release_path="$1" required
+  required="$(node - "$release_path/deploy-manifest.json" "$SYSTEMD_UNIT_VERSION" <<'NODE'
+const fs = require('node:fs');
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+console.log(Number(manifest.requiredSystemdUnitVersion || 0));
+NODE
+)"
+  if [ "$required" -gt "$SYSTEMD_UNIT_VERSION" ]; then
+    die "release requires systemd unit version >= $required; current agentdeckctl supports $SYSTEMD_UNIT_VERSION. Run: sudo agentdeckctl install-units"
+  fi
 }
 
 sqlite_backup() {
@@ -533,7 +595,8 @@ worker_deploy() {
     release_path="$(release_path_for "$release_id")"
     export AGENTDECK_JOB_RELEASE="$release_id"
     write_job "$job_id" running "release built"
-    ROOT="$release_path" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$release_path/deploy/install-units.sh"
+    assert_release_unit_requirement "$release_path"
+    check_systemd_units "$release_path" warn || true
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       start_candidate_runtime "$release_path" "$job_id"
     fi
@@ -641,7 +704,7 @@ COMMAND="${1:-}"
 [ -n "$COMMAND" ] || { usage; exit 2; }
 shift || true
 TARGET="${1:-}"
-case "$COMMAND" in status|check|jobs) ;; *) shift || true ;; esac
+case "$COMMAND" in status|check|jobs|install-units|setup-units) ;; *) shift || true ;; esac
 WAIT=0
 FORCE=0
 JSON=0
@@ -660,6 +723,7 @@ ensure_dirs
 case "$COMMAND" in
   status) [ "$JSON" = "1" ] && status_json || status_text ;;
   check) run_check ;;
+  install-units|setup-units) run_install_units ;;
   restart) [ -n "$TARGET" ] || die "restart target required"; restart_target "$TARGET" "$FORCE" ;;
   deploy)
     TARGET="${TARGET:-all}"

@@ -14,6 +14,18 @@ exec >>"$LOG" 2>&1
 echo "== install-units $(date -Is) =="
 echo "env_dir=$ENV_DIR"
 sudo install -d -m 0755 /run/agentdeck
+changed=0
+
+install_if_changed() {
+  local mode="$1" source="$2" target="$3"
+  if [ -f "$target" ] && cmp -s "$source" "$target"; then
+    echo "unchanged $target"
+    return 0
+  fi
+  sudo install -m "$mode" "$source" "$target"
+  changed=1
+  echo "installed $target"
+}
 
 if ! getent passwd "$RUN_USER" >/dev/null; then
   echo "ERROR: configured service user does not exist: $RUN_USER" >&2
@@ -37,7 +49,7 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 for unit in agentdeck-web.service agentdeck-runtime.service agentdeck-app-server@.service; do
   sed "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" "$ROOT/deploy/systemd/$unit" > "$tmpdir/$unit"
-  sudo install -m 0644 "$tmpdir/$unit" "/etc/systemd/system/$unit"
+  install_if_changed 0644 "$tmpdir/$unit" "/etc/systemd/system/$unit"
 done
 
 if [ ! -f "$ENV_DIR/web.env" ]; then
@@ -61,6 +73,10 @@ if [ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
   sudo chmod 0600 "$ENV_DIR/agentdeck-app-server-default.env"
 fi
 
-sudo systemctl daemon-reload
-sudo install -m 0755 "$ROOT/scripts/agentdeckctl" /usr/local/bin/agentdeckctl
+if [ "$changed" = "1" ]; then
+  sudo systemctl daemon-reload
+else
+  echo "systemd units unchanged; skipping daemon-reload"
+fi
+install_if_changed 0755 "$ROOT/scripts/agentdeckctl" /usr/local/bin/agentdeckctl
 echo "installed units"
