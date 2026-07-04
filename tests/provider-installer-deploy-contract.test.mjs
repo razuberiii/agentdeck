@@ -68,6 +68,30 @@ test('deploy release id is not captured from noisy build stdout and cleanup is b
   assert.match(ctlSource, /release_path_for\(\)/);
   assert.match(ctlSource, /safe_rm_tree\(\)/);
   assert.match(ctlSource, /case "\$real_path" in "\$real_root"\/\*/);
+  assert.match(ctlSource, /require_git_source_root\(\)/);
+  assert.match(ctlSource, /die "source root is not a Git repository: \$SOURCE_ROOT"/);
+  assert.match(ctlSource, /commit="\$\(git rev-parse HEAD\)"/);
+  assert.doesNotMatch(ctlSource, /git rev-parse HEAD 2>\/dev\/null \|\| echo unknown/);
+  assert.match(ctlSource, /release_id="\$ts-\$short"/);
+  assert.match(ctlSource, /sourceCommit:process\.argv\[4\]/);
+  assert.match(ctlSource, /sourceRoot:process\.argv\[5\]/);
+  assert.match(ctlSource, /previousRelease:process\.argv\[7\]/);
+  assert.match(ctlSource, /testResultSummary/);
+});
+
+test('provider installer has timeout, minimal env, and candidate cleanup on failure', () => {
+  assert.match(indexSource, /const PROVIDER_INSTALL_TIMEOUT_MS = 15 \* 60 \* 1000/);
+  assert.match(indexSource, /detached:true/);
+  assert.match(indexSource, /process\.kill\(-child\.pid, signal\)/);
+  assert.match(indexSource, /timed out after/);
+  assert.match(indexSource, /await rm\(candidateDir, \{ recursive:true, force:true \}\)\.catch/);
+  const providerEnv = indexSource.slice(indexSource.indexOf('function providerInstallEnv'), indexSource.indexOf('async function downloadProviderInstallScript'));
+  assert.doesNotMatch(providerEnv, /\.\.\.process\.env/);
+  assert.match(providerEnv, /HOME: home/);
+  assert.match(providerEnv, /XDG_CACHE_HOME/);
+  assert.match(providerEnv, /PATH: process\.env\.PATH/);
+  assert.match(providerEnv, /\['HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy'\]/);
+  assert.doesNotMatch(providerEnv, /COOKIE_SECRET|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|GEMINI_API_KEY/);
 });
 
 test('systemd runtime and web inherit provider tool and shared Playwright paths', () => {

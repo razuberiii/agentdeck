@@ -34,6 +34,14 @@ test('deploy entrypoint supports check deploy rollback without restarting on che
   assert.doesNotMatch(checkBody, /systemctl restart|systemctl stop|cutover\.sh|rollback\.sh/);
 });
 
+test('agentdeckctl status exposes release commit and source metadata', () => {
+  assert.match(ctlSource, /const currentManifest = manifest\(current\)/);
+  assert.match(ctlSource, /currentManifest\.sourceCommit \|\| currentManifest\.commit/);
+  assert.match(ctlSource, /sourceRoot: currentManifest\.sourceRoot \|\| sourceRoot/);
+  assert.match(ctlSource, /originMainCommit: originMain/);
+  assert.match(ctlSource, /console\.log\(`source:\s+\$\{s\.sourceRoot \|\| '-'\}`\)/);
+});
+
 test('deploy preserves the external production env dir and does not remount /etc', () => {
   assert.match(ctlSource, /ENV_DIR="\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}"/);
   assert.match(ctlSource, /\[ -d "\$ENV_DIR" \]/);

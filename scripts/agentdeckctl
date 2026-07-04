@@ -192,6 +192,13 @@ release_target() {
   [ -L "$link" ] && readlink -f "$link" || true
 }
 
+require_git_source_root() {
+  local git_root
+  git_root="$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$git_root" ] || die "source root is not a Git repository: $SOURCE_ROOT"
+  SOURCE_ROOT="$git_root"
+}
+
 status_json() {
   ensure_dirs
   local current previous candidate web runtime last_job db
@@ -202,26 +209,41 @@ status_json() {
   runtime="$(runtime_state)"
   last_job="$(latest_job_file)"
   db="${RUNTIME_DB:-$DATA_DIR/agentdeck-runtime.sqlite3}"
-  node - "$current" "$previous" "$candidate" "$web" "$runtime" "$last_job" "$db" "$CURRENT_LINK" <<'NODE'
+  node - "$current" "$previous" "$candidate" "$web" "$runtime" "$last_job" "$db" "$CURRENT_LINK" "$SOURCE_ROOT" <<'NODE'
 const fs = require('node:fs');
-const [current, previous, candidate, webRaw, runtimeRaw, lastJobFile, db, currentLink] = process.argv.slice(2);
+const cp = require('node:child_process');
+const path = require('node:path');
+const [current, previous, candidate, webRaw, runtimeRaw, lastJobFile, db, currentLink, sourceRoot] = process.argv.slice(2);
 const parse = s => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
 let lastJob = null;
 if (lastJobFile) try { lastJob = JSON.parse(fs.readFileSync(lastJobFile, 'utf8')); } catch {}
+const manifest = release => {
+  if (!release) return {};
+  try { return JSON.parse(fs.readFileSync(path.join(release, 'deploy-manifest.json'), 'utf8')); } catch { return {}; }
+};
+const currentManifest = manifest(current);
+const originMain = (() => {
+  try { return cp.execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'origin/main'], { encoding:'utf8', stdio:['ignore','pipe','ignore'] }).trim() || null; } catch { return null; }
+})();
 const service = unit => {
   try {
-    const cp = require('node:child_process').execFileSync('systemctl', ['show', unit, '-p', 'ActiveState', '-p', 'SubState', '-p', 'MainPID', '--value'], { encoding:'utf8' }).trim().split(/\n/);
-    return { activeState:cp[0] || 'unknown', subState:cp[1] || '', mainPid:Number(cp[2] || 0) };
+    const out = cp.execFileSync('systemctl', ['show', unit, '-p', 'ActiveState', '-p', 'SubState', '-p', 'MainPID', '--value'], { encoding:'utf8' }).trim().split(/\n/);
+    return { activeState:out[0] || 'unknown', subState:out[1] || '', mainPid:Number(out[2] || 0) };
   } catch { return { activeState:'unknown', subState:'', mainPid:0 }; }
 };
 const web = parse(webRaw);
 const runtime = parse(runtimeRaw);
+const currentCommit = currentManifest.sourceCommit || currentManifest.commit || runtime.commit || web.release?.commit || null;
 console.log(JSON.stringify({
   currentRelease: current || null,
   previousRelease: previous || null,
   candidateRelease: candidate || null,
   currentSymlink: currentLink,
-  gitCommit: runtime.commit || web.release?.commit || null,
+  gitCommit: currentCommit,
+  sourceRoot: currentManifest.sourceRoot || sourceRoot || null,
+  sourceBranch: currentManifest.sourceBranch || null,
+  originMainCommit: originMain,
+  releaseManifest: currentManifest,
   web: { pid:service('agentdeck-web.service').mainPid, port:Number(process.env.AGENTDECK_WEB_PORT || 3842), version:web.release || null },
   runtime: { pid:service('agentdeck-runtime.service').mainPid, port:Number(process.env.AGENTDECK_RUNTIME_PORT || 3852), state:runtime },
   activeTurnCount:Number(runtime.activeTurnCount || 0),
@@ -248,6 +270,8 @@ console.log(`current:  ${s.currentRelease || '-'}`);
 console.log(`previous: ${s.previousRelease || '-'}`);
 console.log(`candidate:${s.candidateRelease || '-'}`);
 console.log(`commit:   ${s.gitCommit || '-'}`);
+console.log(`source:   ${s.sourceRoot || '-'}`);
+if (s.originMainCommit) console.log(`origin:   ${s.originMainCommit}`);
 console.log(`web:      pid=${s.web.pid || 0} port=${s.web.port} service=${s.services.web.activeState}/${s.services.web.subState}`);
 console.log(`runtime:  pid=${s.runtime.pid || 0} port=${s.runtime.port} state=${s.runtime.state.state || 'unknown'} activeTurns=${s.activeTurnCount} draining=${s.draining}`);
 console.log(`provider: codex-default pid=${s.providers.codexAppServerDefault.mainPid || 0} service=${s.providers.codexAppServerDefault.activeState}/${s.providers.codexAppServerDefault.subState}`);
@@ -289,23 +313,21 @@ run_check() {
 make_release() {
   ensure_dirs
   ensure_service_owned_dirs
-  local commit short ts release_id release_path
+  require_git_source_root
+  local commit short branch ts release_id release_path previous_release built_by node_version npm_version
   cd "$SOURCE_ROOT"
-  commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  commit="$(git rev-parse HEAD)"
   short="$(printf '%s' "$commit" | cut -c1-12)"
+  branch="$(git branch --show-current 2>/dev/null || true)"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   release_id="$ts-$short"
   valid_release_id "$release_id" || die "generated invalid release id: $release_id"
   release_path="$(release_path_for "$release_id")"
+  previous_release="$(release_target "$CURRENT_LINK")"
+  built_by="$(id -un 2>/dev/null || whoami 2>/dev/null || echo unknown)"
   [ ! -e "$release_path" ] || die "release already exists: $release_id"
   log "creating release $release_id"
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    run_as_service_user git worktree add --detach "$release_path" "$commit" >/dev/null
-  else
-    run_as_service_user mkdir -p "$release_path"
-    tar --exclude='./releases' --exclude='./deploy-state' --exclude='./current' --exclude='./previous' --exclude='./candidate' -C "$SOURCE_ROOT" -cf - . | tar -C "$release_path" -xf -
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$release_path"
-  fi
+  run_as_service_user git worktree add --detach "$release_path" "$commit" >/dev/null
   cd "$release_path"
   ensure_playwright_browsers
   run_as_service_user npm ci
@@ -314,12 +336,29 @@ make_release() {
   run_as_service_user npm run build
   run_as_service_user npm test
   run_as_service_user npm run test:e2e
-  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" <<'NODE'
+  node_version="$(run_as_service_user node --version)"
+  npm_version="$(run_as_service_user npm --version)"
+  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" "$SOURCE_ROOT" "$branch" "$previous_release" "$built_by" "$node_version" "$npm_version" <<'NODE'
 const fs = require('node:fs');
 fs.writeFileSync(process.argv[2], JSON.stringify({
   releaseId:process.argv[3],
   commit:process.argv[4],
+  sourceCommit:process.argv[4],
+  sourceRoot:process.argv[5],
+  sourceBranch:process.argv[6] || null,
+  buildTime:new Date().toISOString(),
   builtAt:new Date().toISOString(),
+  previousRelease:process.argv[7] || null,
+  builtBy:process.argv[8] || null,
+  nodeVersion:process.argv[9] || null,
+  npmVersion:process.argv[10] || null,
+  testResultSummary:{
+    typecheck:'passed',
+    lint:'passed',
+    build:'passed',
+    unit:'passed',
+    e2e:'passed',
+  },
   schemaVersion:1,
   compatibility:{ web:true, runtime:true },
 }, null, 2) + '\n');

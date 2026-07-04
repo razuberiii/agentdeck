@@ -63,6 +63,12 @@ test('Claude official CLI login uses one isolated profile environment for login,
   assert.match(serverSource, /await claudeProfileStore\.markStatus\(profile\.id, 'authenticated'\)/);
   assert.match(clientSource, /使用 Claude CLI 登录/);
   assert.match(clientSource, /其他登录方式/);
+  assert.match(clientSource, /<details className="advancedLogin"/);
+  assert.match(serverSource, /profiles\.filter\(profile => profile\.status === 'authenticated'\)\.map\(claudeProfileDto\)/);
+  assert.match(serverSource, /if \(!profile \|\| profile\.status !== 'authenticated'\) return null/);
+  assert.match(serverSource, /const verified = await claudeAuthStatus\(profile\)/);
+  assert.match(serverSource, /if \(!verified\.ok\)[\s\S]*claudeProfileStore\.delete\(profile\.id\)/);
+  assert.match(serverSource, /existing\.status !== 'authenticated'/);
 });
 
 test('Claude SDK mapper emits canonical events and redacts before persistence', () => {

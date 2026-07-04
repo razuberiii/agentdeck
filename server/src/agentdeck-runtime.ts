@@ -1902,7 +1902,7 @@ function releaseMetadata() {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     return {
       releaseId:String(manifest.releaseId || path.basename(process.cwd())),
-      commit:String(manifest.commit || ''),
+      commit:String(manifest.sourceCommit || manifest.commit || ''),
     };
   } catch {
     return { releaseId:path.basename(process.cwd()), commit:'' };

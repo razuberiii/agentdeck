@@ -130,6 +130,7 @@ type ProviderInstallJob = {
 const providerInstallJobs = new Map<string, ProviderInstallJob>();
 const providerInstallChildren = new Map<string, any>();
 const providerInstallByProvider = new Map<AgentProviderId, string>();
+const PROVIDER_INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 const activeArtifactTurns = new Map<string, string>();
 const PROVIDER_INSTALL_JOBS_FILE = path.join(PROVIDER_TOOLS_DIR, 'jobs', 'install-jobs.json');
 const PROVIDER_INSTALLERS:Record<AgentProviderId, {
@@ -390,6 +391,7 @@ app.delete('/api/provider-install/:id', { preHandler: ensureAuth }, async (req:a
     job.error = '安装已取消';
     job.updatedAt = Date.now();
     providerInstallByProvider.delete(job.provider);
+    await rm(providerInstallCandidateDir(job), { recursive:true, force:true }).catch(()=>{});
     await persistProviderInstallJobs().catch(()=>{});
   }
   return { job:providerInstallJobSummary(job) };
@@ -596,8 +598,17 @@ app.post('/api/claude/profiles', { preHandler: ensureAuth }, async (req:any, rep
     apiKey: typeof req.body?.apiKey === 'string' ? req.body.apiKey : undefined,
     existingConfigDir: typeof req.body?.configDir === 'string' ? req.body.configDir : undefined,
   });
+  if (!profile) return reply.code(500).send({ error:'profile create failed' });
+  const verified = await claudeAuthStatus(profile);
+  if (!verified.ok) {
+    await claudeProfileStore.delete(profile.id).catch(()=>{});
+    invalidateUnifiedProviderStatuses();
+    return reply.code(400).send({ error:'claude_auth_failed', message:verified.error || 'Claude auth status 未通过' });
+  }
+  await claudeProfileStore.markStatus(profile.id, 'authenticated');
+  await claudeProfileStore.switch(profile.id);
   invalidateUnifiedProviderStatuses();
-  return { profile };
+  return { profile: await activeClaudeProfileSummary() };
 });
 app.post('/api/claude/profiles/login', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profileId = typeof req.body?.profileId === 'string' ? req.body.profileId : '';
@@ -656,6 +667,8 @@ app.delete('/api/claude-login/:id', { preHandler: ensureAuth }, async (req:any, 
   return { ok:true };
 });
 app.post('/api/claude/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const existing = await claudeProfileStore.get(String(req.params.id));
+  if (!existing || existing.status !== 'authenticated') return reply.code(404).send({ error:'profile not found' });
   const profile = await claudeProfileStore.switch(String(req.params.id)).catch(()=>null);
   if (!profile) return reply.code(404).send({ error:'profile not found' });
   invalidateUnifiedProviderStatuses();
@@ -1826,61 +1839,73 @@ async function runProviderInstallJob(job:ProviderInstallJob) {
   const installer = PROVIDER_INSTALLERS[job.provider];
   if (!installer.automatic) throw new Error('automatic install is not supported');
   const providerDir = path.join(PROVIDER_TOOLS_DIR, job.provider);
-  const candidateDir = path.join(providerDir, `candidate-${job.id}`);
+  const candidateDir = providerInstallCandidateDir(job);
   const currentLink = path.join(providerDir, 'current');
   const binLink = path.join(MANAGED_PROVIDER_BIN_DIR, installer.binary);
   const binaryPath = job.provider === 'claude'
     ? path.join(candidateDir, '.local', 'bin', installer.binary)
     : path.join(candidateDir, 'node_modules', '.bin', installer.binary);
-  await mkdir(MANAGED_PROVIDER_BIN_DIR, { recursive:true });
-  await mkdir(path.dirname(PROVIDER_INSTALL_JOBS_FILE), { recursive:true });
-  await rm(candidateDir, { recursive:true, force:true });
-  await mkdir(candidateDir, { recursive:true, mode:0o755 });
-  updateProviderInstallJob(job, 'downloading', `Using ${installer.source}`);
-  if (job.provider === 'claude') {
-    const scriptPath = path.join(candidateDir, 'install.sh');
-    updateProviderInstallJob(job, 'downloading', `Downloading ${installer.installScriptUrl}`);
-    await downloadProviderInstallScript(job, String(installer.installScriptUrl), scriptPath);
-    await chmod(scriptPath, 0o755);
-    updateProviderInstallJob(job, 'installing', 'Running official Claude Code installer in managed candidate HOME');
-    await spawnProviderInstall(job, 'bash', [scriptPath], providerInstallEnv(candidateDir));
-  } else {
-    if (!installer.packageName) throw new Error('automatic install source is missing');
-    updateProviderInstallJob(job, 'installing', `npm install ${installer.packageName}@latest`);
-    await spawnProviderInstall(job, 'npm', ['--prefix', candidateDir, 'install', '--omit=dev', `${installer.packageName}@latest`], providerInstallEnv(DEFAULT_HOME, {
-      npm_config_cache: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
-      NPM_CONFIG_CACHE: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
-    }));
+  try {
+    await mkdir(MANAGED_PROVIDER_BIN_DIR, { recursive:true });
+    await mkdir(path.dirname(PROVIDER_INSTALL_JOBS_FILE), { recursive:true });
+    await rm(candidateDir, { recursive:true, force:true });
+    await mkdir(candidateDir, { recursive:true, mode:0o755 });
+    updateProviderInstallJob(job, 'downloading', `Using ${installer.source}`);
+    if (job.provider === 'claude') {
+      const scriptPath = path.join(candidateDir, 'install.sh');
+      updateProviderInstallJob(job, 'downloading', `Downloading ${installer.installScriptUrl}`);
+      await downloadProviderInstallScript(job, String(installer.installScriptUrl), scriptPath);
+      await chmod(scriptPath, 0o755);
+      updateProviderInstallJob(job, 'installing', 'Running official Claude Code installer in managed candidate HOME');
+      await spawnProviderInstall(job, 'bash', [scriptPath], providerInstallEnv(candidateDir));
+    } else {
+      if (!installer.packageName) throw new Error('automatic install source is missing');
+      updateProviderInstallJob(job, 'installing', `npm install ${installer.packageName}@latest`);
+      await spawnProviderInstall(job, 'npm', ['--prefix', candidateDir, 'install', '--omit=dev', `${installer.packageName}@latest`], providerInstallEnv(DEFAULT_HOME, {
+        npm_config_cache: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
+        NPM_CONFIG_CACHE: path.join(DATA_DIR, 'cache', 'npm-provider-tools'),
+      }));
+    }
+    updateProviderInstallJob(job, 'verifying', `${installer.binary} --version`);
+    await access(binaryPath, constants.X_OK).catch(() => { throw new Error(`${installer.binary} binary was not installed at ${binaryPath}`); });
+    const version = await execFileAsync(binaryPath, ['--version'], { timeout:10_000, env:providerInstallEnv(DEFAULT_HOME) }).then(r => (r.stdout || r.stderr).trim()).catch((e:any) => {
+      throw new Error(String(e?.stderr || e?.stdout || e?.message || e));
+    });
+    const previousLink = path.join(providerDir, 'previous');
+    await rm(previousLink, { recursive:true, force:true });
+    if (existsSync(currentLink)) await rename(currentLink, previousLink).catch(()=>{});
+    await rm(currentLink, { recursive:true, force:true });
+    await symlink(candidateDir, currentLink);
+    await rm(binLink, { force:true });
+    const managedBinaryPath = job.provider === 'claude'
+      ? path.join(currentLink, '.local', 'bin', installer.binary)
+      : path.join(currentLink, 'node_modules', '.bin', installer.binary);
+    await symlink(managedBinaryPath, binLink);
+    job.version = version || null;
+    updateProviderInstallJob(job, 'succeeded', `Installed ${installer.binary} ${version || ''}`.trim());
+    providerInstallByProvider.delete(job.provider);
+    invalidateProviderCaches(job.provider);
+  } catch (e) {
+    await rm(candidateDir, { recursive:true, force:true }).catch(()=>{});
+    throw e;
   }
-  updateProviderInstallJob(job, 'verifying', `${installer.binary} --version`);
-  await access(binaryPath, constants.X_OK).catch(() => { throw new Error(`${installer.binary} binary was not installed at ${binaryPath}`); });
-  const version = await execFileAsync(binaryPath, ['--version'], { timeout:10_000, env:{ ...process.env, PATH:process.env.PATH } }).then(r => (r.stdout || r.stderr).trim()).catch((e:any) => {
-    throw new Error(String(e?.stderr || e?.stdout || e?.message || e));
-  });
-  const previousLink = path.join(providerDir, 'previous');
-  await rm(previousLink, { recursive:true, force:true });
-  if (existsSync(currentLink)) await rename(currentLink, previousLink).catch(()=>{});
-  await rm(currentLink, { recursive:true, force:true });
-  await symlink(candidateDir, currentLink);
-  await rm(binLink, { force:true });
-  const managedBinaryPath = job.provider === 'claude'
-    ? path.join(currentLink, '.local', 'bin', installer.binary)
-    : path.join(currentLink, 'node_modules', '.bin', installer.binary);
-  await symlink(managedBinaryPath, binLink);
-  job.version = version || null;
-  updateProviderInstallJob(job, 'succeeded', `Installed ${installer.binary} ${version || ''}`.trim());
-  providerInstallByProvider.delete(job.provider);
-  invalidateProviderCaches(job.provider);
+}
+function providerInstallCandidateDir(job:ProviderInstallJob) {
+  return path.join(PROVIDER_TOOLS_DIR, job.provider, `candidate-${job.id}`);
 }
 function providerInstallEnv(home:string, extra:Record<string,string> = {}) {
-  return {
-    ...process.env,
+  const env:Record<string,string> = {
     HOME: home,
     XDG_CONFIG_HOME: path.join(home, '.config'),
     XDG_CACHE_HOME: path.join(home, '.cache'),
-    PATH: process.env.PATH,
+    PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+    DATA_DIR,
     ...extra,
   };
+  for (const key of ['HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy']) {
+    if (process.env[key]) env[key] = String(process.env[key]);
+  }
+  return env;
 }
 async function downloadProviderInstallScript(job:ProviderInstallJob, url:string, dest:string) {
   const parsed = new URL(url);
@@ -1905,8 +1930,19 @@ function failProviderInstallJob(job:ProviderInstallJob, message:string) {
 }
 function spawnProviderInstall(job:ProviderInstallJob, command:string, args:string[], env:NodeJS.ProcessEnv) {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { env, cwd:PROVIDER_TOOLS_DIR, stdio:['ignore','pipe','pipe'] });
+    const child = spawn(command, args, { env, cwd:PROVIDER_TOOLS_DIR, stdio:['ignore','pipe','pipe'], detached:true });
     providerInstallChildren.set(job.id, child);
+    const killTree = (signal:NodeJS.Signals) => {
+      try { if (child.pid) process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch {} }
+    };
+    const timer = setTimeout(() => {
+      updateProviderInstallJob(job, 'failed', `${command} timed out after ${Math.round(PROVIDER_INSTALL_TIMEOUT_MS / 60000)} minutes`);
+      providerInstallChildren.delete(job.id);
+      killTree('SIGTERM');
+      setTimeout(() => killTree('SIGKILL'), 10_000).unref?.();
+      reject(new Error(`${command} timed out`));
+    }, PROVIDER_INSTALL_TIMEOUT_MS);
+    timer.unref?.();
     const append = (chunk:Buffer) => {
       const text = chunk.toString('utf8');
       for (const line of text.split(/\r?\n/).filter(Boolean)) job.output.push(redactLine(line).slice(0, 1000));
@@ -1916,8 +1952,9 @@ function spawnProviderInstall(job:ProviderInstallJob, command:string, args:strin
     };
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
-    child.on('error', reject);
+    child.on('error', err => { clearTimeout(timer); reject(err); });
     child.on('close', code => {
+      clearTimeout(timer);
       providerInstallChildren.delete(job.id);
       if (job.status === 'cancelled') return resolve();
       code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`));
@@ -2017,12 +2054,12 @@ async function activeAntigravityProfileSummary() {
 }
 async function activeClaudeProfileSummary() {
   const profile = await claudeProfileStore.active();
-  if (!profile) return null;
+  if (!profile || profile.status !== 'authenticated') return null;
   return claudeProfileDto(profile);
 }
 async function listClaudeProfiles() {
   const profiles = await claudeProfileStore.list();
-  return profiles.map(claudeProfileDto);
+  return profiles.filter(profile => profile.status === 'authenticated').map(claudeProfileDto);
 }
 function claudeProfileDto(profile:any) {
   return {
@@ -4021,7 +4058,7 @@ function releaseMetadata() {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     return {
       releaseId:String(manifest.releaseId || path.basename(process.cwd())),
-      commit:String(manifest.commit || ''),
+      commit:String(manifest.sourceCommit || manifest.commit || ''),
     };
   } catch {
     return { releaseId:path.basename(process.cwd()), commit:'' };
