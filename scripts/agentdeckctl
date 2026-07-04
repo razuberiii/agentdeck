@@ -24,6 +24,7 @@ SERVICE_HOME=""
 CREATED_RELEASE_ID=""
 PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$DATA_DIR/cache/ms-playwright}"
 NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$DATA_DIR/cache/npm}"
+export PATH="$DATA_DIR/provider-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 usage() {
   cat >&2 <<'EOF'
@@ -194,6 +195,7 @@ release_target() {
 
 require_git_source_root() {
   local git_root
+  command -v git >/dev/null 2>&1 || die "git is required to create a release"
   git_root="$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
   [ -n "$git_root" ] || die "source root is not a Git repository: $SOURCE_ROOT"
   SOURCE_ROOT="$git_root"
