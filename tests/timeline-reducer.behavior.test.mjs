@@ -9,6 +9,7 @@ function runReducerScenario(source) {
       applyTimelineMessage,
       applyTimelineSnapshot,
       emptyTimelineState,
+      reconcileTimelineEvents,
       resolveTurnUiStatus,
     } from ${JSON.stringify(new URL('../client/src/timeline-reducer.ts', import.meta.url).href)};
     const progress = {key:'progress', role:'assistant', text:'progress'};
@@ -74,6 +75,20 @@ test('duplicate websocket event is idempotent', () => {
     state = applyTimelineMessage(state, event);
     state = applyTimelineMessage(state, event);
     assert.equal(state.liveMessages.length, 1);
+  `);
+});
+
+test('user events from snapshot and replay reconcile by content when ids differ', () => {
+  runReducerScenario(`
+    const events = reconcileTimelineEvents([
+      {key:'canonical', role:'user', messageId:'db-user-1', clientMessageId:'client-1', text:'啊 是啊 做', attachments:[{id:'att-1', name:'shot.png'}], meta:'已保存'},
+      {key:'final', role:'assistant', text:'done'},
+      {key:'replay-user', role:'user', messageId:'provider-user-1', text:'啊 是啊 做', attachments:[{id:'att-1', name:'shot.png'}]},
+    ]);
+    assert.deepEqual(events.map(e => e.key), ['canonical', 'final']);
+    assert.equal(events[0].clientMessageId, 'client-1');
+    assert.equal(events[0].messageId, 'db-user-1');
+    assert.equal(events[0].attachments.length, 1);
   `);
 });
 

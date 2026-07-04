@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useMemo, useRef, useState 
 import { createRoot } from 'react-dom/client';
 import { loginMethodViews, type LoginMethodView } from './login-methods';
 import { attachmentIconLabel, isImageAttachment } from './attachment-preview';
-import { applyTimelineMessage, applyTimelineSnapshot, emptyTimelineState, resolveTurnUiStatus, runtimeMessageSequence, type TimelineState, type TurnUiStatus } from './timeline-reducer';
+import { applyTimelineMessage, applyTimelineSnapshot, emptyTimelineState, reconcileTimelineEvents, resolveTurnUiStatus, runtimeMessageSequence, type TimelineState, type TurnUiStatus } from './timeline-reducer';
 import { api } from './api/client';
 import type { ApprovalRequest, Attachment, DisplayEvent, ModelOption, PlanRequest, Project, ProviderId, ProviderInstallJob, ProviderInstaller, ProviderStatus, RuntimeConnection, Session, Status, Toast } from './api/types';
 import { connectionLabel, formatSize, formatTime, modeLabel, normalizeRuntimeConnection, projectName, providerAuthLabel, providerLabel, sessionProvider, shortError, shortProviderReason, statusLabel } from './utils/format';
@@ -434,29 +434,6 @@ function visibleEvents(items:DisplayEvent[]){
     }
     return true;
   });
-}
-function reconcileTimelineEvents(items:DisplayEvent[]){
-  const out:DisplayEvent[]=[];
-  const userIndex=new Map<string,number>();
-  for(const item of items){
-    if(item.role!=='user'){ out.push(item); continue; }
-    const key=userIdentityKey(item);
-    if(!key){ out.push(item); continue; }
-    const existingIndex=userIndex.get(key);
-    if(existingIndex == null){ userIndex.set(key,out.length); out.push(item); continue; }
-    out[existingIndex]=mergeUserEvents(out[existingIndex], item);
-  }
-  return out;
-}
-function userIdentityKey(e:DisplayEvent){
-  if(e.clientMessageId) return `client:${e.clientMessageId}`;
-  if(e.messageId) return `message:${e.messageId}`;
-  return '';
-}
-function mergeUserEvents(a:DisplayEvent,b:DisplayEvent):DisplayEvent{
-  const attachments=dedupeAttachments([...(a.attachments||[]),...(b.attachments||[])]);
-  const text=b.text.trim()?b.text:a.text;
-  return {...a,...b,key:a.key,clientMessageId:a.clientMessageId||b.clientMessageId,messageId:a.messageId||b.messageId,text,attachments,meta:b.meta||a.meta};
 }
 function dedupeAttachments(items:Attachment[]){
   const seen=new Set<string>();

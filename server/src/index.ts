@@ -3919,6 +3919,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
       if (item?.id) completedItemIds.add(String(item.id));
+      if (item?.type === 'userMessage' && canonicalUsers.length) continue;
       if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) items.push(compactSnapshotItem(item));
       continue;
     }

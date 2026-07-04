@@ -70,8 +70,9 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(server, /canonicalUserMessageItem/);
   assert.match(server, /findCanonicalUserForRuntimeEvent/);
   assert.match(server, /userMessageAttachmentsFromRow/);
+  assert.match(server, /item\?\.type === 'userMessage' && canonicalUsers\.length\) continue/);
   assert.match(client, /reconcileTimelineEvents/);
-  assert.match(client, /userIdentityKey/);
+  assert.match(readFileSync(new URL('../client/src/timeline-reducer.ts', import.meta.url), 'utf8'), /userContentIdentityKey/);
   assert.match(client, /dedupeAttachments/);
 });
 

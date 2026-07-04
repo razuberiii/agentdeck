@@ -4,6 +4,8 @@ export type TimelineDisplayEvent = {
   text?: string;
   clientMessageId?: string;
   messageId?: string;
+  attachments?: { id?: string; url?: string; name?: string; type?: string; size?: number }[];
+  meta?: string;
 };
 
 export type TimelineState = {
@@ -81,6 +83,92 @@ export function sortRuntimeMessages(items: any[]): any[] {
     if (!as && bs) return -1;
     return 0;
   });
+}
+
+export function reconcileTimelineEvents<T extends TimelineDisplayEvent>(items: T[]): T[] {
+  const out: T[] = [];
+  const userIndex = new Map<string, number>();
+  for (const item of items) {
+    if (item.role !== 'user') {
+      out.push(item);
+      continue;
+    }
+    const keys = userIdentityKeys(item);
+    let existingIndex: number | undefined;
+    for (const key of keys) {
+      const found = userIndex.get(key);
+      if (found != null) {
+        existingIndex = found;
+        break;
+      }
+    }
+    if (existingIndex == null) {
+      const index = out.length;
+      out.push(item);
+      for (const key of keys) userIndex.set(key, index);
+      continue;
+    }
+    out[existingIndex] = mergeTimelineUserEvents(out[existingIndex], item);
+    for (const key of userIdentityKeys(out[existingIndex])) userIndex.set(key, existingIndex);
+  }
+  return out;
+}
+
+function userIdentityKeys(e: TimelineDisplayEvent): string[] {
+  const keys: string[] = [];
+  if (e.clientMessageId) keys.push(`client:${e.clientMessageId}`);
+  if (e.messageId) keys.push(`message:${e.messageId}`);
+  const contentKey = userContentIdentityKey(e);
+  if (contentKey) keys.push(contentKey);
+  return keys;
+}
+
+function userContentIdentityKey(e: TimelineDisplayEvent): string {
+  const text = normalizeUserText(e.text || '');
+  const attachments = normalizeUserAttachments(e.attachments || []);
+  if (!attachments) return '';
+  return `content:${text}\nattachments:${attachments}`;
+}
+
+function normalizeUserText(text: string): string {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeUserAttachments(attachments: TimelineDisplayEvent['attachments']): string {
+  const items = (attachments || []).map(item => {
+    const id = String(item.id || item.url || '').trim();
+    const name = String(item.name || '').trim();
+    const type = String(item.type || '').trim();
+    return id || `${name}:${type}`;
+  }).filter(Boolean).sort();
+  return items.length ? items.join('|') : '';
+}
+
+function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T {
+  const attachments = dedupeTimelineAttachments([...(a.attachments || []), ...(b.attachments || [])]);
+  const text = String(b.text || '').trim() ? b.text : a.text;
+  return {
+    ...a,
+    ...b,
+    key: a.key,
+    clientMessageId: a.clientMessageId || b.clientMessageId,
+    messageId: a.messageId || b.messageId,
+    text,
+    attachments,
+    meta: b.meta || a.meta,
+  };
+}
+
+function dedupeTimelineAttachments(items: NonNullable<TimelineDisplayEvent['attachments']>) {
+  const seen = new Set<string>();
+  const out: NonNullable<TimelineDisplayEvent['attachments']> = [];
+  for (const item of items) {
+    const key = String(item.id || item.url || item.name || '');
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
 }
 
 export function normalizeTurnStatus(value: any): TurnUiStatus {
