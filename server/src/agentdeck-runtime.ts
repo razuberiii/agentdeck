@@ -869,6 +869,8 @@ async function initRuntimeSchema() {
   await db.run('CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, codex_home TEXT, runtime_instance_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
   await db.run('CREATE TABLE IF NOT EXISTS runtime_instances (instance_id TEXT PRIMARY KEY, pid INTEGER, started_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL)');
   await db.run("CREATE TABLE IF NOT EXISTS claude_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, profile_dir TEXT NOT NULL UNIQUE, config_dir TEXT NOT NULL UNIQUE, type TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'not_configured', credential_summary TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+  await db.run("CREATE TABLE IF NOT EXISTS plan_tasks (plan_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, original_user_task TEXT NOT NULL, approved_plan_text TEXT, plan_assistant_message_id TEXT, execution_turn_id TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL, approved_at INTEGER, executed_at INTEGER, cancelled_at INTEGER, provider TEXT, model TEXT, diff_summary TEXT, changed_files_json TEXT, policy_violation TEXT)").catch(()=>{});
+  await db.run('CREATE INDEX IF NOT EXISTS plan_tasks_session_status ON plan_tasks(session_id,status,created_at)').catch(()=>{});
   await db.run('INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at', [INSTANCE_ID, process.pid, Date.now()]);
   await db.run('ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT \'codex\'').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
@@ -1027,7 +1029,10 @@ async function runtimeForAccountOnce(accountId:string) {
   if (!runtime) {
     runtime = new CodexAccountRuntime(account, portForAccount(account.id), db);
     runtime.on('notification', (msg:any) => handleCodexNotification(account, msg).catch(e => app.log.error({ err:e }, 'notification handling failed')));
-    runtime.on('request', (msg:any) => runtime!.respond(msg.id, approvalResponse(String(msg.method || ''))));
+    runtime.on('request', (msg:any) => handleCodexRequest(runtime!, msg).catch(error => {
+      app.log.warn({ err:error, method:msg?.method }, 'codex request guard failed');
+      runtime!.respond(msg.id, approvalResponse(String(msg.method || '')));
+    }));
     runtime.on('connect', () => setTimeout(() => recoverAccount(account).catch(e => app.log.error({ err:e }, 'initial recovery failed')), 50));
     runtime.on('disconnect', () => markAccountDisconnect(account).catch(()=>{}));
     runtime.on('reconnect', () => recoverAccount(account).catch(e => app.log.error({ err:e }, 'recovery failed')));
@@ -1061,6 +1066,24 @@ async function handleCodexNotification(account:Account, msg:any) {
   if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
     await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,updated_at=?2 WHERE id=?3', ['idle', Date.now(), session.id]);
   }
+}
+
+async function handleCodexRequest(runtime:CodexAccountRuntime, msg:any) {
+  const method = String(msg.method || '');
+  const threadId = String(msg.params?.threadId || msg.params?.thread?.id || '');
+  const session = threadId ? await sessionForThread(threadId) : null;
+  if (String(session?.status || '') === 'planning') {
+    await db.run(
+      `UPDATE plan_tasks
+       SET policy_violation=COALESCE(policy_violation || char(10), '') || ?1
+       WHERE plan_id=(SELECT plan_id FROM plan_tasks WHERE session_id=?2 AND status='planning' ORDER BY created_at DESC LIMIT 1)`,
+      [`Plan mode is read-only. Blocked ${method || 'approval request'}.`, session!.id]
+    ).catch(()=>{});
+    runtime.respond(msg.id, approvalResponse(method, 'decline'));
+    await appendEvent(session!.id, 'system', { text:'Plan mode is read-only. This action is blocked.', provider:'codex', method });
+    return;
+  }
+  runtime.respond(msg.id, approvalResponse(method));
 }
 
 async function markAccountDisconnect(account:Account) {
@@ -1679,6 +1702,14 @@ async function latestEventSequence(sessionId:string) {
 
 function turnOptions(body:any) {
   const permissionMode = normalizeMode(body.permission_mode || body.permissionMode || body.mode) || 'yolo';
+  if (String(body.planMode || '') === 'plan') {
+    return {
+      permissionMode:'read-only',
+      approvalPolicy:'on-request',
+      sandboxMode:'read-only',
+      model:cleanModel(body.model),
+    };
+  }
   const fields = modeFields(permissionMode);
   return {
     permissionMode,
@@ -1729,10 +1760,12 @@ function isFinalAnswerItem(item:any) {
   return item?.type === 'agentMessage' && item?.phase === 'final_answer' && String(item?.text || '').trim();
 }
 
-function approvalResponse(method:string) {
-  if (method.includes('permissions')) return { permissions:{ network:null, fileSystem:null }, scope:'session' };
-  if (method.includes('fileChange')) return { decision:'accept' };
-  return { decision:'accept' };
+function approvalResponse(method:string, decision:'accept'|'decline' = 'accept') {
+  if (method.includes('permissions')) return decision === 'decline'
+    ? { permissions:{}, scope:'turn' }
+    : { permissions:{ network:null, fileSystem:null }, scope:'session' };
+  if (method.includes('fileChange')) return { decision };
+  return { decision };
 }
 
 function cleanModel(value:any) {

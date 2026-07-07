@@ -1,6 +1,6 @@
 import type { ProviderId, ProviderStatus, RuntimeConnection } from '../api/types';
 
-export function statusLabel(s?:string){ return ({idle:'空闲',submitting:'提交中',planning:'生成计划中',waiting_plan_approval:'等待确认计划',executing_approved_plan:'执行计划中',plan_cancelled:'计划已取消',running:'执行中',waiting_approval:'等待审批',waiting_input:'等待回答',cancelling:'正在停止',output_draining:'正在收尾',completed:'已完成',active:'空闲',failed:'失败',interrupted:'已中断',unknown:'未知',notLoaded:'可继续'} as any)[s||''] || s || '空闲'; }
+export function statusLabel(s?:string){ return ({idle:'空闲',submitting:'提交中',planning:'生成计划中',waiting_plan_approval:'计划完成',executing_approved_plan:'执行计划中',plan_cancelled:'计划已取消',running:'执行中',waiting_approval:'等待审批',waiting_input:'等待回答',cancelling:'正在停止',output_draining:'正在收尾',completed:'已完成',active:'空闲',failed:'失败',interrupted:'已中断',unknown:'未知',notLoaded:'可继续'} as any)[s||''] || s || '空闲'; }
 export function connectionLabel(s?:string){ return ({connected:'已连接',reconnecting:'重连中',offline:'离线',checking:'检查中',recovering:'恢复中',unavailable:'不可用',disconnected:'已断开',unknown:'未知'} as any)[s||''] || s || '未知'; }
 export function formatTime(ms?:number){ if(!ms) return '未知时间'; return new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(ms)); }
 export function formatSize(bytes:number){ if(bytes<1024) return `${bytes} B`; if(bytes<1024*1024) return `${(bytes/1024).toFixed(1)} KB`; return `${(bytes/1024/1024).toFixed(2)} MB`; }

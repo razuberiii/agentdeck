@@ -8,42 +8,42 @@ const db = readFileSync(new URL('../server/src/db.ts', import.meta.url), 'utf8')
 const client = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../client/src/styles.css', import.meta.url), 'utf8');
 
-test('plan mode sends a provider-agnostic plan-only prompt and stores review requests', () => {
+test('plan mode sends a provider-agnostic plan-only prompt without storing it as user text', () => {
   assert.match(web, /function planOnlyPrompt/);
   assert.match(web, /\$plan/);
-  assert.match(web, /不要修改文件，不要执行会改变工作区的命令/);
-  assert.match(web, /CREATE TABLE IF NOT EXISTS interactive_requests/);
-  assert.match(db, /CREATE TABLE IF NOT EXISTS interactive_requests/);
-  assert.match(web, /createPlanReviewRequest/);
-  assert.match(web, /kind='plan_review'/);
-  assert.match(web, /waiting_plan_approval/);
+  assert.match(web, /AgentDeck Plan Mode is active/);
+  assert.match(web, /CREATE TABLE IF NOT EXISTS plan_tasks/);
+  assert.match(db, /CREATE TABLE IF NOT EXISTS plan_tasks/);
+  assert.match(web, /parsePlanSubmission/);
+  assert.match(web, /saveCanonicalUserMessage\(threadId, originalText/);
+  assert.match(web, /stripInternalPlanPrompt/);
 });
 
-test('interactive request answer API supports approve revise regenerate and cancel', () => {
+test('legacy plan review answer API no longer copies assistant plans into follow-up prompts', () => {
   assert.match(web, /app\.post\('\/api\/interactive-requests\/:requestId\/answer'/);
-  assert.match(web, /planApprovalPrompt/);
-  assert.match(web, /planRevisionPrompt/);
-  assert.match(web, /planRegeneratePrompt/);
   assert.match(web, /optionId === 'cancel'/);
-  assert.match(web, /sendTurn\(request\.sessionId, followup, \[\]/);
+  assert.doesNotMatch(web, /planApprovalPrompt/);
+  assert.doesNotMatch(web, /planRevisionPrompt/);
+  assert.doesNotMatch(web, /planRegeneratePrompt/);
+  assert.doesNotMatch(web, /sendTurn\(request\.sessionId, followup, \[\]/);
 });
 
-test('plan review survives refresh and runtime drain treats it as active', () => {
+test('plan mode is forced through read-only runtime policy', () => {
   assert.match(web, /interactiveRequests: await listInteractiveRequests/);
-  assert.match(web, /webPlanStatus/);
-  assert.match(runtime, /waiting_plan_approval/);
-  assert.match(runtime, /executing_approved_plan/);
+  assert.match(web, /approvalPolicy:planTurnOptions\?\.approvalPolicy/);
+  assert.match(web, /sandboxMode:planTurnOptions\?\.sandboxMode/);
+  assert.match(runtime, /String\(body\.planMode \|\| ''\) === 'plan'/);
+  assert.match(runtime, /sandboxMode:'read-only'/);
 });
 
-test('mobile UI exposes direct and plan modes with a non-overflowing plan card', () => {
+test('mobile UI uses a compact plan mode toggle and removes old primary plan buttons', () => {
   assert.match(client, /sendMode/);
-  assert.match(client, /先给计划/);
-  assert.match(client, /PlanCard/);
-  assert.match(client, /批准并执行/);
-  assert.match(client, /修改后执行/);
-  assert.match(client, /重新生成/);
-  assert.match(client, /取消/);
-  assert.match(styles, /\.sendMode/);
-  assert.match(styles, /\.planActions\{[^}]*flex-wrap:wrap/);
-  assert.match(styles, /@media\(max-width:380px\).*\.planActions button\{flex-basis:100%\}/);
+  assert.match(client, /计划模式：描述任务，只生成计划/);
+  assert.match(client, /普通模式/);
+  assert.match(client, /modeToggle/);
+  assert.doesNotMatch(client, /先给计划/);
+  assert.doesNotMatch(client, /直接执行/);
+  assert.doesNotMatch(client, /PlanCard/);
+  assert.doesNotMatch(client, /计划确认/);
+  assert.match(styles, /\.modeToggle/);
 });

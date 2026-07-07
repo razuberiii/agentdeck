@@ -256,6 +256,8 @@ await db.run('ALTER TABLE agent_messages ADD COLUMN status TEXT').catch(()=>{});
 await db.run('CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message ON agent_messages(session_id,client_message_id) WHERE client_message_id IS NOT NULL').catch(()=>{});
 await db.run("CREATE TABLE IF NOT EXISTS interactive_requests (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT, provider_id TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, options_json TEXT NOT NULL, allow_free_text INTEGER NOT NULL DEFAULT 0, default_option_id TEXT, status TEXT NOT NULL, answer_json TEXT, metadata_json TEXT, created_at INTEGER NOT NULL, answered_at INTEGER)").catch(()=>{});
 await db.run('CREATE INDEX IF NOT EXISTS interactive_requests_session_status ON interactive_requests(session_id,status,created_at)').catch(()=>{});
+await db.run("CREATE TABLE IF NOT EXISTS plan_tasks (plan_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, original_user_task TEXT NOT NULL, approved_plan_text TEXT, plan_assistant_message_id TEXT, execution_turn_id TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL, approved_at INTEGER, executed_at INTEGER, cancelled_at INTEGER, provider TEXT, model TEXT, diff_summary TEXT, changed_files_json TEXT, policy_violation TEXT)").catch(()=>{});
+await db.run('CREATE INDEX IF NOT EXISTS plan_tasks_session_status ON plan_tasks(session_id,status,created_at)').catch(()=>{});
 await db.run('CREATE TABLE IF NOT EXISTS artifact_baselines (session_id TEXT NOT NULL, turn_id TEXT NOT NULL, project_dir TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(session_id, turn_id))').catch(()=>{});
 await db.run('CREATE UNIQUE INDEX IF NOT EXISTS artifacts_turn_path_hash ON artifacts(session_id, turn_id, relative_path, content_hash)').catch(()=>{});
 await db.run('CREATE UNIQUE INDEX IF NOT EXISTS artifacts_turn_path_operation ON artifacts(session_id, turn_id, relative_path, operation)').catch(()=>{});
@@ -1447,15 +1449,7 @@ app.post('/api/interactive-requests/:requestId/answer', { preHandler: ensureAuth
     broadcast(request.sessionId, { type:'system', text:'计划已取消' });
     return { ok:true, requestId, sentFollowup:false };
   }
-  const original = String(request.metadata?.originalText || '');
-  const followup = optionId === 'regenerate'
-    ? planRegeneratePrompt(original, text)
-    : optionId === 'revise'
-      ? planRevisionPrompt(request.body, original, text)
-      : planApprovalPrompt(request.body, original);
-  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [optionId === 'regenerate' ? 'planning' : 'executing_approved_plan', now, request.sessionId]).catch(()=>{});
-  await sendTurn(request.sessionId, followup, [], `interactive-${requestId}-${now}`, optionId === 'regenerate' ? 'plan' : 'direct');
-  return { ok:true, requestId, sentFollowup:true };
+  return { ok:true, requestId, sentFollowup:false };
 });
 app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
   cleanupPendingApprovals();
@@ -1522,8 +1516,8 @@ codex.on('notification', async (msg:any) => {
         const turns = read?.thread?.turns || [];
         const lastTurn = turns[turns.length - 1] || {};
         const finalItem = [...(lastTurn.items || [])].reverse().find((item:any) => isFinalAnswerItem(item));
-        const req = await createPlanReviewRequest(sid, String(row?.provider_id || 'codex'), artifactTurnId, String(finalItem?.text || '计划已生成，请确认是否执行。'), {});
-        broadcast(sid, { type:'interactive_request', request:req });
+        await completePlanTask(sid, String(finalItem?.text || ''), String(finalItem?.id || ''), found);
+        await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       } else {
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       }
@@ -1539,6 +1533,12 @@ codex.on('notification', async (msg:any) => {
 codex.on('request', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId);
   const row = sid ? await findSession(sid) : null;
+  if (String(row?.status || '') === 'planning') {
+    await recordPlanPolicyViolation(sid!, `Plan mode is read-only. Blocked ${String(msg.method || 'approval request')}.`);
+    codex.respond(msg.id, approvalResponse(msg.method, 'decline'));
+    if (sid) broadcast(sid, { type:'system', text:'Plan mode is read-only. This action is blocked.' });
+    return;
+  }
   if (!row || sessionMode(row) === 'yolo') {
     codex.respond(msg.id, approvalResponse(msg.method, 'accept'));
     return;
@@ -4040,7 +4040,15 @@ function stripInternalAttachmentPrompt(text:string) {
 }
 function stripProviderOnlyText(text:string) {
   const value = String(text || '');
+  const planText = stripInternalPlanPrompt(value);
+  if (planText !== value) return planText;
   return value.includes(RECOVERY_CONTEXT_MARKER) ? '' : value;
+}
+function stripInternalPlanPrompt(text:string) {
+  const value = String(text || '');
+  if (!/^\s*\$plan\b/.test(value)) return value;
+  const marker = value.match(/用户原始任务：\s*([\s\S]*)$/);
+  return marker ? marker[1].trimStart() : '';
 }
 async function listIndexedThreads(archived:boolean){
   if (USE_AGENT_RUNTIME) {
@@ -4221,16 +4229,21 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const row = await findSession(id);
   if(!row) throw new Error('session not found');
   const threadId = String(row.codex_thread_id || row.id);
-  const originalText = String(text || '');
-  const providerText = planMode === 'plan' ? planOnlyPrompt(originalText) : originalText;
+  const submission = parsePlanSubmission(text, planMode);
+  const originalText = submission.originalText;
+  const effectivePlanMode = submission.planMode;
+  const providerText = effectivePlanMode === 'plan' ? planOnlyPrompt(originalText) : originalText;
+  const planTurnOptions = effectivePlanMode === 'plan' ? { approvalPolicy:'on-request', sandboxMode:'read-only' } : null;
+  const planId = effectivePlanMode === 'plan' ? await createPlanTask(threadId, originalText, row) : '';
   const ack = (status:string, error?:string) => {
     if (clientMessageId) broadcast(threadId, { type:'messageStatus', clientMessageId, status, error });
   };
   ack('received');
   const turnId = clientMessageId || crypto.randomUUID();
+  if (planId) await db.run('UPDATE plan_tasks SET execution_turn_id=?1 WHERE plan_id=?2', [turnId, planId]).catch(()=>{});
   activeArtifactTurns.set(threadId, turnId);
   if (normalizeProvider(row.provider_id) === 'antigravity') {
-    await sendAntigravityTurn(row, providerText, attachments, turnId, clientMessageId, planMode, originalText);
+    await sendAntigravityTurn(row, providerText, attachments, turnId, clientMessageId, effectivePlanMode, originalText);
     ack('accepted');
     return;
   }
@@ -4238,18 +4251,18 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     const dto:any = await getActiveGeminiProfile();
     if (!dto?.id || dto.status !== 'authenticated' || !dto.login?.ok) throw new Error('请先登录 Gemini');
     const input = await buildTurnInput(threadId, providerText, attachments);
-    const userMessage = { type:'user', clientMessageId, status:'persisted', text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+    const userMessage = { type:'user', clientMessageId, status:'persisted', planMode:effectivePlanMode, text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
-    if (planMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
+    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
     else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     ack('persisted');
     try {
-      await runtime.startTurn(threadId, { input, text:providerText, planMode, originalText, accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:row.approval_policy, sandboxMode:row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       ack('accepted');
     } catch (e:any) {
       const message = e?.message || String(e);
@@ -4264,21 +4277,21 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   if (normalizeProvider(row.provider_id) === 'claude') {
     const dto:any = await activeClaudeProfileSummary();
     if (!dto?.id) throw new Error('请先配置 Claude Code profile');
-    const input = planMode === 'plan'
+    const input = effectivePlanMode === 'plan'
       ? await buildClaudeTurnInput(threadId, providerText, attachments)
       : await buildClaudeTurnInput(threadId, text, attachments);
-    const userMessage = { type:'user', clientMessageId, status:'persisted', text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+    const userMessage = { type:'user', clientMessageId, status:'persisted', planMode:effectivePlanMode, text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
-    if (planMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
+    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
     else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     ack('persisted');
     try {
-      await runtime.startTurn(threadId, { input, text:providerText, planMode, originalText, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:row.approval_policy, sandboxMode:row.sandbox_mode, permissionMode:sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, permissionMode:effectivePlanMode === 'plan' ? 'plan' : sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       ack('accepted');
     } catch (e:any) {
       const message = e?.message || String(e);
@@ -4300,7 +4313,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const activeProfile:any = continuePreflight.profile;
   const execution = codexExecutionContext(activeProfile);
   const executionSnapshotJson = JSON.stringify(execution.accountSnapshot || null);
-  const userMessage = { type:'user', clientMessageId, status:'persisted', text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+  const userMessage = { type:'user', clientMessageId, status:'persisted', planMode:effectivePlanMode, text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
   if (USE_AGENT_RUNTIME) {
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
@@ -4309,8 +4322,8 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
       await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]);
       broadcast(threadId,{type:'sessionTitle', title});
     }
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(async () => {
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]);
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(async () => {
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]);
     });
     await db.run(
       'UPDATE sessions SET selected_profile_id=?1,executing_profile_id=?1,last_execution_account_id=?1,account_snapshot_json=?2,updated_at=?3 WHERE codex_thread_id=?4 OR id=?4',
@@ -4334,8 +4347,8 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
         codexHome:execution.runtime.codexHome,
         account:execution.accountSnapshot,
       }, 'codex sendTurn execution profile selected');
-      await runtime.startTurn(threadId, { input, text:providerText, planMode, originalText, accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:opts.approvalPolicy, sandboxMode:opts.sandboxMode, model:opts.model });
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[planMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || opts.approvalPolicy, sandboxMode:planTurnOptions?.sandboxMode || opts.sandboxMode, model:opts.model });
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       ack('accepted');
     } catch(e:any) {
       const message = e?.message || String(e);
@@ -4356,7 +4369,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   }
   await db.run(
     'UPDATE sessions SET status=?1,selected_profile_id=?2,executing_profile_id=?2,last_execution_account_id=?2,account_snapshot_json=?3,updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',
-    [planMode === 'plan' ? 'planning' : 'running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
+    [effectivePlanMode === 'plan' ? 'planning' : 'running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
   );
   activeCodexSessions.add(threadId);
   await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
@@ -4364,7 +4377,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   broadcast(threadId, userMessage);
   ack('persisted');
   try {
-    await codex.startTurn(threadId, input, String(row.project_dir), opts);
+    await codex.startTurn(threadId, input, String(row.project_dir), planTurnOptions ? { ...opts, ...planTurnOptions } : opts);
     ack('accepted');
   } catch(e:any) {
     activeCodexSessions.delete(threadId);
@@ -4391,7 +4404,7 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [],
   if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[title, now, threadId]); broadcast(threadId,{type:'sessionTitle', title}); }
   await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[planMode === 'plan' ? 'planning' : 'running', now, threadId]);
   await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
-  broadcast(threadId,{type:'user', text:String(originalText || message), attachments:attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))});
+  broadcast(threadId,{type:'user', planMode, text:String(originalText || message), attachments:attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))});
   broadcast(threadId,{type:'codex', method:'turn/started', params:{}});
   const assistantId = stableAntigravityAssistantId(threadId, turnId);
   const model = cleanAgentModel(row.model);
@@ -4405,8 +4418,8 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [],
       persistAssistant:(id, value)=>persistAntigravityAssistant(id, threadId, value),
       updateSession:async status=>{
         if (planMode === 'plan' && status === 'idle') {
-          const req = await createPlanReviewRequest(threadId, 'antigravity', turnId, output, { originalText:String(originalText || '') });
-          broadcast(threadId, { type:'interactive_request', request:req });
+          await completePlanTask(threadId, output, assistantId, []);
+          await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
           return;
         }
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[status, Date.now(), threadId]);
@@ -4476,7 +4489,7 @@ async function findCanonicalUserForRuntimeEvent(threadId:string, payload:any, te
     );
     if (byClient) return byClient;
   }
-  const cleanText = stripInternalAttachmentPrompt(String(text || '')).trim();
+  const cleanText = stripProviderOnlyText(stripInternalAttachmentPrompt(String(text || ''))).trim();
   if (!cleanText) return null;
   return db.get(
     `SELECT * FROM agent_messages
@@ -4736,7 +4749,8 @@ async function runtimeEventMessages(threadId:string, event:any) {
       const anchorItemId = read?.thread ? latestAgentItemIdFromThread(read.thread) : null;
       const found = msg.method === 'turn/completed' && row ? await scanArtifactsForTurn(threadId, String(row.project_dir), artifactTurnId, anchorItemId) : [];
       const wasPlanning = String(row?.status || '') === 'planning';
-      const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? (wasPlanning ? 'waiting_plan_approval' : 'idle') : 'interrupted';
+      const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? 'idle' : 'interrupted';
+      if (wasPlanning && msg.method === 'turn/completed' && !turnFailed(msg.params?.turn)) await completePlanTask(threadId, '', '', found);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
       if (found.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }, ...base });
       maybeExitAfterDrain();
@@ -4746,8 +4760,8 @@ async function runtimeEventMessages(threadId:string, event:any) {
       activeTurns.delete(threadId);
       const row = await findSession(threadId);
       if (String(row?.status || '') === 'planning') {
-        const req = await createPlanReviewRequest(threadId, String(row?.provider_id || 'codex'), activeTurns.get(threadId) || '', String(msg.params.item.text || ''), { originalText:String(msg.params.item.originalText || '') });
-        out.push({ type:'interactive_request', request:req, ...base });
+        await completePlanTask(threadId, String(msg.params.item.text || ''), String(msg.params.item.id || ''), []);
+        await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),threadId]);
       } else {
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),threadId]);
       }
@@ -4809,17 +4823,66 @@ function approvalResponse(method:string, decision:'accept'|'decline' = 'accept')
   if (method.includes('fileChange')) return { decision };
   return { decision };
 }
+type PlanModeState = 'none' | 'planning' | 'awaiting_approval' | 'executing' | 'completed' | 'cancelled' | 'failed';
+function parsePlanSubmission(text:string, requestedMode:'direct'|'plan') {
+  const raw = String(text || '').replace(/\r\n/g, '\n');
+  const command = raw.match(/^\s*(?:\/plan|\$plan)\b(?:[ \t]*(?:\n)?([\s\S]*))?$/i);
+  const commandText = command ? String(command[1] || '').trimStart() : raw;
+  return {
+    planMode: (requestedMode === 'plan' || !!command) ? 'plan' as const : 'direct' as const,
+    originalText: command ? commandText : raw,
+  };
+}
 function planOnlyPrompt(text:string) {
-  return ['$plan', '', '先制定计划，不要修改文件，不要执行会改变工作区的命令。', '请给出清晰步骤、预计修改文件、风险点。计划完成后停止，等待用户确认。', '', '用户原始任务：', String(text || '')].join('\n');
+  return [
+    '$plan',
+    '',
+    'AgentDeck Plan Mode is active. Analyze only; do not modify files, run write commands, install dependencies, commit, push, deploy, restart services, or change external state.',
+    'The runtime enforces a read-only sandbox for this turn. If a write action is needed, describe it in the plan instead of attempting it.',
+    '',
+    'Output a complete implementation plan with these sections:',
+    '1. 需求总结',
+    '2. 预计修改文件',
+    '3. 每个文件预计修改内容',
+    '4. 不会修改的范围',
+    '5. 风险点',
+    '6. 测试方案',
+    '7. 分阶段提交建议',
+    '8. 回滚方案',
+    '',
+    '用户原始任务：',
+    String(text || ''),
+  ].join('\n');
 }
-function planApprovalPrompt(plan:string, original:string) {
-  return ['用户已批准以下计划，请开始执行。不要重新询问是否执行。', '', '已批准的计划：', plan, '', '用户原始任务：', original].join('\n');
+async function createPlanTask(sessionId:string, originalUserTask:string, row:any) {
+  const planId = `plan-${crypto.randomUUID()}`;
+  const now = Date.now();
+  await db.run(
+    `INSERT INTO plan_tasks (plan_id,session_id,original_user_task,status,created_at,provider,model)
+     VALUES (?1,?2,?3,'planning',?4,?5,?6)`,
+    [planId, sessionId, originalUserTask, now, normalizeProvider(row?.provider_id) || 'codex', cleanAgentModel(row?.model) || null]
+  ).catch(()=>{});
+  return planId;
 }
-function planRevisionPrompt(plan:string, original:string, revision:string) {
-  return ['请按以下修改意见调整并执行计划。不要停留在再次确认，除非修改意见本身要求重新确认。', '', '修改意见：', revision, '', '原计划：', plan, '', '用户原始任务：', original].join('\n');
+async function completePlanTask(sessionId:string, planText:string, assistantMessageId:string, changedFiles:any[] = []) {
+  const row = await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='planning' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
+  if (!row) return;
+  const changed = changedFiles.map((file:any)=>String(file?.relativePath || file?.name || file?.path || '')).filter(Boolean);
+  const violation = changed.length ? 'Plan mode produced workspace changes during a read-only turn.' : null;
+  await db.run(
+    `UPDATE plan_tasks
+     SET status='completed', approved_plan_text=COALESCE(NULLIF(?1,''), approved_plan_text), plan_assistant_message_id=COALESCE(NULLIF(?2,''), plan_assistant_message_id), executed_at=?3, changed_files_json=?4, diff_summary=?5, policy_violation=?6
+     WHERE plan_id=?7`,
+    [planText, assistantMessageId, Date.now(), JSON.stringify(changed), changed.length ? changed.join('\n') : null, violation, row.plan_id]
+  ).catch(()=>{});
 }
-function planRegeneratePrompt(original:string, revision:string) {
-  return ['$plan', '', '请根据以下修改意见重新生成计划，不要修改文件，不要执行会改变工作区的命令。计划完成后停止，等待用户确认。', revision ? `\n修改意见：\n${revision}\n` : '', '用户原始任务：', original].join('\n');
+async function recordPlanPolicyViolation(sessionId:string, message:string) {
+  await db.run(
+    `UPDATE plan_tasks
+     SET policy_violation=COALESCE(policy_violation || char(10), '') || ?1
+     WHERE plan_id=(SELECT plan_id FROM plan_tasks WHERE session_id=?2 AND status='planning' ORDER BY created_at DESC LIMIT 1)`,
+    [message, sessionId]
+  ).catch(()=>{});
 }
 function interactiveRequestDto(row:any) {
   let options:any[] = [];
@@ -4833,21 +4896,6 @@ function interactiveRequestDto(row:any) {
 async function listInteractiveRequests(sessionId:string, status = 'pending') {
   const rows = await db.all('SELECT * FROM interactive_requests WHERE session_id=?1 AND status=?2 ORDER BY created_at ASC', [sessionId, status]).catch(()=>[]);
   return rows.map(interactiveRequestDto);
-}
-async function createPlanReviewRequest(sessionId:string, providerId:string, turnId:string, body:string, metadata:Record<string, any>) {
-  const existing = await db.get("SELECT * FROM interactive_requests WHERE session_id=?1 AND kind='plan_review' AND status='pending' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
-  if (existing) return interactiveRequestDto(existing);
-  if (!metadata?.originalText) {
-    const lastUser = await db.get("SELECT original_text,text FROM agent_messages WHERE session_id=?1 AND role='user' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
-    metadata = { ...(metadata || {}), originalText:String(lastUser?.original_text || lastUser?.text || '') };
-  }
-  const requestId = `plan-${crypto.randomUUID()}`;
-  const options = [{ id:'approve', label:'批准并执行', variant:'primary' }, { id:'revise', label:'修改后执行', description:'附带修改意见后继续执行' }, { id:'regenerate', label:'重新生成计划' }, { id:'cancel', label:'取消', variant:'danger' }];
-  const now = Date.now();
-  await db.run(`INSERT INTO interactive_requests (request_id,session_id,turn_id,provider_id,kind,title,body,options_json,allow_free_text,default_option_id,status,metadata_json,created_at) VALUES (?1,?2,?3,?4,'plan_review','计划确认',?5,?6,1,'approve','pending',?7,?8)`, [requestId, sessionId, turnId || '', normalizeProvider(providerId) || 'codex', body, JSON.stringify(options), JSON.stringify(metadata || {}), now]);
-  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['waiting_plan_approval', now, sessionId]).catch(()=>{});
-  const row = await db.get('SELECT * FROM interactive_requests WHERE request_id=?1', [requestId]);
-  return interactiveRequestDto(row);
 }
 async function deleteRollout(filePath:string){ const sessionsRoot = realpathSync(path.join(codex.getCodexHome(),'sessions')); if (!existsSync(filePath)) return; const rp = realpathSync(filePath); if (rp === sessionsRoot || !rp.startsWith(sessionsRoot + path.sep)) throw new Error('refusing to delete outside Codex sessions'); await execFileAsync('rm', ['-f', rp]); }
 function sessionIdentitySet(...rows:any[]) {
@@ -5088,7 +5136,8 @@ function sanitizeThreadForMobile(thread:any){
   for (const turn of thread?.turns || []) {
     for (const item of turn.items || []) {
       if (item?.type === 'userMessage') {
-        item.content = (item.content || []).filter((c:any) => !(c.type === 'text' && (String(c.text || '').includes(MOBILE_CONTEXT_MARKER) || String(c.text || '').includes(RECOVERY_CONTEXT_MARKER))));
+        item.content = (item.content || []).map((c:any) => c?.type === 'text' ? { ...c, text:stripProviderOnlyText(stripInternalAttachmentPrompt(String(c.text || ''))) } : c)
+          .filter((c:any) => !(c.type === 'text' && (String(c.text || '').includes(MOBILE_CONTEXT_MARKER) || String(c.text || '').includes(RECOVERY_CONTEXT_MARKER))));
       }
     }
     turn.items = (turn.items || []).filter((item:any) => {
