@@ -517,12 +517,30 @@ function Markdown({text}:{text:string}){ const blocks=parseMarkdown(text); retur
 function parseMarkdown(text:string){ const lines=text.split('\n'); const blocks:any[]=[]; const listRe=/^\s*(?:[-*]|\d+[.)])\s+/; for(let i=0;i<lines.length;i++){ const line=lines[i]; if(line.startsWith('```')){ const lang=line.slice(3).trim(); const code:string[]=[]; i++; while(i<lines.length&&!lines[i].startsWith('```')) code.push(lines[i++]); blocks.push({type:'code',lang,text:code.join('\n')}); } else if(listRe.test(line)){ const items=[line.replace(listRe,'')]; while(i+1<lines.length&&listRe.test(lines[i+1])) items.push(lines[++i].replace(listRe,'')); blocks.push({type:'list',items}); } else if(line.includes('|')&&i+1<lines.length&&/^\s*\|?[-:| ]+\|?\s*$/.test(lines[i+1])){ const rows=[line,lines[++i]]; while(i+1<lines.length&&lines[i+1].includes('|')) rows.push(lines[++i]); blocks.push({type:'table',rows}); } else if(line.startsWith('>')) blocks.push({type:'quote',text:line.replace(/^>\s?/, '')}); else if(/^#{1,4}\s+/.test(line)) blocks.push({type:'heading',text:line.replace(/^#{1,4}\s+/, '')}); else if(line.trim()) blocks.push({type:'p',text:line}); } return blocks; }
 function CodeBlock({code,lang}:{code:string;lang:string}){ const toast=useToast(); return <div className="codeBlock"><div><span>{lang||'code'}</span><CopyButton text={code} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制代码':'复制失败')}/></div><pre><code>{code}</code></pre></div>; }
 function TableBlock({rows}:{rows:string[]}){ const parsed=rows.filter((_,i)=>i!==1).map(r=>r.split('|').map(c=>c.trim()).filter(Boolean)); return <div className="tableWrap"><table><tbody>{parsed.map((r,i)=><tr key={i}>{r.map((c,j)=>i?<td key={j}>{c}</td>:<th key={j}>{c}</th>)}</tr>)}</tbody></table></div>; }
-function renderInlineMarkdown(line:string){ const parts=line.split(/(`[^`]+`|\*\*[^*]+\*\*|!\[[^\]]*\]\([^)]+\)|(?<!!)\[[^\]]+\]\([^)]+\))/g); return parts.map((p,i)=>{ const img=p.match(/^!\[([^\]]*)\]\(([^)]+)\)$/); if(img) return <img className="inlineImage" key={i} alt={img[1]} src={img[2]}/>; const link=p.match(/^\[([^\]]+)\]\(([^)]+)\)$/); if(link) return <a key={i} href={link[2]} target="_blank" rel="noreferrer" download={isDownloadUrl(link[2])?fileNameFromUrl(link[2]):undefined}>{link[1]}</a>; if(/^`[^`]+`$/.test(p)) return <code key={i}>{p.slice(1,-1)}</code>; if(/^\*\*[^*]+\*\*$/.test(p)) return <strong key={i}>{p.slice(2,-2)}</strong>; return <React.Fragment key={i}>{p}</React.Fragment>; }); }
-function extractMarkdownImages(text:string):Attachment[]{ return [...text.matchAll(/!\[([^\]]*)\]\((https?:\/\/[^)]+|\/[^)]+)\)/g)].map((m,i)=>({id:m[2]+i,name:m[1]||'image',type:'image',size:0,url:m[2]})); }
+type SafeUrlKind = 'link' | 'image';
+function safeUrl(url:string, kind:SafeUrlKind):string{
+  const raw = String(url || '').trim();
+  if(!raw || /^(?:javascript|data|file|blob):/i.test(raw)) return '';
+  if(raw.startsWith('/api/')) return raw;
+  try {
+    const parsed = new URL(raw, location.origin);
+    if(parsed.protocol === 'http:' || parsed.protocol === 'https:'){
+      if(parsed.origin === location.origin) return parsed.pathname + parsed.search + parsed.hash;
+      return parsed.href;
+    }
+    if(parsed.origin === location.origin && !/^[a-z][a-z0-9+.-]*:/i.test(raw)) return parsed.pathname + parsed.search + parsed.hash;
+  } catch {
+    if(!/^[a-z][a-z0-9+.-]*:/i.test(raw) && !/[\s<>"']/.test(raw)) return raw;
+  }
+  void kind;
+  return '';
+}
+function renderInlineMarkdown(line:string){ const parts=line.split(/(`[^`]+`|\*\*[^*]+\*\*|!\[[^\]]*\]\([^)]+\)|(?<!!)\[[^\]]+\]\([^)]+\))/g); return parts.map((p,i)=>{ const img=p.match(/^!\[([^\]]*)\]\(([^)]+)\)$/); if(img){ const src=safeUrl(img[2], 'image'); return src ? <img className="inlineImage" key={i} alt={img[1]} src={src}/> : <React.Fragment key={i}>{img[1] || 'image'}</React.Fragment>; } const link=p.match(/^\[([^\]]+)\]\(([^)]+)\)$/); if(link){ const href=safeUrl(link[2], 'link'); return href ? <a key={i} href={href} target="_blank" rel="noopener noreferrer" download={isDownloadUrl(href)?fileNameFromUrl(href):undefined}>{link[1]}</a> : <React.Fragment key={i}>{link[1]}</React.Fragment>; } if(/^`[^`]+`$/.test(p)) return <code key={i}>{p.slice(1,-1)}</code>; if(/^\*\*[^*]+\*\*$/.test(p)) return <strong key={i}>{p.slice(2,-2)}</strong>; return <React.Fragment key={i}>{p}</React.Fragment>; }); }
+function extractMarkdownImages(text:string):Attachment[]{ return [...text.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g)].map((m,i)=>{ const url=safeUrl(m[2], 'image'); return url ? {id:url+i,name:m[1]||'image',type:'image',size:0,url} : null; }).filter((x):x is Attachment=>!!x); }
 function extractFileLinks(text:string):Attachment[]{
   const links = new Map<string,string>();
-  for (const m of text.matchAll(/(?<!!)\[([^\]]+)\]\((https?:\/\/[^)]+|\/[^)]+)\)/g)) if(isDownloadUrl(m[2])) links.set(m[2], m[1]);
-  for (const m of text.matchAll(/(^|\s)((?:https?:\/\/[^\s)]+|\/[^\s)]+)\.(?:conf|zip|txt|log|patch|diff|json|csv|tar\.gz))(?:\s|$)/g)) if(isDownloadUrl(m[2])) links.set(m[2], fileNameFromUrl(m[2]));
+  for (const m of text.matchAll(/(?<!!)\[([^\]]+)\]\(([^)]+)\)/g)) { const url=safeUrl(m[2], 'link'); if(url&&isDownloadUrl(url)) links.set(url, m[1]); }
+  for (const m of text.matchAll(/(^|\s)((?:https?:\/\/[^\s)]+|\/[^\s)]+)\.(?:conf|zip|txt|log|patch|diff|json|csv|tar\.gz))(?:\s|$)/g)) { const url=safeUrl(m[2], 'link'); if(url&&isDownloadUrl(url)) links.set(url, fileNameFromUrl(url)); }
   return [...links].map(([url,label],i)=>({id:url+i,name:fileNameFromUrl(url) || label || 'download',type:fileTypeFromUrl(url),size:0,url}));
 }
 function ImageGrid({images,onOpen}:{images:Attachment[];onOpen:(a:Attachment)=>void}){ if(!images.length)return null; return <div className="imageGrid">{images.map(img=><button className="thumb" key={img.id} onClick={()=>onOpen(img)}><img src={img.previewUrl||img.url} alt={img.name}/></button>)}</div>; }
