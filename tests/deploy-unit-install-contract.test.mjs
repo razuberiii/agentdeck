@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 
 const ctl = readFileSync(new URL('../scripts/agentdeckctl', import.meta.url), 'utf8');
 const installUnits = readFileSync(new URL('../deploy/install-units.sh', import.meta.url), 'utf8');
+const repoRoot = new URL('..', import.meta.url).pathname;
 
 function block(start, end) {
   const from = ctl.indexOf(start);
@@ -51,5 +55,99 @@ test('install-units writes only changed files and reloads systemd only for unit 
   assert.match(installUnits, /cmp -s "\$source" "\$target"/);
   assert.match(installUnits, /unchanged \$target/);
   assert.match(installUnits, /if \[ "\$changed" = "1" \]; then\s+sudo systemctl daemon-reload/s);
-  assert.match(installUnits, /install_if_changed 0755 "\$ROOT\/scripts\/agentdeckctl" \/usr\/local\/bin\/agentdeckctl/);
+  assert.match(installUnits, /install_if_changed 0755 "\$ROOT\/scripts\/agentdeckctl" "\$BIN_DIR\/agentdeckctl"/);
+});
+
+function runInstallUnits(env = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'agentdeck-units-'));
+  const fakeBin = join(dir, 'bin');
+  const systemdDir = join(dir, 'systemd');
+  const envDir = join(dir, 'env');
+  const dataDir = join(dir, 'data');
+  const outBin = join(dir, 'usr-local-bin');
+  mkdirSync(fakeBin, { recursive: true });
+  mkdirSync(systemdDir, { recursive: true });
+  mkdirSync(envDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(outBin, { recursive: true });
+  writeFileSync(join(fakeBin, 'sudo'), `#!/usr/bin/env bash
+if [ "$1" = "install" ] && [ "$2" = "-d" ] && [ "$5" = "/run/agentdeck" ]; then
+  exit 0
+fi
+exec "$@"
+`);
+  writeFileSync(join(fakeBin, 'systemctl'), '#!/usr/bin/env bash\nexit 0\n');
+  writeFileSync(join(fakeBin, 'getent'), `#!/usr/bin/env bash
+if [ "$1" = "passwd" ]; then
+  echo "$2:x:1000:1000::/home/$2:/bin/bash"
+  exit 0
+fi
+if [ "$1" = "group" ]; then
+  echo "$2:x:1000:"
+  exit 0
+fi
+exit 2
+`);
+  chmodSync(join(fakeBin, 'sudo'), 0o755);
+  chmodSync(join(fakeBin, 'systemctl'), 0o755);
+  chmodSync(join(fakeBin, 'getent'), 0o755);
+  execFileSync('bash', [join(repoRoot, 'deploy/install-units.sh')], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      ROOT: repoRoot,
+      LOG: join(dir, 'install.log'),
+      AGENTDECK_SYSTEMD_DIR: systemdDir,
+      AGENTDECK_BIN_DIR: outBin,
+      AGENTDECK_ENV_DIR: envDir,
+      AGENTDECK_DATA_DIR: dataDir,
+      ...env,
+    },
+    stdio: 'pipe',
+  });
+  return { dir, systemdDir, envDir, dataDir };
+}
+
+test('install-units renders default ubuntu user and paths into final units', () => {
+  const rendered = runInstallUnits();
+  try {
+    const web = readFileSync(join(rendered.systemdDir, 'agentdeck-web.service'), 'utf8');
+    const runtime = readFileSync(join(rendered.systemdDir, 'agentdeck-runtime.service'), 'utf8');
+    const appServer = readFileSync(join(rendered.systemdDir, 'agentdeck-app-server@.service'), 'utf8');
+    for (const unit of [web, runtime, appServer]) {
+      assert.match(unit, /^User=ubuntu$/m);
+      assert.match(unit, /^Group=ubuntu$/m);
+      assert.match(unit, /^Environment=HOME=\/home\/ubuntu$/m);
+      assert.match(unit, new RegExp(`^EnvironmentFile=${rendered.envDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`, 'm'));
+      assert.doesNotMatch(unit, /@AGENTDECK_/);
+    }
+    assert.match(web, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current$/m);
+    assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
+  } finally {
+    rmSync(rendered.dir, { recursive: true, force: true });
+  }
+});
+
+test('install-units renders custom run user group and home into final units', () => {
+  const rendered = runInstallUnits({
+    AGENTDECK_RUN_USER: 'agentdeck',
+    AGENTDECK_RUN_GROUP: 'agentdeck',
+    AGENTDECK_HOME: '/var/lib/agentdeck',
+  });
+  try {
+    const web = readFileSync(join(rendered.systemdDir, 'agentdeck-web.service'), 'utf8');
+    const runtime = readFileSync(join(rendered.systemdDir, 'agentdeck-runtime.service'), 'utf8');
+    const appServer = readFileSync(join(rendered.systemdDir, 'agentdeck-app-server@.service'), 'utf8');
+    for (const unit of [web, runtime, appServer]) {
+      assert.match(unit, /^User=agentdeck$/m);
+      assert.match(unit, /^Group=agentdeck$/m);
+      assert.match(unit, /^Environment=HOME=\/var\/lib\/agentdeck$/m);
+      assert.doesNotMatch(unit, /\/home\/ubuntu/);
+      assert.doesNotMatch(unit, /@AGENTDECK_/);
+    }
+    assert.match(web, /\/var\/lib\/agentdeck\/\.local\/bin/);
+  } finally {
+    rmSync(rendered.dir, { recursive: true, force: true });
+  }
 });

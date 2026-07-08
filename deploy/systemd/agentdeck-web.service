@@ -7,23 +7,23 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/opt/stacks/agentdeck/current
-Environment=HOME=/home/ubuntu
-Environment=DATA_DIR=/opt/data/agentdeck
-Environment=PATH=/opt/data/agentdeck/provider-tools/bin:/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
-Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/data/agentdeck/cache/ms-playwright
+User=@AGENTDECK_RUN_USER@
+Group=@AGENTDECK_RUN_GROUP@
+WorkingDirectory=@AGENTDECK_CURRENT_DIR@
+Environment=HOME=@AGENTDECK_HOME@
+Environment=DATA_DIR=@AGENTDECK_DATA_DIR@
+Environment=PATH=@AGENTDECK_DATA_DIR@/provider-tools/bin:/usr/local/bin:/usr/bin:/bin:@AGENTDECK_HOME@/.local/bin
+Environment=PLAYWRIGHT_BROWSERS_PATH=@AGENTDECK_DATA_DIR@/cache/ms-playwright
 Environment=USE_AGENT_RUNTIME=1
 Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
 EnvironmentFile=@AGENTDECK_ENV_DIR@/web.env
-ExecStart=/usr/bin/node /opt/stacks/agentdeck/current/server/dist/index.js
+ExecStart=/usr/bin/node @AGENTDECK_CURRENT_DIR@/server/dist/index.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/data/agentdeck /opt/stacks/agentdeck /tmp /run
+ReadWritePaths=@AGENTDECK_DATA_DIR@ @AGENTDECK_CURRENT_DIR@ /tmp /run
 
 [Install]
 WantedBy=multi-user.target

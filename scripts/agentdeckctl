@@ -4,7 +4,7 @@ set -euo pipefail
 CONTROL_ROOT="${AGENTDECK_ROOT:-/opt/stacks/agentdeck}"
 SOURCE_ROOT="${AGENTDECK_SOURCE_ROOT:-$CONTROL_ROOT}"
 DATA_DIR="${DATA_DIR:-/opt/data/agentdeck}"
-ENV_DIR="${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}"
+ENV_DIR="${AGENTDECK_ENV_DIR:-${ENV_DIR:-/etc/agentdeck}}"
 STATE_DIR="${AGENTDECK_DEPLOY_STATE_DIR:-$CONTROL_ROOT/deploy-state}"
 RELEASES_DIR="$CONTROL_ROOT/releases"
 CURRENT_LINK="$CONTROL_ROOT/current"
@@ -323,7 +323,19 @@ run_check() {
 
 render_unit_template() {
   local root="$1" unit="$2" out="$3"
-  sed "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" "$root/deploy/systemd/$unit" > "$out"
+  local run_user run_group home current_dir
+  run_user="${AGENTDECK_RUN_USER:-ubuntu}"
+  run_group="${AGENTDECK_RUN_GROUP:-$run_user}"
+  home="${AGENTDECK_HOME:-/home/ubuntu}"
+  current_dir="${AGENTDECK_CURRENT_DIR:-$CURRENT_LINK}"
+  sed \
+    -e "s#@AGENTDECK_RUN_USER@#$run_user#g" \
+    -e "s#@AGENTDECK_RUN_GROUP@#$run_group#g" \
+    -e "s#@AGENTDECK_HOME@#$home#g" \
+    -e "s#@AGENTDECK_DATA_DIR@#$DATA_DIR#g" \
+    -e "s#@AGENTDECK_CURRENT_DIR@#$current_dir#g" \
+    -e "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" \
+    "$root/deploy/systemd/$unit" > "$out"
 }
 
 check_systemd_units() {

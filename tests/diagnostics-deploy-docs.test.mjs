@@ -43,9 +43,9 @@ test('agentdeckctl status exposes release commit and source metadata', () => {
 });
 
 test('deploy preserves the external production env dir and does not remount /etc', () => {
-  assert.match(ctlSource, /ENV_DIR="\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}"/);
+  assert.match(ctlSource, /ENV_DIR="\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\/etc\/agentdeck\}\}"/);
   assert.match(ctlSource, /\[ -d "\$ENV_DIR" \]/);
-  assert.match(installUnitsSource, /ENV_DIR=\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\$DATA_DIR\}\}/);
+  assert.match(installUnitsSource, /ENV_DIR=\$\{AGENTDECK_ENV_DIR:-\$\{ENV_DIR:-\/etc\/agentdeck\}\}/);
   assert.match(cutoverSource, /env dir is not writable before cutover/);
   assert.doesNotMatch(installUnitsSource, /mount -o remount/);
   assert.doesNotMatch(cutoverSource, /mount -o remount/);

@@ -24,13 +24,14 @@ test('Codex app-server start failures expose the required structured invalid-use
 
 test('systemd restart policy is bounded for runtime and app-server units', () => {
   for (const unit of [appServerUnit, runtimeUnit]) {
-    assert.match(unit, /^User=ubuntu$/m);
-    assert.match(unit, /^Group=ubuntu$/m);
+    assert.match(unit, /^User=@AGENTDECK_RUN_USER@$/m);
+    assert.match(unit, /^Group=@AGENTDECK_RUN_GROUP@$/m);
     assert.match(unit, /^Restart=on-failure$/m);
     assert.match(unit, /^RestartSec=5$/m);
     assert.match(unit, /^StartLimitIntervalSec=60$/m);
     assert.match(unit, /^StartLimitBurst=3$/m);
     assert.doesNotMatch(unit, /^Restart=always$/m);
+    assert.doesNotMatch(unit, /^User=ubuntu$/m);
     assert.doesNotMatch(unit, /^User=agentdeck$/m);
   }
 });

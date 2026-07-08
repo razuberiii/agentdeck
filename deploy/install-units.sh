@@ -2,16 +2,24 @@
 set -euo pipefail
 
 ROOT=${ROOT:-/opt/agentdeck}
-DATA_DIR=${DATA_DIR:-/opt/data/agentdeck}
-ENV_DIR=${AGENTDECK_ENV_DIR:-${ENV_DIR:-$DATA_DIR}}
+DATA_DIR=${AGENTDECK_DATA_DIR:-${DATA_DIR:-/opt/data/agentdeck}}
+ENV_DIR=${AGENTDECK_ENV_DIR:-${ENV_DIR:-/etc/agentdeck}}
 RUN_USER=${AGENTDECK_RUN_USER:-ubuntu}
 RUN_GROUP=${AGENTDECK_RUN_GROUP:-$RUN_USER}
-AGENTDECK_HOME=${AGENTDECK_HOME:-/home/$RUN_USER}
+AGENTDECK_HOME=${AGENTDECK_HOME:-/home/ubuntu}
+CURRENT_DIR=${AGENTDECK_CURRENT_DIR:-/opt/stacks/agentdeck/current}
+SYSTEMD_DIR=${AGENTDECK_SYSTEMD_DIR:-/etc/systemd/system}
+BIN_DIR=${AGENTDECK_BIN_DIR:-/usr/local/bin}
 LOG=${LOG:-$ROOT/.tools/install-units.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
 exec >>"$LOG" 2>&1
 
 echo "== install-units $(date -Is) =="
+echo "run_user=$RUN_USER"
+echo "run_group=$RUN_GROUP"
+echo "home=$AGENTDECK_HOME"
+echo "data_dir=$DATA_DIR"
+echo "current_dir=$CURRENT_DIR"
 echo "env_dir=$ENV_DIR"
 sudo install -d -m 0755 /run/agentdeck
 changed=0
@@ -25,6 +33,18 @@ install_if_changed() {
   sudo install -m "$mode" "$source" "$target"
   changed=1
   echo "installed $target"
+}
+
+render_unit_template() {
+  local source="$1" target="$2"
+  sed \
+    -e "s#@AGENTDECK_RUN_USER@#$RUN_USER#g" \
+    -e "s#@AGENTDECK_RUN_GROUP@#$RUN_GROUP#g" \
+    -e "s#@AGENTDECK_HOME@#$AGENTDECK_HOME#g" \
+    -e "s#@AGENTDECK_DATA_DIR@#$DATA_DIR#g" \
+    -e "s#@AGENTDECK_CURRENT_DIR@#$CURRENT_DIR#g" \
+    -e "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" \
+    "$source" > "$target"
 }
 
 if ! getent passwd "$RUN_USER" >/dev/null; then
@@ -48,8 +68,8 @@ fi
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 for unit in agentdeck-web.service agentdeck-runtime.service agentdeck-app-server@.service; do
-  sed "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" "$ROOT/deploy/systemd/$unit" > "$tmpdir/$unit"
-  install_if_changed 0644 "$tmpdir/$unit" "/etc/systemd/system/$unit"
+  render_unit_template "$ROOT/deploy/systemd/$unit" "$tmpdir/$unit"
+  install_if_changed 0644 "$tmpdir/$unit" "$SYSTEMD_DIR/$unit"
 done
 
 if [ ! -f "$ENV_DIR/web.env" ]; then
@@ -78,5 +98,5 @@ if [ "$changed" = "1" ]; then
 else
   echo "systemd units unchanged; skipping daemon-reload"
 fi
-install_if_changed 0755 "$ROOT/scripts/agentdeckctl" /usr/local/bin/agentdeckctl
+install_if_changed 0755 "$ROOT/scripts/agentdeckctl" "$BIN_DIR/agentdeckctl"
 echo "installed units"
