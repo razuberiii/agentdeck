@@ -18,11 +18,20 @@ function block(start, end) {
 }
 
 test('agentdeckctl check validates units without invoking install-units', () => {
-  const runCheck = block('run_check()', 'render_unit_template()');
+  const runCheck = block('run_check()', 'run_doctor()');
   assert.match(runCheck, /check_systemd_units "\$SOURCE_ROOT" fail/);
   assert.match(runCheck, /wait_http "http:\/\/127\.0\.0\.1:\$WEB_PORT\/api\/status"/);
   assert.match(runCheck, /wait_http "http:\/\/127\.0\.0\.1:\$RUNTIME_PORT\/healthz"/);
-  assert.doesNotMatch(runCheck, /install-units\.sh|systemctl daemon-reload|\/etc\/systemd\/system|\/usr\/local\/bin\/agentdeckctl/);
+  assert.doesNotMatch(runCheck, /install-units\.sh|systemctl daemon-reload|\/etc\/systemd\/system|\/usr\/local\/bin\/agentdeckctl|chown|ensure_service_owned_dirs|ensure_playwright_browsers|npm run|npm test/);
+});
+
+test('agentdeckctl doctor is read-only and prints suggested fix commands', () => {
+  assert.match(ctl, /doctor\) run_doctor/);
+  const runDoctor = block('run_doctor()', 'render_unit_template()');
+  assert.match(runDoctor, /run_check/);
+  assert.match(runDoctor, /Suggested next steps:/);
+  assert.match(runDoctor, /sudo agentdeckctl install-units/);
+  assert.doesNotMatch(runDoctor, /systemctl restart|install-units\.sh|chown|useradd/);
 });
 
 test('agentdeckctl deploy all does not install systemd units during cutover', () => {
@@ -41,6 +50,18 @@ test('only explicit install-units commands invoke the unit installer', () => {
   assert.match(ctl, /install-units\|setup-units\) run_install_units/);
   const runInstall = block('run_install_units()', 'make_release()');
   assert.match(runInstall, /\$SOURCE_ROOT\/deploy\/install-units\.sh/);
+  assert.match(runInstall, /Installing\/updating systemd units:/);
+  assert.match(runInstall, /Resolved \$unit:/);
+  assert.match(runInstall, /User\|Group\|WorkingDirectory/);
+  assert.match(runInstall, /ENV_DIR=/);
+});
+
+test('waited runtime deploy refuses active turns instead of self-waiting', () => {
+  const submitJob = block('submit_job()', 'wait_job()');
+  assert.match(submitJob, /refusing --wait deploy to avoid self-wait/);
+  assert.match(submitJob, /active_turn_count_from_json/);
+  assert.match(submitJob, /Run without --wait/);
+  assert.match(submitJob, /--force/);
 });
 
 test('unit drift is reported without blocking normal deploy unless a manifest requires newer units', () => {
