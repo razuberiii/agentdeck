@@ -37,7 +37,9 @@ test('systemd restart policy is bounded for runtime and app-server units', () =>
 });
 
 test('install-units validates configured service user and group before installing units', () => {
-  assert.match(installUnits, /RUN_USER=\$\{AGENTDECK_RUN_USER:-ubuntu\}/);
+  assert.match(installUnits, /RUN_USER="\$AGENTDECK_RUN_USER"/);
+  assert.match(installUnits, /RUN_USER=agentdeck/);
+  assert.match(installUnits, /RUN_USER=ubuntu/);
   assert.match(installUnits, /getent passwd "\$RUN_USER"/);
   assert.match(installUnits, /getent group "\$RUN_GROUP"/);
 });

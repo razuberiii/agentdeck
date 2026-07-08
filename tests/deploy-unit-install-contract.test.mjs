@@ -124,6 +124,8 @@ test('install-units renders default ubuntu user and paths into final units', () 
     }
     assert.match(web, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current$/m);
     assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
+    assert.match(appServer, /approval_policy=\\"never\\"/);
+    assert.match(appServer, /sandbox_mode=\\"danger-full-access\\"/);
   } finally {
     rmSync(rendered.dir, { recursive: true, force: true });
   }
@@ -150,4 +152,44 @@ test('install-units renders custom run user group and home into final units', ()
   } finally {
     rmSync(rendered.dir, { recursive: true, force: true });
   }
+});
+
+test('install-units standard profile renders dedicated user and conservative Codex policy', () => {
+  const rendered = runInstallUnits({
+    AGENTDECK_INSTALL_PROFILE: 'standard',
+  });
+  try {
+    const web = readFileSync(join(rendered.systemdDir, 'agentdeck-web.service'), 'utf8');
+    const appServer = readFileSync(join(rendered.systemdDir, 'agentdeck-app-server@.service'), 'utf8');
+    assert.match(web, /^User=agentdeck$/m);
+    assert.match(web, /^Group=agentdeck$/m);
+    assert.match(web, /^Environment=HOME=\/var\/lib\/agentdeck$/m);
+    assert.match(appServer, /approval_policy=\\"on-request\\"/);
+    assert.match(appServer, /sandbox_mode=\\"workspace-write\\"/);
+    assert.doesNotMatch(appServer, /danger-full-access/);
+  } finally {
+    rmSync(rendered.dir, { recursive: true, force: true });
+  }
+});
+
+test('install-units hardened profile renders read-only Codex policy', () => {
+  const rendered = runInstallUnits({
+    AGENTDECK_INSTALL_PROFILE: 'hardened',
+  });
+  try {
+    const appServer = readFileSync(join(rendered.systemdDir, 'agentdeck-app-server@.service'), 'utf8');
+    assert.match(appServer, /approval_policy=\\"on-request\\"/);
+    assert.match(appServer, /sandbox_mode=\\"read-only\\"/);
+  } finally {
+    rmSync(rendered.dir, { recursive: true, force: true });
+  }
+});
+
+test('setup supports install profiles without adding extra interactive questions', () => {
+  const setup = readFileSync(new URL('../scripts/setup.sh', import.meta.url), 'utf8');
+  assert.match(setup, /AGENTDECK_INSTALL_PROFILE/);
+  assert.match(setup, /Choose AgentDeck install profile \[standard\/personal\]/);
+  assert.match(setup, /detect_existing_personal_unit/);
+  assert.match(setup, /useradd --system --create-home --home-dir "\$RUN_HOME"/);
+  assert.doesNotMatch(setup, /approval_policy.*read -r|sandbox.*read -r|sudoers.*read -r/);
 });

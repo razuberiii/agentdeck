@@ -323,11 +323,26 @@ run_check() {
 
 render_unit_template() {
   local root="$1" unit="$2" out="$3"
-  local run_user run_group home current_dir
+  local run_user run_group home current_dir profile codex_approval_policy codex_sandbox_mode
   run_user="${AGENTDECK_RUN_USER:-ubuntu}"
   run_group="${AGENTDECK_RUN_GROUP:-$run_user}"
   home="${AGENTDECK_HOME:-/home/ubuntu}"
   current_dir="${AGENTDECK_CURRENT_DIR:-$CURRENT_LINK}"
+  profile="${AGENTDECK_INSTALL_PROFILE:-personal}"
+  case "$profile" in
+    standard)
+      codex_approval_policy="${AGENTDECK_CODEX_APPROVAL_POLICY:-on-request}"
+      codex_sandbox_mode="${AGENTDECK_CODEX_SANDBOX_MODE:-workspace-write}"
+      ;;
+    hardened)
+      codex_approval_policy="${AGENTDECK_CODEX_APPROVAL_POLICY:-on-request}"
+      codex_sandbox_mode="${AGENTDECK_CODEX_SANDBOX_MODE:-read-only}"
+      ;;
+    *)
+      codex_approval_policy="${AGENTDECK_CODEX_APPROVAL_POLICY:-never}"
+      codex_sandbox_mode="${AGENTDECK_CODEX_SANDBOX_MODE:-danger-full-access}"
+      ;;
+  esac
   sed \
     -e "s#@AGENTDECK_RUN_USER@#$run_user#g" \
     -e "s#@AGENTDECK_RUN_GROUP@#$run_group#g" \
@@ -335,6 +350,8 @@ render_unit_template() {
     -e "s#@AGENTDECK_DATA_DIR@#$DATA_DIR#g" \
     -e "s#@AGENTDECK_CURRENT_DIR@#$current_dir#g" \
     -e "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" \
+    -e "s#@CODEX_APPROVAL_POLICY@#$codex_approval_policy#g" \
+    -e "s#@CODEX_SANDBOX_MODE@#$codex_sandbox_mode#g" \
     "$root/deploy/systemd/$unit" > "$out"
 }
 
