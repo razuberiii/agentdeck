@@ -61,7 +61,11 @@ const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 const COOKIE_NAME = 'agentdeck_session';
 const CSRF_COOKIE = 'agentdeck_csrf';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3842,http://127.0.0.1:3842').split(',').map(s=>s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS_CONFIGURED = typeof process.env.ALLOWED_ORIGINS === 'string' && process.env.ALLOWED_ORIGINS.trim().length > 0;
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+const WS_MAX_MESSAGE_BYTES = Number(process.env.WS_MAX_MESSAGE_BYTES || 1024 * 1024);
+const WS_MAX_CONNECTIONS_PER_SESSION = Number(process.env.WS_MAX_CONNECTIONS_PER_SESSION || 8);
+const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 32);
 const db = new Db(path.join(DATA_DIR, 'agentdeck.sqlite3'));
 const runtimeDb = new Db(process.env.RUNTIME_DB || path.join(DATA_DIR, 'agentdeck-runtime.sqlite3'));
 const codex = new CodexBridge(DEFAULT_HOME, DEFAULT_CODEX_HOME);
@@ -76,6 +80,10 @@ const claudeProvider = new ClaudeProvider();
 const claudeProfileStore = new ClaudeProfileStore(db, DATA_DIR, process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'));
 const clients = new Map<string, Set<any>>();
 let websocketConnectionGeneration = 0;
+const websocketSessions = new Map<any, Set<string>>();
+const websocketConnectionIps = new Map<any, string>();
+const websocketIpCounts = new Map<string, number>();
+const websocketSessionCounts = new Map<string, number>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
@@ -273,13 +281,55 @@ await app.register(websocket);
 await app.register(multipart, { limits: { fileSize: MAX_ATTACHMENT_BYTES, files: MAX_ATTACHMENTS_PER_MESSAGE } });
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 await app.register(staticPlugin, { root: publicDir, prefix: '/' });
-app.addHook('preHandler', async (req, reply) => { if (['POST','PUT','PATCH','DELETE'].includes(req.method) && !['/api/login'].includes(req.url)) { const csrf = req.cookies[CSRF_COOKIE]; if (!csrf || req.headers['x-csrf-token'] !== csrf) return reply.code(403).send({error:'csrf'}); } });
+function requestOrigin(req:any) {
+  const value = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+  return value || '';
+}
+function sameHostOrigin(origin:string, host:string) {
+  try {
+    const parsed = new URL(origin);
+    return !!host && parsed.host === host && (parsed.protocol === 'http:' || parsed.protocol === 'https:');
+  } catch {
+    return false;
+  }
+}
+function localhostOrigin(origin:string) {
+  try {
+    const host = new URL(origin).hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+function allowedRequestOrigin(req:any) {
+  const origin = requestOrigin(req);
+  const referer = typeof req.headers.referer === 'string' ? req.headers.referer : '';
+  const candidate = origin || referer;
+  if (!candidate) return !ALLOWED_ORIGINS_CONFIGURED;
+  let candidateOrigin = candidate;
+  try { candidateOrigin = new URL(candidate).origin; } catch {}
+  if (ALLOWED_ORIGINS.includes(candidate) || ALLOWED_ORIGINS.includes(candidateOrigin)) return true;
+  if (ALLOWED_ORIGINS_CONFIGURED) return false;
+  const host = typeof req.headers.host === 'string' ? req.headers.host : '';
+  return sameHostOrigin(candidate, host) || localhostOrigin(candidate);
+}
+function validSessionCookie(req:any) {
+  const sid = req.cookies?.[COOKIE_NAME];
+  if (!sid) return false;
+  try { return !!app.unsignCookie(sid).valid; } catch { return false; }
+}
+app.addHook('preHandler', async (req, reply) => {
+  if (!['GET','HEAD'].includes(req.method) && !allowedRequestOrigin(req)) return reply.code(403).send({error:'origin'});
+  if (['POST','PUT','PATCH','DELETE'].includes(req.method) && !['/api/login'].includes(req.url)) {
+    const csrf = req.cookies[CSRF_COOKIE];
+    if (!csrf || req.headers['x-csrf-token'] !== csrf) return reply.code(403).send({error:'csrf'});
+  }
+});
 function secureCookie() { return { httpOnly:true, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 function csrfCookie() { return { httpOnly:false, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
-async function ensureAuth(req:any, reply:any) { const sid = req.cookies[COOKIE_NAME]; if (!sid) return reply.code(401).send({error:'unauthorized'}); try { const decoded = app.unsignCookie(sid); if (!decoded.valid) throw new Error('bad cookie'); } catch { return reply.code(401).send({error:'unauthorized'}); } }
+async function ensureAuth(req:any, reply:any) { if (!validSessionCookie(req)) return reply.code(401).send({error:'unauthorized'}); }
 function isAuthenticated(req:any) {
-  const raw = req.cookies[COOKIE_NAME] || '';
-  return !!raw && !!app.unsignCookie(raw).valid;
+  return validSessionCookie(req);
 }
 app.get('/api/auth/status', async (req) => ({ authenticated: isAuthenticated(req) }));
 app.get('/api/status', async (req) => {
@@ -1492,7 +1542,95 @@ app.get('/icons/:file', async (req:any, reply) => {
   if (!/^[A-Za-z0-9_.-]+$/.test(file)) return reply.code(404).send({error:'not found'});
   return reply.sendFile(`icons/${file}`);
 });
-app.get('/ws', { websocket: true }, async (connection:any, req:any) => { const ws = connection.socket || connection; ws.agentdeckGeneration = ++websocketConnectionGeneration; const origin = req.headers.origin; if (origin && !ALLOWED_ORIGINS.includes(origin)) return ws.close(1008, 'origin'); const sid = req.cookies?.[COOKIE_NAME]; if (!sid || !app.unsignCookie(sid).valid) return ws.close(1008, 'auth'); app.log.info({ connectionGeneration:ws.agentdeckGeneration }, 'websocket connected'); ws.on('message', async (raw:Buffer) => { try { const msg = JSON.parse(raw.toString()); if (msg.type === 'join') await joinAndResume(String(msg.sessionId), ws, Number(msg.lastSequence || 0)); if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct'); if (msg.type === 'sendChunkStart') startChunkedMessage(msg); if (msg.type === 'sendChunk') appendChunkedMessage(msg); if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg); if (msg.type === 'stop') await stopTurn(String(msg.sessionId)); } catch (e:any) { ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable})); } }); ws.on('close', () => { for (const [sessionId,set] of clients.entries()) { if (set.delete(ws)) app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers'); } }); });
+function wsClose(ws:any, code:number, reason:string) {
+  try { ws.close(code, reason); } catch {}
+}
+function incrementMapCount(map:Map<string, number>, key:string) {
+  const next = (map.get(key) || 0) + 1;
+  map.set(key, next);
+  return next;
+}
+function decrementMapCount(map:Map<string, number>, key:string) {
+  const next = Math.max(0, (map.get(key) || 0) - 1);
+  if (next) map.set(key, next); else map.delete(key);
+}
+function validateWsMessage(msg:any) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return false;
+  const type = String(msg.type || '');
+  if (!['join','send','sendChunkStart','sendChunk','sendChunkEnd','stop'].includes(type)) return false;
+  if (!msg.sessionId || typeof msg.sessionId !== 'string') return false;
+  if (type === 'join') return !('lastSequence' in msg) || Number.isFinite(Number(msg.lastSequence));
+  if (type === 'send') return typeof msg.text === 'string' && (!('attachments' in msg) || Array.isArray(msg.attachments));
+  if (type === 'sendChunkStart') return typeof msg.messageId === 'string';
+  if (type === 'sendChunk') return typeof msg.messageId === 'string' && typeof msg.chunk === 'string';
+  if (type === 'sendChunkEnd') return typeof msg.messageId === 'string';
+  return type === 'stop';
+}
+function registerWsSession(ws:any, sessionId:string) {
+  let sessions = websocketSessions.get(ws);
+  if (!sessions) {
+    sessions = new Set<string>();
+    websocketSessions.set(ws, sessions);
+  }
+  if (sessions.has(sessionId)) return true;
+  if ((websocketSessionCounts.get(sessionId) || 0) >= WS_MAX_CONNECTIONS_PER_SESSION) return false;
+  sessions.add(sessionId);
+  incrementMapCount(websocketSessionCounts, sessionId);
+  return true;
+}
+function cleanupWsConnection(ws:any) {
+  const ip = websocketConnectionIps.get(ws);
+  if (ip) {
+    decrementMapCount(websocketIpCounts, ip);
+    websocketConnectionIps.delete(ws);
+  }
+  const sessions = websocketSessions.get(ws);
+  if (sessions) {
+    for (const sessionId of sessions) decrementMapCount(websocketSessionCounts, sessionId);
+    websocketSessions.delete(ws);
+  }
+  for (const [sessionId,set] of clients.entries()) {
+    if (set.delete(ws)) app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers');
+  }
+}
+app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
+  const ws = connection.socket || connection;
+  ws.agentdeckGeneration = ++websocketConnectionGeneration;
+  if (!validSessionCookie(req)) return wsClose(ws, 1008, 'auth');
+  if (!allowedRequestOrigin(req)) return wsClose(ws, 1008, 'origin');
+  const ip = String(req.ip || req.socket?.remoteAddress || 'unknown');
+  if (incrementMapCount(websocketIpCounts, ip) > WS_MAX_CONNECTIONS_PER_IP) {
+    decrementMapCount(websocketIpCounts, ip);
+    return wsClose(ws, 1008, 'too_many_connections');
+  }
+  websocketConnectionIps.set(ws, ip);
+  app.log.info({ connectionGeneration:ws.agentdeckGeneration }, 'websocket connected');
+  ws.on('message', async (raw:Buffer) => {
+    if (Buffer.byteLength(raw) > WS_MAX_MESSAGE_BYTES) return wsClose(ws, 1009, 'message_too_large');
+    let msg:any;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return wsClose(ws, 1003, 'invalid_json');
+    }
+    if (!validateWsMessage(msg)) return wsClose(ws, 1008, 'invalid_message');
+    try {
+      if (msg.type === 'join') {
+        const sessionId = String(msg.sessionId);
+        if (!registerWsSession(ws, sessionId)) return wsClose(ws, 1008, 'too_many_session_connections');
+        await joinAndResume(sessionId, ws, Number(msg.lastSequence || 0));
+      }
+      if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct');
+      if (msg.type === 'sendChunkStart') startChunkedMessage(msg);
+      if (msg.type === 'sendChunk') appendChunkedMessage(msg);
+      if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg);
+      if (msg.type === 'stop') await stopTurn(String(msg.sessionId));
+    } catch (e:any) {
+      if (ws.readyState === 1) ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable}));
+    }
+  });
+  ws.on('close', () => cleanupWsConnection(ws));
+});
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
 codex.on('notification', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id);
