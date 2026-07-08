@@ -36,14 +36,14 @@ test('plan mode is forced through read-only runtime policy', () => {
   assert.match(runtime, /sandboxMode:'read-only'/);
 });
 
-test('mobile UI uses a compact plan mode toggle and removes old primary plan buttons', () => {
+test('mobile UI keeps plan mode out of the composer and removes old primary plan buttons', () => {
   assert.match(client, /sendMode/);
   assert.match(client, /计划模式：描述任务，只生成计划/);
   assert.match(client, /普通模式/);
-  assert.match(client, /modeToggle/);
+  assert.match(client, /发送模式/);
   assert.doesNotMatch(client, /先给计划/);
   assert.doesNotMatch(client, /直接执行/);
   assert.doesNotMatch(client, /PlanCard/);
   assert.doesNotMatch(client, /计划确认/);
-  assert.match(styles, /\.modeToggle/);
+  assert.doesNotMatch(styles, /\.modeToggle/);
 });
