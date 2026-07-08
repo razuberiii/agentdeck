@@ -18,6 +18,7 @@ WEB_CANDIDATE_PORT="${AGENTDECK_WEB_CANDIDATE_PORT:-3942}"
 RUNTIME_PORT="${AGENTDECK_RUNTIME_PORT:-3852}"
 RUNTIME_CANDIDATE_PORT="${AGENTDECK_RUNTIME_CANDIDATE_PORT:-3952}"
 DRAIN_TIMEOUT_SECONDS="${AGENTDECK_DRAIN_TIMEOUT_SECONDS:-7200}"
+DRAIN_LEASE_SECONDS="${AGENTDECK_DRAIN_LEASE_SECONDS:-120}"
 KEEP_RELEASES="${AGENTDECK_KEEP_RELEASES:-5}"
 SYSTEMD_UNIT_VERSION=1
 SERVICE_USER=""
@@ -439,12 +440,31 @@ sqlite_backup() {
     : > "$dest_db"
     return
   fi
-  node - "$source_db" "$dest_db" <<'NODE'
+  if ! node - "$source_db" "$dest_db" <<'NODE'
 const Database = require('better-sqlite3');
 const source = process.argv[2], dest = process.argv[3];
 const db = new Database(source, { readonly:true, fileMustExist:true });
-db.backup(dest).then(() => db.close()).catch(err => { console.error(err.message); process.exit(1); });
+db.pragma('busy_timeout = 1000');
+const timeout = setTimeout(() => {
+  try { db.close(); } catch {}
+  console.error('sqlite backup timed out');
+  process.exit(1);
+}, 30000);
+db.backup(dest).then(() => {
+  clearTimeout(timeout);
+  db.close();
+}).catch(err => {
+  clearTimeout(timeout);
+  try { db.close(); } catch {}
+  console.error(err.message);
+  process.exit(1);
+});
 NODE
+  then
+    log "live sqlite backup failed; candidate runtime will initialize an empty validation database"
+    rm -f "$dest_db" "$dest_db-shm" "$dest_db-wal"
+    : > "$dest_db"
+  fi
 }
 
 start_candidate_runtime() {
@@ -510,7 +530,7 @@ cleanup_releases() {
 }
 
 drain_runtime() {
-  curl -fsS -X POST "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/drain" >/dev/null
+  curl -fsS -X POST -H 'content-type: application/json' --data "{\"ttlMs\":$((DRAIN_LEASE_SECONDS * 1000))}" "http://127.0.0.1:$RUNTIME_PORT/admin/runtime/drain" >/dev/null
 }
 
 undrain_runtime() {
@@ -530,6 +550,7 @@ wait_drain() {
       die "runtime active-turn response was invalid during drain"
     fi
     [ "$count" = "0" ] && return
+    drain_runtime
     if [ $(( $(date +%s) - start )) -ge "$DRAIN_TIMEOUT_SECONDS" ]; then
       if [ "$force" = "1" ]; then
         log "drain timed out; --force allows restart with $count active turn(s)"

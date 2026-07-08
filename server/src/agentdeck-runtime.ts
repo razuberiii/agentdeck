@@ -338,7 +338,9 @@ const diagnostics = {
 type RuntimeLifecycle = 'starting' | 'accepting' | 'draining' | 'stopping';
 let runtimeLifecycle:RuntimeLifecycle = 'starting';
 let drainStartedAt:number | null = null;
+let drainExpiresAt:number | null = null;
 const DRAIN_TIMEOUT_MS = Number(process.env.RUNTIME_DRAIN_TIMEOUT_MS || 10 * 60 * 1000);
+const DRAIN_LEASE_MS = Number(process.env.RUNTIME_DRAIN_LEASE_MS || 2 * 60 * 1000);
 const STALE_RUNNING_MS = Number(process.env.STALE_RUNNING_MS || 30 * 60 * 1000);
 const RUNTIME_GENERATION = INSTANCE_ID;
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
@@ -367,7 +369,7 @@ app.addHook('preHandler', async (req, reply) => {
 
 app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle, mode:RUNTIME_MODE, releaseId:RELEASE_ID, commit:RELEASE_COMMIT }));
 app.get('/admin/runtime/state', async () => runtimeAdminState());
-app.post('/admin/runtime/drain', async () => startRuntimeDrain());
+app.post('/admin/runtime/drain', async (req:any) => startRuntimeDrain(req));
 app.post('/admin/runtime/undrain', async () => cancelRuntimeDrain());
 app.get('/admin/runtime/active-turns', async () => activeTurnDetails());
 app.get('/diagnostics', async () => ({
@@ -390,8 +392,11 @@ app.get('/diagnostics', async () => ({
     p99:eventLoopDelay.percentile(99) / 1e6,
   },
 }));
-app.post('/drain/start', async () => startRuntimeDrain());
-app.get('/drain/status', async () => ({ lifecycle:runtimeLifecycle, drainStartedAt, drainTimeoutMs:DRAIN_TIMEOUT_MS, ...(await drainState()) }));
+app.post('/drain/start', async (req:any) => startRuntimeDrain(req));
+app.get('/drain/status', async () => {
+  expireRuntimeDrain();
+  return { lifecycle:runtimeLifecycle, drainStartedAt, drainExpiresAt, drainTimeoutMs:DRAIN_TIMEOUT_MS, drainLeaseMs:DRAIN_LEASE_MS, ...(await drainState()) };
+});
 app.post('/drain/cancel', async () => cancelRuntimeDrain());
 app.get('/schema', async () => ({ tables: await db.all("SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('accounts','sessions','events','runtime_instances') ORDER BY name") }));
 app.get('/gemini/status', async (req:any) => geminiManager.status(String(req.query?.profileId || 'default')));
@@ -1838,6 +1843,7 @@ function redactRuntimeError(message:string) {
     .replace(/(access_token|refresh_token|id_token|client_secret|authorization code)\s*[:=]\s*[^\s]+/ig, '$1=[redacted]');
 }
 function isDraining() {
+  expireRuntimeDrain();
   return runtimeLifecycle === 'draining' || runtimeLifecycle === 'stopping';
 }
 function isCandidateMode() {
@@ -1864,19 +1870,33 @@ function runtimeUnavailableBody(req:any, code:string) {
     requestId:String(req?.id || ''),
   };
 }
-async function startRuntimeDrain() {
+function expireRuntimeDrain() {
+  if (runtimeLifecycle === 'draining' && drainExpiresAt && Date.now() >= drainExpiresAt) {
+    runtimeLifecycle = 'accepting';
+    app.log.warn({ drainStartedAt, drainExpiresAt }, 'runtime drain lease expired; accepting new turns');
+    drainStartedAt = null;
+    drainExpiresAt = null;
+  }
+}
+async function startRuntimeDrain(req?:any) {
+  expireRuntimeDrain();
   if (runtimeLifecycle === 'stopping') return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+  const requestedTtlMs = Number(req?.body?.ttlMs || req?.body?.leaseMs || 0);
+  const ttlMs = Number.isFinite(requestedTtlMs) && requestedTtlMs > 0 ? Math.min(requestedTtlMs, DRAIN_TIMEOUT_MS) : DRAIN_LEASE_MS;
   runtimeLifecycle = 'draining';
   drainStartedAt = drainStartedAt || Date.now();
-  app.log.info({ lifecycle:runtimeLifecycle, drainStartedAt }, 'runtime draining started');
+  drainExpiresAt = Date.now() + ttlMs;
+  app.log.info({ lifecycle:runtimeLifecycle, drainStartedAt, drainExpiresAt, ttlMs }, 'runtime draining started');
   return { lifecycle:runtimeLifecycle, ...(await drainState()) };
 }
 async function cancelRuntimeDrain() {
   if (runtimeLifecycle === 'draining') runtimeLifecycle = 'accepting';
   drainStartedAt = null;
+  drainExpiresAt = null;
   return { lifecycle:runtimeLifecycle, ...(await drainState()) };
 }
 async function runtimeAdminState() {
+  expireRuntimeDrain();
   const drain = await drainState();
   return {
     mode:RUNTIME_MODE,
@@ -1892,10 +1912,13 @@ async function runtimeAdminState() {
     port:PORT,
     database:DB_FILE,
     drainStartedAt,
+    drainExpiresAt,
     drainTimeoutMs:DRAIN_TIMEOUT_MS,
+    drainLeaseMs:DRAIN_LEASE_MS,
   };
 }
 async function activeTurnDetails() {
+  expireRuntimeDrain();
   const rows = await db.all(
     `SELECT id, provider, provider_id, active_turn_id, status, updated_at, created_at
      FROM sessions
@@ -1915,6 +1938,7 @@ async function activeTurnDetails() {
   };
 }
 async function drainState() {
+  expireRuntimeDrain();
   const row = await db.get(
     `SELECT
        SUM(CASE WHEN status IN ('running','active','planning','waiting_plan_approval','executing_approved_plan') OR active_turn_id IS NOT NULL THEN 1 ELSE 0 END) AS activeTurnCount,

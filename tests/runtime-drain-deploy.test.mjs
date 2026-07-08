@@ -15,6 +15,9 @@ test('runtime exposes lifecycle draining and rejects new work while draining', (
   assert.match(runtime, /app\.post\('\/admin\/runtime\/drain'/);
   assert.match(runtime, /app\.post\('\/admin\/runtime\/undrain'/);
   assert.match(runtime, /app\.get\('\/admin\/runtime\/active-turns'/);
+  assert.match(runtime, /DRAIN_LEASE_MS/);
+  assert.match(runtime, /expireRuntimeDrain/);
+  assert.match(runtime, /drainExpiresAt/);
   assert.match(runtime, /code:'runtime_draining'/);
   assert.match(runtime, /RUNTIME_MODE === 'candidate'/);
   assert.match(runtime, /retryable:true/);
@@ -31,6 +34,9 @@ test('draining waits for active turns, submitting turns, and pending event pushe
   assert.match(runtime, /process\.once\('SIGTERM'/);
   assert.match(ctl, /active_turn_count_from_json/);
   assert.match(ctl, /runtime active-turn query failed during drain/);
+  assert.match(ctl, /DRAIN_LEASE_SECONDS/);
+  assert.match(ctl, /ttlMs/);
+  assert.match(ctl, /DRAIN_LEASE_SECONDS \* 1000/);
   assert.match(ctl, /refusing unsafe restart/);
   assert.doesNotMatch(ctl, /active-turns" 2>\/dev\/null \|\| echo '\{"activeTurnCount":0/);
 });
@@ -46,6 +52,12 @@ test('deploy supports component scoped web runtime provider and changed modes', 
   assert.match(ctl, /drain_runtime/);
   assert.match(ctl, /wait_drain/);
   assert.match(ctl, /worker_rollback\(\)/);
+});
+
+test('candidate runtime sqlite backup is bounded and falls back for validation', () => {
+  assert.match(ctl, /sqlite backup timed out/);
+  assert.match(ctl, /live sqlite backup failed; candidate runtime will initialize an empty validation database/);
+  assert.match(ctl, /rm -f "\$dest_db" "\$dest_db-shm" "\$dest_db-wal"/);
 });
 
 test('web-only deploy does not restart runtime or providers', () => {
