@@ -1814,7 +1814,10 @@ function maybeExitAfterDrain() {
 }
 async function ensureAdmin() {
   const pw = process.env.ADMIN_PASSWORD;
-  if (!pw || pw.length < 12) throw new Error('ADMIN_PASSWORD must be set and at least 12 chars');
+  if (!pw) throw new Error('ADMIN_PASSWORD must be set');
+  if (pw.length < 12) {
+    app.log.warn('ADMIN_PASSWORD is shorter than 12 chars; rotate it when convenient');
+  }
   const row = await db.get('SELECT * FROM users WHERE username=?1',['admin']);
   const fingerprint = adminPasswordFingerprint();
   const previous = await getSetting('adminPasswordFingerprint').catch(()=>null);
