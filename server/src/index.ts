@@ -62,6 +62,7 @@ const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 const COOKIE_NAME = 'agentdeck_session';
 const CSRF_COOKIE = 'agentdeck_csrf';
 const AUTH_SESSION_TTL_MS = Number(process.env.AUTH_SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 14);
+const VERBOSE_DIAGNOSTICS = process.env.AGENTDECK_ENABLE_VERBOSE_DIAGNOSTICS === '1';
 const ALLOWED_ORIGINS_CONFIGURED = typeof process.env.ALLOWED_ORIGINS === 'string' && process.env.ALLOWED_ORIGINS.trim().length > 0;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
 const WS_MAX_MESSAGE_BYTES = Number(process.env.WS_MAX_MESSAGE_BYTES || 1024 * 1024);
@@ -511,7 +512,7 @@ app.get('/api/diagnostics', { preHandler: ensureAuth }, async () => {
   const runtimeInfo = await runtime.diagnostics().catch((e:any)=>({ error:e?.message || String(e) }));
   const profileId = String(activeStatus?.activeProfileId || activeStatus?.accountSummary?.profileId || '');
   const appServer = activeProvider === 'codex' && profileId ? diagnosticCodexAppServer(profileId) : null;
-  return {
+  const payload = {
     commit: await currentCommit(),
     web: {
       ok:true,
@@ -543,6 +544,7 @@ app.get('/api/diagnostics', { preHandler: ensureAuth }, async () => {
     },
     session,
     appServer,
+    verbose: VERBOSE_DIAGNOSTICS,
     sequenceTerms: {
       runtimeLatestSequence:'Runtime persisted event high-water mark.',
       snapshotCoveredSequence:'Sequence covered by the current HTTP/thread snapshot.',
@@ -550,14 +552,19 @@ app.get('/api/diagnostics', { preHandler: ensureAuth }, async () => {
       browserAcknowledgedSequence:'Highest sequence the browser has reported back to the server.',
     },
   };
+  return maskSecrets(VERBOSE_DIAGNOSTICS ? payload : redactDiagnosticPaths(payload));
 });
-app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => ({
-  local: {
-    ...runtimeDiagnostics,
-    subscriptions:[...runtimeSubscriptions.entries()].map(([sessionId,state]) => ({ sessionId, connected:state.connected, lastSequence:state.lastSequence, generation:state.generation || null, clients:clients.get(sessionId)?.size || 0 })),
-  },
-  runtime: await runtime.diagnostics().catch((e:any)=>({ error:e?.message || String(e) })),
-}));
+app.get('/api/runtime-diagnostics', { preHandler: ensureAuth }, async () => {
+  const payload = {
+    local: {
+      ...runtimeDiagnostics,
+      subscriptions:[...runtimeSubscriptions.entries()].map(([sessionId,state]) => ({ sessionId, connected:state.connected, lastSequence:state.lastSequence, generation:state.generation || null, clients:clients.get(sessionId)?.size || 0 })),
+    },
+    runtime: await runtime.diagnostics().catch((e:any)=>({ error:e?.message || String(e) })),
+    verbose: VERBOSE_DIAGNOSTICS,
+  };
+  return maskSecrets(VERBOSE_DIAGNOSTICS ? payload : redactDiagnosticPaths(payload));
+});
 app.post('/api/maintenance/cleanup-archived', { preHandler: ensureAuth }, async () => cleanupArchivedSessions('manual'));
 app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const settings = await appSettings();
@@ -2098,8 +2105,8 @@ function providerInstallJobSummary(job:ProviderInstallJob) {
     provider:job.provider,
     action:job.action,
     status:job.status,
-    output:job.output.slice(-80),
-    error:job.error || null,
+    output:job.output.slice(-80).map(line => maskSecretText(line)),
+    error:job.error ? maskSecretText(job.error) : null,
     version:job.version || null,
     startedAt:job.startedAt,
     updatedAt:job.updatedAt,
@@ -2188,13 +2195,13 @@ async function downloadProviderInstallScript(job:ProviderInstallJob, url:string,
 function updateProviderInstallJob(job:ProviderInstallJob, status:ProviderInstallStatus, line?:string) {
   job.status = status;
   job.updatedAt = Date.now();
-  if (line) job.output.push(`[${new Date().toISOString()}] ${line}`);
+  if (line) job.output.push(`[${new Date().toISOString()}] ${maskSecretText(line)}`);
   persistProviderInstallJobs().catch(()=>{});
 }
 function failProviderInstallJob(job:ProviderInstallJob, message:string) {
   if (job.status === 'cancelled') return;
   job.status = 'failed';
-  job.error = safeAntigravitySummary(message);
+  job.error = maskSecretText(safeAntigravitySummary(message));
   job.updatedAt = Date.now();
   job.output.push(`[${new Date().toISOString()}] ERROR ${job.error}`);
   providerInstallChildren.delete(job.id);
@@ -2218,7 +2225,7 @@ function spawnProviderInstall(job:ProviderInstallJob, command:string, args:strin
     timer.unref?.();
     const append = (chunk:Buffer) => {
       const text = chunk.toString('utf8');
-      for (const line of text.split(/\r?\n/).filter(Boolean)) job.output.push(redactLine(line).slice(0, 1000));
+      for (const line of text.split(/\r?\n/).filter(Boolean)) job.output.push(maskSecretText(redactLine(line)).slice(0, 1000));
       job.output = job.output.slice(-200);
       job.updatedAt = Date.now();
       persistProviderInstallJobs().catch(()=>{});
@@ -3864,7 +3871,61 @@ function cleanAgentOutput(text:string) {
 }
 function isTerminalControlNoise(line:string){ return !/[A-Za-z0-9\u4e00-\u9fff]/.test(line) || /^[?;=<>0-9\s()[\]{}|/\\._:-]+$/.test(line); }
 function isUsefulAntigravityUsage(text:string){ return /usage|quota|limit|额度|剩余|remaining|tokens?|requests?|reset/i.test(text) && text.length > 20; }
-function redactLine(line:string){ return line.replace(/(token|secret|password|refresh_token|access_token)[^\n]*/ig, '$1=[redacted]'); }
+function maskSecrets(value:any):any {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return maskSecretText(value);
+  if (Array.isArray(value)) return value.map(maskSecrets);
+  if (typeof value !== 'object') return value;
+  const out:any = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (isSensitiveKey(key)) out[key] = '[redacted]';
+    else if (/email/i.test(key) && typeof raw === 'string') out[key] = maskEmail(raw);
+    else out[key] = maskSecrets(raw);
+  }
+  return out;
+}
+function isSensitiveKey(key:string) {
+  return /token|secret|password|apiKey|api_key|cookie|authorization|deviceCode|device_code|auth code|login URL|loginUrl/i.test(key);
+}
+function maskEmail(email:string) {
+  const value = String(email || '');
+  const match = value.match(/^([^@\s]{1,})(@[^@\s]+\.[^@\s]+)$/);
+  if (!match) return maskSecretText(value);
+  const name = match[1];
+  return `${name.slice(0, Math.min(2, name.length))}${name.length > 2 ? '***' : '*'}${match[2]}`;
+}
+function maskSecretText(text:string) {
+  return String(text || '')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/ig, 'Bearer [redacted]')
+    .replace(/([?&](?:code|token|access_token|refresh_token|id_token|client_secret|api_key|apikey)=)[^&\s]+/ig, '$1[redacted]')
+    .replace(/\b(authorization|cookie|token|secret|password|apiKey|api_key|access_token|refresh_token|id_token|client_secret|deviceCode|device_code)\s*[:=]\s*[^\s,;]+/ig, '$1=[redacted]')
+    .replace(/\b(auth code|authorization code|device code)\s*:?\s*[A-Za-z0-9_./~+=-]{4,}/ig, '$1 [redacted]')
+    .replace(/\b(login URL|login url)\s*:?\s*https?:\/\/\S+/ig, '$1 [redacted]')
+    .replace(/https:\/\/accounts\.google\.com\/o\/oauth2\/[^\s)]+/ig, '[redacted-login-url]')
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[redacted-api-key]');
+}
+function redactDiagnosticPaths(value:any):any {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return redactLocalPathText(value);
+  if (Array.isArray(value)) return value.map(redactDiagnosticPaths);
+  if (typeof value !== 'object') return value;
+  const out:any = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (/profile.*path|home.*path|token.*path|codexHome|homeDir|profileDir|configDir/i.test(key)) out[key] = '[redacted-path]';
+    else out[key] = redactDiagnosticPaths(raw);
+  }
+  return out;
+}
+function redactLocalPathText(text:string) {
+  let out = String(text || '');
+  for (const [prefix,label] of [[DATA_DIR, '[data-dir]'], [DEFAULT_HOME, '[home]'], [os.homedir(), '[home]']] as const) {
+    if (prefix) out = out.split(prefix).join(label);
+  }
+  return out
+    .replace(/\/opt\/data\/agentdeck(?:\/[^\s'",)]+)*/g, '[data-dir]')
+    .replace(/\/home\/[^/\s'",)]+(?:\/[^\s'",)]+)*/g, '[home]');
+}
+function redactLine(line:string){ return maskSecretText(line); }
 function shellQuote(value:string) { return `'${value.replaceAll("'", "'\\''")}'`; }
 function normalizeMode(value:any) { const v = String(value || ''); return ['yolo','workspace-write','read-only'].includes(v) ? v : null; }
 function normalizeProvider(value:any): AgentProviderId | null { return registryNormalizeProvider(value); }
