@@ -57,7 +57,8 @@ test('deploy worker uses service user for build checks and candidate processes',
   assert.match(ctlSource, /run_as_service_user npm test/);
   assert.match(ctlSource, /run_as_service_user npm run test:e2e/);
   assert.match(ctlSource, /run_as_service_user bash -c 'cd "\$1"; RUNTIME_MODE=candidate/);
-  assert.match(ctlSource, /run_as_service_user bash -c 'cd "\$1"; PORT="\$2"/);
+  assert.match(ctlSource, /run_as_service_user bash -c 'set -a; \[ -f "\$8" \] && \. "\$8"; set \+a; cd "\$1"; PORT="\$2"/);
+  assert.match(ctlSource, /"\$ENV_DIR\/web\.env"/);
 });
 
 test('deploy release id is not captured from noisy build stdout and cleanup is bounded', () => {
