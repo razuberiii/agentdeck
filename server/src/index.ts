@@ -1579,7 +1579,21 @@ app.post('/api/interactive-requests/:requestId/answer', { preHandler: ensureAuth
     broadcast(request.sessionId, { type:'system', text:'计划已取消' });
     return { ok:true, requestId, sentFollowup:false };
   }
-  return { ok:true, requestId, sentFollowup:false };
+  const plan = await db.get('SELECT * FROM plan_tasks WHERE session_id=?1 AND plan_assistant_message_id=?2 ORDER BY created_at DESC LIMIT 1', [request.sessionId, request.turnId]).catch(()=>null)
+    || await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='awaiting_approval' ORDER BY created_at DESC LIMIT 1", [request.sessionId]).catch(()=>null);
+  if (!plan) return { ok:true, requestId, sentFollowup:false };
+  if (optionId === 'approve') {
+    await db.run('UPDATE plan_tasks SET status=?1, approved_at=?2 WHERE plan_id=?3', ['executing', now, plan.plan_id]).catch(()=>{});
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['executing_approved_plan', now, request.sessionId]).catch(()=>{});
+    const followup = approvedPlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text);
+    await sendTurn(request.sessionId, followup, [], crypto.randomUUID(), 'direct');
+    return { ok:true, requestId, sentFollowup:true };
+  }
+  const revision = optionId === 'regenerate'
+    ? regeneratePlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text)
+    : revisePlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text);
+  await sendTurn(request.sessionId, revision, [], crypto.randomUUID(), 'plan');
+  return { ok:true, requestId, sentFollowup:true };
 });
 app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
   cleanupPendingApprovals();
@@ -4710,7 +4724,6 @@ async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [],
       updateSession:async status=>{
         if (planMode === 'plan' && status === 'idle') {
           await completePlanTask(threadId, output, assistantId, []);
-          await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['idle', Date.now(), threadId]);
           return;
         }
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[status, Date.now(), threadId]);
@@ -5043,7 +5056,7 @@ async function runtimeEventMessages(threadId:string, event:any) {
       const wasPlanning = String(row?.status || '') === 'planning';
       const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? 'idle' : 'interrupted';
       if (wasPlanning && msg.method === 'turn/completed' && !turnFailed(msg.params?.turn)) await completePlanTask(threadId, '', '', found);
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
+      if (!wasPlanning) await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
       if (found.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }, ...base });
       maybeExitAfterDrain();
     }
@@ -5053,7 +5066,6 @@ async function runtimeEventMessages(threadId:string, event:any) {
       const row = await findSession(threadId);
       if (String(row?.status || '') === 'planning') {
         await completePlanTask(threadId, String(msg.params.item.text || ''), String(msg.params.item.id || ''), []);
-        await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),threadId]);
       } else {
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),threadId]);
       }
@@ -5129,21 +5141,53 @@ function planOnlyPrompt(text:string) {
   return [
     '$plan',
     '',
-    'AgentDeck Plan Mode is active. Analyze only; do not modify files, run write commands, install dependencies, commit, push, deploy, restart services, or change external state.',
-    'The runtime enforces a read-only sandbox for this turn. If a write action is needed, describe it in the plan instead of attempting it.',
-    '',
-    'Output a complete implementation plan with these sections:',
-    '1. 需求总结',
-    '2. 预计修改文件',
-    '3. 每个文件预计修改内容',
-    '4. 不会修改的范围',
-    '5. 风险点',
-    '6. 测试方案',
-    '7. 分阶段提交建议',
-    '8. 回滚方案',
+    'AgentDeck Plan Mode is active. Inspect the repository and reason about the task, but do not modify files, run write commands, install dependencies, commit, push, deploy, restart services, or change external state.',
+    'The runtime enforces read-only execution for this planning turn. If implementation is needed, describe the intended changes and validation steps instead of making them.',
+    'Ask concise clarifying questions only when the task cannot be planned safely from the available context. Otherwise produce a practical implementation plan that the user can review, refine, or approve for execution.',
+    'Include the likely files, key changes, risks, and validation approach when they are relevant. Keep the structure natural for the task instead of forcing a fixed template.',
     '',
     '用户原始任务：',
     String(text || ''),
+  ].join('\n');
+}
+function approvedPlanPrompt(originalTask:string, planText:string, note = '') {
+  return [
+    'Implement the approved plan from the previous Plan Mode review.',
+    '',
+    'Original task:',
+    originalTask,
+    '',
+    'Approved plan:',
+    planText,
+    note ? `\nAdditional instruction from the user:\n${note}` : '',
+  ].filter(Boolean).join('\n');
+}
+function revisePlanPrompt(originalTask:string, planText:string, note = '') {
+  return [
+    'Revise the previous Plan Mode proposal. Stay in Plan Mode and do not modify files.',
+    '',
+    'Original task:',
+    originalTask,
+    '',
+    'Previous plan:',
+    planText,
+    '',
+    'Requested changes:',
+    note || 'Improve the plan based on the current conversation.',
+  ].join('\n');
+}
+function regeneratePlanPrompt(originalTask:string, planText:string, note = '') {
+  return [
+    'Regenerate the Plan Mode proposal from scratch. Stay in Plan Mode and do not modify files.',
+    '',
+    'Original task:',
+    originalTask,
+    '',
+    'Prior plan to reconsider:',
+    planText,
+    '',
+    'User guidance:',
+    note || 'Create a clearer implementation and validation plan.',
   ].join('\n');
 }
 async function createPlanTask(sessionId:string, originalUserTask:string, row:any) {
@@ -5160,6 +5204,7 @@ async function completePlanTask(sessionId:string, planText:string, assistantMess
   const row = await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='planning' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
   if (!row) return;
   const changed = changedFiles.map((file:any)=>String(file?.relativePath || file?.name || file?.path || '')).filter(Boolean);
+  if (!String(planText || '').trim() && !String(assistantMessageId || '').trim() && !changed.length) return;
   const violation = changed.length ? 'Plan mode produced workspace changes during a read-only turn.' : null;
   await db.run(
     `UPDATE plan_tasks
@@ -5167,6 +5212,27 @@ async function completePlanTask(sessionId:string, planText:string, assistantMess
      WHERE plan_id=?7`,
     [planText, assistantMessageId, Date.now(), JSON.stringify(changed), changed.length ? changed.join('\n') : null, violation, row.plan_id]
   ).catch(()=>{});
+  if (!changed.length) await createPlanReviewRequest(sessionId, String(row.plan_id || ''), assistantMessageId, planText).catch(()=>{});
+}
+async function createPlanReviewRequest(sessionId:string, planId:string, assistantMessageId:string, planText:string) {
+  const existing = await db.get("SELECT request_id FROM interactive_requests WHERE session_id=?1 AND kind='plan_review' AND status='pending' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
+  if (existing) return;
+  const requestId = `plan-review-${crypto.randomUUID()}`;
+  const now = Date.now();
+  const options = [
+    { id:'approve', label:'开始实现', description:'按这份计划继续执行当前任务。', variant:'primary' },
+    { id:'revise', label:'调整计划', description:'带着你的补充要求重新规划。' },
+    { id:'regenerate', label:'重新生成', description:'丢开当前方案，从头生成一版计划。' },
+    { id:'cancel', label:'取消', description:'结束本次计划流程。', variant:'danger' },
+  ];
+  await db.run(
+    `INSERT INTO interactive_requests (request_id,session_id,turn_id,provider_id,kind,title,body,options_json,allow_free_text,default_option_id,status,metadata_json,created_at)
+     VALUES (?1,?2,?3,'codex','plan_review','计划已生成',?4,?5,1,'approve','pending',?6,?7)`,
+    [requestId, sessionId, assistantMessageId, planText, JSON.stringify(options), JSON.stringify({ planId }), now]
+  );
+  await db.run('UPDATE plan_tasks SET status=?1 WHERE plan_id=?2', ['awaiting_approval', planId]).catch(()=>{});
+  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['waiting_plan_approval', now, sessionId]).catch(()=>{});
+  broadcast(sessionId, { type:'interactive_request', request:interactiveRequestDto(await db.get('SELECT * FROM interactive_requests WHERE request_id=?1', [requestId])) });
 }
 async function recordPlanPolicyViolation(sessionId:string, message:string) {
   await db.run(

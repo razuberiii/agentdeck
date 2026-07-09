@@ -12,20 +12,25 @@ test('plan mode sends a provider-agnostic plan-only prompt without storing it as
   assert.match(web, /function planOnlyPrompt/);
   assert.match(web, /\$plan/);
   assert.match(web, /AgentDeck Plan Mode is active/);
+  assert.match(web, /Inspect the repository and reason about the task/);
   assert.match(web, /CREATE TABLE IF NOT EXISTS plan_tasks/);
   assert.match(db, /CREATE TABLE IF NOT EXISTS plan_tasks/);
   assert.match(web, /parsePlanSubmission/);
   assert.match(web, /saveCanonicalUserMessage\(threadId, originalText/);
   assert.match(web, /stripInternalPlanPrompt/);
+  assert.doesNotMatch(web, /Output a complete implementation plan with these sections/);
 });
 
-test('legacy plan review answer API no longer copies assistant plans into follow-up prompts', () => {
+test('plan review answer API drives approve, revise, regenerate, and cancel follow-ups', () => {
   assert.match(web, /app\.post\('\/api\/interactive-requests\/:requestId\/answer'/);
   assert.match(web, /optionId === 'cancel'/);
-  assert.doesNotMatch(web, /planApprovalPrompt/);
-  assert.doesNotMatch(web, /planRevisionPrompt/);
-  assert.doesNotMatch(web, /planRegeneratePrompt/);
-  assert.doesNotMatch(web, /sendTurn\(request\.sessionId, followup, \[\]/);
+  assert.match(web, /approvedPlanPrompt/);
+  assert.match(web, /revisePlanPrompt/);
+  assert.match(web, /regeneratePlanPrompt/);
+  assert.match(web, /sendTurn\(request\.sessionId, followup, \[\], crypto\.randomUUID\(\), 'direct'\)/);
+  assert.match(web, /sendTurn\(request\.sessionId, revision, \[\], crypto\.randomUUID\(\), 'plan'\)/);
+  assert.match(web, /createPlanReviewRequest/);
+  assert.match(web, /waiting_plan_approval/);
 });
 
 test('plan mode is forced through read-only runtime policy', () => {
@@ -36,14 +41,16 @@ test('plan mode is forced through read-only runtime policy', () => {
   assert.match(runtime, /sandboxMode:'read-only'/);
 });
 
-test('mobile UI keeps plan mode out of the composer and removes old primary plan buttons', () => {
+test('mobile UI exposes plan mode and a lightweight plan review card', () => {
   assert.match(client, /sendMode/);
   assert.match(client, /计划模式：描述任务，只生成计划/);
   assert.match(client, /普通模式/);
   assert.match(client, /发送模式/);
+  assert.match(client, /PlanReviewCard/);
+  assert.match(client, /计划已生成，等待确认/);
+  assert.match(client, /answerPlan/);
   assert.doesNotMatch(client, /先给计划/);
   assert.doesNotMatch(client, /直接执行/);
-  assert.doesNotMatch(client, /PlanCard/);
-  assert.doesNotMatch(client, /计划确认/);
+  assert.match(styles, /\.planReviewCard/);
   assert.doesNotMatch(styles, /\.modeToggle/);
 });
