@@ -37,6 +37,8 @@ commands:
   check
   doctor
   install-units
+  backup [--include-secrets]
+  restore <backup.tar.zst> [--dry-run] [--force]
   restart web|runtime|all [--force]
   deploy web|runtime|all [--wait] [--force]
   rollback web|runtime|all [--wait] [--force]
@@ -50,6 +52,7 @@ log() { printf '[agentdeckctl] %s\n' "$*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 json_escape() { node -e 'process.stdout.write(JSON.stringify(process.argv[1] || ""))' "$1"; }
 is_worker() { [ "${AGENTDECK_DEPLOY_WORKER:-0}" = "1" ]; }
+backup_dir() { printf '%s\n' "${AGENTDECK_BACKUP_DIR:-$DATA_DIR/backups}"; }
 
 resolve_service_user() {
   if [ -n "$SERVICE_USER" ]; then return 0; fi
@@ -516,6 +519,171 @@ NODE
   fi
 }
 
+sqlite_file_backup() {
+  local source_db="$1" dest_db="$2"
+  mkdir -p "$(dirname "$dest_db")"
+  if [ ! -f "$source_db" ]; then
+    return 0
+  fi
+  if node - "$source_db" "$dest_db" <<'NODE'
+const Database = require('better-sqlite3');
+const source = process.argv[2], dest = process.argv[3];
+const db = new Database(source, { readonly:true, fileMustExist:true });
+db.pragma('busy_timeout = 1000');
+db.backup(dest).then(() => db.close()).catch(err => {
+  try { db.close(); } catch {}
+  console.error(err.message);
+  process.exit(1);
+});
+NODE
+  then
+    return 0
+  fi
+  log "sqlite online backup failed for $source_db; falling back to file copy"
+  cp -a "$source_db" "$dest_db"
+}
+
+backup_manifest() {
+  local file="$1" include_secrets="$2"
+  node - "$file" "$SOURCE_ROOT" "$DATA_DIR" "$include_secrets" "${AGENTDECK_INSTALL_PROFILE:-personal}" <<'NODE'
+const fs = require('node:fs');
+const cp = require('node:child_process');
+const [file, sourceRoot, dataDir, includeSecrets, profile] = process.argv.slice(2);
+const pkg = JSON.parse(fs.readFileSync(`${sourceRoot}/package.json`, 'utf8'));
+let commit = '';
+try { commit = cp.execFileSync('git', ['-c', `safe.directory=${sourceRoot}`, '-C', sourceRoot, 'rev-parse', 'HEAD'], { encoding:'utf8', stdio:['ignore','pipe','ignore'] }).trim(); } catch {}
+fs.writeFileSync(file, JSON.stringify({
+  version:pkg.version || '0.0.0',
+  commit,
+  created_at:new Date().toISOString(),
+  profile:profile || 'personal',
+  data_dir:dataDir,
+  included_secrets:includeSecrets === '1',
+}, null, 2) + '\n');
+NODE
+}
+
+redacted_env_summary() {
+  local out="$1"
+  mkdir -p "$(dirname "$out")"
+  node - "$ENV_DIR" "$out" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const envDir = process.argv[2], out = process.argv[3];
+const sensitive = /token|secret|password|api[_-]?key|cookie|authorization|device[_-]?code|auth[_ -]?code|login[_ -]?url/i;
+const summary = {};
+for (const name of ['web.env','runtime.env','agentdeck-app-server-default.env']) {
+  const file = path.join(envDir, name);
+  const values = {};
+  try {
+    for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!m) continue;
+      values[m[1]] = sensitive.test(m[1]) ? '[redacted]' : m[2].replace(/^['"]|['"]$/g, '');
+    }
+  } catch {}
+  summary[name] = values;
+}
+fs.writeFileSync(out, JSON.stringify(summary, null, 2) + '\n');
+NODE
+}
+
+copy_backup_dir_if_present() {
+  local rel="$1" tmp="$2"
+  if [ -e "$DATA_DIR/$rel" ]; then
+    mkdir -p "$tmp/data/$(dirname "$rel")"
+    cp -a "$DATA_DIR/$rel" "$tmp/data/$rel"
+  fi
+}
+
+run_backup() {
+  local include_secrets="$1" out_dir stamp tmp archive
+  ensure_dirs
+  out_dir="$(backup_dir)"
+  stamp="$(date -u +%Y%m%d-%H%M%S)"
+  archive="$out_dir/agentdeck-backup-$stamp.tar.zst"
+  tmp="$(mktemp -d)"
+  mkdir -p "$out_dir" "$tmp/data"
+  if [ "$include_secrets" = "1" ]; then
+    echo "WARNING: --include-secrets will include provider tokens, OAuth state, API keys, and local profile secrets." >&2
+    echo "Store this backup like a password vault." >&2
+  fi
+  sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$tmp/data/agentdeck.sqlite3"
+  sqlite_file_backup "${RUNTIME_DB:-$DATA_DIR/agentdeck-runtime.sqlite3}" "$tmp/data/agentdeck-runtime.sqlite3"
+  for rel in attachments artifacts shared/generated_images; do
+    copy_backup_dir_if_present "$rel" "$tmp"
+  done
+  if [ "$include_secrets" = "1" ]; then
+    for rel in profiles claude/profiles gemini/profiles antigravity-profiles shared/sessions; do
+      copy_backup_dir_if_present "$rel" "$tmp"
+    done
+  fi
+  backup_manifest "$tmp/manifest.json" "$include_secrets"
+  redacted_env_summary "$tmp/redacted-env-summary.json"
+  tar -C "$tmp" --zstd -cf "$archive" .
+  rm -rf "$tmp"
+  echo "$archive"
+}
+
+restore_usage() {
+  echo "usage: sudo agentdeckctl restore <agentdeck-backup-YYYYMMDD-HHMMSS.tar.zst> [--dry-run] [--force]" >&2
+}
+
+restore_content_list() {
+  local tmp="$1"
+  find "$tmp" -mindepth 1 -maxdepth 3 -print | sed "s#^$tmp/##" | sort
+}
+
+run_restore() {
+  local archive="$1" dry_run="$2" force="$3" tmp included_secrets
+  [ -n "$archive" ] || { restore_usage; exit 2; }
+  [ -f "$archive" ] || die "backup file not found: $archive"
+  tmp="$(mktemp -d)"
+  tar -C "$tmp" --zstd -xf "$archive"
+  [ -f "$tmp/manifest.json" ] || { rm -rf "$tmp"; die "backup manifest.json is missing"; }
+  echo "Backup manifest:"
+  cat "$tmp/manifest.json"
+  echo
+  echo "Will restore:"
+  restore_content_list "$tmp"
+  included_secrets="$(node - "$tmp/manifest.json" <<'NODE'
+const fs = require('node:fs');
+const m = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+console.log(m.included_secrets ? '1' : '0');
+NODE
+)"
+  if [ "$dry_run" = "1" ]; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  for rel in agentdeck.sqlite3 agentdeck-runtime.sqlite3 attachments artifacts shared/generated_images profiles claude/profiles gemini/profiles antigravity-profiles shared/sessions; do
+    if [ -e "$tmp/data/$rel" ] && [ -e "$DATA_DIR/$rel" ]; then
+      [ "$force" = "1" ] || { rm -rf "$tmp"; die "target data exists in $DATA_DIR; rerun with --force to overwrite"; }
+    fi
+  done
+  echo "WARNING: restoring will overwrite AgentDeck data in $DATA_DIR." >&2
+  [ "$force" = "1" ] || { rm -rf "$tmp"; die "restore requires --force"; }
+  mkdir -p "$DATA_DIR"
+  for rel in agentdeck.sqlite3 agentdeck-runtime.sqlite3 attachments artifacts shared/generated_images; do
+    if [ -e "$tmp/data/$rel" ]; then
+      mkdir -p "$DATA_DIR/$(dirname "$rel")"
+      rm -rf "$DATA_DIR/$rel"
+      cp -a "$tmp/data/$rel" "$DATA_DIR/$rel"
+    fi
+  done
+  if [ "$included_secrets" = "1" ]; then
+    for rel in profiles claude/profiles gemini/profiles antigravity-profiles shared/sessions; do
+      if [ -e "$tmp/data/$rel" ]; then
+        mkdir -p "$DATA_DIR/$(dirname "$rel")"
+        rm -rf "$DATA_DIR/$rel"
+        cp -a "$tmp/data/$rel" "$DATA_DIR/$rel"
+      fi
+    done
+  fi
+  rm -rf "$tmp"
+  echo "Restore complete. Restart AgentDeck services after reviewing the restored data."
+}
+
 start_candidate_runtime() {
   local release_path="$1" job_id="$2" candidate_dir pid_file
   candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
@@ -782,16 +950,20 @@ COMMAND="${1:-}"
 [ -n "$COMMAND" ] || { usage; exit 2; }
 shift || true
 TARGET="${1:-}"
-case "$COMMAND" in status|check|doctor|jobs|install-units|setup-units) ;; *) shift || true ;; esac
+case "$COMMAND" in status|check|doctor|jobs|install-units|setup-units|backup) ;; *) shift || true ;; esac
 WAIT=0
 FORCE=0
 JSON=0
+INCLUDE_SECRETS=0
+DRY_RUN=0
 JOB_ID=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --wait) WAIT=1; shift ;;
     --force) FORCE=1; shift ;;
     --json) JSON=1; shift ;;
+    --include-secrets) INCLUDE_SECRETS=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --job-id=*) JOB_ID="${1#--job-id=}"; shift ;;
     *) usage; exit 2 ;;
   esac
@@ -803,6 +975,8 @@ case "$COMMAND" in
   check) run_check ;;
   doctor) run_doctor ;;
   install-units|setup-units) run_install_units ;;
+  backup) run_backup "$INCLUDE_SECRETS" ;;
+  restore) run_restore "$TARGET" "$DRY_RUN" "$FORCE" ;;
   restart) [ -n "$TARGET" ] || die "restart target required"; restart_target "$TARGET" "$FORCE" ;;
   deploy)
     TARGET="${TARGET:-all}"
