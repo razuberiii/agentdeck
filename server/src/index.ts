@@ -61,6 +61,7 @@ const MOBILE_CONTEXT_MARKER = '[[CODEX_MOBILE_CLIENT_CONTEXT]]';
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 const COOKIE_NAME = 'agentdeck_session';
 const CSRF_COOKIE = 'agentdeck_csrf';
+const AUTH_SESSION_TTL_MS = Number(process.env.AUTH_SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 14);
 const ALLOWED_ORIGINS_CONFIGURED = typeof process.env.ALLOWED_ORIGINS === 'string' && process.env.ALLOWED_ORIGINS.trim().length > 0;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
 const WS_MAX_MESSAGE_BYTES = Number(process.env.WS_MAX_MESSAGE_BYTES || 1024 * 1024);
@@ -201,6 +202,8 @@ let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
 await db.init();
+await db.run('CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER, last_seen_at INTEGER, user_agent TEXT, ip_hint TEXT)').catch(()=>{});
+await db.run('CREATE INDEX IF NOT EXISTS auth_sessions_active ON auth_sessions(revoked_at,expires_at)').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN model TEXT').catch(()=>{});
 await db.run("ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'codex'").catch(()=>{});
@@ -313,10 +316,59 @@ function allowedRequestOrigin(req:any) {
   const host = typeof req.headers.host === 'string' ? req.headers.host : '';
   return sameHostOrigin(candidate, host) || localhostOrigin(candidate);
 }
-function validSessionCookie(req:any) {
-  const sid = req.cookies?.[COOKIE_NAME];
-  if (!sid) return false;
-  try { return !!app.unsignCookie(sid).valid; } catch { return false; }
+function authTokenHash(token:string) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+function adminPasswordFingerprint() {
+  return crypto.createHash('sha256').update(process.env.ADMIN_PASSWORD || '').digest('hex');
+}
+function requestIpHint(req:any) {
+  return String(req.ip || req.socket?.remoteAddress || '').slice(0, 80);
+}
+function legacySignedSessionCookie(req:any) {
+  const value = req.cookies?.[COOKIE_NAME];
+  if (!value) return null;
+  try {
+    const unsigned = app.unsignCookie(value);
+    return unsigned.valid ? String(unsigned.value || '') : null;
+  } catch {
+    return null;
+  }
+}
+async function createAuthSession(req:any, reply:any) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const csrf = crypto.randomBytes(24).toString('base64url');
+  const now = Date.now();
+  const expiresAt = now + AUTH_SESSION_TTL_MS;
+  const id = crypto.randomUUID();
+  await db.run(
+    'INSERT INTO auth_sessions (id,token_hash,created_at,expires_at,last_seen_at,user_agent,ip_hint) VALUES (?1,?2,?3,?4,?5,?6,?7)',
+    [id, authTokenHash(token), now, expiresAt, now, String(req.headers['user-agent'] || '').slice(0, 300), requestIpHint(req)]
+  );
+  await db.run('DELETE FROM auth_sessions WHERE expires_at<?1 OR revoked_at<?1', [now - AUTH_SESSION_TTL_MS]).catch(()=>{});
+  reply.setCookie(COOKIE_NAME, token, secureCookie());
+  reply.setCookie(CSRF_COOKIE, csrf, csrfCookie());
+  return { id, token, csrf, expiresAt };
+}
+async function authSessionForRequest(req:any, reply?:any) {
+  const token = req.cookies?.[COOKIE_NAME];
+  const now = Date.now();
+  if (token) {
+    const row = await db.get('SELECT * FROM auth_sessions WHERE token_hash=?1 AND revoked_at IS NULL AND expires_at>?2', [authTokenHash(String(token)), now]).catch(()=>null);
+    if (row) {
+      req.authSession = row;
+      await db.run('UPDATE auth_sessions SET last_seen_at=?1 WHERE id=?2', [now, row.id]).catch(()=>{});
+      return row;
+    }
+  }
+  const legacy = legacySignedSessionCookie(req);
+  if (legacy && reply) {
+    const session = await createAuthSession(req, reply);
+    const row = await db.get('SELECT * FROM auth_sessions WHERE id=?1', [session.id]).catch(()=>null);
+    req.authSession = row;
+    return row;
+  }
+  return null;
 }
 app.addHook('preHandler', async (req, reply) => {
   if (!['GET','HEAD'].includes(req.method) && !allowedRequestOrigin(req)) return reply.code(403).send({error:'origin'});
@@ -327,14 +379,14 @@ app.addHook('preHandler', async (req, reply) => {
 });
 function secureCookie() { return { httpOnly:true, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 function csrfCookie() { return { httpOnly:false, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
-async function ensureAuth(req:any, reply:any) { if (!validSessionCookie(req)) return reply.code(401).send({error:'unauthorized'}); }
-function isAuthenticated(req:any) {
-  return validSessionCookie(req);
+async function ensureAuth(req:any, reply:any) { if (!(await authSessionForRequest(req, reply))) return reply.code(401).send({error:'unauthorized'}); }
+async function isAuthenticated(req:any, reply?:any) {
+  return !!(await authSessionForRequest(req, reply));
 }
-app.get('/api/auth/status', async (req) => ({ authenticated: isAuthenticated(req) }));
+app.get('/api/auth/status', async (req, reply) => ({ authenticated: await isAuthenticated(req, reply) }));
 app.get('/api/status', async (req) => {
   const startedAt = Date.now();
-  const authed = isAuthenticated(req);
+  const authed = await isAuthenticated(req);
   if (!authed) return { authed:false, authenticated:false, serverTime:Date.now(), capabilities:{} };
   const force = !!(req.query && typeof req.query === 'object' && (req.query as any).refresh === '1');
   const [
@@ -1140,8 +1192,29 @@ app.get('/api/antigravity-login/:jobId', { preHandler: ensureAuth }, async (req:
   await maybeFinishAntigravityLoginJob(job).catch(()=>{});
   return { job };
 });
-app.post('/api/login', { config: { rateLimit: { max: 8, timeWindow: '5 minutes' } } }, async (req:any, reply) => { const { username, password } = req.body || {}; const row = await db.get('SELECT * FROM users WHERE username = ?1', [username || 'admin']); if (!row || typeof password !== 'string' || !(await argon2.verify(String(row.password_hash), password))) return reply.code(401).send({error:'invalid login'}); const sid = crypto.randomBytes(32).toString('base64url'); const csrf = crypto.randomBytes(24).toString('base64url'); reply.setCookie(COOKIE_NAME, sid, { ...secureCookie(), signed:true }); reply.setCookie(CSRF_COOKIE, csrf, csrfCookie()); return { ok:true, csrf }; });
-app.post('/api/logout', { preHandler: ensureAuth }, async (_req, reply) => { reply.clearCookie(COOKIE_NAME, {path:'/'}); reply.clearCookie(CSRF_COOKIE, {path:'/'}); return {ok:true}; });
+app.post('/api/login', { config: { rateLimit: { max: 8, timeWindow: '5 minutes' } } }, async (req:any, reply) => {
+  const { username, password } = req.body || {};
+  const row = await db.get('SELECT * FROM users WHERE username = ?1', [username || 'admin']);
+  if (!row || typeof password !== 'string' || !(await argon2.verify(String(row.password_hash), password))) return reply.code(401).send({error:'invalid login'});
+  const session = await createAuthSession(req, reply);
+  return { ok:true, csrf:session.csrf };
+});
+app.post('/api/logout', { preHandler: ensureAuth }, async (req:any, reply) => {
+  if (req.authSession?.id) await db.run('UPDATE auth_sessions SET revoked_at=?1 WHERE id=?2', [Date.now(), req.authSession.id]).catch(()=>{});
+  reply.clearCookie(COOKIE_NAME, {path:'/'});
+  reply.clearCookie(CSRF_COOKIE, {path:'/'});
+  return {ok:true};
+});
+app.get('/api/auth/sessions', { preHandler: ensureAuth }, async (req:any) => {
+  const rows = await db.all('SELECT id,created_at,expires_at,revoked_at,last_seen_at,user_agent,ip_hint FROM auth_sessions WHERE revoked_at IS NULL AND expires_at>?1 ORDER BY last_seen_at DESC LIMIT 50', [Date.now()]);
+  return { sessions: rows.map(row => ({ ...row, current: row.id === req.authSession?.id })) };
+});
+app.delete('/api/auth/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
+  const id = String(req.params.id || '');
+  if (!id) return reply.code(400).send({ error:'missing session id' });
+  await db.run('UPDATE auth_sessions SET revoked_at=?1 WHERE id=?2', [Date.now(), id]);
+  return { ok:true, revoked:id };
+});
 app.get('/api/projects', { preHandler: ensureAuth }, async (req:any) => ({ roots, projects: await cachedProjects(req.query?.refresh === '1') }));
 app.get('/api/sessions', { preHandler: ensureAuth }, async (req:any) => ({ sessions: await listIndexedThreads(req.query?.archived === '1') }));
 app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -1596,7 +1669,7 @@ function cleanupWsConnection(ws:any) {
 app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
   const ws = connection.socket || connection;
   ws.agentdeckGeneration = ++websocketConnectionGeneration;
-  if (!validSessionCookie(req)) return wsClose(ws, 1008, 'auth');
+  if (!(await authSessionForRequest(req))) return wsClose(ws, 1008, 'auth');
   if (!allowedRequestOrigin(req)) return wsClose(ws, 1008, 'origin');
   const ip = String(req.ip || req.socket?.remoteAddress || 'unknown');
   if (incrementMapCount(websocketIpCounts, ip) > WS_MAX_CONNECTIONS_PER_IP) {
@@ -1718,7 +1791,25 @@ function maybeExitAfterDrain() {
   app.log.info('active agent turns drained; exiting for restart');
   setTimeout(() => process.exit(0), 50);
 }
-async function ensureAdmin() { const row = await db.get('SELECT * FROM users WHERE username=?1',['admin']); if (row) return; const pw = process.env.ADMIN_PASSWORD; if (!pw || pw.length < 12) throw new Error('ADMIN_PASSWORD must be set and at least 12 chars'); const hash = await argon2.hash(pw, { type: argon2.argon2id }); await db.run('INSERT INTO users (username,password_hash,created_at) VALUES (?1,?2,?3)', ['admin', hash, Date.now()]); }
+async function ensureAdmin() {
+  const pw = process.env.ADMIN_PASSWORD;
+  if (!pw || pw.length < 12) throw new Error('ADMIN_PASSWORD must be set and at least 12 chars');
+  const row = await db.get('SELECT * FROM users WHERE username=?1',['admin']);
+  const fingerprint = adminPasswordFingerprint();
+  const previous = await getSetting('adminPasswordFingerprint').catch(()=>null);
+  if (!row) {
+    const hash = await argon2.hash(pw, { type: argon2.argon2id });
+    await db.run('INSERT INTO users (username,password_hash,created_at) VALUES (?1,?2,?3)', ['admin', hash, Date.now()]);
+    await setSetting('adminPasswordFingerprint', fingerprint);
+    return;
+  }
+  if (previous && previous !== fingerprint) {
+    const hash = await argon2.hash(pw, { type: argon2.argon2id });
+    await db.run('UPDATE users SET password_hash=?1 WHERE username=?2', [hash, 'admin']);
+    await db.run('UPDATE auth_sessions SET revoked_at=?1 WHERE revoked_at IS NULL', [Date.now()]);
+  }
+  if (!previous || previous !== fingerprint) await setSetting('adminPasswordFingerprint', fingerprint);
+}
 async function cachedProjects(force = false) {
   if (!force) return projectsCache.value || [];
   if (projectsCache.promise) return projectsCache.promise;
@@ -2507,6 +2598,7 @@ async function appSettings() {
     defaultModelModes: { gemini:geminiDefault.mode },
   };
 }
+async function getSetting(key:string) { return (await db.get('SELECT value FROM settings WHERE key=?1', [key]))?.value as string | undefined; }
 async function setSetting(key:string, value:string) { await db.run('INSERT INTO settings (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value', [key, value]); }
 async function activeGeminiDefaultModel() {
   const row = await db.get("SELECT default_model_mode, default_model FROM gemini_profiles WHERE active=1 AND COALESCE(status,'configured')='authenticated' ORDER BY updated_at DESC LIMIT 1").catch(()=>null);

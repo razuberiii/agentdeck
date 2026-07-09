@@ -27,7 +27,7 @@ test('websocket upgrade requires session cookie and legal origin', () => {
   const routeEnd = server.indexOf('app.setNotFoundHandler', routeStart);
   assert.notEqual(routeStart, -1);
   const route = server.slice(routeStart, routeEnd);
-  assert.match(route, /validSessionCookie\(req\).*1008, 'auth'/s);
+  assert.match(route, /authSessionForRequest\(req\).*1008, 'auth'/s);
   assert.match(route, /allowedRequestOrigin\(req\).*1008, 'origin'/s);
 });
 

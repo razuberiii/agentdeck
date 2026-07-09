@@ -16,6 +16,7 @@ export class Db {
     db.pragma('foreign_keys = ON');
     db.exec(`
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER, last_seen_at INTEGER, user_agent TEXT, ip_hint TEXT);
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, codex_thread_id TEXT UNIQUE, project_dir TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, permission_mode TEXT NOT NULL, approval_policy TEXT NOT NULL, sandbox_mode TEXT NOT NULL, model TEXT, archived INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL, anchor_item_id TEXT, turn_id TEXT, relative_path TEXT, content_hash TEXT, modified_at INTEGER, UNIQUE(session_id, path));
