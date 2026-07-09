@@ -92,6 +92,34 @@ test('user events from snapshot and replay reconcile by content when ids differ'
   `);
 });
 
+test('snapshot removes unsequenced live user echo already represented in the snapshot', () => {
+  runReducerScenario(`
+    let state = emptyTimelineState(0);
+    state = applyTimelineMessage(state, {type:'user', clientMessageId:'client-1', status:'persisted', text:'计划模式测试', attachments:[]});
+    assert.equal(state.liveMessages.length, 1);
+    state = applyTimelineSnapshot(state, [
+      {key:'canonical', role:'user', clientMessageId:'client-1', messageId:'db-user-1', text:'计划模式测试', attachments:[], meta:'已保存'},
+      {key:'final', role:'assistant', text:'done'},
+    ], 12);
+    assert.equal(state.liveMessages.length, 0);
+    assert.deepEqual(state.snapshotEvents.map(e => e.key), ['canonical','final']);
+  `);
+});
+
+test('snapshot removes pure text live user echo when runtime snapshot has a different id', () => {
+  runReducerScenario(`
+    let state = emptyTimelineState(0);
+    state = applyTimelineMessage(state, {type:'user', messageId:'runtime-user-1', status:'persisted', text:'计划模式测试', attachments:[]});
+    assert.equal(state.liveMessages.length, 1);
+    state = applyTimelineSnapshot(state, [
+      {key:'canonical', role:'user', messageId:'db-user-1', text:'计划模式测试', attachments:[], meta:'已保存'},
+      {key:'final', role:'assistant', text:'done'},
+    ], 12);
+    assert.equal(state.liveMessages.length, 0);
+    assert.deepEqual(state.snapshotEvents.map(e => e.key), ['canonical','final']);
+  `);
+});
+
 test('active turn status beats active session status and waiting states have priority', () => {
   runReducerScenario(`
     assert.equal(resolveTurnUiStatus({status:'active', activeTurn:{turnId:'t1', status:'running'}}, [], false), 'running');

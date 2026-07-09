@@ -34,9 +34,21 @@ export function runtimeMessageKey(msg: any): string {
 
 export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: TimelineDisplayEvent[], throughSequence: number): TimelineState {
   const coveredSequence = Math.max(state.coveredSequence, Number(throughSequence || 0));
+  const snapshotUserKeys = new Set(snapshotEvents.filter(e => e.role === 'user').flatMap(userIdentityKeys));
+  const snapshotUserLooseTextKeys = new Set(snapshotEvents.filter(e => e.role === 'user').map(userLooseTextKey).filter(Boolean));
   const next = dedupeRuntimeMessages(state.liveMessages.filter(msg => {
     const seq = runtimeMessageSequence(msg);
-    return !seq || seq > coveredSequence;
+    if (seq && seq <= coveredSequence) return false;
+    if (msg?.type === 'user' && liveUserKeys(msg).some(key => snapshotUserKeys.has(key))) return false;
+    if (msg?.type === 'user') {
+      const loose = userLooseTextKey({
+        role: 'user',
+        text: String(msg.text || ''),
+        attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
+      });
+      if (loose && snapshotUserLooseTextKeys.has(loose)) return false;
+    }
+    return true;
   }));
   return {
     snapshotEvents,
@@ -44,6 +56,17 @@ export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: Time
     coveredSequence,
     appliedSequence: Math.max(state.appliedSequence, coveredSequence),
   };
+}
+
+function liveUserKeys(msg: any): string[] {
+  if (msg?.type !== 'user') return [];
+  return userIdentityKeys({
+    role: 'user',
+    text: String(msg.text || ''),
+    clientMessageId: msg.clientMessageId ? String(msg.clientMessageId) : undefined,
+    messageId: msg.messageId ? String(msg.messageId) : undefined,
+    attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
+  });
 }
 
 export function applyTimelineMessage(state: TimelineState, msg: any): TimelineState {
@@ -128,6 +151,12 @@ function userContentIdentityKey(e: TimelineDisplayEvent): string {
   const attachments = normalizeUserAttachments(e.attachments || []);
   if (!attachments) return '';
   return `content:${text}\nattachments:${attachments}`;
+}
+
+function userLooseTextKey(e: TimelineDisplayEvent): string {
+  if ((e.attachments || []).length) return '';
+  const text = normalizeUserText(e.text || '');
+  return text ? `text:${text}` : '';
 }
 
 function normalizeUserText(text: string): string {

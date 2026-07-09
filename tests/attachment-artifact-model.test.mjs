@@ -68,11 +68,14 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(server, /CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message/);
   assert.match(server, /ON CONFLICT\(session_id,client_message_id\) WHERE client_message_id IS NOT NULL DO UPDATE/);
   assert.match(server, /canonicalUserMessageItem/);
+  assert.match(server, /ensureCanonicalUsersInThreadSnapshot/);
   assert.match(server, /findCanonicalUserForRuntimeEvent/);
   assert.match(server, /userMessageAttachmentsFromRow/);
   assert.match(server, /item\?\.type === 'userMessage' && canonicalUsers\.length\) continue/);
+  assert.match(server, /await ensureCanonicalUsersInThreadSnapshot\(thread, threadId\)/);
   assert.match(client, /reconcileTimelineEvents/);
   assert.match(readFileSync(new URL('../client/src/timeline-reducer.ts', import.meta.url), 'utf8'), /userContentIdentityKey/);
+  assert.match(readFileSync(new URL('../client/src/timeline-reducer.ts', import.meta.url), 'utf8'), /userLooseTextKey/);
   assert.match(client, /dedupeAttachments/);
 });
 

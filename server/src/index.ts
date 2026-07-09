@@ -4995,6 +4995,7 @@ async function runtimeEventMessages(threadId:string, event:any) {
     if (thread && row) {
       decorateThreadImages(thread, threadId, String(row.project_dir));
       await injectArtifacts(thread, threadId).catch(()=>{});
+      await ensureCanonicalUsersInThreadSnapshot(thread, threadId).catch(()=>{});
       sanitizeThreadForMobile(thread);
     }
     out.push({ type:'thread_snapshot', thread, status:payload?.status, activeTurnId:payload?.activeTurnId || null, activeTurn:payload?.activeTurn || (payload?.activeTurnId ? { turnId:payload.activeTurnId, status:payload?.status || 'running' } : null), snapshot:{ generation:runtimeGeneration, coveredSequence:runtimeSequence, throughSequence:runtimeSequence, latestSequence:runtimeSequence }, ...base });
@@ -5439,6 +5440,45 @@ function sanitizeThreadForMobile(thread:any){
       return false;
     });
   }
+}
+async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string) {
+  const canonicalUsers = await db.all(
+    `SELECT * FROM agent_messages
+     WHERE session_id=?1 AND role='user'
+     ORDER BY created_at ASC, id ASC`,
+    [threadId]
+  ).catch(()=>[]);
+  if (!canonicalUsers.length) return;
+  const existing = new Set<string>();
+  for (const turn of thread?.turns || []) {
+    for (const item of turn.items || []) {
+      if (item?.type !== 'userMessage') continue;
+      if (item.id) existing.add(`id:${String(item.id)}`);
+      if (item.clientMessageId) existing.add(`client:${String(item.clientMessageId)}`);
+      const text = userMessageItemText(item);
+      if (text) existing.add(`text:${text}`);
+    }
+  }
+  const missing = canonicalUsers.filter((row:any) => {
+    const id = String(row.id || '');
+    const client = String(row.client_message_id || '');
+    const text = normalizeUserSnapshotText(String(row.original_text || row.text || ''));
+    return !(id && existing.has(`id:${id}`)) && !(client && existing.has(`client:${client}`)) && !(text && existing.has(`text:${text}`));
+  });
+  if (!missing.length) return;
+  if (!Array.isArray(thread.turns)) thread.turns = [];
+  if (!thread.turns.length) thread.turns.push({ id:`turn-${threadId}`, items:[] });
+  let insertTurn = thread.turns.find((turn:any) => (turn.items || []).some((item:any) => item?.type === 'agentMessage'));
+  if (!insertTurn) insertTurn = thread.turns[0];
+  if (!Array.isArray(insertTurn.items)) insertTurn.items = [];
+  insertTurn.items.unshift(...missing.map(canonicalUserMessageItem));
+}
+function userMessageItemText(item:any) {
+  const content = Array.isArray(item?.content) ? item.content : [];
+  return normalizeUserSnapshotText(content.filter((part:any) => part?.type === 'text').map((part:any) => part.text || '').join('\n'));
+}
+function normalizeUserSnapshotText(text:string) {
+  return stripProviderOnlyText(stripInternalAttachmentPrompt(String(text || ''))).replace(/\s+/g, ' ').trim();
 }
 async function injectGeneratedImages(thread:any, threadId:string){
   let files:any[] = [];
