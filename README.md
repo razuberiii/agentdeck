@@ -114,11 +114,21 @@ sudo agentdeckctl jobs
 
 # 回滚
 sudo agentdeckctl rollback all
+
+# 备份和恢复预览
+sudo agentdeckctl backup
+sudo agentdeckctl restore /opt/data/agentdeck/backups/agentdeck-backup-YYYYMMDD-HHMMSS.tar.zst --dry-run
 ```
 
 涉及 Runtime 的部署会等待正在运行的任务结束，再安全切换版本。
 
-更详细的部署、备份和排错说明见 [`docs/`](docs/)。
+更详细说明：
+
+- [`docs/install.md`](docs/install.md): 安装、profile、用户和路径。
+- [`docs/security.md`](docs/security.md): 推荐网络边界和安全模式。
+- [`docs/providers.md`](docs/providers.md): Provider 登录和能力差异。
+- [`docs/backup-restore.md`](docs/backup-restore.md): 备份、恢复和 secrets 处理。
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): 常见故障排查。
 
 ## 本地开发
 
