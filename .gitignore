@@ -4,6 +4,11 @@ server/public/
 test-artifacts/
 .tools/
 .backups/
+candidate
+current
+previous
+deploy-state/
+releases/
 
 .env
 *.log
