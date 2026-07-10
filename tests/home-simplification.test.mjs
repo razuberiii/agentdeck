@@ -30,3 +30,10 @@ test('home Agent label only exposes provider name plus short unavailable/login s
   assert.doesNotMatch(helperBlock, /email/);
   assert.doesNotMatch(helperBlock, /authType/);
 });
+
+test('work pulse only appears for active work and does not duplicate recent sessions', () => {
+  const block=source.slice(source.indexOf('function WorkPulse'),source.indexOf('function AgentDock'));
+  assert.match(block,/if\(!running\.length\) return null/);
+  assert.doesNotMatch(block,/刚刚完成或更新/);
+  assert.doesNotMatch(block,/const recent=/);
+});

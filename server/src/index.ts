@@ -786,8 +786,9 @@ app.post('/api/claude/profiles/:id/switch', { preHandler: ensureAuth }, async (r
   if (!existing || existing.status !== 'authenticated') return reply.code(404).send({ error:'profile not found' });
   const profile = await claudeProfileStore.switch(String(req.params.id)).catch(()=>null);
   if (!profile) return reply.code(404).send({ error:'profile not found' });
-  invalidateUnifiedProviderStatuses();
-  return { ok:true, activeClaudeProfile: await activeClaudeProfileSummary() };
+  invalidateProviderCaches('claude');
+  const statuses = await unifiedProviderStatuses(true);
+  return { ok:true, activeClaudeProfile: await activeClaudeProfileSummary(), providerStatus:statuses.claude };
 });
 app.post('/api/claude/profiles/:id/logout', { preHandler: ensureAuth }, async (req:any, reply) => {
   const id = String(req.params.id);
@@ -837,9 +838,9 @@ app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any)
     throw new Error(`Codex 账户切换失败：${safeAntigravitySummary(String(error?.message || error))}`);
   }
   await refreshCodexProfileMetadata(String(profile.id), String(profile.codex_home));
-  codexStatusCache = { expiresAt:0 };
-  invalidateUnifiedProviderStatuses();
-  return { ok:true, activeProfile: await getActiveProfile() };
+  invalidateProviderCaches('codex');
+  const statuses = await unifiedProviderStatuses(true);
+  return { ok:true, activeProfile: await getActiveProfile(), providerStatus:statuses.codex };
 });
 app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getProfile(String(req.params.id));
@@ -893,8 +894,9 @@ app.post('/api/gemini/profiles/:id/switch', { preHandler: ensureAuth }, async (r
   const dto = await getGeminiProfileDto(String(profile.id), { includeHidden:true });
   if (dto?.status !== 'authenticated' || !dto.login?.ok) return reply.code(409).send({error:'请先登录该 Gemini 账户'});
   await activateGeminiProfile(String(profile.id));
-  invalidateUnifiedProviderStatuses();
-  return { ok:true, activeGeminiProfile: await getActiveGeminiProfile() };
+  invalidateProviderCaches('gemini');
+  const statuses = await unifiedProviderStatuses(true);
+  return { ok:true, activeGeminiProfile: await getActiveGeminiProfile(), providerStatus:statuses.gemini };
 });
 app.post('/api/gemini/profiles/:id/refresh', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getGeminiProfile(String(req.params.id));
@@ -1172,8 +1174,9 @@ app.post('/api/antigravity/profiles/:id/switch', { preHandler: ensureAuth }, asy
   const profile = await getAntigravityProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
   await activateAntigravityProfile(String(profile.id));
-  invalidateUnifiedProviderStatuses();
-  return { activeProfile: await getActiveAntigravityProfile() };
+  invalidateProviderCaches('antigravity');
+  const statuses = await unifiedProviderStatuses(true);
+  return { activeProfile: await getActiveAntigravityProfile(), providerStatus:statuses.antigravity };
 });
 app.delete('/api/antigravity/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getAntigravityProfile(String(req.params.id));
