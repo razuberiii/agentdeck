@@ -230,7 +230,7 @@ function Home(){
   return <main className="appShell homeShell">
     <header className="homeTop">
       <Brand/>
-      <div className="iconRow"><button className="commandTrigger" aria-label="打开命令中心" onClick={()=>setCommandOpen(true)}><Icon name="search" size={16}/><span>查找任务</span><kbd>⌘ K</kbd></button><button className="iconBtn secondaryAction" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
+      <div className="iconRow"><button className="commandTrigger" aria-label="打开命令中心" onClick={()=>setCommandOpen(true)}><Icon name="search" size={16}/><span>查找任务</span><kbd>⌘ K</kbd></button><button className="iconBtn secondaryAction" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn quotaAction" aria-label="额度与用量" title="额度与用量" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="homeHero">
