@@ -21,3 +21,10 @@ test('settings applies returned provider status immediately',async()=>{
   assert.match(client,/function applyFreshProviderStatus\(provider:ProviderId,status:any\)/);
   for(const provider of ['codex','claude','gemini','antigravity']) assert.match(client,new RegExp(`applyFreshProviderStatus\\('${provider}',result\\.providerStatus\\)`));
 });
+
+test('account switch refreshes the home status source and active profile rows',async()=>{
+  const client=await readFile(new URL('../client/src/main.tsx',import.meta.url),'utf8');
+  assert.match(client,/api\('\/api\/status'\+\(force\?'\?refresh=1':''\)\)/);
+  assert.match(client,/onChanged=\{async\(\)=>\{ await refreshSessions\(\); await refreshStatus\(\);/);
+  for(const provider of ['claude','gemini','antigravity']) assert.match(client,new RegExp(`markActiveProfile\\(id,'${provider}'\\)`));
+});

@@ -187,9 +187,9 @@ function Home(){
   useEffect(()=>{ refresh(); void refreshStatus(); },[archived]);
   useEffect(()=>{ const on=()=>setOnline(navigator.onLine); addEventListener('online',on); addEventListener('offline',on); return()=>{removeEventListener('online',on); removeEventListener('offline',on)} },[]);
   useEffect(()=>{ const onKey=(event:KeyboardEvent)=>{ if((event.metaKey||event.ctrlKey)&&event.key.toLowerCase()==='k'){ event.preventDefault(); setCommandOpen(open=>!open); } }; addEventListener('keydown',onKey); return()=>removeEventListener('keydown',onKey); },[]);
-  async function refresh(scanProjects=false){ setError(''); const sessionsPromise=refreshSessions(); if(scanProjects){ refreshStatus(); loadProjects(true); } await sessionsPromise; }
+  async function refresh(scanProjects=false){ setError(''); const sessionsPromise=refreshSessions(); if(scanProjects){ refreshStatus(true); loadProjects(true); } await sessionsPromise; }
   async function refreshSessions(){ setSessionsLoading(true); try{ const next=await api<Dashboard>('/api/dashboard'+(archived?'?archived=1':'')); setDashboard(next); setStatus(next.control); setSessions(next.sessions); } catch(e:any){ setError(shortError(e)); toast('error','工作台读取失败'); } finally { setSessionsLoading(false); setAppStateLoading(false); } }
-  async function refreshStatus(){ setStatusRefreshing(true); try{ setStatus((await api('/api/status')) as Status); } catch(e:any){ console.warn('status refresh failed', e); } finally { setStatusRefreshing(false); } }
+  async function refreshStatus(force=false){ setStatusRefreshing(true); try{ const next=(await api('/api/status'+(force?'?refresh=1':''))) as Status; setStatus(next); return next; } catch(e:any){ console.warn('status refresh failed', e); return null; } finally { setStatusRefreshing(false); } }
   async function loadProjects(force=true){ setProjectsLoading(true); try{ const ps=await api('/api/projects'+(force?'?refresh=1':'')); setProjects(ps.projects); } catch(e:any){ toast('error','项目扫描失败：'+shortError(e)); } finally{ setProjectsLoading(false); } }
   async function openProjectPicker(){ setPicker(true); await loadProjects(true); }
   const defaultWorkspace = status?.defaultWorkspace || status?.roots?.[0] || FALLBACK_WORKSPACE;
@@ -233,7 +233,7 @@ function Home(){
     </section>
     {picker&&<ProjectPicker projects={projects} busy={busy} loading={projectsLoading} onRefresh={()=>loadProjects(true)} onClose={()=>setPicker(false)} onPick={(p)=>newSession(p.path,p.name,taskText)}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
-    {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} initialPage={settingsInitialPage} onRetry={loadSettings} onChanged={async()=>{ refresh(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
+    {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} initialPage={settingsInitialPage} onRetry={loadSettings} onChanged={async()=>{ await refreshSessions(); await refreshStatus(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
     {commandOpen&&<CommandCenter sessions={sessions} dashboard={dashboard} onClose={()=>setCommandOpen(false)} onNew={()=>newSession(defaultWorkspace,'Default Workspace')} onProjects={()=>{setCommandOpen(false);openProjectPicker()}} onSettings={()=>{setCommandOpen(false);showSettings()}}/>}
   </main>;
 }
@@ -710,10 +710,13 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   useEffect(()=>setLocalData((current:any)=>mergeSettingsData(current, data)),[data]);
   useEffect(()=>{ if(page!=='model') return; setModels(null); api('/api/models?provider='+encodeURIComponent(activeProvider)).then(setModels).catch((e:any)=>setModels({models:[], error:shortError(e)})); },[page,activeProvider]);
   async function syncSettings(){ const next=await onChanged(); if(next) setLocalData((current:any)=>mergeSettingsData(current, next)); }
-  function markActiveProfile(id:string){
+  function markActiveProfile(id:string, provider:ProviderId='codex'){
     setLocalData((d:any)=>{
-      const profiles = activeFirst((d?.profiles||[]).map((p:any)=>({...p, active:p.id===id?1:0})));
-      return {...d, activeProfile:{...(d?.activeProfile||{}), id, active:1}, profiles};
+      const keys:Record<ProviderId,[string,string]>={codex:['profiles','activeProfile'],claude:['claudeProfiles','activeClaudeProfile'],gemini:['geminiProfiles','activeGeminiProfile'],antigravity:['antigravityProfiles','activeAntigravityProfile']};
+      const [listKey,activeKey]=keys[provider];
+      const profiles=activeFirst((d?.[listKey]||[]).map((p:any)=>({...p,active:p.id===id?1:0})));
+      const selected=profiles.find((p:any)=>p.id===id) || {...(d?.[activeKey]||{}),id,active:1};
+      return {...d,[activeKey]:selected,[listKey]:profiles};
     });
   }
   function applyFreshProviderStatus(provider:ProviderId,status:any){ if(!status) return; setLocalData((data:any)=>({...data,[provider]:status,providerStatus:{...(data?.providerStatus||{}),[provider]:status},providers:(data?.providers||[]).some((item:any)=>item.id===provider)?(data.providers||[]).map((item:any)=>item.id===provider?status:item):[...(data?.providers||[]),status]})); }
@@ -741,7 +744,7 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   async function loginClaudeCli(profile?:any){ try{ const r=await api('/api/claude/profiles/login',{method:'POST',body:JSON.stringify({profileId:profile?.id,name:profile?.name||'Claude Code Account'})}); setClaudeLoginJob(r.job); setClaudeLoginInput(''); toast('info','Claude CLI 登录已启动'); await syncSettings(); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function submitClaudeLoginInput(){ if(!claudeLoginJob?.id || !claudeLoginInput.trim()) return; try{ await api('/api/claude-login/'+claudeLoginJob.id+'/input',{method:'POST',body:JSON.stringify({text:claudeLoginInput.trim()})}); setClaudeLoginInput(''); toast('info','已提交，正在等待 Claude CLI'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
   async function cancelClaudeLogin(){ if(!claudeLoginJob?.id) return; try{ await api('/api/claude-login/'+claudeLoginJob.id,{method:'DELETE'}); setClaudeLoginJob(null); setClaudeLoginInput(''); toast('info','已取消登录'); await syncSettings(); } catch(e:any){ toast('error','取消失败：'+shortError(e)); } }
-  async function switchClaudeProfile(id:string){ try{ const result=await api(`/api/claude/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('claude',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchClaudeProfile(id:string){ try{ const result=await api(`/api/claude/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id,'claude'); applyFreshProviderStatus('claude',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
   async function logoutClaudeProfile(profile:any){ try{ await api(`/api/claude/profiles/${profile.id}/logout`,{method:'POST'}); haptic(); toast('success','已退出登录'); await syncSettings(); } catch(e:any){ toast('error','退出失败：'+shortError(e)); } }
   async function removeClaudeProfile(profile:any){ setClaudeDeleteBusy(true); setClaudeDeleteError(''); try{ await api(`/api/claude/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteClaudeProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setClaudeDeleteError(msg); toast('error','删除失败：'+msg); } finally { setClaudeDeleteBusy(false); } }
   async function refreshCodexMetadata(id:string){ try{ const result=await api(`/api/profiles/${id}/metadata/refresh`,{method:'POST'}); await syncSettings(); toast(result.ok?'success':'error',result.ok?'账户信息已更新':'账户信息读取失败，可重试'); } catch(e:any){ toast('error','账户信息读取失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
@@ -770,10 +773,10 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   async function startGeminiLogin(methodId:string){ if(!geminiAuthProfile?.id) return; try{ const body:any={methodId}; if(methodId==='api_key' || methodId.toLowerCase().includes('api')) body.apiKey=geminiApiKey; const r=await api(`/api/gemini/profiles/${geminiAuthProfile.id}/login`,{method:'POST',body:JSON.stringify(body)}); setGeminiLoginJob(r.job); setGeminiApiKey(''); setGeminiAuthCode(''); toast('info','Gemini 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function submitGeminiAuthCode(){ if(!geminiLoginJob?.id || !geminiAuthCode.trim()) return; try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id+'/input',{method:'POST',body:JSON.stringify({code:geminiAuthCode.trim()})}); setGeminiLoginJob((job:any)=>({...job,...(r.job||{}),codeSubmitted:true})); setGeminiAuthCode(''); toast('info','授权码已提交，正在确认登录'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
   async function cancelGeminiLogin(){ if(!geminiLoginJob?.id) return; try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id+'/cancel',{method:'POST'}); setGeminiLoginJob(r.job); toast('info','已取消登录'); } catch(e:any){ toast('error','取消失败：'+shortError(e)); } }
-  async function switchGeminiProfile(id:string){ try{ const result=await api(`/api/gemini/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('gemini',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchGeminiProfile(id:string){ try{ const result=await api(`/api/gemini/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id,'gemini'); applyFreshProviderStatus('gemini',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
   async function logoutGeminiProfile(profile:any){ try{ await api(`/api/gemini/profiles/${profile.id}/logout`,{method:'POST'}); haptic(); toast('success','已退出登录'); await syncSettings(); } catch(e:any){ toast('error','退出失败：'+shortError(e)); } }
   async function removeGeminiProfile(profile:any){ setGeminiDeleteBusy(true); setGeminiDeleteError(''); try{ await api(`/api/gemini/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteGeminiProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setGeminiDeleteError(msg); toast('error','删除失败：'+msg); } finally { setGeminiDeleteBusy(false); } }
-  async function switchAntigravityProfile(id:string){ try{ const result=await api(`/api/antigravity/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('antigravity',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchAntigravityProfile(id:string){ try{ const result=await api(`/api/antigravity/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id,'antigravity'); applyFreshProviderStatus('antigravity',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
   async function removeAntigravityProfile(profile:any){ setAntigravityDeleteBusy(true); setAntigravityDeleteError(''); try{ await api(`/api/antigravity/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteAntigravityProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setAntigravityDeleteError(msg); toast('error','删除失败：'+msg); } finally { setAntigravityDeleteBusy(false); } }
   async function removeProfile(profile:any){ setProfileDeleteBusy(true); setProfileDeleteError(''); try{ await api(`/api/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setProfileDeleteError(msg); toast('error','删除失败：'+msg); } finally { setProfileDeleteBusy(false); } }
   const currentModel = localData?.settings?.defaultModels ? (localData.settings.defaultModels[activeProvider] || catalogCurrent(models)) : (localData?.settings?.defaultModel || catalogCurrent(models));
@@ -831,7 +834,7 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
 function mergeSettingsData(current:any, next:any){
   if(!current) return next;
   const merged:any = {...next};
-  for(const key of ['profiles','geminiProfiles','geminiPendingProfiles','antigravityProfiles']){
+  for(const key of ['profiles','claudeProfiles','geminiProfiles','geminiPendingProfiles','antigravityProfiles']){
     if(!current?.[key]?.length || !next?.[key]?.length) continue;
     const byId = new Map(next[key].map((p:any)=>[p.id,p]));
     const ordered = current[key].map((p:any)=>byId.get(p.id)).filter(Boolean);

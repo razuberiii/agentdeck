@@ -1,55 +1,43 @@
 <div align="center">
 
+<img src="client/public/icons/agentdeck.svg" width="76" alt="AgentDeck logo" />
+
 # AgentDeck
 
-**在浏览器和手机上，继续运行在服务器里的 Coding Agent。**
+**让服务器里的 Coding Agent，变成一个随时可以回来的工作空间。**
 
-统一使用 Codex、Claude Code 和其他 CLI Agent。
-关掉页面、换台设备，任务和会话仍然留在自己的服务器上。
+在电脑上交代任务，在路上用手机查看进度。页面关掉、网络断开或换一台设备，任务仍在自己的服务器上继续。
 
-![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
-![PWA](https://img.shields.io/badge/PWA-mobile--first-5A0FC8?logo=pwa&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-2F855A)
+[安装](#开始使用) · [工作原理](#工作原理) · [Provider](#provider) · [文档](#文档)
 
 </div>
 
----
+## 为什么做它
 
-## 它是做什么的？
+我喜欢把 Coding Agent 放在服务器里跑：环境完整、项目都在、任务也不怕笔记本合盖。但终端并不是一个适合随时回来查看、补一句话或处理审批的界面。
 
-Coding Agent 很适合放在服务器里工作，但终端并不适合一直带在身边。
+AgentDeck 是我希望拥有的那层产品界面。它不搬走代码，也不接管 Agent；它只是把服务器里真实运行的 CLI Agent、账号、项目和会话整理成一个桌面与手机都舒服的工作空间。
 
-AgentDeck 给这些 CLI 加了一个适合电脑和手机使用的控制台。你可以在电脑上发起任务，离开以后从手机查看进度、补充附件、处理审批，再回到电脑继续。
+它适合这样的使用方式：
 
-Agent 仍然运行在你自己的服务器上。AgentDeck 不托管你的代码，也不会把项目变成某个平台里的副本。
+- 发出一个任务，然后离开页面；
+- 从另一台设备继续同一段对话；
+- 保存多个 Agent 账号，并在需要时切换；
+- 上传截图、源码、PDF，查看产物与执行过程；
+- 自己掌握代码、凭据、数据库和运行环境。
 
-## 主要功能
+## 现在能做什么
 
-- 在桌面和手机之间继续同一个会话；
-- 统一管理多个 Agent、账户和工作区；
-- 上传图片、源码、PDF 和其他附件；
-- 查看运行过程，处理审批或随时停止任务；
-- 页面刷新、断线或 Web 服务重启后恢复已经保存的内容；
-- 通过 PWA 像普通应用一样打开；
-- 所有项目、凭据和运行数据都留在自己的机器上。
+- **持久任务**：Web 页面重启不等于任务重启，Runtime 会保存会话和事件序列。
+- **多 Agent 工作区**：统一使用 Codex、Claude Code、Gemini CLI 与 Antigravity。
+- **多账号状态**：保存 Provider 账号、切换当前账号，并把会话绑定到实际执行账号。
+- **跨设备继续**：桌面浏览器与手机 PWA 使用同一份任务状态。
+- **真实执行过程**：查看回复、命令、审批、附件和任务状态，而不是只保留聊天文本。
+- **自托管**：项目、凭据、附件和 SQLite 数据都留在自己的机器上。
 
-## Provider
+## 开始使用
 
-| Provider | 说明 |
-| --- | --- |
-| **Codex** | 当前最完整的接入，支持持久会话、审批、附件和多账户。 |
-| **Claude Code** | 通过官方 CLI 登录和 Claude Agent SDK 运行。 |
-| **Antigravity** | 提供基础 CLI Agent 支持，能力取决于上游。 |
-| **Gemini CLI** | 实验性支持；个人账户目前可能受上游限制，不建议作为主要 Provider。 |
-
-打开 AgentDeck 后，可以在 Provider 设置中查看 CLI 状态、安装受支持的 CLI，并完成登录。
-
-## 快速开始
-
-需要一台 Linux 服务器，以及 Node.js 22 或更高版本。
-
-推荐把 AgentDeck 放在 localhost、LAN、VPN、Tailscale、Headscale 或 WireGuard 后面使用。不要把未加防护的 AgentDeck 直接暴露到公网。
+需要 Linux 与 Node.js 22 或更高版本。推荐放在 localhost、可信局域网、VPN、Tailscale、Headscale 或 WireGuard 后面；不要把未加防护的 AgentDeck 直接暴露到公网。
 
 ```bash
 git clone https://github.com/razuberiii/agentdeck.git
@@ -57,87 +45,69 @@ cd agentdeck
 sudo AGENTDECK_INSTALL_PROFILE=standard ./install.sh
 ```
 
-安装完成后，脚本会打印访问地址和下一步操作。
+安装脚本会输出访问地址。打开页面后进入 **设置 → Agent 与账号**，完成 CLI 登录即可开始任务。
 
-打开 AgentDeck，进入 **设置 → Provider**，登录你要使用的 Agent，然后就可以创建任务。
-
-已有 ubuntu/full-access/VPN 部署可以继续使用 personal profile：
+如果你是在自己的可信服务器上，希望保持完整权限：
 
 ```bash
 sudo AGENTDECK_INSTALL_PROFILE=personal ./install.sh
 ```
 
-安装 profile：
-
-| Profile | 适合谁 | 默认行为 |
+| Profile | 适用环境 | 默认权限 |
 | --- | --- | --- |
-| `personal` | 个人、localhost、VPN、可信内网 | 保持原来的爽用体验：ubuntu 用户、Codex `danger-full-access`、`approval_policy=never`。 |
-| `standard` | 新的自托管用户 | 使用专用 `agentdeck` 用户，Codex 默认 `workspace-write` + `on-request`。 |
-| `hardened` | 熟悉 Linux/systemd 的高级用户 | 更保守的基础框架，Codex 默认 `read-only` + `on-request`。 |
+| `standard` | 大多数自托管安装 | 专用用户，`workspace-write`，操作时确认 |
+| `personal` | 个人服务器、VPN、可信内网 | 当前用户，`danger-full-access`，无需确认 |
+| `hardened` | 希望自行配置安全边界 | `read-only`，操作时确认 |
 
-更多安装说明见 [`docs/install.md`](docs/install.md)。
+完整安装与升级说明见 [docs/install.md](docs/install.md)。
 
-## 架构
+## Provider
+
+| Provider | 当前定位 |
+| --- | --- |
+| **Codex** | 主力接入；支持持久会话、审批、附件、多账号和账号绑定。 |
+| **Claude Code** | 通过官方 CLI 与 Claude Agent SDK 运行。 |
+| **Antigravity** | 基础 CLI Agent 接入，能力取决于上游。 |
+| **Gemini CLI** | 实验性接入；个人账号能力可能受上游客户端限制。 |
+
+AgentDeck 不假装所有 Provider 完全相同。界面会根据实际 CLI、登录状态与 Runtime 能力告诉你当前可以创建或继续什么任务。
+
+## 工作原理
 
 ```mermaid
 flowchart LR
-    A[Browser / PWA] -->|HTTP + WebSocket| B[Web Gateway]
-    B -->|HTTP + SSE| C[AgentDeck Runtime]
-
-    C --> D[Codex app-server]
-    C --> E[Claude Agent SDK]
-    C --> F[Antigravity CLI]
-    C --> G[Gemini CLI ACP]
-
-    C --> H[(SQLite)]
-    B --> I[Attachments / Artifacts]
+    UI[Browser / PWA] -->|HTTP + WebSocket| Web[Web Gateway]
+    Web -->|HTTP + SSE| Runtime[Persistent Runtime]
+    Runtime --> Codex[Codex app-server]
+    Runtime --> Claude[Claude Agent SDK]
+    Runtime --> Gemini[Gemini ACP]
+    Runtime --> Other[Other CLI Agents]
+    Runtime --> DB[(SQLite)]
 ```
 
-浏览器只是控制界面。
+浏览器是控制面，Runtime 才是任务的事实来源。会话、活动 Turn、执行账号和有序事件会被持久化；浏览器重新连接后从最后确认的位置继续补事件。
 
-真正的会话、活动任务、Provider session 和事件序列保存在 Runtime 中。页面重新连接时，会补回已经持久化的事件，而不是从头开始。
+这也意味着升级 Web 界面时，不需要打断正在工作的 Agent。涉及 Runtime 的发布会先等待活动任务安全结束，再完成切换。
 
-## 常用命令
+## 运维
 
 ```bash
-# 查看状态
-sudo agentdeckctl status
-
-# 检查环境
-sudo agentdeckctl check
-
-# 部署当前代码
-sudo agentdeckctl deploy all
-
-# 查看部署任务
-sudo agentdeckctl jobs
-
-# 回滚
-sudo agentdeckctl rollback all
-
-# 备份和恢复预览
-sudo agentdeckctl backup
-sudo agentdeckctl restore /opt/data/agentdeck/backups/agentdeck-backup-YYYYMMDD-HHMMSS.tar.zst --dry-run
+sudo agentdeckctl status          # 服务与当前发布
+sudo agentdeckctl check           # 环境检查
+sudo agentdeckctl deploy all      # 发布当前提交
+sudo agentdeckctl jobs            # 发布任务
+sudo agentdeckctl rollback all    # 回滚
+sudo agentdeckctl backup          # 备份
 ```
 
-涉及 Runtime 的部署会等待正在运行的任务结束，再安全切换版本。
-
-更详细说明：
-
-- [`docs/install.md`](docs/install.md): 安装、profile、用户和路径。
-- [`docs/security.md`](docs/security.md): 推荐网络边界和安全模式。
-- [`docs/providers.md`](docs/providers.md): Provider 登录和能力差异。
-- [`docs/backup-restore.md`](docs/backup-restore.md): 备份、恢复和 secrets 处理。
-- [`docs/troubleshooting.md`](docs/troubleshooting.md): 常见故障排查。
-
-## 本地开发
+## 开发
 
 ```bash
 npm ci
 npm run start:local
 ```
 
-检查项目：
+提交前建议运行：
 
 ```bash
 npm run typecheck
@@ -147,12 +117,17 @@ npm test
 npm run test:e2e
 ```
 
+## 文档
+
+- [架构](docs/architecture.md)
+- [安装与升级](docs/install.md)
+- [Provider 与登录](docs/providers.md)
+- [安全边界](docs/security.md)
+- [备份与恢复](docs/backup-restore.md)
+- [故障排查](docs/troubleshooting.md)
+
 ## 项目状态
 
-AgentDeck 仍在持续开发中。不同 Provider 的 CLI 和协议可能变化，部分能力也并不完全一致。
+AgentDeck 还在快速演进。CLI、认证方式和上游协议会变化，某些 Provider 能力也仍然有限。如果你遇到问题，欢迎带上环境信息和复现步骤提交 Issue。
 
-发现问题可以直接提交 Issue。
-
-## License
-
-[MIT](LICENSE)
+MIT License。见 [LICENSE](LICENSE)。
