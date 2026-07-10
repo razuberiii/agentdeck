@@ -87,7 +87,8 @@ test('runtime SSE events are consumed serially so terminal snapshots cannot over
 test('terminal events reconcile the open conversation with the authoritative snapshot', () => {
   assert.match(client,/function syncTerminalSnapshot/);
   assert.match(client,/timeline\.liveMessages\.some\(isTerminalSignal\)/);
-  assert.match(client,/void load\(false,generation\)/);
+  assert.match(client,/void load\(true,generation\)/);
+  assert.match(client,/resetLive\?\{\.\.\.state,liveMessages:\[\]\}:state/);
   const terminalHelper=client.slice(client.indexOf('function isTerminalSignal'),client.indexOf('function turnFailed'));
   assert.match(terminalHelper,/turn\/completed/);
   assert.doesNotMatch(terminalHelper,/final_answer|item\/completed/);

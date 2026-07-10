@@ -18,6 +18,9 @@ test('home is task-first and keeps provider switching in the Agent dock', () => 
   assert.match(homeBlock, /onSwitch=\{switchProvider\}/);
   assert.match(homeBlock, /const selectedWorkspace = workspaceOverride \|\| defaultWorkspace/);
   assert.match(homeBlock, /setWorkspaceOverride\(p\.path\)/);
+  assert.match(homeBlock, /pickerProjects:Project\[\]/);
+  assert.match(homeBlock, /disabled=\{!!busy\}/);
+  assert.match(homeBlock, /busy\?'创建中':'开工'/);
   assert.doesNotMatch(homeBlock, /onPick=\{\(p\)=>newSession\(p\.path/);
   assert.match(homeBlock, /aria-label="额度与用量"[^>]+onClick=\{showQuota\}/);
   assert.match(homeBlock, /storageSet\(draftKey\(s\.id\),initialTask\.trim\(\)\)/);
@@ -40,6 +43,7 @@ test('work pulse only appears for active work and does not duplicate recent sess
   assert.match(block,/if\(!running\.length\) return null/);
   assert.doesNotMatch(block,/刚刚完成或更新/);
   assert.doesNotMatch(block,/const recent=/);
+  assert.doesNotMatch(block,/\['running','active','waiting'\]/);
 });
 
 test('editorial headline is randomized once per page visit instead of rotating', () => {
