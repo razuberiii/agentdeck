@@ -428,7 +428,7 @@ async function lightAppState() {
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
   const claudeStatus = cachedProviderStatusSnapshot('claude', claudeStatusCache.value);
   const antigravityStatus = cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value);
-  const providerStatuses = await unifiedProviderStatuses(false);
+  const providerStatuses = cachedUnifiedProviderStatusesSnapshot();
   return {
     authed:true,
     authenticated:true,
@@ -681,7 +681,7 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     light ? Promise.resolve(cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value)) : cachedAntigravityStatus(force),
     light ? Promise.resolve(cachedProviderStatusSnapshot('gemini', geminiStatusCache.value)) : cachedGeminiStatus(force),
     light || !USE_AGENT_RUNTIME ? Promise.resolve({ error: light ? 'not refreshed' : 'persistent runtime disabled' }) : runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })),
-    unifiedProviderStatuses(force && !light),
+    light ? Promise.resolve(cachedUnifiedProviderStatusesSnapshot()) : unifiedProviderStatuses(force),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]), providerInstallers:providerInstallerSummaries(), providerInstallJobs:providerInstallJobSummaries() };
@@ -1227,7 +1227,7 @@ app.get('/api/projects', { preHandler: ensureAuth }, async (req:any) => ({ roots
 app.get('/api/sessions', { preHandler: ensureAuth }, async (req:any) => ({ sessions: await listIndexedThreads(req.query?.archived === '1') }));
 app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
   const archived = req.query?.archived === '1';
-  const [sessions,control] = await Promise.all([listIndexedThreads(archived), lightAppState()]);
+  const [sessions,control,artifacts] = await Promise.all([listIndexedThreads(archived), lightAppState(), dashboardArtifacts()]);
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
   const startOfToday = new Date(new Date(now).toDateString()).getTime();
@@ -1251,6 +1251,7 @@ app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
     generatedAt:now,
     archived,
     control,
+    artifacts,
     metrics:{
       total:sessions.length,
       running:sessions.filter(session => runningStates.has(String(session.status))).length,
@@ -1263,6 +1264,16 @@ app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
     sessions,
   };
 });
+async function dashboardArtifacts(){
+  const sql='SELECT id,session_id,name,mime,size,created_at,modified_at FROM artifacts ORDER BY COALESCE(modified_at,created_at) DESC LIMIT 12';
+  const [webRows,runtimeRows,webCount,runtimeCount]=await Promise.all([db.all(sql).catch(()=>[]),runtimeDb.all(sql).catch(()=>[]),db.get('SELECT COUNT(*) count FROM artifacts').catch(()=>null),runtimeDb.get('SELECT COUNT(*) count FROM artifacts').catch(()=>null)]);
+  const byId=new Map<string,any>();
+  for(const row of [...runtimeRows,...webRows]) if(!byId.has(String(row.id))) byId.set(String(row.id),row);
+  const items=[...byId.values()].sort((a,b)=>Number(b.modified_at||b.created_at||0)-Number(a.modified_at||a.created_at||0)).slice(0,8).map(row=>({
+    id:String(row.id),sessionId:String(row.session_id),name:String(row.name),type:String(row.mime||'application/octet-stream'),size:Number(row.size||0),updatedAt:Number(row.modified_at||row.created_at||0),url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}`,
+  }));
+  return { total:Math.max(Number(webCount?.count||0),Number(runtimeCount?.count||0),byId.size), items };
+}
 app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => {
   let projectDir:string;
   try { projectDir = await validateProject(req.body?.projectDir || DEFAULT_WORKSPACE_DIR, roots); }
@@ -1984,6 +1995,26 @@ function codexQuotaLogFields(rateLimits:any) {
 }
 function providerDisplayName(provider:AgentProviderId) {
   return registryProviderDisplayName(provider);
+}
+function cachedUnifiedProviderStatusesSnapshot():Record<AgentProviderId, ProviderStatus> {
+  if (unifiedProviderStatusCache.value) return unifiedProviderStatusCache.value;
+  const snapshots:Record<AgentProviderId, any> = {
+    codex:cachedCodexStatusSnapshot(),
+    claude:cachedProviderStatusSnapshot('claude', claudeStatusCache.value),
+    gemini:cachedProviderStatusSnapshot('gemini', geminiStatusCache.value),
+    antigravity:cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value),
+  };
+  return Object.fromEntries(PROVIDER_ORDER.map(provider => [provider, providerStatus({
+    provider,
+    displayName:providerDisplayName(provider),
+    cliStatus:snapshots[provider],
+    auth:'checking',
+    canCreateSession:false,
+    canContinueSession:false,
+    capabilities:providerCapabilitiesFor(provider),
+    reasonCode:'status_refreshing',
+    message:'账号状态正在后台刷新',
+  })])) as Record<AgentProviderId, ProviderStatus>;
 }
 function isGeminiPersonalUnsupportedProfile(profile:any) {
   return String(profile?.authType || profile?.auth_type || profile?.login?.authType || '').toLowerCase() === 'oauth-personal';

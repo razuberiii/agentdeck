@@ -127,6 +127,7 @@ function Icon({name,size=18}:{name:IconName;size?:number}){
   };
   return <svg className="uiIcon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
+function Brand({compact=false}:{compact?:boolean}){ return <div className={`brandLockup ${compact?'compact':''}`}><img className="brandMark" src="/icons/agentdeck.svg" alt=""/><span><strong>{APP_NAME}</strong>{!compact&&<small>Persistent agent workspace</small>}</span></div>; }
 
 function App(){
   const [authed,setAuthed]=useState(false);
@@ -144,7 +145,7 @@ function App(){
 function Login({onLogin}:{onLogin:()=>void}){
   const toast=useToast(); const [password,setPassword]=useState(''); const [busy,setBusy]=useState(false);
   async function submit(e:any){ e.preventDefault(); setBusy(true); try{ await api('/api/login',{method:'POST',body:JSON.stringify({username:'admin',password})}); haptic(); onLogin(); } catch { toast('error','登录失败'); } finally { setBusy(false); } }
-  return <main className="login"><form onSubmit={submit} className="loginPanel"><div className="mark">AD</div><h1>{APP_NAME}</h1><input autoFocus type="password" placeholder="管理员密码" value={password} onChange={e=>setPassword(e.target.value)}/><button className="btn primary" disabled={busy}>{busy?'登录中':'登录'}</button></form></main>;
+  return <main className="login"><form onSubmit={submit} className="loginPanel"><img className="loginMark" src="/icons/agentdeck.svg" alt=""/><div><h1>{APP_NAME}</h1><p>回到你的 Agent 工作区</p></div><input autoFocus type="password" placeholder="管理员密码" aria-label="管理员密码" value={password} onChange={e=>setPassword(e.target.value)}/><button className="btn primary" disabled={busy}>{busy?'登录中':'登录并进入工作区'}</button></form></main>;
 }
 
 function DiagnosticsView(){
@@ -202,7 +203,7 @@ function Home(){
   async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
   async function loadSettings(){ setSettingsLoading(true); setSettingsError(''); try{ setSettings(await api('/api/settings?light=1')); } catch(e:any){ const msg=shortError(e); setSettingsError(msg); toast('error','设置读取失败：'+msg); } finally { setSettingsLoading(false); } }
   const [settingsInitialPage,setSettingsInitialPage]=useState<'main'|'agent'>('main');
-  function showSettings(page:'main'|'agent'='main'){ setSettingsInitialPage(page); setSettingsOpen(true); loadSettings(); }
+  function showSettings(page:'main'|'agent'='main'){ setSettingsInitialPage(page); setSettings((current:any)=>current||{settings:{activeProvider:status?.activeProvider||'codex',defaultMode:status?.defaultMode||'yolo',defaultModel:status?.defaultModel,defaultModels:status?.defaultModels||{}},providers:status?.providers||[],providerStatus:status?.providerStatus||{},codex:status?.codex,claude:status?.claude,gemini:status?.gemini,antigravity:status?.antigravity,activeProfile:status?.activeProfile,activeClaudeProfile:status?.activeClaudeProfile,activeGeminiProfile:status?.activeGeminiProfile,activeAntigravityProfile:status?.activeAntigravityProfile,profiles:[],claudeProfiles:[],geminiProfiles:[],geminiPendingProfiles:[],antigravityProfiles:[]}); setSettingsOpen(true); loadSettings(); }
   async function switchProvider(provider:ProviderId){ if(provider===activeProvider) return; try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); setStatus(current=>current?{...current,activeProvider:provider}:current); haptic(); toast('success',`已切换到 ${providerLabel(provider)}`); await refreshSessions(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
   const activeProvider=status?.activeProvider || 'codex';
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
@@ -210,7 +211,7 @@ function Home(){
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell homeShell">
     <header className="homeTop">
-      <div><strong>{APP_NAME}</strong><span>你的 AI 工程工作台</span></div>
+      <Brand/>
       <div className="iconRow"><button className="commandTrigger" aria-label="打开命令中心" onClick={()=>setCommandOpen(true)}><Icon name="search" size={16}/><span>命令中心</span><kbd>⌘ K</kbd></button><button className="iconBtn" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="查看额度" title="查看额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
@@ -224,6 +225,7 @@ function Home(){
       <button className="taskButton secondary" onClick={openProjectPicker}><i><Icon name="folder" size={20}/></i><span>Open project</span><b>{projectsLoading?'正在扫描…':projects.length ? `从 ${projects.length} 个项目中选择` : '选择一个代码仓库'}</b><small>扫描工作区与 Git 仓库</small><Icon name="arrow"/></button>
     </section>
     {dashboard&&<MissionControl dashboard={dashboard}/>}
+    {dashboard&&dashboard.artifacts.items.length>0&&<OutputShelf dashboard={dashboard}/>}
     <div className="sectionHeading"><div><span>WORKSPACE</span><h2>{archived?'归档会话':'最近会话'}</h2></div><b>{filtered.length}</b></div>
     <section className="sessionTools">
       <div className="seg"><button className={!archived?'active':''} onClick={()=>setArchived(false)}>当前</button><button className={archived?'active':''} onClick={()=>setArchived(true)}>归档</button></div>
@@ -260,6 +262,7 @@ function MissionControl({dashboard}:{dashboard:Dashboard}){
   const metrics:[string,number,string][]=[['运行中',dashboard.metrics.running,'live'],['等待处理',dashboard.metrics.waiting,'wait'],['今日活动',dashboard.metrics.updatedToday,'today'],['活跃项目',dashboard.metrics.projects,'projects']];
   return <section className="missionControl"><div className="missionMetrics">{metrics.map(([label,value,tone])=><div className={`missionMetric ${tone}`} key={label}><span>{label}</span><b>{value}</b></div>)}</div><div className="activityChart"><header><div><span>ACTIVITY</span><b>最近 7 天</b></div><small>{dashboard.metrics.total} 个会话</small></header><div className="activityBars">{dashboard.activity.map(day=><i key={day.date} style={{height:`${Math.max(8,day.count/max*100)}%`}} title={`${day.date} · ${day.count}`}/>)}</div></div></section>;
 }
+function OutputShelf({dashboard}:{dashboard:Dashboard}){ return <section className="outputShelf"><header><div><span>OUTPUTS</span><b>最近产物</b></div><small>{dashboard.artifacts.total} 个文件</small></header><div>{dashboard.artifacts.items.slice(0,4).map(file=><a href={file.url} target="_blank" rel="noreferrer" key={file.id}><i>{attachmentIconLabel({name:file.name,type:file.type})}</i><span><b>{file.name}</b><small>{formatSize(file.size)} · {formatTime(file.updatedAt)}</small></span><Icon name="arrow" size={15}/></a>)}</div></section>; }
 
 function AgentDock({status,activeProvider,serverLabel,onSwitch,onManage}:{status:Status|null;activeProvider:ProviderId;serverLabel:string;onSwitch:(provider:ProviderId)=>void;onManage:()=>void}){
   const statuses=status?.providerStatus||{} as Record<ProviderId,ProviderStatus>;
@@ -804,10 +807,10 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
     {loading&&!localData&&<LoadingRows count={4}/>}
     {localData&&<div className="settingsGrid">
       {page==='main'&&<div className="settingsNav">
-        <button onClick={()=>setPage('agent')}><span><b>Agent</b><small>{providerSubtitle(activeProviderStatus)}</small></span><i>›</i></button>
-        <button onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
-        <button onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.canListModels ? modelLabel(currentModel) : providerAuthLabel(activeProviderStatus)}</small></span><i>›</i></button>
-        <button onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
+        <button aria-label="Agent" disabled={loading} onClick={()=>setPage('agent')}><span><b>Agent</b><small>{loading?'正在同步账号状态':providerSubtitle(activeProviderStatus)}</small></span><i>›</i></button>
+        <button disabled={loading} onClick={()=>setPage('mode')}><span><b>沙盒</b><small>{modeLabel(localData?.settings?.defaultMode)}</small></span><i>›</i></button>
+        <button disabled={loading} onClick={()=>setPage('model')}><span><b>模型</b><small>{activeProviderStatus?.canListModels ? modelLabel(currentModel) : providerAuthLabel(activeProviderStatus)}</small></span><i>›</i></button>
+        <button disabled={loading} onClick={()=>setPage('account')}><span><b>当前账户</b><small>{accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus)}</small></span><i>›</i></button>
       </div>}
       {page==='agent'&&<section className="agentProviderPage"><div className="providerChoices">
         {PROVIDER_ORDER.map(provider=><button key={provider} className={activeProvider===provider?'active':''} aria-pressed={activeProvider===provider} onClick={()=>setActiveProvider(provider)}><span><b>{providerLabel(provider)}</b><small>{providerChoiceDetail(providerStatusById[provider])}</small>{providerChoiceNote(providerStatusById[provider])&&<em>{providerChoiceNote(providerStatusById[provider])}</em>}</span><i/></button>)}
