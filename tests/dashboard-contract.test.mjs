@@ -26,3 +26,10 @@ test('client dashboard contract stays typed', async () => {
   assert.match(types, /artifacts:\{total:number;items:DashboardArtifact\[\]\}/);
   assert.match(types, /metrics:\{total:number;running:number;waiting:number;updatedToday:number;projects:number\}/);
 });
+
+test('dashboard control state awaits authoritative provider statuses', async () => {
+  const server=await readFile(new URL('../server/src/index.ts',import.meta.url),'utf8');
+  const lightState=server.slice(server.indexOf('async function lightAppState()'),server.indexOf("app.get('/api/providers/status'"));
+  assert.match(lightState,/const providerStatuses = await unifiedProviderStatuses\(false\)/);
+  assert.doesNotMatch(lightState,/const providerStatuses = cachedUnifiedProviderStatusesSnapshot\(\)/);
+});

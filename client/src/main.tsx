@@ -33,11 +33,12 @@ function deleteAccountDetail(only:boolean){
 }
 function cancelLoginDetail(){ return '将停止本次登录并删除临时授权信息。'; }
 function providerChoiceStatus(status?:ProviderStatus|null){
+  if(!status || status.auth==='checking' || status.availability==='checking') return '正在检测';
   if(status?.availability==='unavailable' || status?.availability==='error') return '不可用';
   if(status?.auth==='authenticated') return '已登录';
   if(status?.auth==='unauthenticated') return '未登录';
   if(status?.auth==='authenticating') return '正在登录';
-  return '状态未知';
+  return status?.message || '暂时无法确认';
 }
 function providerChoiceDetail(status?:ProviderStatus|null){
   const account = status?.accountSummary?.email || status?.accountSummary?.displayName || status?.account?.email || status?.account?.displayName || '';
@@ -216,7 +217,7 @@ function Home(){
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="homeHero">
-      <div className="taskLaunch"><span className="heroKicker"><i/>NEW TASK</span><h1>交给 Agent，<br/><em>把事情做完。</em></h1><div className="taskPrompt"><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter'&&taskText.trim())newSession(defaultWorkspace,'New task',taskText)}} placeholder="直接说你想完成什么…"/><footer><button className="workspacePill" aria-label="选择默认工作区" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(defaultWorkspace)}</span></button><span className="launchHint">⌘ Enter</span><button className="launchButton" disabled={!taskText.trim()||!!busy} onClick={()=>newSession(defaultWorkspace,'New task',taskText)}><span>{busy?'创建中':'开始'}</span><Icon name="arrow" size={17}/></button></footer></div><div className="heroMeta"><span>{online?'已连接':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 件事正在处理`:'Agent 已就绪'}</span></div></div>
+      <div className="taskLaunch"><span className="heroKicker"><i/>AGENT WORKSPACE</span><h1>一句话，<br/><em>现在开工。</em></h1><div className="taskPrompt"><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter'&&taskText.trim())newSession(defaultWorkspace,'New task',taskText)}} placeholder="描述结果，剩下的交给 Agent…"/><footer><button className="workspacePill" aria-label="选择默认工作区" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(defaultWorkspace)}</span></button><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!taskText.trim()||!!busy} onClick={()=>newSession(defaultWorkspace,'New task',taskText)}><span>{busy?'创建中':'交给 Agent'}</span><Icon name="arrow" size={17}/></button></footer></div><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
       <AgentDock status={status} activeProvider={activeProvider} serverLabel={homeServerLabel(error,appStateLoading,statusRefreshing,activeProviderStatus,runtimeForHome)} onSwitch={switchProvider} onManage={()=>showSettings('agent')}/>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
@@ -262,7 +263,7 @@ function AgentDock({status,activeProvider,serverLabel,onSwitch,onManage}:{status
   const statuses=status?.providerStatus||{} as Record<ProviderId,ProviderStatus>;
   const active=statuses[activeProvider] || (status?.providers||[]).find(provider=>provider.id===activeProvider);
   const account=active?.accountSummary?.email||active?.accountSummary?.displayName||active?.account?.email||active?.account?.displayName||'未连接账号';
-  return <aside className="agentDock"><header><div><span>AGENT DOCK</span><b>执行环境</b></div><i className={serverLabel.includes('在线')||serverLabel.includes('正常')?'online':''}>{serverLabel}</i></header><div className="providerDock">{PROVIDER_ORDER.map(provider=>{const providerStatus=statuses[provider] || (status?.providers||[]).find(item=>item.id===provider);const ready=providerStatus?.canCreateSession;return <button className={provider===activeProvider?'active':''} key={provider} onClick={()=>onSwitch(provider)}><i>{providerLabel(provider).slice(0,1)}</i><span><b>{providerLabel(provider)}</b><small>{provider===activeProvider?account:ready?'可用':providerChoiceStatus(providerStatus)}</small></span><em className={ready?'ready':''}/></button>})}</div><footer><div><span>当前权限</span><b>{modeLabel(status?.defaultMode)}</b></div><button onClick={onManage}>管理账号 <Icon name="arrow" size={15}/></button></footer></aside>;
+  return <aside className="agentDock"><header><div><span>CHOOSE YOUR AGENT</span><b>谁来完成这件事？</b></div><i className={serverLabel.includes('在线')||serverLabel.includes('正常')?'online':''}>{serverLabel}</i></header><div className="providerDock">{PROVIDER_ORDER.map((provider,index)=>{const providerStatus=statuses[provider] || (status?.providers||[]).find(item=>item.id===provider);const ready=providerStatus?.canCreateSession;const detail=provider===activeProvider?account:ready?'可直接使用':providerChoiceStatus(providerStatus);return <button className={provider===activeProvider?'active':''} key={provider} onClick={()=>onSwitch(provider)}><span className="providerIndex">0{index+1}</span><i>{providerLabel(provider).slice(0,1)}</i><span><b>{providerLabel(provider)}</b><small>{detail}</small></span><em className={ready?'ready':''}/></button>})}</div><footer><div><span>当前组合</span><b>{providerLabel(activeProvider)} · {modeLabel(status?.defaultMode)}</b></div><button onClick={onManage}>账号与模型 <Icon name="arrow" size={15}/></button></footer></aside>;
 }
 
 function CommandCenter({sessions,dashboard,onClose,onNew,onProjects,onSettings}:{sessions:Session[];dashboard:Dashboard|null;onClose:()=>void;onNew:()=>void;onProjects:()=>void;onSettings:()=>void}){
@@ -1088,7 +1089,7 @@ function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <di
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').then(reg=>{
+  navigator.serviceWorker.register('/sw.js?v=39',{updateViaCache:'none'}).then(reg=>{
     reg.update().catch(()=>{});
     let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{

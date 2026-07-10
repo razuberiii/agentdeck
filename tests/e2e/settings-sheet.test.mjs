@@ -56,10 +56,10 @@ test('settings sheet opens, navigates providers, and does not black screen', asy
     await page.locator('.sheet').waitFor({ timeout:3000 });
     await assertNotBlack(page);
 
-    await page.getByRole('button', { name:'Agent' }).click();
+    await page.getByRole('button', { name:'Agent', exact:true }).click();
     await page.getByRole('button', { name:'返回', exact:true }).click();
-    await page.getByRole('button', { name:'Agent' }).waitFor({ timeout:3000 });
-    await page.getByRole('button', { name:'Agent' }).click();
+    await page.getByRole('button', { name:'Agent', exact:true }).waitFor({ timeout:3000 });
+    await page.getByRole('button', { name:'Agent', exact:true }).click();
     for (const provider of ['Codex', 'Claude Code', 'Antigravity', 'Gemini']) {
       await page.getByRole('button', { name:new RegExp(`^${provider}`) }).click();
       await page.getByRole('button', { name:'返回', exact:true }).click();

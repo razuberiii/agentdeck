@@ -223,3 +223,72 @@ header.homeTop>.brandLockup{display:flex;grid-template-columns:none;flex:1 1 aut
   .homeTop .iconBtn{width:34px;height:34px}
   .taskLaunch h1{font-size:34px}
 }
+
+/* Launchpad: editorial hierarchy with the agent picker inside the task flow */
+.homeShell{
+  --signal:#c8ff57;--signal-2:#6d7cff;
+  background:
+    radial-gradient(780px 420px at 84% 4%,rgba(92,105,255,.16),transparent 70%),
+    radial-gradient(660px 400px at 4% 34%,rgba(200,255,87,.07),transparent 74%),
+    #080b0e
+}
+.homeShell:before{opacity:.07;background-size:80px 80px}
+.homeTop{max-width:1280px;margin:0 auto;border-bottom:0}
+.brandMark{border-radius:9px;filter:saturate(.7);box-shadow:none}
+.brandLockup strong{color:#e8edf0}.brandLockup small{color:#58636b}
+.homeTop .iconBtn,.commandTrigger{border-color:#20282e;border-radius:999px;background:#0e1418}
+.homeTop .iconBtn:hover,.commandTrigger:hover{border-color:#4d5961;background:#151c21}
+.homeHero{display:grid;grid-template-columns:minmax(0,1fr);gap:32px;max-width:1280px;margin:0 auto;padding:70px 0 36px}
+.homeHero:before{display:none}
+.taskLaunch{display:grid;grid-template-columns:minmax(300px,.74fr) minmax(420px,1.26fr);grid-template-rows:auto auto;column-gap:clamp(48px,8vw,120px);align-items:end}
+.taskLaunch>.heroKicker,.taskLaunch>h1{grid-column:1}
+.taskLaunch>.taskPrompt{grid-column:2;grid-row:1/3}
+.taskLaunch>.heroMeta{grid-column:2;grid-row:3}
+.heroKicker{color:#909a83}.heroKicker i{background:var(--signal);box-shadow:0 0 18px rgba(200,255,87,.65)}
+.taskLaunch h1{margin:18px 0 0;font-size:clamp(54px,7vw,94px);font-weight:680;line-height:.91;letter-spacing:-.075em}
+.taskLaunch h1 em{background:linear-gradient(105deg,var(--signal) 0%,#a5ffbb 38%,#7989ff 94%);background-clip:text;-webkit-background-clip:text}
+.taskPrompt{width:100%;border:1px solid #29333a;border-radius:3px;background:#0d1317;box-shadow:18px 18px 0 rgba(109,124,255,.09)}
+.taskPrompt:focus-within{border-color:#81925c;box-shadow:18px 18px 0 rgba(200,255,87,.09)}
+.taskPrompt textarea{min-height:190px;padding:24px 26px 15px;font-size:18px;line-height:1.55}
+.taskPrompt footer{padding:12px 14px;border-top-color:#222b30}
+.launchButton{min-width:140px;border-radius:999px;background:var(--signal);color:#101408;box-shadow:none}
+.launchButton:hover:not(:disabled){border-color:var(--signal);background:#dcff92;color:#101408}
+.heroMeta{margin:16px 0 0}
+.agentDock{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:stretch;width:100%;border:1px solid #20292f;border-radius:3px;background:#0a1013;box-shadow:none;backdrop-filter:none}
+.agentDock>header{min-width:220px;padding:18px 20px;border:0;border-right:1px solid #20292f}
+.agentDock>header b{font-size:15px}.agentDock>header>i{align-self:start;padding-top:4px}
+.providerDock{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:0;padding:0;overflow:auto}
+.providerDock button{position:relative;display:grid;grid-template-columns:28px minmax(0,1fr) 7px;grid-template-rows:auto auto;gap:3px 10px;min-height:94px;padding:16px;border:0;border-right:1px solid #1b2429;border-radius:0;background:transparent}
+.providerDock button:last-child{border-right:0}.providerDock button:hover{background:#10181c}
+.providerDock button.active{background:linear-gradient(145deg,rgba(200,255,87,.13),rgba(200,255,87,.025));box-shadow:inset 0 3px var(--signal)}
+.providerDock .providerIndex{position:absolute;right:10px;top:8px;color:#465158;font:8px ui-monospace,monospace}
+.providerDock button>i{grid-row:1/3;width:28px;height:28px;border-radius:50%;background:#172127;color:#85949b}
+.providerDock button.active>i{color:#18200c;background:var(--signal)}
+.providerDock button>span:not(.providerIndex){align-self:center}.providerDock button b{font-size:12px}.providerDock button small{font-size:9px}
+.providerDock button>em{align-self:center}.providerDock button>em.ready{background:var(--signal);box-shadow:0 0 10px rgba(200,255,87,.45)}
+.agentDock>footer{min-width:190px;padding:16px 18px;border:0;border-left:1px solid #20292f}
+.agentDock>footer button{color:#aeb8bd}
+.sectionHeading,.sessionTools,.sessionList,.workPulse{max-width:1040px;margin-left:auto;margin-right:auto}
+.sectionHeading{margin-top:24px}
+
+@media(max-width:980px){
+  .taskLaunch{grid-template-columns:1fr;gap:20px}.taskLaunch>.heroKicker,.taskLaunch>h1,.taskLaunch>.taskPrompt,.taskLaunch>.heroMeta{grid-column:1;grid-row:auto}
+  .taskLaunch h1{margin-bottom:10px}
+  .agentDock{grid-template-columns:1fr}.agentDock>header{border-right:0;border-bottom:1px solid #20292f}.agentDock>footer{border-left:0;border-top:1px solid #20292f}
+}
+@media(max-width:700px){
+  .homeTop{border-bottom:1px solid #1c2429}
+  .homeHero{gap:20px;padding:42px 0 30px}
+  .taskLaunch{gap:14px}
+  .taskLaunch h1{margin:10px 0 16px;font-size:clamp(48px,15vw,64px);line-height:.9}
+  .taskPrompt{border-radius:2px;box-shadow:9px 9px 0 rgba(109,124,255,.11)}
+  .taskPrompt:focus-within{box-shadow:9px 9px 0 rgba(200,255,87,.1)}
+  .taskPrompt textarea{min-height:148px;padding:19px;font-size:16px}
+  .launchButton{min-width:126px}
+  .agentDock{border-radius:2px}
+  .agentDock>header{min-width:0;padding:15px 16px}
+  .providerDock{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none}
+  .providerDock button{flex:0 0 152px;min-height:88px;scroll-snap-align:start}
+  .agentDock>footer{min-width:0;padding:12px 15px}
+  .sectionHeading{margin-top:18px}
+}

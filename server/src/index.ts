@@ -423,13 +423,15 @@ app.get('/api/status', async (req) => {
 });
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
 async function lightAppState() {
-  void unifiedProviderStatuses(false).catch(()=>{});
   const settings = await appSettings();
   const codexStatus = cachedCodexStatusSnapshot();
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
   const claudeStatus = cachedProviderStatusSnapshot('claude', claudeStatusCache.value);
   const antigravityStatus = cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value);
-  const providerStatuses = cachedUnifiedProviderStatusesSnapshot();
+  // The dashboard is the product's primary control surface. Returning synthetic
+  // "checking" snapshots here made every provider look unknown after switching
+  // agents, even when the authoritative status was available milliseconds later.
+  const providerStatuses = await unifiedProviderStatuses(false);
   return {
     authed:true,
     authenticated:true,
