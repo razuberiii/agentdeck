@@ -16,6 +16,9 @@ test('home is task-first and keeps provider switching in the Agent dock', () => 
   assert.doesNotMatch(homeBlock, /MissionControl|OutputShelf|最近产物|最近 7 天/);
   assert.match(homeBlock, /<AgentDock/);
   assert.match(homeBlock, /onSwitch=\{switchProvider\}/);
+  assert.match(homeBlock, /const selectedWorkspace = workspaceOverride \|\| defaultWorkspace/);
+  assert.match(homeBlock, /setWorkspaceOverride\(p\.path\)/);
+  assert.doesNotMatch(homeBlock, /onPick=\{\(p\)=>newSession\(p\.path/);
   assert.match(homeBlock, /aria-label="额度与用量"[^>]+onClick=\{showQuota\}/);
   assert.match(homeBlock, /storageSet\(draftKey\(s\.id\),initialTask\.trim\(\)\)/);
 });
