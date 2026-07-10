@@ -145,8 +145,11 @@ test('install-units renders default ubuntu user and paths into final units', () 
     }
     assert.match(web, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current$/m);
     assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
+    assert.match(runtime, /^Environment=CODEX_BIN=\/home\/ubuntu\/\.local\/bin\/codex$/m);
+    assert.match(web, /^Environment=PATH=.*\/home\/ubuntu\/\.local\/bin:\/usr\/local\/bin/m);
     assert.match(appServer, /approval_policy=\\"never\\"/);
     assert.match(appServer, /sandbox_mode=\\"danger-full-access\\"/);
+    assert.match(appServer, /^ExecStart=\/home\/ubuntu\/\.local\/bin\/codex app-server/m);
   } finally {
     rmSync(rendered.dir, { recursive: true, force: true });
   }
@@ -170,6 +173,7 @@ test('install-units renders custom run user group and home into final units', ()
       assert.doesNotMatch(unit, /@AGENTDECK_/);
     }
     assert.match(web, /\/var\/lib\/agentdeck\/\.local\/bin/);
+    assert.match(appServer, /^ExecStart=\/var\/lib\/agentdeck\/\.local\/bin\/codex app-server/m);
   } finally {
     rmSync(rendered.dir, { recursive: true, force: true });
   }

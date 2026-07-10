@@ -12,7 +12,8 @@ Group=@AGENTDECK_RUN_GROUP@
 WorkingDirectory=@AGENTDECK_CURRENT_DIR@
 Environment=HOME=@AGENTDECK_HOME@
 Environment=DATA_DIR=@AGENTDECK_DATA_DIR@
-Environment=PATH=@AGENTDECK_DATA_DIR@/provider-tools/bin:/usr/local/bin:/usr/bin:/bin:@AGENTDECK_HOME@/.local/bin
+Environment=CODEX_BIN=@CODEX_BIN@
+Environment=PATH=@AGENTDECK_DATA_DIR@/provider-tools/bin:@AGENTDECK_HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PLAYWRIGHT_BROWSERS_PATH=@AGENTDECK_DATA_DIR@/cache/ms-playwright
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852

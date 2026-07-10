@@ -99,7 +99,8 @@ test('provider installer has timeout, minimal env, and candidate cleanup on fail
 test('systemd runtime and web inherit provider tool and shared Playwright paths', () => {
   for (const unit of [runtimeUnit, webUnit]) {
     assert.match(unit, /^Environment=PATH=@AGENTDECK_DATA_DIR@\/provider-tools\/bin:/m);
-    assert.match(unit, /:@AGENTDECK_HOME@\/\.local\/bin$/m);
+    assert.match(unit, /@AGENTDECK_HOME@\/\.local\/bin:\/usr\/local\/bin/m);
+    assert.match(unit, /^Environment=CODEX_BIN=@CODEX_BIN@$/m);
     assert.match(unit, /^Environment=PLAYWRIGHT_BROWSERS_PATH=@AGENTDECK_DATA_DIR@\/cache\/ms-playwright$/m);
   }
 });
