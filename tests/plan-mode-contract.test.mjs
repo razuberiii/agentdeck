@@ -66,3 +66,11 @@ test('failed plan starts leave planning state and can be retried', () => {
   assert.match(web,/status='failed'/);
   assert.match(web,/计划生成失败，可以修改描述后重试/);
 });
+
+test('active conversations expose an ephemeral live trace without adding it to the transcript', () => {
+  assert.match(client,/function LiveTrace/);
+  assert.match(client,/liveActivity/);
+  assert.match(client,/timeline\.liveMessages/);
+  assert.match(client,/\['command','file','reasoning'\]/);
+  assert.match(styles,/\.liveTrace/);
+});

@@ -133,16 +133,16 @@ function Icon({name,size=18}:{name:IconName;size?:number}){
 function Brand({compact=false}:{compact?:boolean}){ return <div className={`brandLockup brandWordmark ${compact?'compact':''}`}><span className="brandGlyph" aria-hidden="true"><i/><i/></span><span><strong>AGENT/DECK</strong>{!compact&&<small>Remote workbench · 01</small>}</span></div>; }
 
 const HEADLINES=[
-  ['把麻烦，','放这儿。'],
-  ['今天适合，','动点真格。'],
-  ['先开个头，','风会进来。'],
-  ['别等灵感，','它总迟到。'],
-  ['凌晨也算，','一种白天。'],
+  {quote:'Well begun is half done.',author:'Aristotle'},
+  {quote:'Chance favors the prepared mind.',author:'Louis Pasteur'},
+  {quote:'Nothing will work unless you do.',author:'Maya Angelou'},
+  {quote:'Fortune favors the bold.',author:'Virgil'},
+  {quote:'Do what you can, with what you have.',author:'Theodore Roosevelt'},
 ] as const;
 function RotatingHeadline(){
   const [index]=useState(()=>Math.floor(Math.random()*HEADLINES.length));
-  const words=HEADLINES[index];
-  return <h1 className="rotatingHeadline"><span>{words[0]}</span><br/><em>{words[1]}</em></h1>;
+  const item=HEADLINES[index];
+  return <h1 className="rotatingHeadline"><span>“{item.quote}”</span><small>— {item.author}</small></h1>;
 }
 
 function App(){
@@ -330,7 +330,7 @@ function SessionView({id}:{id:string}){
   async function setSessionModel(model:string){ setBusy('model'); try{ await api('/api/sessions/'+id,{method:'PATCH',body:JSON.stringify({model})}); setSession(s=>s?{...s,model}:s); setModelOpen(false); haptic(); toast('success','已切换模型'); } catch(e:any){ toast('error','模型切换失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function answerApproval(req:ApprovalRequest, decision:'accept'|'decline'|'accept_session'){ setBusy('approval:'+req.requestId); try{ await api('/api/approvals/'+encodeURIComponent(req.requestId),{method:'POST',body:JSON.stringify({decision,method:req.method,options:req.params?.options||[]})}); setApprovals(v=>v.filter(a=>a.requestId!==req.requestId)); haptic(); toast(decision==='decline'?'info':'success', decision==='decline'?'已拒绝':decision==='accept_session'?'本会话已允许':'已允许'); } catch(e:any){ toast('error','授权回复失败：'+shortError(e)); } finally{ setBusy(''); } }
   async function answerPlan(req:PlanRequest, optionId:string, note:string){ setBusy('plan:'+req.requestId); try{ await api('/api/interactive-requests/'+encodeURIComponent(req.requestId)+'/answer',{method:'POST',body:JSON.stringify({optionId,text:note})}); setPlans(v=>v.filter(p=>p.requestId!==req.requestId)); haptic(); toast(optionId==='cancel'?'info':'success', optionId==='approve'?'已开始实现':optionId==='cancel'?'已取消计划':'已提交计划调整'); } catch(e:any){ toast('error','计划回复失败：'+shortError(e)); } finally{ setBusy(''); } }
-  const rendered=visibleEvents(reconcileTimelineEvents([...(timeline.snapshotEvents as DisplayEvent[]),...liveEvents(timeline.liveMessages)])); const currentStatus=resolveTurnUiStatus(session, approvals, busy==='stop'||turnStatus==='cancelling', turnStatus, timeline.liveMessages); const activeModel=session?.model || (modelsProvider===(session ? sessionProvider(session) : '') ? catalogCurrent(models) : '') || status?.defaultModel; const runtimeUpdating=status?.runtimeState && status.runtimeState.acceptingNewTurns===false; const planStage=plans.length?'计划等待确认':session?.status==='planning'?(rendered.some(event=>event.role==='assistant')?'正在整理执行路线':'正在检查仓库'):session?.status==='executing_approved_plan'?'正在按计划执行':'';
+  const live=liveEvents(timeline.liveMessages); const rendered=visibleEvents(reconcileTimelineEvents([...(timeline.snapshotEvents as DisplayEvent[]),...live])); const currentStatus=resolveTurnUiStatus(session, approvals, busy==='stop'||turnStatus==='cancelling', turnStatus, timeline.liveMessages); const activeModel=session?.model || (modelsProvider===(session ? sessionProvider(session) : '') ? catalogCurrent(models) : '') || status?.defaultModel; const runtimeUpdating=status?.runtimeState && status.runtimeState.acceptingNewTurns===false; const planStage=plans.length?'计划等待确认':session?.status==='planning'?(rendered.some(event=>event.role==='assistant')?'正在整理执行路线':'正在检查仓库'):session?.status==='executing_approved_plan'?'正在按计划执行':''; const liveActivity=['running','planning','submitting','recovering','executing_approved_plan'].includes(String(session?.status||''))?live.filter(event=>['command','file','reasoning'].includes(event.role)).slice(-4):[];
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
     <header className="chatTop"><button className="iconBtn chatBack" aria-label="返回" onClick={()=>location.hash='#/'}><Icon name="back"/></button><div className="chatIdentity"><span className="chatEyebrow">{providerLabel(session ? sessionProvider(session) : 'codex')} · {projectName(session?.project_dir||'')}</span><div className="chatTitle"><b>{session?.title||'Session'}</b><span>{modelLabel(activeModel)} · {modeLabel(session?.permission_mode)}</span></div></div><div className={`chatPresence ${currentStatus}`}><i/><span>{statusLabel(currentStatus)}</span><small>Browser {connectionLabel(browserConnection)} · Runtime {connectionLabel(runtimeConnection)}</small></div><button className="iconBtn" aria-label="额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}><Icon name="more"/></button></header>
     <div className="noticeStack" aria-live="polite">
@@ -342,6 +342,7 @@ function SessionView({id}:{id:string}){
       {runtimeUpdating&&<InlineNotice tone="info" text="系统正在更新，新任务暂时不可发送。当前会话读取和停止仍可用。"/>}
       {planStage&&<div className="planStage"><i/><span>PLAN MODE</span><b>{planStage}</b></div>}
     </div>
+    {!!liveActivity.length&&<LiveTrace events={liveActivity}/>}
     {menu&&<><button className="menuScrim" aria-label="关闭菜单" onClick={closeMenu}/><nav className="moreMenu">
       {menuPage==='main'&&<><button disabled={!!busy} onClick={openModelPicker}><b>模型</b><span>{modelLabel(activeModel)}</span></button><button disabled={!!busy} onClick={()=>setMenuPage('mode')}><b>权限模式</b><span>{modeLabel(session?.permission_mode)}</span></button><button disabled={!!busy} onClick={()=>{ closeMenu(); showDiff(); }}><b>Diff</b><span>查看当前改动</span></button><button disabled={!!busy} onClick={()=>setMenuPage('manage')}><b>会话管理</b><span>改名、Fork、归档</span></button></>}
       {menuPage==='mode'&&<><button className="menuBack" onClick={()=>setMenuPage('main')}>‹ 权限模式</button><button disabled={!!busy} className={session?.permission_mode==='yolo'?'active':''} onClick={()=>setSessionMode('yolo')}><b>YOLO</b><span>自动允许写入和命令</span></button><button disabled={!!busy} className={session?.permission_mode==='workspace-write'?'active':''} onClick={()=>setSessionMode('workspace-write')}><b>Workspace</b><span>写工作区前确认</span></button><button disabled={!!busy} className={session?.permission_mode==='read-only'?'active':''} onClick={()=>setSessionMode('read-only')}><b>Read Only</b><span>只读模式</span></button></>}
@@ -549,6 +550,9 @@ function EventCard({e,onImage,onMediaLoad}:{e:DisplayEvent;onImage:(a:Attachment
     return <article className={`bubble ${e.role}`}><div className="bubbleHead"><span>{e.role==='user'?(e.meta?`你 · ${e.meta}`:'你'):e.meta||e.title||'回复'}</span>{e.text.trim()&&<CopyButton text={e.text} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制':'复制失败')}/>}</div>{!!e.text.trim()&&<Markdown text={e.text}/>}<ImageGrid images={images} onOpen={onImage} onLoad={onMediaLoad}/><FileGrid files={files}/></article>;
   }
   return <details className={`event ${e.role}`} open={e.open}><summary><b>{e.title||e.role}</b>{e.meta&&<span>{e.meta}</span>}</summary><CopyButton text={e.text} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制':'复制失败')}/><pre>{e.text}</pre></details>;
+}
+function LiveTrace({events}:{events:DisplayEvent[]}){
+  return <aside className="liveTrace" aria-live="polite"><header><span>LIVE TRACE</span><b>Codex 正在现场工作</b><i/></header><div>{events.map((event,index)=><article className={event.role} key={event.key||index}><em>{event.role==='command'?'RUN':event.role==='file'?'FILE':'THINK'}</em><span><b>{event.title||event.meta||'处理中'}</b><small>{String(event.text||event.meta||'').replace(/\s+/g,' ').slice(0,180)}</small></span></article>)}</div></aside>;
 }
 function PlanReviewCard({req,busy,onAnswer}:{req:PlanRequest;busy:boolean;onAnswer:(req:PlanRequest,optionId:string,note:string)=>void}){
   const [note,setNote]=useState('');
@@ -1107,7 +1111,7 @@ function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <di
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js?v=42',{updateViaCache:'none'}).then(reg=>{
+  navigator.serviceWorker.register('/sw.js?v=43',{updateViaCache:'none'}).then(reg=>{
     reg.update().catch(()=>{});
     let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{
