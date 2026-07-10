@@ -91,14 +91,27 @@ flowchart LR
 
 ## 运维
 
+最省心的升级方式是拉取代码后只发布发生变化的部分：
+
+```bash
+git pull
+sudo scripts/deploy.sh --deploy --changed
+```
+
+命令会先构建并跑检查，再创建可回滚的 Release。只有 Web 变化时不会重启 Runtime；涉及 Runtime 且仍有任务运行时，发布任务会等待安全切换。提交后终端会给出 Job ID，可用 `sudo agentdeckctl job <Job ID>` 查看进度。
+
+日常只需要记住下面几条：
+
 ```bash
 sudo agentdeckctl status          # 服务与当前发布
 sudo agentdeckctl check           # 环境检查
-sudo agentdeckctl deploy all      # 发布当前提交
+sudo scripts/deploy.sh --deploy --changed # 按代码变化安全发布
 sudo agentdeckctl jobs            # 发布任务
 sudo agentdeckctl rollback all    # 回滚
 sudo agentdeckctl backup          # 备份
 ```
+
+如果明确只改了界面，可以用 `sudo scripts/deploy.sh --deploy --components web`。`--force` 会中断活动任务，除非正在处理故障，否则不要使用。
 
 ## 开发
 

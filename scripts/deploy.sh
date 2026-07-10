@@ -17,7 +17,7 @@ CHANGED=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --components) COMPONENTS="${2:-}"; shift 2 ;;
+    --components) [ "$#" -ge 2 ] || { usage; exit 2; }; COMPONENTS="$2"; shift 2 ;;
     --changed) CHANGED=1; shift ;;
     --wait) WAIT=(--wait); shift ;;
     --force) FORCE=(--force); shift ;;
@@ -32,8 +32,8 @@ normalize_target() {
     web) echo web ;;
     runtime) echo runtime ;;
     web,runtime|runtime,web|all|"") echo all ;;
-    none) echo web ;;
-    *) echo all ;;
+    none) echo none ;;
+    *) echo "unknown component set: $components (expected web, runtime, or all)" >&2; return 2 ;;
   esac
 }
 
@@ -63,7 +63,9 @@ case "$MODE" in
     ;;
   --deploy)
     if [ "$CHANGED" = "1" ]; then COMPONENTS="$(changed_components)"; fi
-    exec "$CTL" deploy "$(normalize_target "${COMPONENTS:-all}")" "${WAIT[@]}" "${FORCE[@]}"
+    TARGET="$(normalize_target "${COMPONENTS:-all}")"
+    if [ "$TARGET" = "none" ]; then echo "No deployable changes; nothing to deploy."; exit 0; fi
+    exec "$CTL" deploy "$TARGET" "${WAIT[@]}" "${FORCE[@]}"
     ;;
   --rollback)
     exec "$CTL" rollback "$(normalize_target "${COMPONENTS:-all}")" "${WAIT[@]}" "${FORCE[@]}"

@@ -48,8 +48,8 @@ test('mobile UI exposes plan mode and a lightweight plan review card', () => {
   assert.match(client, /sendMode/);
   assert.match(client, /计划模式：描述任务，只生成计划/);
   assert.match(client, /className="sendModeSwitch"/);
-  assert.match(client, /直接执行/);
-  assert.match(client, /先规划/);
+  assert.match(client, /<b>执行<\/b><small>直接处理/);
+  assert.match(client, /<b>规划<\/b><small>只读分析/);
   assert.match(client, /sessionSendModeKey/);
   assert.match(client, /pendingTaskModeKey/);
   assert.match(client, /PlanReviewCard/);

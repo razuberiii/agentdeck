@@ -25,7 +25,7 @@ test('PWA worker updates bypass the browser HTTP cache', async () => {
   const root=new URL('../client/public/',import.meta.url);
   const worker=await readFile(new URL('sw.js',root),'utf8');
   const source=await readFile(new URL('../client/src/main.tsx',import.meta.url),'utf8');
-  assert.match(worker,/agentdeck-v45/);
+  assert.match(worker,/agentdeck-v46/);
   assert.match(worker,/cache:'reload'/);
   assert.match(source,/updateViaCache:'none'/);
 });
