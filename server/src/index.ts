@@ -1224,6 +1224,43 @@ app.delete('/api/auth/sessions/:id', { preHandler: ensureAuth }, async (req:any,
 });
 app.get('/api/projects', { preHandler: ensureAuth }, async (req:any) => ({ roots, projects: await cachedProjects(req.query?.refresh === '1') }));
 app.get('/api/sessions', { preHandler: ensureAuth }, async (req:any) => ({ sessions: await listIndexedThreads(req.query?.archived === '1') }));
+app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
+  const archived = req.query?.archived === '1';
+  const sessions = await listIndexedThreads(archived);
+  const now = Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const startOfToday = new Date(new Date(now).toDateString()).getTime();
+  const runningStates = new Set(['running','planning','submitting','recovering','inProgress']);
+  const waitingStates = new Set(['waiting_approval','waiting_plan_approval','waiting_input']);
+  const projects = new Map<string,{path:string;name:string;sessions:number;lastActiveAt:number}>();
+  for (const session of sessions) {
+    const projectPath = String(session.project_dir || session.workspace_path || '');
+    if (!projectPath) continue;
+    const current = projects.get(projectPath) || { path:projectPath, name:projectNameFromPath(projectPath), sessions:0, lastActiveAt:0 };
+    current.sessions++;
+    current.lastActiveAt = Math.max(current.lastActiveAt, Number(session.updated_at || 0));
+    projects.set(projectPath, current);
+  }
+  const activity = Array.from({length:7}, (_,index) => {
+    const from = startOfToday - (6 - index) * dayMs;
+    const to = from + dayMs;
+    return { date:new Date(from).toISOString().slice(0,10), count:sessions.filter(session => Number(session.updated_at || 0) >= from && Number(session.updated_at || 0) < to).length };
+  });
+  return {
+    generatedAt:now,
+    archived,
+    metrics:{
+      total:sessions.length,
+      running:sessions.filter(session => runningStates.has(String(session.status))).length,
+      waiting:sessions.filter(session => waitingStates.has(String(session.status))).length,
+      updatedToday:sessions.filter(session => Number(session.updated_at || 0) >= startOfToday).length,
+      projects:projects.size,
+    },
+    activity,
+    projects:[...projects.values()].sort((a,b)=>b.lastActiveAt-a.lastActiveAt).slice(0,8),
+    sessions,
+  };
+});
 app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => {
   let projectDir:string;
   try { projectDir = await validateProject(req.body?.projectDir || DEFAULT_WORKSPACE_DIR, roots); }

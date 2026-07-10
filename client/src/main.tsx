@@ -4,7 +4,7 @@ import { loginMethodViews, type LoginMethodView } from './login-methods';
 import { attachmentIconLabel, isImageAttachment } from './attachment-preview';
 import { applyTimelineMessage, applyTimelineSnapshot, emptyTimelineState, reconcileTimelineEvents, resolveTurnUiStatus, runtimeMessageSequence, type TimelineState, type TurnUiStatus } from './timeline-reducer';
 import { api } from './api/client';
-import type { ApprovalRequest, Attachment, DisplayEvent, ModelOption, PlanRequest, Project, ProviderId, ProviderInstallJob, ProviderInstaller, ProviderStatus, RuntimeConnection, Session, Status, Toast } from './api/types';
+import type { ApprovalRequest, Attachment, Dashboard, DisplayEvent, ModelOption, PlanRequest, Project, ProviderId, ProviderInstallJob, ProviderInstaller, ProviderStatus, RuntimeConnection, Session, Status, Toast } from './api/types';
 import { connectionLabel, formatSize, formatTime, modeLabel, normalizeRuntimeConnection, projectName, providerAuthLabel, providerLabel, sessionProvider, shortError, shortProviderReason, statusLabel } from './utils/format';
 import { draftAttachmentsKey, draftKey, loadDraftAttachments, saveDraftAttachments, sequenceKey, storageGet, storageRemove, storageSet } from './utils/storage';
 import './styles.css';
@@ -179,13 +179,15 @@ function DiagnosticSection({title,rows}:{title:string;rows:[string,string][]}){
 function Home(){
   const toast=useToast();
   const [status,setStatus]=useState<Status|null>(null); const [projects,setProjects]=useState<Project[]>([]); const [sessions,setSessions]=useState<Session[]>([]);
+  const [dashboard,setDashboard]=useState<Dashboard|null>(null); const [commandOpen,setCommandOpen]=useState(false);
   const [archived,setArchived]=useState(false); const [query,setQuery]=useState(''); const [picker,setPicker]=useState(false); const [busy,setBusy]=useState(''); const [sessionsLoading,setSessionsLoading]=useState(true); const [appStateLoading,setAppStateLoading]=useState(true); const [statusRefreshing,setStatusRefreshing]=useState(false); const [projectsLoading,setProjectsLoading]=useState(false); const [error,setError]=useState('');
   const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [settingsOpen,setSettingsOpen]=useState(false); const [settings,setSettings]=useState<any>(null); const [settingsLoading,setSettingsLoading]=useState(false); const [settingsError,setSettingsError]=useState(''); const [online,setOnline]=useState(navigator.onLine);
   const appStateRequestRef=useRef(0);
   useEffect(()=>{ refresh(); },[archived]);
   useEffect(()=>{ const on=()=>setOnline(navigator.onLine); addEventListener('online',on); addEventListener('offline',on); return()=>{removeEventListener('online',on); removeEventListener('offline',on)} },[]);
+  useEffect(()=>{ const onKey=(event:KeyboardEvent)=>{ if((event.metaKey||event.ctrlKey)&&event.key.toLowerCase()==='k'){ event.preventDefault(); setCommandOpen(open=>!open); } }; addEventListener('keydown',onKey); return()=>removeEventListener('keydown',onKey); },[]);
   async function refresh(scanProjects=false){ setError(''); const sessionsPromise=refreshSessions(); refreshAppState(); if(scanProjects){ refreshStatus(); loadProjects(true); } await sessionsPromise; }
-  async function refreshSessions(){ setSessionsLoading(true); try{ const ss=await api('/api/sessions'+(archived?'?archived=1':'')); setSessions(ss.sessions); } catch(e:any){ setError(shortError(e)); toast('error','会话读取失败'); } finally { setSessionsLoading(false); } }
+  async function refreshSessions(){ setSessionsLoading(true); try{ const next=await api<Dashboard>('/api/dashboard'+(archived?'?archived=1':'')); setDashboard(next); setSessions(next.sessions); } catch(e:any){ setError(shortError(e)); toast('error','工作台读取失败'); } finally { setSessionsLoading(false); } }
   async function refreshAppState(){ const requestId=++appStateRequestRef.current; setAppStateLoading(true); try{ const next=(await api('/api/app-state')) as Status; if(requestId===appStateRequestRef.current) setStatus(next); } catch(e:any){ if(requestId===appStateRequestRef.current) setError(shortError(e)); } finally { if(requestId===appStateRequestRef.current) setAppStateLoading(false); } }
   async function refreshStatus(){ setStatusRefreshing(true); try{ setStatus((await api('/api/status')) as Status); } catch(e:any){ console.warn('status refresh failed', e); } finally { setStatusRefreshing(false); } }
   async function loadProjects(force=true){ setProjectsLoading(true); try{ const ps=await api('/api/projects'+(force?'?refresh=1':'')); setProjects(ps.projects); } catch(e:any){ toast('error','项目扫描失败：'+shortError(e)); } finally{ setProjectsLoading(false); } }
@@ -206,15 +208,14 @@ function Home(){
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
   const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
-  const runningCount=sessions.filter(s=>['running','planning','waiting_approval','waiting_plan_approval'].includes(String(s.status))).length;
   return <main className="appShell homeShell">
     <header className="homeTop">
       <div><strong>{APP_NAME}</strong><span>你的 AI 工程工作台</span></div>
-      <div className="iconRow"><button className="iconBtn" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="查看额度" title="查看额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
+      <div className="iconRow"><button className="commandTrigger" aria-label="打开命令中心" onClick={()=>setCommandOpen(true)}><Icon name="search" size={16}/><span>命令中心</span><kbd>⌘ K</kbd></button><button className="iconBtn" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="查看额度" title="查看额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="homeHero">
-      <div className="heroCopy"><span className="heroKicker"><i/>SYSTEM READY</span><h1>从一个想法，<br/><em>启动你的下一个构建。</em></h1><p>选择工作区，让 Agent 在服务器上持续工作。关闭页面也不会中断任务。</p><div className="heroMeta"><span>{online?'网络在线':'网络离线'}</span><span>{runningCount?`${runningCount} 个任务运行中`:'当前没有运行任务'}</span></div></div>
+      <div className="heroCopy"><span className="heroKicker"><i/>SYSTEM READY</span><h1>从一个想法，<br/><em>启动你的下一个构建。</em></h1><p>选择工作区，让 Agent 在服务器上持续工作。关闭页面也不会中断任务。</p><div className="heroMeta"><span>{online?'网络在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务运行中`:'当前没有运行任务'}</span><span>{dashboard?.metrics.updatedToday||0} 个今日活动</span></div></div>
       <section className="statusStrip">
         <div><span>Runtime</span><b>{homeServerLabel(error, appStateLoading, statusRefreshing, activeProviderStatus, runtimeForHome)}</b><small>持久运行服务</small></div>
         <button className="statusRowButton" aria-label="打开提供方选择" onClick={()=>showSettings('agent')}><span aria-hidden="true">Active agent</span><b aria-hidden="true">{homeAgentLabel(activeProvider, activeProviderStatus)}</b><small aria-hidden="true">点击切换 Provider</small></button>
@@ -226,6 +227,7 @@ function Home(){
       <button className="taskButton taskPrimary" disabled={!!busy} onClick={()=>newSession(defaultWorkspace,'Default Workspace')}><i><Icon name="spark" size={20}/></i><span>Quick start</span><b>{busy===defaultWorkspace?'正在创建…':'在默认工作区开始'}</b><small>立即创建一个新会话</small><Icon name="arrow"/></button>
       <button className="taskButton secondary" onClick={openProjectPicker}><i><Icon name="folder" size={20}/></i><span>Open project</span><b>{projectsLoading?'正在扫描…':projects.length ? `从 ${projects.length} 个项目中选择` : '选择一个代码仓库'}</b><small>扫描工作区与 Git 仓库</small><Icon name="arrow"/></button>
     </section>
+    {dashboard&&<MissionControl dashboard={dashboard}/>}
     <div className="sectionHeading"><div><span>WORKSPACE</span><h2>{archived?'归档会话':'最近会话'}</h2></div><b>{filtered.length}</b></div>
     <section className="sessionTools">
       <div className="seg"><button className={!archived?'active':''} onClick={()=>setArchived(false)}>当前</button><button className={archived?'active':''} onClick={()=>setArchived(true)}>归档</button></div>
@@ -239,6 +241,7 @@ function Home(){
     {picker&&<ProjectPicker projects={projects} busy={busy} loading={projectsLoading} onRefresh={()=>loadProjects(true)} onClose={()=>setPicker(false)} onPick={(p)=>newSession(p.path,p.name)}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
     {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} initialPage={settingsInitialPage} onRetry={loadSettings} onChanged={async()=>{ refresh(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
+    {commandOpen&&<CommandCenter sessions={sessions} dashboard={dashboard} onClose={()=>setCommandOpen(false)} onNew={()=>newSession(defaultWorkspace,'Default Workspace')} onProjects={()=>{setCommandOpen(false);openProjectPicker()}} onSettings={()=>{setCommandOpen(false);showSettings()}}/>}
   </main>;
 }
 
@@ -254,6 +257,20 @@ function SessionRow({session,onArchive}:{session:Session;onArchive:()=>void}){
 function ProjectPicker({projects,busy,loading,onRefresh,onClose,onPick}:{projects:Project[];busy:string;loading:boolean;onRefresh:()=>void;onClose:()=>void;onPick:(p:Project)=>void}){
   const [q,setQ]=useState(''); const filtered=projects.filter(p=>(p.name+' '+p.path+' '+(p.branch||'')).toLowerCase().includes(q.toLowerCase()));
   return <Sheet className="projectSheet" onClose={onClose} title="选择项目" subtitle={loading?'正在扫描项目':'点击后创建新会话'} actions={<button disabled={loading} onClick={onRefresh}>刷新</button>}><input className="search" value={q} onChange={e=>setQ(e.target.value)} placeholder="搜索项目"/><div className="projectList">{loading&&<LoadingRows count={5}/>} {!loading&&!filtered.length&&<EmptyState title="没有项目" detail="点刷新重新扫描可用工作区"/>}{!loading&&filtered.map(p=><button className="projectRow" key={p.path} disabled={busy===p.path} onClick={()=>onPick(p)}><b>{busy===p.path?'创建中':p.name}</b><span>{p.branch || 'no branch'} · {formatTime(p.updatedAt)}</span><small>{p.path}</small></button>)}</div></Sheet>;
+}
+
+function MissionControl({dashboard}:{dashboard:Dashboard}){
+  const max=Math.max(1,...dashboard.activity.map(day=>day.count));
+  const metrics:[string,number,string][]=[['运行中',dashboard.metrics.running,'live'],['等待处理',dashboard.metrics.waiting,'wait'],['今日活动',dashboard.metrics.updatedToday,'today'],['活跃项目',dashboard.metrics.projects,'projects']];
+  return <section className="missionControl"><div className="missionMetrics">{metrics.map(([label,value,tone])=><div className={`missionMetric ${tone}`} key={label}><span>{label}</span><b>{value}</b></div>)}</div><div className="activityChart"><header><div><span>ACTIVITY</span><b>最近 7 天</b></div><small>{dashboard.metrics.total} 个会话</small></header><div className="activityBars">{dashboard.activity.map(day=><i key={day.date} style={{height:`${Math.max(8,day.count/max*100)}%`}} title={`${day.date} · ${day.count}`}/>)}</div></div></section>;
+}
+
+function CommandCenter({sessions,dashboard,onClose,onNew,onProjects,onSettings}:{sessions:Session[];dashboard:Dashboard|null;onClose:()=>void;onNew:()=>void;onProjects:()=>void;onSettings:()=>void}){
+  const [query,setQuery]=useState('');
+  useEffect(()=>{ const onKey=(event:KeyboardEvent)=>{ if(event.key==='Escape') onClose(); }; addEventListener('keydown',onKey); return()=>removeEventListener('keydown',onKey); },[onClose]);
+  const commands=[{id:'new',title:'开始新任务',detail:'默认工作区',icon:'spark' as IconName,run:onNew},{id:'project',title:'打开代码仓库',detail:`${dashboard?.metrics.projects||0} 个活跃项目`,icon:'folder' as IconName,run:onProjects},{id:'settings',title:'打开设置',detail:'Agent、模型和权限',icon:'settings' as IconName,run:onSettings}];
+  const matches=sessions.filter(session=>(displaySessionTitle(session)+' '+session.project_dir).toLowerCase().includes(query.toLowerCase())).slice(0,6);
+  return <div className="commandBackdrop" onClick={onClose}><section className="commandCenter" role="dialog" aria-modal="true" aria-label="命令中心" onClick={event=>event.stopPropagation()}><label><Icon name="search"/><input autoFocus value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索会话或输入命令…"/><kbd>ESC</kbd></label><div className="commandResults">{!query&&<><span className="commandLabel">快捷操作</span>{commands.map(command=><button key={command.id} onClick={()=>{onClose();command.run()}}><i><Icon name={command.icon}/></i><span><b>{command.title}</b><small>{command.detail}</small></span><Icon name="arrow" size={16}/></button>)}</>}<span className="commandLabel">{query?'搜索结果':'最近会话'}</span>{matches.map(session=><button key={session.id} onClick={()=>{onClose();location.hash='#/s/'+session.id}}><i className="commandProject">{projectName(session.project_dir).slice(0,1).toUpperCase()}</i><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {statusLabel(session.status)}</small></span><Icon name="arrow" size={16}/></button>)}{query&&!matches.length&&<div className="commandEmpty">没有匹配的会话</div>}</div><footer><span>输入关键词筛选</span><span>点击打开</span><span>ESC 关闭</span></footer></section></div>;
 }
 
 function SessionView({id}:{id:string}){
