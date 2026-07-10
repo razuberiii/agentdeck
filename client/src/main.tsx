@@ -113,6 +113,21 @@ function ToastProvider({children}:{children:React.ReactNode}){
 }
 function useToast(){ return useContext(ToastContext); }
 
+type IconName='pulse'|'settings'|'quota'|'refresh'|'spark'|'folder'|'search'|'archive'|'arrow'|'stop'|'attach'|'send'|'more'|'back';
+function Icon({name,size=18}:{name:IconName;size?:number}){
+  const paths:Record<IconName,React.ReactNode>={
+    pulse:<><path d="M4 12h3l2-6 4 12 2-6h5"/></>,
+    settings:<><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6l-.04.08H10l-.04-.08a1.7 1.7 0 0 0-1-.6 1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1L3.92 14v-4L4 9.96a1.7 1.7 0 0 0 .6-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6l.04-.08h3.92L14 4a1.7 1.7 0 0 0 1 .6 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.08.39.29.74.6 1l.08.04v3.92L20 14c-.31.26-.52.61-.6 1Z"/></>,
+    quota:<><path d="M4 18V9m6 9V5m6 13v-7m4 7V3"/></>,refresh:<><path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></>,
+    spark:<><path d="m12 3 1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></>,
+    folder:<><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5v-11Z"/></>,
+    search:<><circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/></>,archive:<><path d="M4 7h16v13H4zM3 3h18v4H3zM9 11h6"/></>,
+    arrow:<><path d="M5 12h14m-5-5 5 5-5 5"/></>,stop:<><rect x="7" y="7" width="10" height="10" rx="1"/></>,attach:<><path d="m20 11.5-8.5 8.5a6 6 0 0 1-8.5-8.5L12 2.5a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 1 1-2.9-2.8L14 6"/></>,
+    send:<><path d="m22 2-7 20-4-9-9-4 20-7Z"/><path d="M22 2 11 13"/></>,more:<><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,back:<><path d="m15 18-6-6 6-6"/></>,
+  };
+  return <svg className="uiIcon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
+}
+
 function App(){
   const [authed,setAuthed]=useState(false);
   const [checked,setChecked]=useState(false);
@@ -191,25 +206,30 @@ function Home(){
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
   const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
-  return <main className="appShell">
+  const runningCount=sessions.filter(s=>['running','planning','waiting_approval','waiting_plan_approval'].includes(String(s.status))).length;
+  return <main className="appShell homeShell">
     <header className="homeTop">
-      <div><strong>{APP_NAME}</strong><span>{online?'网络在线':'网络离线'} · {providerLabel(activeProvider)} · {modeLabel(status?.defaultMode)}</span></div>
-      <div className="iconRow"><button className="iconBtn" aria-label="诊断" onClick={()=>{location.hash='#/diagnostics'}}>i</button><button className="iconBtn" aria-label="设置" onClick={()=>showSettings()}>⚙</button><button className="iconBtn" aria-label="查看额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="刷新" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}>↻</button></div>
+      <div><strong>{APP_NAME}</strong><span>你的 AI 工程工作台</span></div>
+      <div className="iconRow"><button className="iconBtn" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="查看额度" title="查看额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
-    <section className="statusStrip">
-      <div><span>服务器</span><b>{homeServerLabel(error, appStateLoading, statusRefreshing, activeProviderStatus, runtimeForHome)}</b></div>
-      <button className="statusRowButton" aria-label="打开提供方选择" onClick={()=>showSettings('agent')}><span aria-hidden="true">Agent</span><b aria-hidden="true">{homeAgentLabel(activeProvider, activeProviderStatus)}</b></button>
-      <div><span>模式</span><b>{modeLabel(status?.defaultMode)}</b></div>
+    <section className="homeHero">
+      <div className="heroCopy"><span className="heroKicker"><i/>SYSTEM READY</span><h1>从一个想法，<br/><em>启动你的下一个构建。</em></h1><p>选择工作区，让 Agent 在服务器上持续工作。关闭页面也不会中断任务。</p><div className="heroMeta"><span>{online?'网络在线':'网络离线'}</span><span>{runningCount?`${runningCount} 个任务运行中`:'当前没有运行任务'}</span></div></div>
+      <section className="statusStrip">
+        <div><span>Runtime</span><b>{homeServerLabel(error, appStateLoading, statusRefreshing, activeProviderStatus, runtimeForHome)}</b><small>持久运行服务</small></div>
+        <button className="statusRowButton" aria-label="打开提供方选择" onClick={()=>showSettings('agent')}><span aria-hidden="true">Active agent</span><b aria-hidden="true">{homeAgentLabel(activeProvider, activeProviderStatus)}</b><small aria-hidden="true">点击切换 Provider</small></button>
+        <div><span>Permission</span><b>{modeLabel(status?.defaultMode)}</b><small>默认执行策略</small></div>
+      </section>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
     <section className="quickStart">
-      <button className="taskButton" disabled={!!busy} onClick={()=>newSession(defaultWorkspace,'Default Workspace')}><span>新建任务</span><b>{busy===defaultWorkspace?'创建中':'默认工作区'}</b></button>
-      <button className="taskButton secondary" onClick={openProjectPicker}><span>选择项目</span><b>{projectsLoading?'扫描中':projects.length ? `${projects.length} 个可用` : '点击扫描'}</b></button>
+      <button className="taskButton taskPrimary" disabled={!!busy} onClick={()=>newSession(defaultWorkspace,'Default Workspace')}><i><Icon name="spark" size={20}/></i><span>Quick start</span><b>{busy===defaultWorkspace?'正在创建…':'在默认工作区开始'}</b><small>立即创建一个新会话</small><Icon name="arrow"/></button>
+      <button className="taskButton secondary" onClick={openProjectPicker}><i><Icon name="folder" size={20}/></i><span>Open project</span><b>{projectsLoading?'正在扫描…':projects.length ? `从 ${projects.length} 个项目中选择` : '选择一个代码仓库'}</b><small>扫描工作区与 Git 仓库</small><Icon name="arrow"/></button>
     </section>
+    <div className="sectionHeading"><div><span>WORKSPACE</span><h2>{archived?'归档会话':'最近会话'}</h2></div><b>{filtered.length}</b></div>
     <section className="sessionTools">
       <div className="seg"><button className={!archived?'active':''} onClick={()=>setArchived(false)}>当前</button><button className={archived?'active':''} onClick={()=>setArchived(true)}>归档</button></div>
-      <input className="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索会话、项目或状态"/>
+      <label className="searchWrap"><Icon name="search" size={17}/><input className="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索会话、项目或状态"/></label>
     </section>
     <section className="sessionList" aria-busy={sessionsLoading}>
       {sessionsLoading&&<LoadingRows count={6}/>}
@@ -223,11 +243,12 @@ function Home(){
 }
 
 function SessionRow({session,onArchive}:{session:Session;onArchive:()=>void}){
+  const title=displaySessionTitle(session);
   return <article className="sessionRow">
-    <button className="sessionMain" onClick={()=>location.hash='#/s/'+session.id}>
-      <b>{session.title}</b><span><i className="providerBadge">{providerLabel(sessionProvider(session))}</i>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
+    <button className="sessionGlyph" aria-label={`打开 ${title}`} onClick={()=>location.hash='#/s/'+session.id}>{projectName(session.project_dir).slice(0,1).toUpperCase()}</button><button className="sessionMain" onClick={()=>location.hash='#/s/'+session.id}>
+      <b>{title}</b><span><i className="providerBadge">{providerLabel(sessionProvider(session))}</i>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
     </button>
-    <button className="thinBtn" onClick={onArchive}>{session.archived?'恢复':'归档'}</button>
+    <button className="thinBtn sessionArchive" aria-label={session.archived?'恢复':'归档'} title={session.archived?'恢复':'归档'} onClick={onArchive}><Icon name="archive" size={17}/></button>
   </article>;
 }
 function ProjectPicker({projects,busy,loading,onRefresh,onClose,onPick}:{projects:Project[];busy:string;loading:boolean;onRefresh:()=>void;onClose:()=>void;onPick:(p:Project)=>void}){
@@ -277,7 +298,7 @@ function SessionView({id}:{id:string}){
   async function answerPlan(req:PlanRequest, optionId:string, note:string){ setBusy('plan:'+req.requestId); try{ await api('/api/interactive-requests/'+encodeURIComponent(req.requestId)+'/answer',{method:'POST',body:JSON.stringify({optionId,text:note})}); setPlans(v=>v.filter(p=>p.requestId!==req.requestId)); haptic(); toast(optionId==='cancel'?'info':'success', optionId==='approve'?'已开始实现':optionId==='cancel'?'已取消计划':'已提交计划调整'); } catch(e:any){ toast('error','计划回复失败：'+shortError(e)); } finally{ setBusy(''); } }
   const rendered=visibleEvents(reconcileTimelineEvents([...(timeline.snapshotEvents as DisplayEvent[]),...liveEvents(timeline.liveMessages)])); const currentStatus=resolveTurnUiStatus(session, approvals, busy==='stop'||turnStatus==='cancelling', turnStatus, timeline.liveMessages); const activeModel=session?.model || (modelsProvider===(session ? sessionProvider(session) : '') ? catalogCurrent(models) : '') || status?.defaultModel; const runtimeUpdating=status?.runtimeState && status.runtimeState.acceptingNewTurns===false;
   return <main className={`chatShell ${drag?'dragging':''}`} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadFiles(e.dataTransfer.files)}}>
-    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}>‹</button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · 浏览器 {connectionLabel(browserConnection)} · Runtime {connectionLabel(runtimeConnection)}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}>%</button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}>⋯</button></header>
+    <header className="chatTop"><button className="iconBtn" aria-label="返回" onClick={()=>location.hash='#/'}><Icon name="back"/></button><div className="chatTitle"><b>{session?.title||'Session'}</b><span><i className={`dot ${currentStatus}`}></i>{statusLabel(currentStatus)} · {projectName(session?.project_dir||'')} · {modelLabel(activeModel)} · {modeLabel(session?.permission_mode)} · 浏览器 {connectionLabel(browserConnection)} · Runtime {connectionLabel(runtimeConnection)}</span></div><button className="iconBtn" aria-label="额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="更多" onClick={toggleMenu}><Icon name="more"/></button></header>
     <div className="noticeStack" aria-live="polite">
       {!online&&<InlineNotice tone="error" text="网络离线，发送会在连接恢复后可用。"/>}
       {online&&browserConnection!=='connected'&&<InlineNotice tone="info" text="浏览器正在重新连接会话。"/>}
@@ -296,7 +317,7 @@ function SessionView({id}:{id:string}){
     {showBottom&&<button className="jumpBottom" onClick={()=>{nearBottomRef.current=true;feedRef.current?.scrollTo({top:feedRef.current.scrollHeight,behavior:'smooth'});setShowBottom(false)}}>回到底部</button>}
     <footer className="composer">
       {!!attachments.length&&<AttachmentTray items={attachments} onRemove={id=>setAttachments(v=>v.filter(a=>a.id!==id))} onOpen={setViewer}/>}
-      <div className="composeRow"><button className="iconBtn attach" aria-label="添加附件" disabled={!status?.capabilities?.imageInput&&!status?.capabilities?.fileInput} onClick={()=>fileRef.current?.click()}>＋</button><textarea ref={textareaRef} rows={1} value={text} onPaste={e=>{const files=Array.from(e.clipboardData.files); if(files.length){e.preventDefault();uploadFiles(files)}}} onChange={e=>setText(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!isMobileInput()){e.preventDefault();send()}}} placeholder={runtimeUpdating?'系统正在更新，输入会保留':sendMode==='plan'?'计划模式：描述任务，只生成计划':'输入任务'}/><button className="iconBtn" aria-label="停止生成" disabled={busy==='stop'} onClick={stop}>■</button><button className="sendBtn" disabled={runtimeUpdating||busy==='send'||(!text.trim()&&!attachments.length)} onClick={send}>{runtimeUpdating?'更新中':busy==='send'?'发送中':'发送'}</button></div>
+      <div className="composeRow"><button className="iconBtn attach" aria-label="添加附件" disabled={!status?.capabilities?.imageInput&&!status?.capabilities?.fileInput} onClick={()=>fileRef.current?.click()}><Icon name="attach"/></button><textarea ref={textareaRef} rows={1} value={text} onPaste={e=>{const files=Array.from(e.clipboardData.files); if(files.length){e.preventDefault();uploadFiles(files)}}} onChange={e=>setText(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!isMobileInput()){e.preventDefault();send()}}} placeholder={runtimeUpdating?'系统正在更新，输入会保留':sendMode==='plan'?'计划模式：描述任务，只生成计划':'输入任务'}/><button className="iconBtn" aria-label="停止生成" disabled={busy==='stop'} onClick={stop}><Icon name="stop"/></button><button className="sendBtn" aria-label="发送" disabled={runtimeUpdating||busy==='send'||(!text.trim()&&!attachments.length)} onClick={send}>{runtimeUpdating?'更新中':busy==='send'?'发送中':<><span>发送</span><Icon name="send" size={16}/></>}</button></div>
       <input ref={fileRef} hidden type="file" accept="image/*,.txt,.md,.json,.yaml,.yml,.xml,.csv,.log,.patch,.diff,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,.tar,.gz,.ts,.tsx,.js,.jsx,.mjs,.css,.html,.py,.go,.rs,.java,.kt,.swift,.sh,.sql" capture={undefined} multiple onChange={e=>{ if(e.target.files) uploadFiles(e.target.files); e.currentTarget.value=''; }}/>
     </footer>
     {confirmDelete&&<ConfirmDialog title="删除会话？" detail="会删除本地索引并尝试删除 Codex 会话文件。此操作不可撤销。" confirm="删除" onCancel={()=>setConfirmDelete(false)} onConfirm={del}/>}
@@ -325,6 +346,7 @@ function stripInternalPlanPrompt(text:string){
   return marker ? marker[1].trimStart() : '';
 }
 function hasInternalProviderText(text:any){ const value=String(text||''); return value.includes(MOBILE_CONTEXT_MARKER) || value.includes(RECOVERY_CONTEXT_MARKER); }
+function displaySessionTitle(session:Session){ const title=String(session.title||'').trim(); return hasInternalProviderText(title)||title.startsWith('[[AGENT_')?'恢复的会话':title||projectName(session.project_dir)||'未命名会话'; }
 function itemToEvent(item:any):DisplayEvent|null{
   if(item.type==='userMessage'){ const c=userContent(item.content); const text=stripInternalAttachmentPrompt(c.text); const attachments=dedupeAttachments([...(item.attachments||[]),...c.attachments]); return (text.trim() || attachments.length) ? {key:String(item.clientMessageId||item.id),messageId:String(item.id||''),clientMessageId:item.clientMessageId?String(item.clientMessageId):undefined,role:'user',text,attachments,meta:messageStatusLabel(item.status)} : null; }
   if(item.type==='agentMessage') {
