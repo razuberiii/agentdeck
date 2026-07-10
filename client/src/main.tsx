@@ -225,19 +225,17 @@ function Home(){
   async function switchProvider(provider:ProviderId){ if(provider===activeProvider) return; setStatus(current=>current?{...current,activeProvider:provider}:current); haptic(); try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); toast('success',`已切换到 ${providerLabel(provider)}`); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await refreshStatus(); } }
   const activeProvider=status?.activeProvider || 'codex';
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
-  useEffect(()=>{ setQuota(null); if(activeProviderStatus?.canQueryQuota) void loadQuota(false); },[activeProvider,activeProviderStatus?.activeProfileId]);
   const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell homeShell">
     <header className="homeTop">
       <Brand/>
-      <div className="iconRow"><button className="commandTrigger" aria-label="打开命令中心" onClick={()=>setCommandOpen(true)}><Icon name="search" size={16}/><span>查找任务</span><kbd>⌘ K</kbd></button><button className="iconBtn secondaryAction" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn secondaryAction" aria-label="查看额度" title="查看额度" onClick={showQuota}><Icon name="quota"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
+      <div className="iconRow"><button className="commandTrigger" aria-label="打开命令中心" onClick={()=>setCommandOpen(true)}><Icon name="search" size={16}/><span>查找任务</span><kbd>⌘ K</kbd></button><button className="iconBtn secondaryAction" aria-label="诊断" title="运行诊断" onClick={()=>{location.hash='#/diagnostics'}}><Icon name="pulse"/></button><button className="iconBtn" aria-label="设置" title="设置" onClick={()=>showSettings()}><Icon name="settings"/></button><button className="iconBtn" aria-label="刷新" title="刷新状态" disabled={statusRefreshing||appStateLoading} onClick={()=>refresh(true)}><Icon name="refresh"/></button></div>
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="homeHero">
       <div className="taskLaunch"><span className="heroKicker"><i/>OPEN DESK / {String(new Date().getDate()).padStart(2,'0')}</span><RotatingHeadline/><div className={`taskPrompt ${launchMode==='plan'?'planning':''}`}><div className="taskModeBar" aria-label="任务方式"><button aria-pressed={launchMode==='direct'} className={launchMode==='direct'?'active':''} onClick={()=>setLaunchMode('direct')}><b>执行</b><small>直接处理</small></button><button aria-pressed={launchMode==='plan'} className={launchMode==='plan'?'active':''} onClick={()=>setLaunchMode('plan')}><b>规划</b><small>只读分析</small></button><span>{launchMode==='plan'?'先看清全局，确认后才修改':'立即进入工作区并开始处理'}</span></div><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter'&&taskText.trim())newSession(defaultWorkspace,'New task',taskText)}} placeholder={launchMode==='plan'?'先说清目标，我们一起定路线…':'写下要发生的事…'}/><footer><button className="workspacePill" aria-label="选择默认工作区" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(defaultWorkspace)}</span></button><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!taskText.trim()||!!busy} onClick={()=>newSession(defaultWorkspace,'New task',taskText)}><span>{busy?'创建中':launchMode==='plan'?'生成计划':'开工'}</span><Icon name="arrow" size={17}/></button></footer></div><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
       <AgentDock status={status} activeProvider={activeProvider} serverLabel={homeServerLabel(error,appStateLoading,statusRefreshing,activeProviderStatus,runtimeForHome)} onSwitch={switchProvider} onManage={()=>showSettings('agent')}/>
-      {activeProviderStatus?.canQueryQuota&&<HomeQuota quota={quota} onOpen={showQuota}/>}
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
     {dashboard&&<WorkPulse dashboard={dashboard} sessions={filtered}/>}
@@ -254,7 +252,7 @@ function Home(){
     {picker&&<ProjectPicker projects={projects} busy={busy} loading={projectsLoading} onRefresh={()=>loadProjects(true)} onClose={()=>setPicker(false)} onPick={(p)=>newSession(p.path,p.name,taskText)}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
     {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} initialPage={settingsInitialPage} onRetry={loadSettings} onChanged={async()=>{ await refreshSessions(); await refreshStatus(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
-    {commandOpen&&<CommandCenter sessions={sessions} dashboard={dashboard} onClose={()=>setCommandOpen(false)} onNew={()=>newSession(defaultWorkspace,'Default Workspace')} onProjects={()=>{setCommandOpen(false);openProjectPicker()}} onSettings={()=>{setCommandOpen(false);showSettings()}}/>}
+    {commandOpen&&<CommandCenter sessions={sessions} dashboard={dashboard} onClose={()=>setCommandOpen(false)} onNew={()=>newSession(defaultWorkspace,'Default Workspace')} onProjects={()=>{setCommandOpen(false);openProjectPicker()}} onQuota={()=>{setCommandOpen(false);showQuota()}} onSettings={()=>{setCommandOpen(false);showSettings()}}/>}
   </main>;
 }
 
@@ -277,11 +275,6 @@ function WorkPulse({dashboard,sessions}:{dashboard:Dashboard;sessions:Session[]}
   if(!running.length) return null;
   return <section className="workPulse"><header><div><span>IN PROGRESS</span><b>{running.length} 件事正在处理</b></div>{dashboard.metrics.waiting>0&&<i>{dashboard.metrics.waiting} 件需要处理</i>}</header><div className="workPulseList">{running.map(session=><button key={session.id} onClick={()=>location.hash='#/s/'+session.id}><i className="liveDot"/><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {statusLabel(session.status)}</small></span><Icon name="arrow" size={15}/></button>)}</div></section>;
 }
-function HomeQuota({quota,onOpen}:{quota:any;onOpen:()=>void}){
-  const limit=quota?.rateLimits?.rateLimitsByLimitId?.codex || quota?.rateLimits?.rateLimits;
-  const windows=[limit?.primary,limit?.secondary].filter(Boolean);
-  return <button className="homeQuota" onClick={onOpen} aria-label="查看额度详情"><span><i>USAGE</i><b>{windows.length?'剩余额度':'额度状态'}</b></span><div>{windows.length?windows.map((window:any,index:number)=>{const remaining=Math.max(0,100-Number(window?.usedPercent||0));return <em key={index}><small>{quotaWindowTitle(window)}</small><strong>{Math.round(remaining)}%</strong><i><u style={{width:`${remaining}%`}}/></i></em>}):<em><small>{quota?'暂时无法读取':'正在读取'}</small><strong>—</strong></em>}</div><Icon name="arrow" size={15}/></button>;
-}
 
 function AgentDock({status,activeProvider,serverLabel,onSwitch,onManage}:{status:Status|null;activeProvider:ProviderId;serverLabel:string;onSwitch:(provider:ProviderId)=>void;onManage:()=>void}){
   const statuses=status?.providerStatus||{} as Record<ProviderId,ProviderStatus>;
@@ -290,10 +283,10 @@ function AgentDock({status,activeProvider,serverLabel,onSwitch,onManage}:{status
   return <aside className="agentDock"><header><div><span>CHOOSE YOUR AGENT</span><b>谁来完成这件事？</b></div><i className={serverLabel.includes('在线')||serverLabel.includes('正常')?'online':''}>{serverLabel}</i></header><div className="providerDock">{PROVIDER_ORDER.map((provider,index)=>{const providerStatus=statuses[provider] || (status?.providers||[]).find(item=>item.id===provider);const ready=providerStatus?.canCreateSession;const detail=provider===activeProvider?account:ready?'可直接使用':providerChoiceStatus(providerStatus);return <button className={provider===activeProvider?'active':''} key={provider} onClick={()=>onSwitch(provider)}><span className="providerIndex">0{index+1}</span><i>{providerLabel(provider).slice(0,1)}</i><span><b>{providerLabel(provider)}</b><small>{detail}</small></span><em className={ready?'ready':''}/></button>})}</div><footer><div><span>当前组合</span><b>{providerLabel(activeProvider)} · {modeLabel(status?.defaultMode)}</b></div><button onClick={onManage}>账号与模型 <Icon name="arrow" size={15}/></button></footer></aside>;
 }
 
-function CommandCenter({sessions,dashboard,onClose,onNew,onProjects,onSettings}:{sessions:Session[];dashboard:Dashboard|null;onClose:()=>void;onNew:()=>void;onProjects:()=>void;onSettings:()=>void}){
+function CommandCenter({sessions,dashboard,onClose,onNew,onProjects,onQuota,onSettings}:{sessions:Session[];dashboard:Dashboard|null;onClose:()=>void;onNew:()=>void;onProjects:()=>void;onQuota:()=>void;onSettings:()=>void}){
   const [query,setQuery]=useState('');
   useEffect(()=>{ const onKey=(event:KeyboardEvent)=>{ if(event.key==='Escape') onClose(); }; addEventListener('keydown',onKey); return()=>removeEventListener('keydown',onKey); },[onClose]);
-  const commands=[{id:'new',title:'开始新任务',detail:'默认工作区',icon:'spark' as IconName,run:onNew},{id:'project',title:'打开代码仓库',detail:`${dashboard?.metrics.projects||0} 个活跃项目`,icon:'folder' as IconName,run:onProjects},{id:'settings',title:'打开设置',detail:'Agent、模型和权限',icon:'settings' as IconName,run:onSettings}];
+  const commands=[{id:'new',title:'开始新任务',detail:'默认工作区',icon:'spark' as IconName,run:onNew},{id:'project',title:'打开代码仓库',detail:`${dashboard?.metrics.projects||0} 个活跃项目`,icon:'folder' as IconName,run:onProjects},{id:'quota',title:'额度与用量',detail:'查看当前 Agent 的额度窗口',icon:'quota' as IconName,run:onQuota},{id:'settings',title:'打开设置',detail:'Agent、模型和权限',icon:'settings' as IconName,run:onSettings}];
   const matches=sessions.filter(session=>(displaySessionTitle(session)+' '+session.project_dir).toLowerCase().includes(query.toLowerCase())).slice(0,6);
   return <div className="commandBackdrop" onClick={onClose}><section className="commandCenter" role="dialog" aria-modal="true" aria-label="命令中心" onClick={event=>event.stopPropagation()}><label><Icon name="search"/><input autoFocus value={query} onChange={event=>setQuery(event.target.value)} placeholder="搜索会话或输入命令…"/><kbd>ESC</kbd></label><div className="commandResults">{!query&&<><span className="commandLabel">快捷操作</span>{commands.map(command=><button key={command.id} onClick={()=>{onClose();command.run()}}><i><Icon name={command.icon}/></i><span><b>{command.title}</b><small>{command.detail}</small></span><Icon name="arrow" size={16}/></button>)}</>}<span className="commandLabel">{query?'搜索结果':'最近会话'}</span>{matches.map(session=><button key={session.id} onClick={()=>{onClose();location.hash='#/s/'+session.id}}><i className="commandProject">{projectName(session.project_dir).slice(0,1).toUpperCase()}</i><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {statusLabel(session.status)}</small></span><Icon name="arrow" size={16}/></button>)}{query&&!matches.length&&<div className="commandEmpty">没有匹配的会话</div>}</div><footer><span>输入关键词筛选</span><span>点击打开</span><span>ESC 关闭</span></footer></section></div>;
 }
@@ -1122,7 +1115,7 @@ function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <di
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js?v=47',{updateViaCache:'none'}).then(reg=>{
+  navigator.serviceWorker.register('/sw.js?v=48',{updateViaCache:'none'}).then(reg=>{
     reg.update().catch(()=>{});
     let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{

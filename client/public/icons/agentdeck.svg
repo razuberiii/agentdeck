@@ -1,22 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <defs>
-    <linearGradient id="bg" x1="72" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#10242b"/>
-      <stop offset="1" stop-color="#071015"/>
-    </linearGradient>
-    <linearGradient id="edge" x1="148" y1="150" x2="382" y2="376" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#66e6b7"/>
-      <stop offset="1" stop-color="#3d83ee"/>
-    </linearGradient>
-    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="12"/>
-    </filter>
-  </defs>
-  <rect width="512" height="512" rx="116" fill="#071015"/>
-  <path d="M132 152h228a28 28 0 0 1 28 28v174" fill="none" stroke="#233d47" stroke-width="22" stroke-linecap="round"/>
-  <path d="M112 188h228a28 28 0 0 1 28 28v174" fill="none" stroke="#315661" stroke-width="22" stroke-linecap="round"/>
-  <rect x="92" y="216" width="256" height="190" rx="36" fill="#0d1c22" stroke="#39766a" stroke-width="14"/>
-  <path d="M144 322h46l24-54 42 102 27-62h25" fill="none" stroke="#5de2b1" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="348" cy="216" r="34" fill="#59e1af" opacity=".24" filter="url(#glow)"/>
-  <circle cx="348" cy="216" r="15" fill="#69edba"/>
+  <rect width="512" height="512" rx="112" fill="#080d10"/>
+  <circle cx="256" cy="256" r="164" fill="#0a0f12" stroke="#39434a" stroke-width="12"/>
+  <rect x="170" y="166" width="112" height="112" fill="none" stroke="#c8ff57" stroke-width="15"/>
+  <rect x="232" y="232" width="112" height="112" fill="#0a0f12" stroke="#7f8dff" stroke-width="15"/>
 </svg>
