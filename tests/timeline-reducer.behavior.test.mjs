@@ -89,6 +89,18 @@ test('streaming deltas and live activity stay coalesced instead of growing per t
   `);
 });
 
+test('streaming answer keeps its first position when a user sends during generation', () => {
+  runReducerScenario(`
+    let state = emptyTimelineState(0);
+    state = applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:10,runtimeGeneration:'g1',params:{itemId:'answer-1',delta:'first'}});
+    state = applyTimelineMessage(state,{type:'user',clientMessageId:'client-2',runtimeSequence:11,text:'follow up',attachments:[]});
+    state = applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:12,runtimeGeneration:'g1',params:{itemId:'answer-1',delta:' second'}});
+    assert.deepEqual(state.liveMessages.map(item => item.type), ['codex','user']);
+    assert.equal(state.liveMessages[0].runtimeSequence, 10);
+    assert.equal(state.liveMessages[0].params.delta, 'first second');
+  `);
+});
+
 test('user events from snapshot and replay reconcile by content when ids differ', () => {
   runReducerScenario(`
     const events = reconcileTimelineEvents([

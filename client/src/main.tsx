@@ -241,7 +241,7 @@ function Home(){
       <AgentDock status={status} activeProvider={activeProvider} serverLabel={homeServerLabel(error,appStateLoading,statusRefreshing,activeProviderStatus,runtimeForHome)} onSwitch={switchProvider} onManage={()=>showSettings('agent')}/>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
-    {dashboard&&<WorkPulse dashboard={dashboard} sessions={filtered}/>}
+    {dashboard&&!archived&&<WorkPulse dashboard={dashboard} sessions={filtered}/>}
     <div className="sectionHeading"><div><span>YOUR WORK</span><h2>{archived?'已归档':'最近做的事'}</h2></div><button className="projectShortcut" onClick={openProjectPicker}><Icon name="folder" size={15}/> 切换项目</button></div>
     <section className="sessionTools">
       <div className="seg"><button className={!archived?'active':''} onClick={()=>setArchived(false)}>当前</button><button className={archived?'active':''} onClick={()=>setArchived(true)}>归档</button></div>
@@ -276,7 +276,9 @@ function ProjectPicker({projects,loading,onRefresh,onClose,onPick}:{projects:Pro
 function WorkPulse({dashboard,sessions}:{dashboard:Dashboard;sessions:Session[]}){
   const running=sessions.filter(session=>['running','planning','submitting','executing_approved_plan','waiting_approval','waiting_input','waiting_plan_approval'].includes(String(session.activeTurn?.status || session.status))).slice(0,3);
   const runningIds=new Set(running.map(session=>session.id));
-  const recentlyDone=sessions.filter(session=>!runningIds.has(session.id)&&['idle','complete','completed'].includes(String(session.status))&&Date.now()-Number(session.updated_at||0)<10*60_000).slice(0,Math.max(1,3-running.length));
+  // `idle` only means the latest turn ended. Showing every recently touched idle
+  // session makes one stack look as if several tasks completed at once.
+  const recentlyDone=sessions.filter(session=>!session.archived&&!runningIds.has(session.id)&&['idle','complete','completed'].includes(String(session.status))&&Date.now()-Number(session.updated_at||0)<10*60_000).slice(0,running.length?Math.max(0,3-running.length):1);
   const items=[...running,...recentlyDone].slice(0,3);
   if(!items.length) return null;
   return <section className="workPulse"><header><div><span>{running.length?'IN PROGRESS':'JUST FINISHED'}</span><b>{running.length?`${running.length} 件事正在处理`:`${recentlyDone.length} 件事刚刚完成`}</b></div>{dashboard.metrics.waiting>0&&<i>{dashboard.metrics.waiting} 件需要处理</i>}</header><div className="workPulseList">{items.map(session=>{const done=!runningIds.has(session.id);return <button className={done?'done':''} key={session.id} onClick={()=>location.hash='#/s/'+session.id}><i className={done?'doneDot':'liveDot'}>{done?'✓':''}</i><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {done?`已完成 · ${formatTime(session.updated_at)}`:statusLabel(session.status)}</small></span><Icon name="arrow" size={15}/></button>})}</div></section>;

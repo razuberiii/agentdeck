@@ -97,7 +97,10 @@ function coalesceLiveMessage(items:any[], msg:any):any[] {
     if (index >= 0) {
       const next = [...items];
       const previous = next[index];
-      next[index] = { ...previous, ...msg, params:{ ...previous.params, ...msg.params, delta:String(previous.params?.delta || '') + String(msg.params?.delta || '') } };
+      // Keep the sequence where the streaming answer first appeared. Using the
+      // newest delta sequence makes the answer move below a user message sent
+      // during generation until the authoritative snapshot is reloaded.
+      next[index] = { ...previous, ...msg, runtimeSequence:runtimeMessageSequence(previous) || runtimeMessageSequence(msg), sequence:previous?.sequence || msg?.sequence, params:{ ...previous.params, ...msg.params, delta:String(previous.params?.delta || '') + String(msg.params?.delta || '') } };
       return next;
     }
   }
