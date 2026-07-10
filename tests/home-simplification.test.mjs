@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const source = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
+const styles = readFileSync(new URL('../client/src/styles.css', import.meta.url), 'utf8');
 
 test('home is task-first and keeps provider switching in the Agent dock', () => {
   const homeBlock = source.slice(
@@ -50,4 +51,10 @@ test('editorial headline is randomized once per page visit instead of rotating',
   const block=source.slice(source.indexOf('function RotatingHeadline'),source.indexOf('function App'));
   assert.match(block,/Math\.random\(\)/);
   assert.doesNotMatch(block,/setInterval/);
+});
+
+test('launch and conversation send actions share one signal-control language', () => {
+  assert.match(styles,/\.launchButton,\.composer \.sendBtn\{/);
+  assert.match(styles,/\.launchButton:before,\.composer \.sendBtn:before/);
+  assert.match(styles,/background:var\(--signal\)!important/);
 });
