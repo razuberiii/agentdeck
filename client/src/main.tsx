@@ -138,10 +138,9 @@ const HEADLINES=[
   ['凌晨也算，','一种白天。'],
 ] as const;
 function RotatingHeadline(){
-  const [index,setIndex]=useState(()=>Math.floor(Date.now()/6000)%HEADLINES.length);
-  useEffect(()=>{ if(matchMedia('(prefers-reduced-motion: reduce)').matches) return; const timer=window.setInterval(()=>setIndex(value=>(value+1)%HEADLINES.length),5200); return()=>window.clearInterval(timer); },[]);
+  const [index]=useState(()=>Math.floor(Math.random()*HEADLINES.length));
   const words=HEADLINES[index];
-  return <h1 key={index} className="rotatingHeadline"><span>{words[0]}</span><br/><em>{words[1]}</em></h1>;
+  return <h1 className="rotatingHeadline"><span>{words[0]}</span><br/><em>{words[1]}</em></h1>;
 }
 
 function App(){
@@ -1103,7 +1102,7 @@ function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <di
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js?v=40',{updateViaCache:'none'}).then(reg=>{
+  navigator.serviceWorker.register('/sw.js?v=41',{updateViaCache:'none'}).then(reg=>{
     reg.update().catch(()=>{});
     let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{

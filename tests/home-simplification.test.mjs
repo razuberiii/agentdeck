@@ -37,3 +37,9 @@ test('work pulse only appears for active work and does not duplicate recent sess
   assert.doesNotMatch(block,/刚刚完成或更新/);
   assert.doesNotMatch(block,/const recent=/);
 });
+
+test('editorial headline is randomized once per page visit instead of rotating', () => {
+  const block=source.slice(source.indexOf('function RotatingHeadline'),source.indexOf('function App'));
+  assert.match(block,/Math\.random\(\)/);
+  assert.doesNotMatch(block,/setInterval/);
+});
