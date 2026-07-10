@@ -47,3 +47,12 @@ test('attachment tray falls back on broken image and keeps mobile chip columns s
   assert.match(cssSource, /\.attachName\{[^}]*text-overflow:ellipsis/);
   assert.match(cssSource, /\.attachRemove\{[^}]*width:32px/);
 });
+
+test('mobile composer offers a direct photo picker before the general file picker', () => {
+  assert.match(clientSource,/const imageFileRef=useRef<HTMLInputElement\|null>/);
+  assert.match(clientSource,/className="attachMenu"/);
+  assert.match(clientSource,/>照片<\/b><span>直接打开手机图库/);
+  assert.match(clientSource,/ref=\{imageFileRef\} hidden type="file" accept="image\/\*" multiple/);
+  assert.match(clientSource,/>文件<\/b><span>源码、PDF、压缩包等/);
+  assert.match(cssSource,/\.attachMenu/);
+});
