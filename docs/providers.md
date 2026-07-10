@@ -1,36 +1,29 @@
-# Providers
+# Provider
 
-AgentDeck presents multiple coding agents through one web gateway. Provider capability is not identical; check the Provider settings page after install for the current local status.
+AgentDeck 在同一个工作台中接入多个编码 Agent，但不会假装它们能力完全一致。界面以 `ProviderStatus` 返回的真实能力决定哪些操作可用。
 
 ## Codex
 
-Codex is the most complete integration. It supports persistent sessions, approvals, attachments, account selection, and app-server based execution.
-
-Personal profile keeps Codex `danger-full-access` and `approval_policy=never` for the current smooth single-user workflow. Standard and hardened profiles render more conservative defaults unless overridden.
+支持持久会话、权限审批、附件、多账号、额度读取和 app-server 执行。每个账号拥有独立的进程绑定，切换账号后下一次 Turn 使用当前账号，不会静默回退到旧账号。
 
 ## Claude Code
 
-Claude Code uses the official CLI login and Claude Agent SDK. Credentials live in provider profile state under `DATA_DIR` and are excluded from normal backups.
+使用官方 CLI 登录和 Anthropic Agent SDK。支持会话延续与文件操作；模型、额度等能力以本机 SDK 和账号实际返回为准。
 
 ## Antigravity
 
-Antigravity support depends on the installed upstream CLI. If `ANTIGRAVITY_BIN` is empty, AgentDeck discovers it from `PATH`, `DATA_DIR/provider-tools/bin`, and the service user's `$HOME/.local/bin`.
+依赖本机安装的上游 CLI。未设置 `ANTIGRAVITY_BIN` 时，会从 `PATH`、`DATA_DIR/provider-tools/bin` 和运行用户的本地 bin 目录寻找。
 
 ## Gemini CLI
 
-Gemini CLI support is experimental. Personal Google login behavior depends on upstream support and may not be suitable as the primary provider.
+通过 ACP 接入。个人 Google 登录是否可创建新会话取决于上游客户端支持；“已认证但客户端不支持”会显示为能力不可用，而不是错误地显示为未登录。
 
-## Installing Provider Tools
+## 安装 Provider 工具
 
-The UI can install supported provider CLIs into:
+界面可把受支持的 CLI 安装到：
 
 ```text
 DATA_DIR/provider-tools/bin
 ```
 
-This keeps tools outside the Git worktree and makes systemd `PATH` consistent across web, runtime, and app-server units.
-
-## Backups
-
-Default backups include AgentDeck data, attachments, artifacts, and a redacted env summary. Provider tokens and OAuth secrets are not included unless `--include-secrets` is passed.
-
+该目录位于 Git 工作区之外，并加入 Web、Runtime 和 Provider unit 的 `PATH`。Provider 凭据默认不进入普通备份，完整迁移时才使用 `--include-secrets`。

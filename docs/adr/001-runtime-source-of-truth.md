@@ -1,17 +1,17 @@
-# ADR 001: Runtime Source Of Truth
+# ADR 001：Runtime 是执行状态的唯一事实来源
 
-## Status
+## 状态
 
-Accepted.
+已采纳。
 
-## Decision
+## 决策
 
-Runtime is the owner of execution state. Web and browser can display or cache state, but they cannot decide whether a session is running, which provider profile executes a turn, whether a provider runtime must be started, or which event sequence is latest.
+Runtime 负责执行状态。Web 和浏览器可以展示或缓存状态，但不能自行判断会话是否运行、当前 Turn 使用哪个 Provider 账号、是否需要启动 Provider 进程，或哪一个事件序列最新。
 
-## Rationale
+## 原因
 
-The previous split let Web, Runtime, and browser each infer parts of the same state. That made reconnects, account switching, and provider process reuse ambiguous. A single owner prevents silent fallback to the wrong account and prevents browser cursor mistakes from hiding persisted events.
+过去三层分别推断同一状态，导致重连、账号切换和进程复用存在歧义。单一事实来源可以避免静默使用错误账号，也避免浏览器游标错误隐藏已持久化事件。
 
-## Consequences
+## 影响
 
-Web routes must call Runtime for execution decisions. Browser code must treat snapshots as data to apply, not as acknowledgement cursors. Runtime DB remains separate for now, but duplicate Web fields are read-only mirrors or compatibility fields.
+Web 的执行决策必须询问 Runtime。浏览器把快照当作待应用的数据，而不是确认游标。重复存在于 Web 的字段只能作为只读镜像或兼容字段。

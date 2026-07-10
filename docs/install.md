@@ -1,27 +1,24 @@
-# Install
+# 安装与升级
 
-AgentDeck is a self-hosted coding agent gateway. The recommended deployment is localhost, LAN, VPN, Tailscale, Headscale, or WireGuard. Do not expose an unprotected AgentDeck service directly to the public internet.
+AgentDeck 适合运行在本机、可信局域网或 VPN 后面。不要把没有额外访问控制的实例直接暴露到公网。
 
-## Profiles
+## 安装档位
 
-Set `AGENTDECK_INSTALL_PROFILE` when running the installer:
+安装时通过 `AGENTDECK_INSTALL_PROFILE` 选择权限基线：
 
 ```bash
 sudo AGENTDECK_INSTALL_PROFILE=personal ./install.sh
 sudo AGENTDECK_INSTALL_PROFILE=standard ./install.sh
+sudo AGENTDECK_INSTALL_PROFILE=hardened ./install.sh
 ```
 
-`personal` keeps the existing single-user experience. It defaults to the `ubuntu` service user, Codex `approval_policy=never`, and Codex `sandbox_mode=danger-full-access`. Use it for trusted localhost, VPN, or LAN deployments where convenience is the priority.
+- `personal`：面向可信的单用户环境，默认沿用现有运行用户，并允许 Codex 自动执行工作区操作。
+- `standard`：推荐的新安装默认值，使用独立的 `agentdeck` 系统用户、`on-request` 审批和 `workspace-write` 沙箱。
+- `hardened`：更严格的只读基线，适合熟悉 Linux、systemd 和 Provider 权限差异的维护者。
 
-`standard` is recommended for new installs. It defaults to a dedicated `agentdeck` system user unless you set `AGENTDECK_RUN_USER`, and renders Codex with `approval_policy=on-request` and `sandbox_mode=workspace-write`.
+升级不会静默改变既有运行用户、数据目录、端口或权限档位。
 
-`hardened` is for operators who understand Linux and systemd hardening tradeoffs. The initial framework uses the dedicated service user defaults and renders Codex with `approval_policy=on-request` and `sandbox_mode=read-only`.
-
-Existing deployments are not forced to migrate. If the installer sees an existing unit using `ubuntu` or `danger-full-access`, it keeps `personal` unless you explicitly set another profile.
-
-## Custom Paths And Users
-
-The systemd units are rendered from templates. These variables can be set during install:
+## 自定义目录与用户
 
 ```bash
 sudo AGENTDECK_INSTALL_PROFILE=standard \
@@ -34,4 +31,13 @@ sudo AGENTDECK_INSTALL_PROFILE=standard \
   ./install.sh
 ```
 
-Personal mode keeps the old defaults unless you override them.
+安装脚本会渲染 systemd unit。修改模板后需显式运行 `sudo agentdeckctl install-units`；普通部署不会偷偷覆盖系统 unit。
+
+## 升级
+
+```bash
+git pull --ff-only
+sudo agentdeckctl deploy all
+```
+
+只改前端时可执行 `sudo agentdeckctl deploy web`。发布会先运行检查并保留可回滚版本；Runtime 发布会等待活动任务结束。

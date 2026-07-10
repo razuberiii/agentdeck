@@ -88,4 +88,12 @@ test('terminal events reconcile the open conversation with the authoritative sna
   assert.match(client,/function syncTerminalSnapshot/);
   assert.match(client,/timeline\.liveMessages\.some\(isTerminalSignal\)/);
   assert.match(client,/void load\(false,generation\)/);
+  const terminalHelper=client.slice(client.indexOf('function isTerminalSignal'),client.indexOf('function turnFailed'));
+  assert.match(terminalHelper,/turn\/completed/);
+  assert.doesNotMatch(terminalHelper,/final_answer|item\/completed/);
+});
+
+test('timeline refresh settles at the newest message while the reader is pinned', () => {
+  assert.match(client,/requestAnimationFrame\(\(\)=>\{ scroll\(\); requestAnimationFrame\(scroll\); \}\)/);
+  assert.match(client,/window\.setTimeout\(scroll,120\)/);
 });

@@ -1,111 +1,71 @@
-# AgentDeck Architecture
-
-AgentDeck is split into three layers:
+# AgentDeck 架构
 
 ```text
-Browser
-  |
-  | HTTP, WebSocket, uploads
-  v
-Web server
-  |
-  | Runtime HTTP/SSE
-  v
+浏览器
+  │ HTTP / WebSocket / 上传
+  ▼
+Web 服务
+  │ Runtime HTTP / SSE
+  ▼
 Runtime
-  |
-  | Provider protocol
-  v
+  │ Provider 协议
+  ▼
 Codex app-server / Claude Agent SDK / Antigravity CLI / Gemini ACP
 ```
 
-The Web server handles login to AgentDeck, CSRF and origin checks, file upload/download, static assets, and forwarding events to the browser. The Runtime owns execution state: sessions, turns, provider thread IDs, event sequence, app-server lifecycle, and the active upstream account used for each turn.
+Web 负责 AgentDeck 登录、CSRF 与来源校验、文件传输、静态资源和浏览器事件转发。Runtime 是执行状态的唯一事实来源，负责会话、Turn、Provider 线程、事件序列、进程生命周期和实际执行账号。
 
-## Message Flow
+## 消息流
 
-1. Browser sends a user message over the WebSocket.
-2. Web validates the request and forwards it to Runtime.
-3. Runtime validates the selected provider profile, records the executing profile, and sends the turn to the provider.
-4. Provider events are persisted by Runtime.
-5. Runtime streams events to Web.
-6. Web forwards events to subscribed browsers.
-7. Browser renders only events it has actually applied.
+1. 浏览器通过 WebSocket 发送用户消息。
+2. Web 校验请求并转交 Runtime。
+3. Runtime 校验当前 Provider 账号，记录执行账号，再发起 Turn。
+4. Provider 事件先由 Runtime 持久化，再通过 SSE 送到 Web。
+5. Web 转发给订阅浏览器，浏览器按序列应用并去重。
+6. Turn 结束后，浏览器用权威快照收口实时事件。
 
-Canonical user messages store the user-visible `originalText` and structured
-`attachments[]`. Provider adapters may derive a temporary provider input with
-resource references, but that input is not persisted as message text, replayed
-to the browser, exported, or allowed to expose server absolute paths.
+用户消息只持久化用户实际输入和结构化附件。Adapter 可以临时生成带资源引用的 Provider 输入，但不会把服务器绝对路径或内部提示写回对话历史。
 
-Artifacts are owned by the turn that created or modified them. Web records a
-file manifest baseline before the turn and compares path, size, and content hash
-after completion. Only changed files are persisted as artifacts, with a stable
-turn and item anchor. Session reads only inject persisted artifacts and do not
-rescan the workspace to infer old files as new output.
+文件产物归属于创建或修改它的 Turn。执行前后通过路径、大小和内容哈希比较，只登记真实变化的文件；读取历史会话时使用已持久化清单，不重新扫描并伪造旧产物。
 
-## Stored State
+## 状态归属
 
-Runtime-owned:
+### Runtime 负责
 
-- Session running status and active turn.
-- Provider session/thread IDs.
-- creatorProfileId, selectedProfileId, executingProfileId, upstreamBindingProfileId.
-- Session model and provider capabilities.
-- Runtime events and latest sequence.
-- Codex app-server unit and endpoint ownership.
-- Turn artifact baselines and persisted artifact records.
-- Runtime lifecycle: starting, accepting, draining, stopping.
+- 会话运行状态、活动 Turn 和交互等待状态。
+- Provider 会话或线程 ID、模型和能力。
+- 创建账号、选择账号、执行账号与上游绑定账号。
+- Runtime 事件、最新序列与产物清单。
+- Codex app-server 的 unit、端点和账号归属。
+- 生命周期：starting、accepting、draining、stopping。
 
-Web-owned:
+### Web 负责
 
-- AgentDeck web authentication.
-- CSRF and origin policy.
-- Upload metadata and static file serving.
-- UI settings that are not execution state.
+- AgentDeck 自身的登录会话。
+- CSRF、Origin 和 WebSocket 来源策略。
+- 上传元数据、静态文件和浏览器订阅。
+- 不影响执行语义的界面设置。
 
-Read-only mirror:
+### 只读镜像与兼容字段
 
-- Web may mirror session rows for listing and migration compatibility.
-- Browser snapshots are views, not the source of truth.
+Web 可以镜像会话行用于列表与迁移，但不能用它决定执行状态。浏览器快照只是视图。历史遗留的 Web 运行状态和 Provider 就绪推断只为兼容保留，不得驱动执行。
 
-Deprecated duplicate:
+## 快照、事件与重连
 
-- Web-side running status and inferred provider readiness are retained only for compatibility and should not drive execution decisions.
+系统区分 `runtimeLatestSequence`、`snapshotCoveredSequence`、`browserAppliedSequence` 和 `browserAcknowledgedSequence`。重连携带浏览器真正应用过的序列，缺失事件由 Web 和 Runtime 重放。重复投递可以去重，永久丢失不可以接受。
 
-## Refresh And Reconnect
+## 账号与会话
 
-On page load, the browser loads a snapshot and opens a WebSocket subscription. Snapshot coverage does not mean the browser applied every event. Reconnect sends the browser-applied sequence so Web and Runtime replay anything missing. Duplicate events are acceptable; lost events are not.
+AgentDeck 会话不永久属于某个 Provider 账号。每个 Turn 单独记录实际消耗额度的执行账号。切换账号会影响下一次执行，但不会删除本地历史，也不会静默回退到旧账号。
 
-## Accounts And Sessions
+## Provider 边界
 
-An AgentDeck Session belongs to AgentDeck, not to one provider account. Each turn records the executing profile that will consume provider quota. Switching accounts changes the default executing profile for the next turn; it does not delete history.
+- Gemini 账号可以已认证但因上游客户端限制而不能创建会话，此时返回 `gemini_client_unsupported` 和 `canCreateSession=false`，不能误报为未登录。
+- Claude Code 通过官方 Agent SDK 的 `query()` 与 `claude_code` preset 执行，并保存上游 session ID。Runtime 崩溃时会把活动 Turn 标记为中断，不承诺 Provider 侧任务无损续跑。
+- Provider 密钥存放在 `DATA_DIR` 的受限目录，不进入普通 SQLite 字段或浏览器事件。
 
-## Deployment Boundary
+## 部署边界
 
-Provider processes are independent of Web and Runtime deployment by default.
-Healthy Codex app-servers survive Web/Runtime restarts; the new Runtime
-reconnects to them from persisted account, unit, endpoint, and session binding
-state.
+Provider 进程默认独立于 Web 和 Runtime 发布。Web-only 发布不会重启 Runtime；Runtime 发布先进入 draining，等待活动 Turn、提交过程和事件写入结束。Provider 只有在显式指定 `provider:<name>:<profileId>` 时才重启。
 
-Gemini personal OAuth profiles can be authenticated while unable to create new
-sessions when the upstream personal CLI client is unsupported. AgentDeck reports
-that as `gemini_client_unsupported` with `canCreateSession=false`, not as an
-unauthenticated account. API Key and enterprise-style profiles are evaluated
-separately.
-
-Claude Code is driven through the official Anthropic Agent SDK `query()` API
-with the `claude_code` preset. Runtime stores the returned Claude session ID and
-uses it for later turns. Runtime crash during an active Claude turn is recorded
-as interrupted; AgentDeck does not claim no-loss continuation for in-flight
-provider work. Claude profile secrets live under `DATA_DIR/claude/profiles/`
-with file permissions, not in ordinary SQLite fields or browser events.
-
-`scripts/deploy.sh --check` performs validation without restarting services.
-`--deploy --components web` restarts only Web. `--deploy --components runtime`
-starts Runtime draining, waits for active turns, submitting turns, and pending
-event writes to finish, then restarts Runtime. `--deploy --components
-web,runtime` drains/restarts Runtime first, then Web. Provider components are
-restarted only when explicitly requested, for example
-`provider:codex:<profileId>`.
-
-Backups live outside the Git worktree under `/opt/data/agentdeck/backups/`.
-The worktree-local `.backups/` path is ignored and only kept as a legacy staging
-name if it appears.
+备份位于 `/opt/data/agentdeck/backups/`，不进入 Git 工作区。

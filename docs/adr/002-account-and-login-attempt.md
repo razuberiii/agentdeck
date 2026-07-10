@@ -1,17 +1,17 @@
-# ADR 002: Account And LoginAttempt
+# ADR 002：正式账号与登录任务分离
 
-## Status
+## 状态
 
-Accepted.
+已采纳。
 
-## Decision
+## 决策
 
-Formal provider accounts are separate from login attempts. Starting a login creates a LoginAttempt only. A ProviderProfile becomes visible only after authentication succeeds and identity is read.
+开始登录时只创建 `LoginAttempt`。认证成功并读取到身份后，才创建可见的 `ProviderProfile`。
 
-## Rationale
+## 原因
 
-Placeholder accounts such as "Codex Account" and "Gemini Account" leaked into the UI and could become active profiles. Separating LoginAttempt prevents unfinished authorization jobs from being treated as accounts.
+占位账号曾经会出现在界面里，甚至被设为当前账号。分离登录任务可避免未完成的授权被当成正式账号。
 
-## Consequences
+## 影响
 
-Pending login UI is labelled as tasks. Failed or cancelled attempts do not alter the active account. Unresolved identities are not allowed to create sessions until account identity is resolved or the user intervenes.
+界面把未完成登录显示为任务；失败或取消不会改变当前账号；身份未确认前不能创建会话。

@@ -1,17 +1,17 @@
-# ADR 006: Event Sequence And Replay
+# ADR 006：事件序列与重放
 
-## Status
+## 状态
 
-Accepted.
+已采纳。
 
-## Decision
+## 决策
 
-AgentDeck distinguishes runtimeLatestSequence, snapshotCoveredSequence, browserAppliedSequence, and browserAcknowledgedSequence.
+AgentDeck 区分 `runtimeLatestSequence`、`snapshotCoveredSequence`、`browserAppliedSequence` 和 `browserAcknowledgedSequence`。
 
-## Rationale
+## 原因
 
-Treating snapshot coverage as browser acknowledgement can skip persisted Runtime events. The browser must advance its applied cursor only after it has accepted and rendered an event or snapshot content.
+把快照覆盖范围误当成浏览器确认会跳过已持久化事件。浏览器只有真正接受事件或快照后，才能推进应用游标。
 
-## Consequences
+## 影响
 
-Reconnect sends the browser-applied sequence. Web buffers/replays from Runtime and deduplicates by sequence and generation. Duplicate delivery is acceptable; permanent event loss is not.
+重连发送浏览器已应用序列。Web 从 Runtime 缓冲并重放事件，按序列与 generation 去重。允许重复投递，不允许永久丢失。

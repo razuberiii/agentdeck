@@ -1,40 +1,29 @@
-# Security
+# 安全边界
 
-AgentDeck is a self-hosted coding agent gateway. It is designed for localhost, LAN, VPN, Tailscale, Headscale, WireGuard, or a reverse proxy with an allowlist.
+AgentDeck 能执行命令和修改代码，应只部署在本机、可信局域网、VPN、Tailscale、Headscale、WireGuard，或带访问控制的反向代理后面。不要直接暴露到公网。
 
-Do not expose an unprotected AgentDeck service directly to the public internet.
+## 权限档位
 
-## Install Profiles
+- `personal` 追求可信单用户环境下的流畅体验。
+- `standard` 使用独立系统用户和较保守的工作区写入策略，推荐新安装采用。
+- `hardened` 从只读基线开始，需要维护者显式开放能力。
 
-`personal` is the most convenient mode. It preserves the existing single-user workflow: the `ubuntu` run user, Codex `danger-full-access`, and `approval_policy=never` remain valid defaults. Use it only on trusted localhost, VPN, or private LAN networks.
+升级不会自动改变既有运行用户、数据目录、端口、沙箱或审批策略。
 
-`standard` is recommended for new self-hosted installs. It uses a dedicated `agentdeck` user by default and renders more conservative Codex settings while keeping normal setup simple.
+## 浏览器与网络
 
-`hardened` is for operators who are comfortable with Linux, systemd, and provider-specific tradeoffs. It starts from stricter defaults and is expected to require more explicit configuration.
-
-Existing deployments are not silently migrated between profiles. In particular, upgrades do not change the run user, data directory, ports, Codex sandbox mode, or approval policy unless you explicitly set those variables.
-
-## Origin And WebSocket Checks
-
-HTTP state-changing requests validate `Origin` or `Referer`. WebSocket connections require a valid session cookie and a legal origin. If `ALLOWED_ORIGINS` is set, requests must match it.
-
-For personal mode, leaving `ALLOWED_ORIGINS` unset keeps localhost, same-host, and VPN access compatible. For standard and hardened deployments, set it explicitly:
+修改状态的 HTTP 请求会校验 `Origin` 或 `Referer`；WebSocket 需要有效会话和合法来源。生产环境建议明确配置：
 
 ```bash
 ALLOWED_ORIGINS=https://agentdeck.example.internal,http://100.64.0.10:3842
 ```
 
-## Sessions
+浏览器 Cookie 只保存随机会话令牌，服务端保存令牌哈希。修改 `ADMIN_PASSWORD` 会撤销已有会话。
 
-Browser cookies contain random session tokens only. Server-side sessions are stored as token hashes and can be revoked through logout or the session management API.
+## 凭据与日志
 
-Changing `ADMIN_PASSWORD` revokes existing sessions.
+Provider 凭据保存在 `DATA_DIR` 下的受限文件或专用状态中，不应写入 Git、普通日志或浏览器事件。诊断与安装日志在进入界面前会脱敏。
 
-## Secrets
+普通备份不包含 Token、OAuth 状态、API Key 和账号密钥。`backup --include-secrets` 生成的迁移包应按密码库同等级保护。
 
-Diagnostics and provider install logs are redacted before reaching the UI. The default backup excludes provider tokens, OAuth state, API keys, and profile secrets.
-
-Use `AGENTDECK_ENABLE_VERBOSE_DIAGNOSTICS=1` only while debugging a trusted private deployment.
-
-Use `agentdeckctl backup --include-secrets` only when you need a full credential-bearing migration backup. Treat that archive like a password vault.
-
+只在可信环境临时启用 `AGENTDECK_ENABLE_VERBOSE_DIAGNOSTICS=1`，排查结束后立即关闭。

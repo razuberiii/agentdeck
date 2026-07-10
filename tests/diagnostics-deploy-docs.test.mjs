@@ -64,12 +64,12 @@ test('architecture docs and ADRs are present', () => {
   ];
   for (const doc of docs) assert.ok(existsSync(new URL(`../${doc}`, import.meta.url)), `${doc} is missing`);
   const architecture = readFileSync(new URL('../docs/architecture.md', import.meta.url), 'utf8');
-  assert.match(architecture, /Runtime-owned/);
-  assert.match(architecture, /Web-owned/);
-  assert.match(architecture, /Deprecated duplicate/);
-  assert.match(architecture, /Canonical user messages/);
-  assert.match(architecture, /Artifacts are owned by the turn/);
-  assert.match(architecture, /Runtime draining/);
+  assert.match(architecture, /Runtime 负责/);
+  assert.match(architecture, /Web 负责/);
+  assert.match(architecture, /只读镜像与兼容字段/);
+  assert.match(architecture, /用户消息只持久化/);
+  assert.match(architecture, /文件产物归属于/);
+  assert.match(architecture, /draining/);
   assert.match(architecture, /gemini_client_unsupported/);
   assert.match(architecture, /\/opt\/data\/agentdeck\/backups\//);
   assert.match(gitignoreSource, /^\.backups\/$/m);

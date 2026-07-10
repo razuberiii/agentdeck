@@ -1,17 +1,17 @@
-# ADR 004: Provider Adapter
+# ADR 004：统一 Provider Adapter
 
-## Status
+## 状态
 
-Accepted.
+已采纳。
 
-## Decision
+## 决策
 
-Provider-specific behavior belongs behind ProviderAdapter operations and capability flags. Unsupported features return supported=false with a reason code and message.
+Provider 差异封装在 `ProviderAdapter` 操作和能力标记之后。不支持的能力返回 `supported=false`、原因码和可读说明。
 
-## Rationale
+## 原因
 
-React pages and Web routes previously guessed login state, model support, quota support, and creation capability from provider-specific details. That caused inconsistent UI states.
+过去 React 页面和 Web 路由从 Provider 私有字段猜测登录、模型、额度和创建能力，导致不同页面显示不一致。
 
-## Consequences
+## 影响
 
-Pages consume ProviderStatus and adapter capabilities. Gemini quota unsupported is an informational state, not an unauthenticated state. Antigravity can report unknown auth when reliable detection is not available.
+页面统一消费 `ProviderStatus` 和能力标记。不支持额度不等于未登录；无法可靠探测时可以明确返回未知状态。

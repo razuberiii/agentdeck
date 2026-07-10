@@ -135,6 +135,7 @@ npm run test:e2e
 
 ## 文档
 
+- [文档索引](docs/README.md)
 - [架构](docs/architecture.md)
 - [安装与升级](docs/install.md)
 - [Provider 与登录](docs/providers.md)

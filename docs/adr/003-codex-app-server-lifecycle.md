@@ -1,17 +1,17 @@
-# ADR 003: Codex App Server Lifecycle
+# ADR 003：Codex App Server 生命周期
 
-## Status
+## 状态
 
-Accepted.
+已采纳。
 
-## Decision
+## 决策
 
-Runtime owns Codex app-server lifecycle through a profile-aware ensure path. Each profile maps to one unit, one endpoint, one runtime client, and one account identity.
+Runtime 通过感知账号的统一入口管理 Codex app-server。每个账号对应一个 systemd unit、一个端点、一个 Runtime 客户端和一个账号身份。
 
-## Rationale
+## 原因
 
-Starting app-servers from multiple routes caused duplicate systemd-run calls and stale endpoint reuse. Invalid run users produced 217/USER and Restart=always amplified the failure.
+多个入口分别启动进程会造成重复调用和旧端点复用；错误运行用户还会触发 `217/USER`，无限重启会进一步放大故障。
 
-## Consequences
+## 影响
 
-The default service user is the existing deployment user unless configured otherwise. Units use bounded restart policies. Invalid user/group, endpoint conflicts, and identity mismatches return structured errors instead of retry loops.
+默认沿用现有部署用户，unit 使用有界重启策略。用户、组、端点或身份不匹配时返回结构化错误，不进入无限重试。
