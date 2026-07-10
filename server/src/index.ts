@@ -1803,6 +1803,8 @@ codex.on('notification', async (msg:any) => {
       if (msg.params?.turn?.id && !activeTurns.has(sid)) activeTurns.set(sid, String(msg.params.turn.id));
     }
     if (msg.method === 'thread/tokenUsage/updated') threadTokenUsage.set(sid, msg.params?.tokenUsage);
+    const activity = compactCodexActivity(msg);
+    if (activity) broadcast(sid, activity);
     if (shouldBroadcastCodexNotification(msg)) broadcast(sid, { type:'codex', method:msg.method, params:msg.params });
     if (msg.method === 'turn/completed') {
       const artifactTurnId = activeArtifactTurns.get(sid) || activeTurns.get(sid) || '';
@@ -5141,6 +5143,8 @@ async function runtimeEventMessages(threadId:string, event:any) {
   }
   if (eventType.includes('/')) {
     const msg = payload?.method ? payload : { method:eventType, params:payload?.params || payload };
+    const activity = compactCodexActivity(msg, base);
+    if (activity) out.push(activity);
     if (shouldBroadcastCodexNotification(msg)) out.push({ type:'codex', method:msg.method, params:msg.params, ...base });
     if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(threadId, String(msg.params.turn.id));
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
@@ -5879,6 +5883,26 @@ function shouldBroadcastCodexNotification(msg:any){
   }
   if (msg.method && (msg.method.includes('fileChange') || msg.method.includes('command'))) return false;
   return true;
+}
+function compactCodexActivity(msg:any, base:Record<string,any> = {}) {
+  const method = String(msg?.method || '');
+  const item = msg?.params?.item || {};
+  const type = String(item?.type || '');
+  const activityId = String(item?.id || msg?.params?.itemId || '');
+  if (!activityId) return null;
+  if (type === 'commandExecution' || method.includes('commandExecution')) {
+    const command = String(item?.command || msg?.params?.command || '').replace(/\s+/g,' ').trim();
+    return { type:'activity', activityId, role:'command', title:method.includes('completed')?'命令已完成':'正在运行命令', detail:command.slice(0,180) || '执行工作区命令', phase:method.includes('completed')?'completed':'running', ...base };
+  }
+  if (type === 'fileChange' || method.includes('fileChange')) {
+    const paths = (item?.changes || msg?.params?.changes || []).map((change:any)=>String(change?.path || change || '')).filter(Boolean);
+    return { type:'activity', activityId, role:'file', title:method.includes('completed')?'文件已更新':'正在修改文件', detail:paths.slice(0,3).join(' · ').slice(0,180) || '更新工作区内容', phase:method.includes('completed')?'completed':'running', ...base };
+  }
+  if (type === 'reasoning' || method.includes('reasoning')) {
+    const detail = [...(item?.summary || []), ...(item?.content || [])].join(' ').replace(/\s+/g,' ').trim();
+    return { type:'activity', activityId, role:'reasoning', title:'正在梳理思路', detail:detail.slice(0,180) || '分析当前任务', phase:method.includes('completed')?'completed':'running', ...base };
+  }
+  return null;
 }
 function itemHasProviderOnlyRecovery(item:any) {
   if (String(item?.text || '').includes(RECOVERY_CONTEXT_MARKER)) return true;

@@ -39,10 +39,11 @@ export class RuntimeClient {
   events(id:string, after = 0, includeDeltas = false) { return this.request('GET', `/sessions/${encodeURIComponent(id)}/events?after=${encodeURIComponent(String(after))}${includeDeltas ? '&includeDeltas=1' : ''}`); }
   startTurn(id:string, body:any) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/turns`, body); }
   stopTurn(id:string) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/stop`); }
-  subscribe(id:string, after:number, onEvent:(event:any)=>void, onStatus?:(status:'connected'|'closed'|'error', error?:any)=>void) {
+  subscribe(id:string, after:number, onEvent:(event:any)=>void|Promise<void>, onStatus?:(status:'connected'|'closed'|'error', error?:any)=>void) {
     const url = new URL(`/sessions/${encodeURIComponent(id)}/subscribe?after=${encodeURIComponent(String(after))}`, this.baseUrl);
     const req = http.request(url, { method:'GET', headers:{ accept:'text/event-stream', ...this.authHeaders() } });
     let buffer = '';
+    let eventQueue = Promise.resolve();
     req.on('response', res => {
       if ((res.statusCode || 500) >= 400) {
         const chunks:Buffer[] = [];
@@ -61,7 +62,10 @@ export class RuntimeClient {
           buffer = buffer.slice(idx + 2);
           const data = raw.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
           if (data) {
-            try { onEvent(JSON.parse(data)); } catch {}
+            try {
+              const event = JSON.parse(data);
+              eventQueue = eventQueue.then(()=>onEvent(event)).catch(()=>{});
+            } catch {}
           }
         }
       });

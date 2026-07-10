@@ -78,11 +78,31 @@ export function applyTimelineMessage(state: TimelineState, msg: any): TimelineSt
   if (state.liveMessages.some(item => runtimeMessageKey(item) === key)) {
     return { ...state, appliedSequence: Math.max(state.appliedSequence, seq) };
   }
+  const coalesced = coalesceLiveMessage(state.liveMessages, msg);
   return {
     ...state,
-    liveMessages: sortRuntimeMessages(dedupeRuntimeMessages([...state.liveMessages, msg])),
+    liveMessages: sortRuntimeMessages(dedupeRuntimeMessages(coalesced)),
     appliedSequence: Math.max(state.appliedSequence, seq),
   };
+}
+
+function coalesceLiveMessage(items:any[], msg:any):any[] {
+  if (msg?.type === 'activity') {
+    const withoutPrevious = items.filter(item => item?.type !== 'activity' || item.activityId !== msg.activityId);
+    return [...withoutPrevious.filter(item => item?.type !== 'activity').slice(-220), ...withoutPrevious.filter(item => item?.type === 'activity').slice(-7), msg];
+  }
+  if (msg?.type === 'codex' && msg?.method === 'item/agentMessage/delta') {
+    const itemId = String(msg?.params?.itemId || 'live-agent');
+    const index = items.findIndex(item => item?.type === 'codex' && item?.method === 'item/agentMessage/delta' && String(item?.params?.itemId || 'live-agent') === itemId);
+    if (index >= 0) {
+      const next = [...items];
+      const previous = next[index];
+      next[index] = { ...previous, ...msg, params:{ ...previous.params, ...msg.params, delta:String(previous.params?.delta || '') + String(msg.params?.delta || '') } };
+      return next;
+    }
+  }
+  if (msg?.type === 'codex' && msg?.method === 'turn/started') return [...items.filter(item => item?.type !== 'activity'), msg];
+  return [...items, msg];
 }
 
 export function dedupeRuntimeMessages(items: any[]): any[] {

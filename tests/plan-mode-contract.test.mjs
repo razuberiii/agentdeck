@@ -73,4 +73,12 @@ test('active conversations expose an ephemeral live trace without adding it to t
   assert.match(client,/timeline\.liveMessages/);
   assert.match(client,/\['command','file','reasoning'\]/);
   assert.match(styles,/\.liveTrace/);
+  assert.match(web,/function compactCodexActivity/);
+  assert.match(client,/m\.type==='activity'/);
+});
+
+test('runtime SSE events are consumed serially so terminal snapshots cannot overtake replies', () => {
+  const runtimeClient=readFileSync(new URL('../server/src/runtime-client.ts', import.meta.url),'utf8');
+  assert.match(runtimeClient,/let eventQueue = Promise\.resolve\(\)/);
+  assert.match(runtimeClient,/eventQueue = eventQueue\.then\(\(\)=>onEvent\(event\)\)/);
 });

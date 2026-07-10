@@ -217,13 +217,15 @@ function Home(){
     catch(e:any){ toast('error','创建失败：'+shortError(e)); }
     finally{ setBusy(''); }
   }
-  async function showQuota(){ setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
+  async function loadQuota(open=false){ if(open) setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
+  async function showQuota(){ await loadQuota(true); }
   async function loadSettings(){ setSettingsLoading(true); setSettingsError(''); try{ setSettings(await api('/api/settings?light=1')); } catch(e:any){ const msg=shortError(e); setSettingsError(msg); toast('error','设置读取失败：'+msg); } finally { setSettingsLoading(false); } }
   const [settingsInitialPage,setSettingsInitialPage]=useState<'main'|'agent'>('main');
   function showSettings(page:'main'|'agent'='main'){ setSettingsInitialPage(page); setSettings((current:any)=>current||{settings:{activeProvider:status?.activeProvider||'codex',defaultMode:status?.defaultMode||'yolo',defaultModel:status?.defaultModel,defaultModels:status?.defaultModels||{}},providers:status?.providers||[],providerStatus:status?.providerStatus||{},codex:status?.codex,claude:status?.claude,gemini:status?.gemini,antigravity:status?.antigravity,activeProfile:status?.activeProfile,activeClaudeProfile:status?.activeClaudeProfile,activeGeminiProfile:status?.activeGeminiProfile,activeAntigravityProfile:status?.activeAntigravityProfile,profiles:[],claudeProfiles:[],geminiProfiles:[],geminiPendingProfiles:[],antigravityProfiles:[]}); setSettingsOpen(true); loadSettings(); }
   async function switchProvider(provider:ProviderId){ if(provider===activeProvider) return; setStatus(current=>current?{...current,activeProvider:provider}:current); haptic(); try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); toast('success',`已切换到 ${providerLabel(provider)}`); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await refreshStatus(); } }
   const activeProvider=status?.activeProvider || 'codex';
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
+  useEffect(()=>{ setQuota(null); if(activeProviderStatus?.canQueryQuota) void loadQuota(false); },[activeProvider,activeProviderStatus?.activeProfileId]);
   const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
   const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
   return <main className="appShell homeShell">
@@ -235,6 +237,7 @@ function Home(){
     <section className="homeHero">
       <div className="taskLaunch"><span className="heroKicker"><i/>OPEN DESK / {String(new Date().getDate()).padStart(2,'0')}</span><RotatingHeadline/><div className={`taskPrompt ${launchMode==='plan'?'planning':''}`}><div className="taskModeBar" aria-label="任务方式"><button className={launchMode==='direct'?'active':''} onClick={()=>setLaunchMode('direct')}>直接执行</button><button className={launchMode==='plan'?'active':''} onClick={()=>setLaunchMode('plan')}>先规划</button><span>{launchMode==='plan'?'只读检查，确认计划后再动手':'Agent 可以直接修改工作区'}</span></div><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter'&&taskText.trim())newSession(defaultWorkspace,'New task',taskText)}} placeholder={launchMode==='plan'?'先说清目标，我们一起定路线…':'写下要发生的事…'}/><footer><button className="workspacePill" aria-label="选择默认工作区" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(defaultWorkspace)}</span></button><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!taskText.trim()||!!busy} onClick={()=>newSession(defaultWorkspace,'New task',taskText)}><span>{busy?'创建中':launchMode==='plan'?'生成计划':'开工'}</span><Icon name="arrow" size={17}/></button></footer></div><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
       <AgentDock status={status} activeProvider={activeProvider} serverLabel={homeServerLabel(error,appStateLoading,statusRefreshing,activeProviderStatus,runtimeForHome)} onSwitch={switchProvider} onManage={()=>showSettings('agent')}/>
+      {activeProviderStatus?.canQueryQuota&&<HomeQuota quota={quota} onOpen={showQuota}/>}
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
     {dashboard&&<WorkPulse dashboard={dashboard} sessions={filtered}/>}
@@ -273,6 +276,11 @@ function WorkPulse({dashboard,sessions}:{dashboard:Dashboard;sessions:Session[]}
   const running=sessions.filter(session=>['running','active','waiting'].includes(String(session.status))).slice(0,3);
   if(!running.length) return null;
   return <section className="workPulse"><header><div><span>IN PROGRESS</span><b>{running.length} 件事正在处理</b></div>{dashboard.metrics.waiting>0&&<i>{dashboard.metrics.waiting} 件需要处理</i>}</header><div className="workPulseList">{running.map(session=><button key={session.id} onClick={()=>location.hash='#/s/'+session.id}><i className="liveDot"/><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {statusLabel(session.status)}</small></span><Icon name="arrow" size={15}/></button>)}</div></section>;
+}
+function HomeQuota({quota,onOpen}:{quota:any;onOpen:()=>void}){
+  const limit=quota?.rateLimits?.rateLimitsByLimitId?.codex || quota?.rateLimits?.rateLimits;
+  const windows=[limit?.primary,limit?.secondary].filter(Boolean);
+  return <button className="homeQuota" onClick={onOpen} aria-label="查看额度详情"><span><i>USAGE</i><b>{windows.length?'剩余额度':'额度状态'}</b></span><div>{windows.length?windows.map((window:any,index:number)=>{const remaining=Math.max(0,100-Number(window?.usedPercent||0));return <em key={index}><small>{quotaWindowTitle(window)}</small><strong>{Math.round(remaining)}%</strong><i><u style={{width:`${remaining}%`}}/></i></em>}):<em><small>{quota?'暂时无法读取':'正在读取'}</small><strong>—</strong></em>}</div><Icon name="arrow" size={15}/></button>;
 }
 
 function AgentDock({status,activeProvider,serverLabel,onSwitch,onManage}:{status:Status|null;activeProvider:ProviderId;serverLabel:string;onSwitch:(provider:ProviderId)=>void;onManage:()=>void}){
@@ -438,6 +446,7 @@ function liveEvents(items:any[]):DisplayEvent[]{
   for(const m of items) if(m.type==='messageStatus'&&m.clientMessageId) messageStatuses.set(String(m.clientMessageId), {status:String(m.status||''), error:m.error});
   for(const m of items){
     const item=m.params?.item;
+    if(m.type==='activity') out.push({key:`activity:${m.activityId}`,role:m.role||'reasoning',title:m.title||'处理中',text:String(m.detail||''),meta:m.phase||''} as DisplayEvent);
     if(m.type==='error') out.push({key:'e'+out.length,role:'system',text:'请求失败：'+m.error});
     if(m.type==='messageStatus'&&m.status==='failed') out.push({key:'mf'+out.length,role:'system',text:'请求失败：'+(m.error||'runtime 未接受任务')});
     if(m.type==='system' && String(m.text||'').trim()) out.push({key:'s'+out.length,role:'system',text:m.text});
@@ -1112,7 +1121,7 @@ function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <di
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js?v=44',{updateViaCache:'none'}).then(reg=>{
+  navigator.serviceWorker.register('/sw.js?v=45',{updateViaCache:'none'}).then(reg=>{
     reg.update().catch(()=>{});
     let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{
