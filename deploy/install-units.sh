@@ -35,6 +35,10 @@ else
 fi
 CURRENT_DIR=${AGENTDECK_CURRENT_DIR:-/opt/stacks/agentdeck/current}
 BIN_DIR=${AGENTDECK_BIN_DIR:-/usr/local/bin}
+CODEX_BIN=${AGENTDECK_CODEX_BIN:-${CODEX_BIN:-}}
+if [ -z "$CODEX_BIN" ]; then
+  CODEX_BIN="$AGENTDECK_HOME/.local/bin/codex"
+fi
 case "$INSTALL_PROFILE" in
   personal)
     CODEX_APPROVAL_POLICY=${AGENTDECK_CODEX_APPROVAL_POLICY:-never}
@@ -61,6 +65,7 @@ echo "home=$AGENTDECK_HOME"
 echo "data_dir=$DATA_DIR"
 echo "current_dir=$CURRENT_DIR"
 echo "env_dir=$ENV_DIR"
+echo "codex_bin=$CODEX_BIN"
 echo "codex_approval_policy=$CODEX_APPROVAL_POLICY"
 echo "codex_sandbox_mode=$CODEX_SANDBOX_MODE"
 sudo install -d -m 0755 /run/agentdeck
@@ -86,6 +91,7 @@ render_unit_template() {
     -e "s#@AGENTDECK_DATA_DIR@#$DATA_DIR#g" \
     -e "s#@AGENTDECK_CURRENT_DIR@#$CURRENT_DIR#g" \
     -e "s#@AGENTDECK_ENV_DIR@#$ENV_DIR#g" \
+    -e "s#@CODEX_BIN@#$CODEX_BIN#g" \
     -e "s#@CODEX_APPROVAL_POLICY@#$CODEX_APPROVAL_POLICY#g" \
     -e "s#@CODEX_SANDBOX_MODE@#$CODEX_SANDBOX_MODE#g" \
     "$source" > "$target"
@@ -98,6 +104,9 @@ fi
 if ! getent group "$RUN_GROUP" >/dev/null; then
   echo "ERROR: configured service group does not exist: $RUN_GROUP" >&2
   exit 1
+fi
+if [ ! -x "$CODEX_BIN" ]; then
+  echo "WARNING: configured Codex binary is not executable yet: $CODEX_BIN" >&2
 fi
 
 if [ ! -d "$ENV_DIR" ]; then

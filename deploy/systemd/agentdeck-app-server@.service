@@ -12,7 +12,7 @@ Group=@AGENTDECK_RUN_GROUP@
 WorkingDirectory=@AGENTDECK_CURRENT_DIR@
 Environment=HOME=@AGENTDECK_HOME@
 EnvironmentFile=@AGENTDECK_ENV_DIR@/agentdeck-app-server-%i.env
-ExecStart=/usr/local/bin/codex app-server --listen ${CODEX_APP_SERVER_LISTEN} -c approval_policy=\"@CODEX_APPROVAL_POLICY@\" -c sandbox_mode=\"@CODEX_SANDBOX_MODE@\"
+ExecStart=@CODEX_BIN@ app-server --listen ${CODEX_APP_SERVER_LISTEN} -c approval_policy=\"@CODEX_APPROVAL_POLICY@\" -c sandbox_mode=\"@CODEX_SANDBOX_MODE@\"
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=false

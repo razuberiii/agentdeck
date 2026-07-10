@@ -45,6 +45,8 @@ test('deploy supports component scoped web runtime provider and changed modes', 
   assert.match(deploy, /--components web,runtime\|--changed/);
   assert.match(deploy, /agentdeckctl/);
   assert.match(deploy, /changed_components\(\)/);
+  assert.match(deploy, /No deployable changes; nothing to deploy/);
+  assert.match(deploy, /unknown component set/);
   assert.match(ctl, /SOURCE_ROOT="\$\{AGENTDECK_SOURCE_ROOT:-\$CONTROL_ROOT\}"/);
   assert.match(ctl, /worker_deploy\(\)/);
   assert.match(ctl, /start_candidate_web/);

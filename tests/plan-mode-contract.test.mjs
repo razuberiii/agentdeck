@@ -31,6 +31,9 @@ test('plan review answer API drives approve, revise, regenerate, and cancel foll
   assert.match(web, /sendTurn\(request\.sessionId, revision, \[\], crypto\.randomUUID\(\), 'plan'\)/);
   assert.match(web, /createPlanReviewRequest/);
   assert.match(web, /waiting_plan_approval/);
+  assert.match(web, /AND status=\?5/);
+  assert.match(web, /interactive request already answered/);
+  assert.match(web, /status='superseded'/);
 });
 
 test('plan mode is forced through read-only runtime policy', () => {
@@ -44,13 +47,39 @@ test('plan mode is forced through read-only runtime policy', () => {
 test('mobile UI exposes plan mode and a lightweight plan review card', () => {
   assert.match(client, /sendMode/);
   assert.match(client, /计划模式：描述任务，只生成计划/);
-  assert.match(client, /普通模式/);
-  assert.match(client, /发送模式/);
+  assert.match(client, /className="sendModeSwitch"/);
+  assert.match(client, /<b>执行<\/b><small>直接处理/);
+  assert.match(client, /<b>规划<\/b><small>只读分析/);
+  assert.match(client, /sessionSendModeKey/);
+  assert.match(client, /pendingTaskModeKey/);
   assert.match(client, /PlanReviewCard/);
   assert.match(client, /计划已生成，等待确认/);
   assert.match(client, /answerPlan/);
   assert.doesNotMatch(client, /先给计划/);
-  assert.doesNotMatch(client, /直接执行/);
   assert.match(styles, /\.planReviewCard/);
+  assert.match(styles, /\.sendModeSwitch/);
   assert.doesNotMatch(styles, /\.modeToggle/);
+});
+
+test('failed plan starts leave planning state and can be retried', () => {
+  assert.match(web,/async function failPlanningTask/);
+  assert.match(web,/status='failed'/);
+  assert.match(web,/计划生成失败，可以修改描述后重试/);
+});
+
+test('active conversations expose an ephemeral live trace without adding it to the transcript', () => {
+  assert.match(client,/function LiveTrace/);
+  assert.match(client,/liveActivity/);
+  assert.match(client,/timeline\.liveMessages/);
+  assert.match(client,/const activityLive=liveEvents/);
+  assert.match(styles,/\.liveTrace/);
+  assert.match(web,/function compactCodexActivity/);
+  assert.match(client,/m\.type==='activity'/);
+  assert.match(client,/timeline\.liveMessages\.filter\(message=>message\?\.type!==\'activity\'\)/);
+});
+
+test('runtime SSE events are consumed serially so terminal snapshots cannot overtake replies', () => {
+  const runtimeClient=readFileSync(new URL('../server/src/runtime-client.ts', import.meta.url),'utf8');
+  assert.match(runtimeClient,/let eventQueue = Promise\.resolve\(\)/);
+  assert.match(runtimeClient,/eventQueue = eventQueue\.then\(\(\)=>onEvent\(event\)\)/);
 });

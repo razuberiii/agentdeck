@@ -421,12 +421,16 @@ app.get('/api/status', async (req) => {
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
   return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
-app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
+app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
+async function lightAppState() {
   const settings = await appSettings();
   const codexStatus = cachedCodexStatusSnapshot();
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
   const claudeStatus = cachedProviderStatusSnapshot('claude', claudeStatusCache.value);
   const antigravityStatus = cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value);
+  // The dashboard is the product's primary control surface. Returning synthetic
+  // "checking" snapshots here made every provider look unknown after switching
+  // agents, even when the authoritative status was available milliseconds later.
   const providerStatuses = await unifiedProviderStatuses(false);
   return {
     authed:true,
@@ -453,7 +457,7 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     activeAntigravityProfile:await activeAntigravityProfileSummary(),
     capabilities:attachmentCapabilities(null),
   };
-});
+}
 app.get('/api/providers/status', { preHandler: ensureAuth }, async (req:any) => {
   const providers = await unifiedProviderStatuses(req.query?.refresh === '1');
   return { providers, checkedAt:new Date().toISOString() };
@@ -680,14 +684,17 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     light ? Promise.resolve(cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value)) : cachedAntigravityStatus(force),
     light ? Promise.resolve(cachedProviderStatusSnapshot('gemini', geminiStatusCache.value)) : cachedGeminiStatus(force),
     light || !USE_AGENT_RUNTIME ? Promise.resolve({ error: light ? 'not refreshed' : 'persistent runtime disabled' }) : runtime.geminiStatus().catch((e:any)=>({ error:e?.message || String(e) })),
-    unifiedProviderStatuses(force && !light),
+    light ? Promise.resolve(cachedUnifiedProviderStatusesSnapshot()) : unifiedProviderStatuses(force),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]), providerInstallers:providerInstallerSummaries(), providerInstallJobs:providerInstallJobSummaries() };
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
-  if (provider) { await setSetting('activeProvider', provider); invalidateUnifiedProviderStatuses(); }
+  // Selecting an agent does not change CLI or account health. Keep the warm
+  // provider snapshot so this interaction stays instant instead of probing all
+  // four CLIs again (Gemini alone can take several seconds to answer).
+  if (provider) await setSetting('activeProvider', provider);
   const mode = normalizeMode(req.body?.defaultMode);
   if (mode) await setSetting('defaultMode', mode);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultModel')) {
@@ -784,8 +791,9 @@ app.post('/api/claude/profiles/:id/switch', { preHandler: ensureAuth }, async (r
   if (!existing || existing.status !== 'authenticated') return reply.code(404).send({ error:'profile not found' });
   const profile = await claudeProfileStore.switch(String(req.params.id)).catch(()=>null);
   if (!profile) return reply.code(404).send({ error:'profile not found' });
-  invalidateUnifiedProviderStatuses();
-  return { ok:true, activeClaudeProfile: await activeClaudeProfileSummary() };
+  invalidateProviderCaches('claude');
+  const statuses = await unifiedProviderStatuses(true);
+  return { ok:true, activeClaudeProfile: await activeClaudeProfileSummary(), providerStatus:statuses.claude };
 });
 app.post('/api/claude/profiles/:id/logout', { preHandler: ensureAuth }, async (req:any, reply) => {
   const id = String(req.params.id);
@@ -835,9 +843,9 @@ app.post('/api/profiles/:id/switch', { preHandler: ensureAuth }, async (req:any)
     throw new Error(`Codex 账户切换失败：${safeAntigravitySummary(String(error?.message || error))}`);
   }
   await refreshCodexProfileMetadata(String(profile.id), String(profile.codex_home));
-  codexStatusCache = { expiresAt:0 };
-  invalidateUnifiedProviderStatuses();
-  return { ok:true, activeProfile: await getActiveProfile() };
+  invalidateProviderCaches('codex');
+  const statuses = await unifiedProviderStatuses(true);
+  return { ok:true, activeProfile: await getActiveProfile(), providerStatus:statuses.codex };
 });
 app.delete('/api/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getProfile(String(req.params.id));
@@ -891,8 +899,9 @@ app.post('/api/gemini/profiles/:id/switch', { preHandler: ensureAuth }, async (r
   const dto = await getGeminiProfileDto(String(profile.id), { includeHidden:true });
   if (dto?.status !== 'authenticated' || !dto.login?.ok) return reply.code(409).send({error:'请先登录该 Gemini 账户'});
   await activateGeminiProfile(String(profile.id));
-  invalidateUnifiedProviderStatuses();
-  return { ok:true, activeGeminiProfile: await getActiveGeminiProfile() };
+  invalidateProviderCaches('gemini');
+  const statuses = await unifiedProviderStatuses(true);
+  return { ok:true, activeGeminiProfile: await getActiveGeminiProfile(), providerStatus:statuses.gemini };
 });
 app.post('/api/gemini/profiles/:id/refresh', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getGeminiProfile(String(req.params.id));
@@ -1170,8 +1179,9 @@ app.post('/api/antigravity/profiles/:id/switch', { preHandler: ensureAuth }, asy
   const profile = await getAntigravityProfile(String(req.params.id));
   if (!profile) return reply.code(404).send({error:'profile not found'});
   await activateAntigravityProfile(String(profile.id));
-  invalidateUnifiedProviderStatuses();
-  return { activeProfile: await getActiveAntigravityProfile() };
+  invalidateProviderCaches('antigravity');
+  const statuses = await unifiedProviderStatuses(true);
+  return { activeProfile: await getActiveAntigravityProfile(), providerStatus:statuses.antigravity };
 });
 app.delete('/api/antigravity/profiles/:id', { preHandler: ensureAuth }, async (req:any, reply) => {
   const profile = await getAntigravityProfile(String(req.params.id));
@@ -1224,12 +1234,62 @@ app.delete('/api/auth/sessions/:id', { preHandler: ensureAuth }, async (req:any,
 });
 app.get('/api/projects', { preHandler: ensureAuth }, async (req:any) => ({ roots, projects: await cachedProjects(req.query?.refresh === '1') }));
 app.get('/api/sessions', { preHandler: ensureAuth }, async (req:any) => ({ sessions: await listIndexedThreads(req.query?.archived === '1') }));
+app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
+  const archived = req.query?.archived === '1';
+  const [sessions,control,artifacts] = await Promise.all([listIndexedThreads(archived), lightAppState(), dashboardArtifacts()]);
+  const now = Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const startOfToday = new Date(new Date(now).toDateString()).getTime();
+  const runningStates = new Set(['running','planning','submitting','recovering','inProgress']);
+  const waitingStates = new Set(['waiting_approval','waiting_plan_approval','waiting_input']);
+  const projects = new Map<string,{path:string;name:string;sessions:number;lastActiveAt:number}>();
+  for (const session of sessions) {
+    const projectPath = String(session.project_dir || session.workspace_path || '');
+    if (!projectPath) continue;
+    const current = projects.get(projectPath) || { path:projectPath, name:projectNameFromPath(projectPath), sessions:0, lastActiveAt:0 };
+    current.sessions++;
+    current.lastActiveAt = Math.max(current.lastActiveAt, Number(session.updated_at || 0));
+    projects.set(projectPath, current);
+  }
+  const activity = Array.from({length:7}, (_,index) => {
+    const from = startOfToday - (6 - index) * dayMs;
+    const to = from + dayMs;
+    return { date:new Date(from).toISOString().slice(0,10), count:sessions.filter(session => Number(session.updated_at || 0) >= from && Number(session.updated_at || 0) < to).length };
+  });
+  return {
+    generatedAt:now,
+    archived,
+    control,
+    artifacts,
+    metrics:{
+      total:sessions.length,
+      running:sessions.filter(session => runningStates.has(String(session.status))).length,
+      waiting:sessions.filter(session => waitingStates.has(String(session.status))).length,
+      updatedToday:sessions.filter(session => Number(session.updated_at || 0) >= startOfToday).length,
+      projects:projects.size,
+    },
+    activity,
+    projects:[...projects.values()].sort((a,b)=>b.lastActiveAt-a.lastActiveAt).slice(0,8),
+    sessions,
+  };
+});
+async function dashboardArtifacts(){
+  const sql='SELECT id,session_id,name,mime,size,created_at,modified_at FROM artifacts ORDER BY COALESCE(modified_at,created_at) DESC LIMIT 12';
+  const [webRows,runtimeRows,webCount,runtimeCount]=await Promise.all([db.all(sql).catch(()=>[]),runtimeDb.all(sql).catch(()=>[]),db.get('SELECT COUNT(*) count FROM artifacts').catch(()=>null),runtimeDb.get('SELECT COUNT(*) count FROM artifacts').catch(()=>null)]);
+  const byId=new Map<string,any>();
+  for(const row of [...runtimeRows,...webRows]) if(!byId.has(String(row.id))) byId.set(String(row.id),row);
+  const items=[...byId.values()].sort((a,b)=>Number(b.modified_at||b.created_at||0)-Number(a.modified_at||a.created_at||0)).slice(0,8).map(row=>({
+    id:String(row.id),sessionId:String(row.session_id),name:String(row.name),type:String(row.mime||'application/octet-stream'),size:Number(row.size||0),updatedAt:Number(row.modified_at||row.created_at||0),url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}`,
+  }));
+  return { total:Math.max(Number(webCount?.count||0),Number(runtimeCount?.count||0),byId.size), items };
+}
 app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => {
   let projectDir:string;
   try { projectDir = await validateProject(req.body?.projectDir || DEFAULT_WORKSPACE_DIR, roots); }
   catch { return reply.code(400).send({error:'project path is outside allowed workspace roots'}); }
   const provider = normalizeProvider(req.body?.providerId) || (await appSettings()).activeProvider;
-  const title = String(req.body?.title || path.basename(projectDir));
+  const requestedTitle = String(req.body?.title || '').trim();
+  const title = sessionTitleFromTask(req.body?.initialTask, requestedTitle || path.basename(projectDir));
   const settings = await appSettings();
   const mode = normalizeMode(req.body?.mode) || settings.defaultMode;
   const statuses = await unifiedProviderStatuses();
@@ -1572,9 +1632,14 @@ app.post('/api/interactive-requests/:requestId/answer', { preHandler: ensureAuth
   const text = String(req.body?.text || '').trim();
   const answer = { optionId, text };
   const now = Date.now();
-  await db.run('UPDATE interactive_requests SET status=?1, answer_json=?2, answered_at=?3 WHERE request_id=?4', [optionId === 'cancel' ? 'cancelled' : 'answered', JSON.stringify(answer), now, requestId]);
+  const claimed:any = await db.run('UPDATE interactive_requests SET status=?1, answer_json=?2, answered_at=?3 WHERE request_id=?4 AND status=?5', [optionId === 'cancel' ? 'cancelled' : 'answered', JSON.stringify(answer), now, requestId, 'pending']);
+  if (!Number(claimed?.changes || 0)) {
+    const latest = await db.get('SELECT * FROM interactive_requests WHERE request_id=?1', [requestId]).catch(()=>row);
+    return reply.code(409).send({ error:'interactive request already answered', request:interactiveRequestDto(latest) });
+  }
   broadcast(request.sessionId, { type:'interactive_answered', requestId, answer });
   if (optionId === 'cancel') {
+    await db.run("UPDATE plan_tasks SET status='cancelled',cancelled_at=?1 WHERE session_id=?2 AND status IN ('planning','completed','awaiting_approval')", [now, request.sessionId]).catch(()=>{});
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['plan_cancelled', now, request.sessionId]);
     broadcast(request.sessionId, { type:'system', text:'计划已取消' });
     return { ok:true, requestId, sentFollowup:false };
@@ -1583,16 +1648,19 @@ app.post('/api/interactive-requests/:requestId/answer', { preHandler: ensureAuth
     || await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='awaiting_approval' ORDER BY created_at DESC LIMIT 1", [request.sessionId]).catch(()=>null);
   if (!plan) return { ok:true, requestId, sentFollowup:false };
   if (optionId === 'approve') {
-    await db.run('UPDATE plan_tasks SET status=?1, approved_at=?2 WHERE plan_id=?3', ['executing', now, plan.plan_id]).catch(()=>{});
+    await db.run('UPDATE plan_tasks SET status=?1, approved_at=?2,approved_plan_text=COALESCE(approved_plan_text,?3) WHERE plan_id=?4', ['executing', now, request.body || '', plan.plan_id]).catch(()=>{});
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['executing_approved_plan', now, request.sessionId]).catch(()=>{});
     const followup = approvedPlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text);
-    await sendTurn(request.sessionId, followup, [], crypto.randomUUID(), 'direct');
+    try { await sendTurn(request.sessionId, followup, [], crypto.randomUUID(), 'direct'); }
+    catch (error) { await restorePlanReviewAfterFailure(requestId, request.sessionId, String(plan.plan_id), error); throw error; }
     return { ok:true, requestId, sentFollowup:true };
   }
   const revision = optionId === 'regenerate'
     ? regeneratePlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text)
     : revisePlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text);
-  await sendTurn(request.sessionId, revision, [], crypto.randomUUID(), 'plan');
+  await db.run("UPDATE plan_tasks SET status='superseded' WHERE plan_id=?1 AND status='awaiting_approval'", [plan.plan_id]).catch(()=>{});
+  try { await sendTurn(request.sessionId, revision, [], crypto.randomUUID(), 'plan'); }
+  catch (error) { await restorePlanReviewAfterFailure(requestId, request.sessionId, String(plan.plan_id), error); throw error; }
   return { ok:true, requestId, sentFollowup:true };
 });
 app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -1720,6 +1788,7 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
       if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg);
       if (msg.type === 'stop') await stopTurn(String(msg.sessionId));
     } catch (e:any) {
+      await failPlanningTask(String(msg.sessionId || ''), e?.message || String(e)).catch(()=>{});
       if (ws.readyState === 1) ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable}));
     }
   });
@@ -1734,6 +1803,8 @@ codex.on('notification', async (msg:any) => {
       if (msg.params?.turn?.id && !activeTurns.has(sid)) activeTurns.set(sid, String(msg.params.turn.id));
     }
     if (msg.method === 'thread/tokenUsage/updated') threadTokenUsage.set(sid, msg.params?.tokenUsage);
+    const activity = compactCodexActivity(msg);
+    if (activity) broadcast(sid, activity);
     if (shouldBroadcastCodexNotification(msg)) broadcast(sid, { type:'codex', method:msg.method, params:msg.params });
     if (msg.method === 'turn/completed') {
       const artifactTurnId = activeArtifactTurns.get(sid) || activeTurns.get(sid) || '';
@@ -1944,6 +2015,26 @@ function codexQuotaLogFields(rateLimits:any) {
 }
 function providerDisplayName(provider:AgentProviderId) {
   return registryProviderDisplayName(provider);
+}
+function cachedUnifiedProviderStatusesSnapshot():Record<AgentProviderId, ProviderStatus> {
+  if (unifiedProviderStatusCache.value) return unifiedProviderStatusCache.value;
+  const snapshots:Record<AgentProviderId, any> = {
+    codex:cachedCodexStatusSnapshot(),
+    claude:cachedProviderStatusSnapshot('claude', claudeStatusCache.value),
+    gemini:cachedProviderStatusSnapshot('gemini', geminiStatusCache.value),
+    antigravity:cachedProviderStatusSnapshot('antigravity', antigravityStatusCache.value),
+  };
+  return Object.fromEntries(PROVIDER_ORDER.map(provider => [provider, providerStatus({
+    provider,
+    displayName:providerDisplayName(provider),
+    cliStatus:snapshots[provider],
+    auth:'checking',
+    canCreateSession:false,
+    canContinueSession:false,
+    capabilities:providerCapabilitiesFor(provider),
+    reasonCode:'status_refreshing',
+    message:'账号状态正在后台刷新',
+  })])) as Record<AgentProviderId, ProviderStatus>;
 }
 function isGeminiPersonalUnsupportedProfile(profile:any) {
   return String(profile?.authType || profile?.auth_type || profile?.login?.authType || '').toLowerCase() === 'oauth-personal';
@@ -4404,6 +4495,13 @@ function isHiddenGeminiUtilitySession(row:any) {
   return id.startsWith('gemini-login-verify-') || id.startsWith('gemini-smoke-') || title === 'Gemini login verification' || title === 'Gemini smoke test';
 }
 function projectNameFromPath(p:string){ return p.split(path.sep).filter(Boolean).pop() || p; }
+function sessionTitleFromTask(task:any,fallback:string){
+  const firstLine=String(task||'').replace(/\r/g,'').split('\n').map(line=>line.trim()).find(Boolean)||'';
+  const clean=firstLine.replace(/^[-*#>\s]+/,'').replace(/\s+/g,' ').trim();
+  if(!clean) return String(fallback||'New task').slice(0,72);
+  const chars=Array.from(clean);
+  return chars.length>72?chars.slice(0,71).join('')+'…':clean;
+}
 async function runtimeAdminState() {
   const url = `${process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852'}/admin/runtime/state`;
   const res = await fetch(url, { headers:runtimeAuthHeaders() });
@@ -5045,6 +5143,8 @@ async function runtimeEventMessages(threadId:string, event:any) {
   }
   if (eventType.includes('/')) {
     const msg = payload?.method ? payload : { method:eventType, params:payload?.params || payload };
+    const activity = compactCodexActivity(msg, base);
+    if (activity) out.push(activity);
     if (shouldBroadcastCodexNotification(msg)) out.push({ type:'codex', method:msg.method, params:msg.params, ...base });
     if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(threadId, String(msg.params.turn.id));
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
@@ -5202,6 +5302,22 @@ async function createPlanTask(sessionId:string, originalUserTask:string, row:any
     [planId, sessionId, originalUserTask, now, normalizeProvider(row?.provider_id) || 'codex', cleanAgentModel(row?.model) || null]
   ).catch(()=>{});
   return planId;
+}
+async function failPlanningTask(sessionId:string, error:string) {
+  if (!sessionId) return;
+  const now=Date.now();
+  const failed:any=await db.run("UPDATE plan_tasks SET status='failed',policy_violation=COALESCE(policy_violation,?1) WHERE session_id=?2 AND status='planning'", [String(error || 'Plan generation failed').slice(0,500),sessionId]).catch(()=>null);
+  if (!Number(failed?.changes || 0)) return;
+  await db.run("UPDATE sessions SET status='interrupted',updated_at=?1 WHERE (id=?2 OR codex_thread_id=?2) AND status='planning'", [now,sessionId]).catch(()=>{});
+  broadcast(sessionId,{type:'system',text:'计划生成失败，可以修改描述后重试'});
+}
+async function restorePlanReviewAfterFailure(requestId:string, sessionId:string, planId:string, error:unknown) {
+  const now=Date.now();
+  await db.run("UPDATE interactive_requests SET status='pending',answer_json=NULL,answered_at=NULL WHERE request_id=?1", [requestId]).catch(()=>{});
+  await db.run("UPDATE plan_tasks SET status='awaiting_approval',policy_violation=COALESCE(policy_violation,?1) WHERE plan_id=?2", [`Plan follow-up failed: ${String((error as any)?.message || error).slice(0,400)}`,planId]).catch(()=>{});
+  await db.run("UPDATE sessions SET status='waiting_plan_approval',updated_at=?1 WHERE id=?2 OR codex_thread_id=?2", [now,sessionId]).catch(()=>{});
+  const restored=await db.get('SELECT * FROM interactive_requests WHERE request_id=?1',[requestId]).catch(()=>null);
+  if (restored) broadcast(sessionId,{type:'interactive_request',request:interactiveRequestDto(restored)});
 }
 async function completePlanTask(sessionId:string, planText:string, assistantMessageId:string, changedFiles:any[] = []) {
   const row = await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='planning' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
@@ -5767,6 +5883,27 @@ function shouldBroadcastCodexNotification(msg:any){
   }
   if (msg.method && (msg.method.includes('fileChange') || msg.method.includes('command'))) return false;
   return true;
+}
+function compactCodexActivity(msg:any, base:Record<string,any> = {}) {
+  const method = String(msg?.method || '');
+  const item = msg?.params?.item || {};
+  const type = String(item?.type || '');
+  const activityId = String(item?.id || msg?.params?.itemId || '');
+  if (!activityId) return null;
+  if (type === 'commandExecution' || method.includes('commandExecution')) {
+    const command = String(item?.command || msg?.params?.command || '').replace(/\s+/g,' ').trim();
+    return { type:'activity', activityId, role:'command', title:method.includes('completed')?'命令已完成':'正在运行命令', detail:command.slice(0,180) || '执行工作区命令', phase:method.includes('completed')?'completed':'running', ...base };
+  }
+  if (type === 'fileChange' || method.includes('fileChange')) {
+    const paths = (item?.changes || msg?.params?.changes || []).map((change:any)=>String(change?.path || change || '')).filter(Boolean);
+    return { type:'activity', activityId, role:'file', title:method.includes('completed')?'文件已更新':'正在修改文件', detail:paths.slice(0,3).join(' · ').slice(0,180) || '更新工作区内容', phase:method.includes('completed')?'completed':'running', ...base };
+  }
+  if (type === 'reasoning' || method.includes('reasoning')) {
+    const detail = [...(item?.summary || []), ...(item?.content || [])].join(' ').replace(/\s+/g,' ').trim();
+    if (!detail || detail === '[object Object]') return null;
+    return { type:'activity', activityId, role:'reasoning', title:'正在梳理思路', detail:detail.slice(0,180), phase:method.includes('completed')?'completed':'running', ...base };
+  }
+  return null;
 }
 function itemHasProviderOnlyRecovery(item:any) {
   if (String(item?.text || '').includes(RECOVERY_CONTEXT_MARKER)) return true;

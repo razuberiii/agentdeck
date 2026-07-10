@@ -78,6 +78,17 @@ test('duplicate websocket event is idempotent', () => {
   `);
 });
 
+test('streaming deltas and live activity stay coalesced instead of growing per token', () => {
+  runReducerScenario(`
+    let state = emptyTimelineState(0);
+    for (let sequence=1; sequence<=500; sequence++) state=applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:sequence,runtimeGeneration:'g1',params:{itemId:'answer-1',delta:'x'}});
+    assert.equal(state.liveMessages.length,1);
+    assert.equal(state.liveMessages[0].params.delta.length,500);
+    for (let sequence=501; sequence<=530; sequence++) state=applyTimelineMessage(state,{type:'activity',activityId:'job-'+sequence,role:'command',title:'运行命令',detail:'test',runtimeSequence:sequence});
+    assert.equal(state.liveMessages.filter(item=>item.type==='activity').length,8);
+  `);
+});
+
 test('user events from snapshot and replay reconcile by content when ids differ', () => {
   runReducerScenario(`
     const events = reconcileTimelineEvents([

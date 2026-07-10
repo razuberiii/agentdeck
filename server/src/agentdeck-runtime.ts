@@ -33,6 +33,7 @@ const DEFAULT_CODEX_APP_SERVER_PORT = Number(process.env.CODEX_APP_SERVER_DEFAUL
 const INSTANCE_ID = process.env.RUNTIME_INSTANCE_ID || `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
 const DEFAULT_CODEX_HOME = process.env.CODEX_HOME || path.join(DEFAULT_HOME, '.codex');
 const DEFAULT_WORKDIR = process.env.RUNTIME_DEFAULT_CWD || process.cwd();
+const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const APP_SERVER_USER = process.env.CODEX_APP_SERVER_USER || 'ubuntu';
 const APP_SERVER_GROUP = process.env.CODEX_APP_SERVER_GROUP || APP_SERVER_USER;
 const SHARED_CODEX_DIR = RUNTIME_MODE === 'candidate' ? path.join(DATA_DIR, 'candidate-shared') : path.join(DATA_DIR, 'shared');
@@ -2044,7 +2045,7 @@ function codexSystemdRunArgs(account:Account, unit:string, listen:string) {
     '--setenv', `HOME=${DEFAULT_HOME}`,
     '--setenv', `CODEX_HOME=${account.codex_home}`,
     '--collect',
-    'codex', 'app-server', '--listen', listen,
+    CODEX_BIN, 'app-server', '--listen', listen,
     '-c', 'approval_policy="never"',
     '-c', 'sandbox_mode="danger-full-access"',
   ];
