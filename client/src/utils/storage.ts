@@ -1,6 +1,7 @@
 import type { Attachment } from '../api/types';
 
 export function draftKey(id:string){ return `agentdeck:draft:${id}`; }
+export function pendingTaskKey(id:string){ return `agentdeck:pendingTask:${id}`; }
 export function draftAttachmentsKey(id:string){ return `agentdeck:draftAttachments:${id}`; }
 export function sequenceKey(id:string){ return `agentdeck:lastSequence:${id}`; }
 export function storageGet(key:string){ try { return localStorage.getItem(key); } catch { return null; } }

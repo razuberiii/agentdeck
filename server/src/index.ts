@@ -421,7 +421,8 @@ app.get('/api/status', async (req) => {
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
   return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
-app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
+app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
+async function lightAppState() {
   const settings = await appSettings();
   const codexStatus = cachedCodexStatusSnapshot();
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
@@ -453,7 +454,7 @@ app.get('/api/app-state', { preHandler: ensureAuth }, async () => {
     activeAntigravityProfile:await activeAntigravityProfileSummary(),
     capabilities:attachmentCapabilities(null),
   };
-});
+}
 app.get('/api/providers/status', { preHandler: ensureAuth }, async (req:any) => {
   const providers = await unifiedProviderStatuses(req.query?.refresh === '1');
   return { providers, checkedAt:new Date().toISOString() };
@@ -1226,7 +1227,7 @@ app.get('/api/projects', { preHandler: ensureAuth }, async (req:any) => ({ roots
 app.get('/api/sessions', { preHandler: ensureAuth }, async (req:any) => ({ sessions: await listIndexedThreads(req.query?.archived === '1') }));
 app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
   const archived = req.query?.archived === '1';
-  const sessions = await listIndexedThreads(archived);
+  const [sessions,control] = await Promise.all([listIndexedThreads(archived), lightAppState()]);
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
   const startOfToday = new Date(new Date(now).toDateString()).getTime();
@@ -1249,6 +1250,7 @@ app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
   return {
     generatedAt:now,
     archived,
+    control,
     metrics:{
       total:sessions.length,
       running:sessions.filter(session => runningStates.has(String(session.status))).length,

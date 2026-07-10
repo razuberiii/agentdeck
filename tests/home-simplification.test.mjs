@@ -4,17 +4,17 @@ import test from 'node:test';
 
 const source = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 
-test('home status strip keeps provider details off the first viewport', () => {
+test('home is task-first and keeps provider switching in the Agent dock', () => {
   const homeBlock = source.slice(
     source.indexOf('<header className="homeTop">'),
     source.indexOf('<section className="quickStart">')
   );
   assert.match(homeBlock, /homeServerLabel/);
-  assert.match(homeBlock, /homeAgentLabel\(activeProvider, activeProviderStatus\)/);
-  assert.match(homeBlock, /showSettings\('agent'\)/);
-  assert.doesNotMatch(homeBlock, /providerSubtitle/);
-  assert.doesNotMatch(homeBlock, /accountSummary/);
-  assert.doesNotMatch(homeBlock, /activeStatusProfileLabel/);
+  assert.match(homeBlock, /className="taskPrompt"/);
+  assert.match(homeBlock, /今天想让 Agent/);
+  assert.match(homeBlock, /<AgentDock/);
+  assert.match(homeBlock, /onSwitch=\{switchProvider\}/);
+  assert.match(homeBlock, /storageSet\(draftKey\(s\.id\),initialTask\.trim\(\)\)/);
 });
 
 test('home Agent label only exposes provider name plus short unavailable/login state', () => {
