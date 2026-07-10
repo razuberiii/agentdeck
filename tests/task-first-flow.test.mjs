@@ -4,10 +4,11 @@ import test from 'node:test';
 
 test('home task composer creates a persistent session and auto-submits after join', async () => {
   const source = await readFile(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
-  assert.match(source, /className="taskPrompt"/);
+  assert.match(source, /taskPrompt/);
   assert.match(source, /storageSet\(pendingTaskKey\(s\.id\),initialTask\.trim\(\)\)/);
   assert.match(source, /const pendingTask=storageGet\(pendingTaskKey\(id\)\)/);
-  assert.match(source, /sendMessage\(ws,id,\{text:pendingTask\.trim\(\),attachments:\[\],planMode:'direct'\}\)/);
+  assert.match(source, /const pendingMode=storageGet\(pendingTaskModeKey\(id\)\).*'plan':'direct'/);
+  assert.match(source, /sendMessage\(ws,id,\{text:pendingTask\.trim\(\),attachments:\[\],planMode:pendingMode\}\)/);
   assert.match(source, /storageRemove\(pendingTaskKey\(id\)\)/);
 });
 

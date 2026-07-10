@@ -160,6 +160,39 @@ input:hover,textarea:hover{border-color:#34505d}input:focus,textarea:focus{backg
   .composer{padding:0 8px calc(env(safe-area-inset-bottom) + 8px)}.composerSurface{border-radius:14px}.composeRow{grid-template-columns:38px minmax(0,1fr) 38px 44px;padding:5px;gap:3px}.composer textarea{min-height:46px;height:46px;padding:12px 8px}.composer .sendBtn{width:40px;min-height:40px;height:40px;padding:0;border-radius:12px}.composer .sendBtn span{display:none}.composer .stopButton:disabled{visibility:hidden}.composerMeta{padding:0 9px 7px}.jumpBottom{left:50%;right:auto;bottom:calc(env(safe-area-inset-bottom) + 102px);translate:-50% 0;min-height:34px;padding:5px 11px;font-size:10px;box-shadow:0 10px 28px rgba(0,0,0,.42)}
 }
 
+/* Edition 04: explicit planning controls and fewer decorative pills */
+.taskModeBar{display:grid;grid-template-columns:auto auto minmax(0,1fr);align-items:center;border-bottom:1px solid #222b30;background:#090f12}
+.taskModeBar button{min-height:38px;padding:8px 14px;border:0;border-right:1px solid #222b30;border-radius:0;background:transparent;color:#748087;font:750 10px ui-monospace,SFMono-Regular,Menlo,monospace}
+.taskModeBar button.active{color:#11170b;background:var(--signal)}.taskModeBar>span{padding:0 14px;color:#566269;font-size:9px;text-align:right}
+.taskPrompt.planning{border-color:#63763c}.taskPrompt.planning textarea{background:linear-gradient(135deg,rgba(200,255,87,.025),transparent)}
+.launchButton{min-width:132px;border-radius:0!important;box-shadow:none;justify-content:space-between;padding:9px 14px}
+.workspacePill{border-radius:0!important}.taskPrompt footer{padding:0}.workspacePill{align-self:stretch;min-height:48px;padding:8px 14px;border-right:1px solid #222b30}.launchHint{padding-right:10px}
+.seg{padding:0;border:0;border-bottom:1px solid #263138;border-radius:0;background:transparent}.seg button{border-radius:0!important;border-bottom:2px solid transparent}.seg .active{color:var(--signal);background:transparent;border-bottom-color:var(--signal)}
+.searchWrap .search{border-radius:2px}.providerBadge{border-radius:2px!important}.profileBadges i,.profileBadges em{border-radius:2px}
+.agentDock{border-color:#252f35}.providerDock button{border-right-color:#182126}.providerDock button.active{background:linear-gradient(145deg,rgba(200,255,87,.09),transparent)}
+.providerDock button b{white-space:nowrap}.providerDock button small{max-width:100%;text-overflow:ellipsis}.agentDock>header>i{font-size:8px}.agentDock>footer span{opacity:.7}
+.moreMenu{border-radius:2px;padding:0;background:#0a1013;border-color:#2a353b;box-shadow:12px 12px 0 rgba(109,124,255,.08)}
+.moreMenu button{min-height:58px;padding:11px 14px;border-bottom:1px solid #20292f;border-radius:0}.moreMenu button:last-child{border-bottom:0}.moreMenu button:hover{background:#10171b}.moreMenu button.active{box-shadow:inset 3px 0 var(--signal);background:#11180f}
+.moreMenu .menuBack{margin:0;border-bottom:1px solid #2c373d}
+.sys{position:relative;align-self:stretch;max-width:100%;padding:7px 10px 7px 22px;border:0!important;border-radius:0!important;background:transparent!important;color:#66737a!important;text-align:left;font:9px ui-monospace,SFMono-Regular,Menlo,monospace}
+.sys:before{content:"";position:absolute;left:5px;top:0;bottom:0;width:1px;background:#273239}.sys:after{content:"";position:absolute;left:2px;top:50%;width:7px;height:7px;border:1px solid #546168;background:#080b0e}
+.sys.complete:after{border-color:var(--signal);background:var(--signal)}
+.sendModeSwitch{display:grid;grid-template-columns:auto auto minmax(0,1fr);align-items:stretch;border-bottom:1px solid #263138;background:#090f12}
+.sendModeSwitch button{display:grid;gap:1px;min-width:92px;min-height:44px;padding:7px 12px;border:0;border-right:1px solid #263138;border-radius:0;background:transparent;text-align:left;color:#7d898f}.sendModeSwitch button span{font-size:11px}.sendModeSwitch button small{font-size:8px;color:#536068}.sendModeSwitch button.active{color:#11170b;background:var(--signal)}.sendModeSwitch button.active small{color:#34431e}.sendModeSwitch>i{align-self:center;justify-self:end;padding:0 13px;color:#4f5c62;font:8px ui-monospace,SFMono-Regular,Menlo,monospace;font-style:normal}
+.composerSurface.planning{border-color:#63763c}.composerSurface.planning .sendBtn{background:#d7ff86}
+.planStage{display:grid;grid-template-columns:8px auto 1fr;align-items:center;gap:9px;padding:8px 10px;border-left:2px solid var(--signal);background:#10150d}.planStage i{width:6px;height:6px;background:var(--signal);animation:pulse 1.2s ease-in-out infinite}.planStage span{color:#748064;font:8px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em}.planStage b{font-size:10px}
+.planReviewCard{position:relative;grid-template-columns:minmax(0,1fr) auto;padding:18px;border-color:#65783c;background:#0d120b;box-shadow:10px 10px 0 rgba(200,255,87,.05)}
+.planReviewCard .reviewIndex{grid-column:1/-1;color:#81905f;font:8px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.16em}.planReviewCard .approvalHead{grid-column:1}.planReviewCard .approvalHead b{font-size:18px;color:#eff6e8}.planReviewCard .approvalHead span{color:#819078}.planRevision{grid-column:1/-1;display:grid;gap:7px}.planRevision>div{display:flex;gap:6px}.planNote{border-radius:2px;background:#080d08}.planSecondary{grid-column:1;display:flex;align-items:center;gap:3px}.planSecondary button{min-height:32px;padding:5px 8px;border:0;border-radius:0;background:transparent;color:#85917d;font-size:9px}.planSecondary .dangerText{color:#a97676}.planApprove{grid-column:2;grid-row:2/4;align-self:stretch;display:flex;align-items:center;justify-content:space-between;gap:18px;min-width:150px;border:0;border-radius:0;background:var(--signal);color:#101408;padding:12px 15px}
+.approvalCard{border-radius:2px}.approvalActions button{border-radius:2px}.diff{background:#080b0e}.diff header{min-height:54px;border-bottom:1px solid #273239}.diff pre{border:0;border-left:1px solid #273239;border-radius:0;background:#080d10}
+.attachItem{border-radius:2px}.attachPreview{border-radius:0}.fileCard{border-radius:2px}
+@media(max-width:700px){
+  .taskModeBar{grid-template-columns:1fr 1fr}.taskModeBar>span{grid-column:1/-1;padding:7px 10px;border-top:1px solid #20292f;text-align:left}
+  .taskModeBar button{width:100%}.launchButton{min-width:112px}.workspacePill{padding:8px 10px}
+  .sendModeSwitch{grid-template-columns:1fr 1fr auto}.sendModeSwitch button{min-width:0}.sendModeSwitch>i{font-size:7px;padding:0 8px}
+  .planReviewCard{grid-template-columns:1fr}.planReviewCard .approvalHead,.planReviewCard .planSecondary,.planReviewCard .planApprove{grid-column:1;grid-row:auto}.planApprove{min-height:50px}.planSecondary{flex-wrap:wrap}
+  .providerDock button{flex-basis:142px}.providerDock button b{font-size:11px}
+}
+
 /* Edition 02: one visual language from masthead to archive */
 header.homeTop>.brandWordmark{gap:12px}
 .brandGlyph{position:relative;width:34px;height:34px;display:block;flex:0 0 auto;border:1px solid #39434a;border-radius:50%;background:#0a0f12}
@@ -349,3 +382,14 @@ header.homeTop>.brandLockup{display:flex;grid-template-columns:none;flex:1 1 aut
   .agentDock>footer{min-width:0;padding:12px 15px}
   .sectionHeading{margin-top:18px}
 }
+
+/* Final cascade: interaction states must win over legacy editions above. */
+.taskModeBar button{background:transparent!important;color:#748087!important}
+.taskModeBar button.active{background:var(--signal)!important;color:#11170b!important}
+.launchButton{min-width:132px!important;border-radius:0!important;background:var(--signal)!important;color:#101408!important;box-shadow:none!important}
+.workspacePill{border-radius:0!important}
+.seg{padding:0!important;border:0!important;border-bottom:1px solid #263138!important;border-radius:0!important;background:transparent!important}
+.seg button{border-radius:0!important;background:transparent!important;box-shadow:none!important;border-bottom:2px solid transparent!important}
+.seg .active{color:var(--signal)!important;border-bottom-color:var(--signal)!important}
+.searchWrap .search{border-radius:2px!important}
+@media(max-width:700px){.launchButton{min-width:112px!important}}

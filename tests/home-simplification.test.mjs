@@ -10,7 +10,7 @@ test('home is task-first and keeps provider switching in the Agent dock', () => 
     source.indexOf('function SessionRow')
   );
   assert.match(homeBlock, /homeServerLabel/);
-  assert.match(homeBlock, /className="taskPrompt"/);
+  assert.match(homeBlock, /taskPrompt/);
   assert.match(homeBlock, /<RotatingHeadline/);
   assert.match(homeBlock, /<WorkPulse/);
   assert.doesNotMatch(homeBlock, /MissionControl|OutputShelf|最近产物|最近 7 天/);

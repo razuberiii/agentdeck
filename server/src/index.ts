@@ -1632,9 +1632,14 @@ app.post('/api/interactive-requests/:requestId/answer', { preHandler: ensureAuth
   const text = String(req.body?.text || '').trim();
   const answer = { optionId, text };
   const now = Date.now();
-  await db.run('UPDATE interactive_requests SET status=?1, answer_json=?2, answered_at=?3 WHERE request_id=?4', [optionId === 'cancel' ? 'cancelled' : 'answered', JSON.stringify(answer), now, requestId]);
+  const claimed:any = await db.run('UPDATE interactive_requests SET status=?1, answer_json=?2, answered_at=?3 WHERE request_id=?4 AND status=?5', [optionId === 'cancel' ? 'cancelled' : 'answered', JSON.stringify(answer), now, requestId, 'pending']);
+  if (!Number(claimed?.changes || 0)) {
+    const latest = await db.get('SELECT * FROM interactive_requests WHERE request_id=?1', [requestId]).catch(()=>row);
+    return reply.code(409).send({ error:'interactive request already answered', request:interactiveRequestDto(latest) });
+  }
   broadcast(request.sessionId, { type:'interactive_answered', requestId, answer });
   if (optionId === 'cancel') {
+    await db.run("UPDATE plan_tasks SET status='cancelled',cancelled_at=?1 WHERE session_id=?2 AND status IN ('planning','completed','awaiting_approval')", [now, request.sessionId]).catch(()=>{});
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['plan_cancelled', now, request.sessionId]);
     broadcast(request.sessionId, { type:'system', text:'计划已取消' });
     return { ok:true, requestId, sentFollowup:false };
@@ -1643,16 +1648,19 @@ app.post('/api/interactive-requests/:requestId/answer', { preHandler: ensureAuth
     || await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='awaiting_approval' ORDER BY created_at DESC LIMIT 1", [request.sessionId]).catch(()=>null);
   if (!plan) return { ok:true, requestId, sentFollowup:false };
   if (optionId === 'approve') {
-    await db.run('UPDATE plan_tasks SET status=?1, approved_at=?2 WHERE plan_id=?3', ['executing', now, plan.plan_id]).catch(()=>{});
+    await db.run('UPDATE plan_tasks SET status=?1, approved_at=?2,approved_plan_text=COALESCE(approved_plan_text,?3) WHERE plan_id=?4', ['executing', now, request.body || '', plan.plan_id]).catch(()=>{});
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', ['executing_approved_plan', now, request.sessionId]).catch(()=>{});
     const followup = approvedPlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text);
-    await sendTurn(request.sessionId, followup, [], crypto.randomUUID(), 'direct');
+    try { await sendTurn(request.sessionId, followup, [], crypto.randomUUID(), 'direct'); }
+    catch (error) { await restorePlanReviewAfterFailure(requestId, request.sessionId, String(plan.plan_id), error); throw error; }
     return { ok:true, requestId, sentFollowup:true };
   }
   const revision = optionId === 'regenerate'
     ? regeneratePlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text)
     : revisePlanPrompt(String(plan.original_user_task || ''), String(plan.approved_plan_text || request.body || ''), text);
-  await sendTurn(request.sessionId, revision, [], crypto.randomUUID(), 'plan');
+  await db.run("UPDATE plan_tasks SET status='superseded' WHERE plan_id=?1 AND status='awaiting_approval'", [plan.plan_id]).catch(()=>{});
+  try { await sendTurn(request.sessionId, revision, [], crypto.randomUUID(), 'plan'); }
+  catch (error) { await restorePlanReviewAfterFailure(requestId, request.sessionId, String(plan.plan_id), error); throw error; }
   return { ok:true, requestId, sentFollowup:true };
 });
 app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any, reply) => {
@@ -1780,6 +1788,7 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
       if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg);
       if (msg.type === 'stop') await stopTurn(String(msg.sessionId));
     } catch (e:any) {
+      await failPlanningTask(String(msg.sessionId || ''), e?.message || String(e)).catch(()=>{});
       if (ws.readyState === 1) ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable}));
     }
   });
@@ -5289,6 +5298,22 @@ async function createPlanTask(sessionId:string, originalUserTask:string, row:any
     [planId, sessionId, originalUserTask, now, normalizeProvider(row?.provider_id) || 'codex', cleanAgentModel(row?.model) || null]
   ).catch(()=>{});
   return planId;
+}
+async function failPlanningTask(sessionId:string, error:string) {
+  if (!sessionId) return;
+  const now=Date.now();
+  const failed:any=await db.run("UPDATE plan_tasks SET status='failed',policy_violation=COALESCE(policy_violation,?1) WHERE session_id=?2 AND status='planning'", [String(error || 'Plan generation failed').slice(0,500),sessionId]).catch(()=>null);
+  if (!Number(failed?.changes || 0)) return;
+  await db.run("UPDATE sessions SET status='interrupted',updated_at=?1 WHERE (id=?2 OR codex_thread_id=?2) AND status='planning'", [now,sessionId]).catch(()=>{});
+  broadcast(sessionId,{type:'system',text:'计划生成失败，可以修改描述后重试'});
+}
+async function restorePlanReviewAfterFailure(requestId:string, sessionId:string, planId:string, error:unknown) {
+  const now=Date.now();
+  await db.run("UPDATE interactive_requests SET status='pending',answer_json=NULL,answered_at=NULL WHERE request_id=?1", [requestId]).catch(()=>{});
+  await db.run("UPDATE plan_tasks SET status='awaiting_approval',policy_violation=COALESCE(policy_violation,?1) WHERE plan_id=?2", [`Plan follow-up failed: ${String((error as any)?.message || error).slice(0,400)}`,planId]).catch(()=>{});
+  await db.run("UPDATE sessions SET status='waiting_plan_approval',updated_at=?1 WHERE id=?2 OR codex_thread_id=?2", [now,sessionId]).catch(()=>{});
+  const restored=await db.get('SELECT * FROM interactive_requests WHERE request_id=?1',[requestId]).catch(()=>null);
+  if (restored) broadcast(sessionId,{type:'interactive_request',request:interactiveRequestDto(restored)});
 }
 async function completePlanTask(sessionId:string, planText:string, assistantMessageId:string, changedFiles:any[] = []) {
   const row = await db.get("SELECT * FROM plan_tasks WHERE session_id=?1 AND status='planning' ORDER BY created_at DESC LIMIT 1", [sessionId]).catch(()=>null);
