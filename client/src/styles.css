@@ -159,6 +159,30 @@ input:hover,textarea:hover{border-color:#34505d}input:focus,textarea:focus{backg
   .homeHero{width:100%;gap:22px;padding:30px 0 24px}.taskLaunch h1{margin:12px 0 16px;font-size:clamp(31px,9.5vw,40px);line-height:1.08}.taskPrompt{width:100%;border-radius:15px}.taskPrompt textarea{min-height:94px;padding:14px;font-size:14px}.taskPrompt footer{padding:7px}.launchButton{min-width:74px;justify-content:center}.agentDock{width:100%;border-radius:15px;box-shadow:none}.providerDock{grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.providerDock button{width:100%;min-width:0}.workPulse{margin:0 0 34px;border-radius:14px}.workPulse>footer{scrollbar-width:none}.sectionHeading{margin-bottom:8px}.sectionHeading h2{font-size:20px}.sessionTools{top:-1px}
   .composer{padding:0 8px calc(env(safe-area-inset-bottom) + 8px)}.composerSurface{border-radius:14px}.composeRow{grid-template-columns:38px minmax(0,1fr) 38px 44px;padding:5px;gap:3px}.composer textarea{min-height:46px;height:46px;padding:12px 8px}.composer .sendBtn{width:40px;min-height:40px;height:40px;padding:0;border-radius:12px}.composer .sendBtn span{display:none}.composer .stopButton:disabled{visibility:hidden}.composerMeta{padding:0 9px 7px}.jumpBottom{left:50%;right:auto;bottom:calc(env(safe-area-inset-bottom) + 102px);translate:-50% 0;min-height:34px;padding:5px 11px;font-size:10px;box-shadow:0 10px 28px rgba(0,0,0,.42)}
 }
+
+/* Edition 02: one visual language from masthead to archive */
+header.homeTop>.brandWordmark{gap:12px}
+.brandGlyph{position:relative;width:34px;height:34px;display:block;flex:0 0 auto;border:1px solid #39434a;border-radius:50%;background:#0a0f12}
+.brandGlyph i{position:absolute;display:block;width:9px;height:9px;border:1px solid var(--signal);background:transparent}
+.brandGlyph i:first-child{left:8px;top:8px}.brandGlyph i:last-child{right:7px;bottom:7px;border-color:#7f8dff}
+.brandWordmark>span:last-child{display:grid;gap:2px}.brandWordmark strong{font:760 13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em}
+.brandWordmark small{font:7px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.11em}
+.rotatingHeadline{animation:headlineIn .55s cubic-bezier(.2,.8,.2,1) both}
+.rotatingHeadline span,.rotatingHeadline em{display:inline-block}
+@keyframes headlineIn{from{opacity:0;translate:0 18px;filter:blur(7px)}to{opacity:1;translate:0 0;filter:blur(0)}}
+.sectionHeading{padding:20px 0 12px;border-top:1px solid #20292f}.sectionHeading>div{display:flex;align-items:baseline;gap:12px}.sectionHeading>div span{color:#66727a}.sectionHeading h2{font-size:20px}
+.sessionTools{position:relative;top:auto;padding:0 0 12px;background:transparent;backdrop-filter:none;border-bottom:1px solid #20292f}
+.seg{border-color:#263138;border-radius:999px;background:#0a1013}.seg button{border-radius:999px}.seg .active{background:var(--signal);color:#101408}
+.searchWrap .search{border-color:#20292f;border-radius:999px;background:#0a1013}
+.sessionList{gap:0}.sessionRow{min-height:70px;padding:10px 2px;border:0;border-bottom:1px solid #1b2429;border-radius:0}
+.sessionRow:hover{background:transparent;translate:6px 0}.sessionGlyph{border-radius:50%;color:#11170b;background:var(--signal);border-color:var(--signal)}
+.providerBadge{color:#9facb2;background:transparent!important;border:1px solid #283239}
+.workPulse{border-color:#20292f;border-radius:2px;background:#0a1013}
+@media(max-width:700px){
+  header.homeTop>.brandWordmark{gap:9px}.brandGlyph{width:32px;height:32px}.brandWordmark strong{font-size:12px}
+  .sectionHeading>div{display:grid;gap:2px}.sessionTools{grid-template-columns:auto minmax(0,1fr)}
+}
+@media(prefers-reduced-motion:reduce){.rotatingHeadline{animation:none}}
 @media(max-width:380px){.homeShell{padding-left:12px;padding-right:12px}.brandLockup strong{font-size:15px}.homeTop .iconBtn{width:38px;height:38px}.providerDock button small{max-width:105px}.composeRow{grid-template-columns:36px minmax(0,1fr) 36px 42px}}
 
 /* 2026 workspace polish: quieter surfaces, stronger rhythm, balanced mobile chrome */

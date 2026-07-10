@@ -691,7 +691,10 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
-  if (provider) { await setSetting('activeProvider', provider); invalidateUnifiedProviderStatuses(); }
+  // Selecting an agent does not change CLI or account health. Keep the warm
+  // provider snapshot so this interaction stays instant instead of probing all
+  // four CLIs again (Gemini alone can take several seconds to answer).
+  if (provider) await setSetting('activeProvider', provider);
   const mode = normalizeMode(req.body?.defaultMode);
   if (mode) await setSetting('defaultMode', mode);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultModel')) {

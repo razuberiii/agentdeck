@@ -28,3 +28,12 @@ test('account switch refreshes the home status source and active profile rows',a
   assert.match(client,/onChanged=\{async\(\)=>\{ await refreshSessions\(\); await refreshStatus\(\);/);
   for(const provider of ['claude','gemini','antigravity']) assert.match(client,new RegExp(`markActiveProfile\\(id,'${provider}'\\)`));
 });
+
+test('agent selection stays optimistic and does not invalidate provider health',async()=>{
+  const client=await readFile(new URL('../client/src/main.tsx',import.meta.url),'utf8');
+  const settingsRoute=source.slice(source.indexOf("app.patch('/api/settings'"),source.indexOf("app.get('/api/models'"));
+  assert.doesNotMatch(settingsRoute,/if \(provider\).*invalidateUnifiedProviderStatuses/);
+  const switchBlock=client.slice(client.indexOf('async function switchProvider'),client.indexOf('const activeProvider='));
+  assert.match(switchBlock,/setStatus\(current=>current\?\{\.\.\.current,activeProvider:provider\}/);
+  assert.doesNotMatch(switchBlock,/await refreshSessions\(\)/);
+});

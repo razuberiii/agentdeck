@@ -128,7 +128,21 @@ function Icon({name,size=18}:{name:IconName;size?:number}){
   };
   return <svg className="uiIcon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
-function Brand({compact=false}:{compact?:boolean}){ return <div className={`brandLockup ${compact?'compact':''}`}><img className="brandMark" src="/icons/agentdeck.svg" alt=""/><span><strong>{APP_NAME}</strong>{!compact&&<small>Persistent agent workspace</small>}</span></div>; }
+function Brand({compact=false}:{compact?:boolean}){ return <div className={`brandLockup brandWordmark ${compact?'compact':''}`}><span className="brandGlyph" aria-hidden="true"><i/><i/></span><span><strong>AGENT/DECK</strong>{!compact&&<small>Remote workbench · 01</small>}</span></div>; }
+
+const HEADLINES=[
+  ['把麻烦，','放这儿。'],
+  ['今天适合，','动点真格。'],
+  ['先开个头，','风会进来。'],
+  ['别等灵感，','它总迟到。'],
+  ['凌晨也算，','一种白天。'],
+] as const;
+function RotatingHeadline(){
+  const [index,setIndex]=useState(()=>Math.floor(Date.now()/6000)%HEADLINES.length);
+  useEffect(()=>{ if(matchMedia('(prefers-reduced-motion: reduce)').matches) return; const timer=window.setInterval(()=>setIndex(value=>(value+1)%HEADLINES.length),5200); return()=>window.clearInterval(timer); },[]);
+  const words=HEADLINES[index];
+  return <h1 key={index} className="rotatingHeadline"><span>{words[0]}</span><br/><em>{words[1]}</em></h1>;
+}
 
 function App(){
   const [authed,setAuthed]=useState(false);
@@ -205,7 +219,7 @@ function Home(){
   async function loadSettings(){ setSettingsLoading(true); setSettingsError(''); try{ setSettings(await api('/api/settings?light=1')); } catch(e:any){ const msg=shortError(e); setSettingsError(msg); toast('error','设置读取失败：'+msg); } finally { setSettingsLoading(false); } }
   const [settingsInitialPage,setSettingsInitialPage]=useState<'main'|'agent'>('main');
   function showSettings(page:'main'|'agent'='main'){ setSettingsInitialPage(page); setSettings((current:any)=>current||{settings:{activeProvider:status?.activeProvider||'codex',defaultMode:status?.defaultMode||'yolo',defaultModel:status?.defaultModel,defaultModels:status?.defaultModels||{}},providers:status?.providers||[],providerStatus:status?.providerStatus||{},codex:status?.codex,claude:status?.claude,gemini:status?.gemini,antigravity:status?.antigravity,activeProfile:status?.activeProfile,activeClaudeProfile:status?.activeClaudeProfile,activeGeminiProfile:status?.activeGeminiProfile,activeAntigravityProfile:status?.activeAntigravityProfile,profiles:[],claudeProfiles:[],geminiProfiles:[],geminiPendingProfiles:[],antigravityProfiles:[]}); setSettingsOpen(true); loadSettings(); }
-  async function switchProvider(provider:ProviderId){ if(provider===activeProvider) return; try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); setStatus(current=>current?{...current,activeProvider:provider}:current); haptic(); toast('success',`已切换到 ${providerLabel(provider)}`); await refreshSessions(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchProvider(provider:ProviderId){ if(provider===activeProvider) return; setStatus(current=>current?{...current,activeProvider:provider}:current); haptic(); try{ await api('/api/settings',{method:'PATCH',body:JSON.stringify({activeProvider:provider})}); toast('success',`已切换到 ${providerLabel(provider)}`); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await refreshStatus(); } }
   const activeProvider=status?.activeProvider || 'codex';
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
   const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
@@ -217,7 +231,7 @@ function Home(){
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="homeHero">
-      <div className="taskLaunch"><span className="heroKicker"><i/>AGENT WORKSPACE</span><h1>一句话，<br/><em>现在开工。</em></h1><div className="taskPrompt"><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter'&&taskText.trim())newSession(defaultWorkspace,'New task',taskText)}} placeholder="描述结果，剩下的交给 Agent…"/><footer><button className="workspacePill" aria-label="选择默认工作区" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(defaultWorkspace)}</span></button><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!taskText.trim()||!!busy} onClick={()=>newSession(defaultWorkspace,'New task',taskText)}><span>{busy?'创建中':'交给 Agent'}</span><Icon name="arrow" size={17}/></button></footer></div><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
+      <div className="taskLaunch"><span className="heroKicker"><i/>OPEN DESK / {String(new Date().getDate()).padStart(2,'0')}</span><RotatingHeadline/><div className="taskPrompt"><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter'&&taskText.trim())newSession(defaultWorkspace,'New task',taskText)}} placeholder="写下要发生的事…"/><footer><button className="workspacePill" aria-label="选择默认工作区" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(defaultWorkspace)}</span></button><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!taskText.trim()||!!busy} onClick={()=>newSession(defaultWorkspace,'New task',taskText)}><span>{busy?'创建中':'开工'}</span><Icon name="arrow" size={17}/></button></footer></div><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
       <AgentDock status={status} activeProvider={activeProvider} serverLabel={homeServerLabel(error,appStateLoading,statusRefreshing,activeProviderStatus,runtimeForHome)} onSwitch={switchProvider} onManage={()=>showSettings('agent')}/>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
@@ -1089,7 +1103,7 @@ function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <di
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js?v=39',{updateViaCache:'none'}).then(reg=>{
+  navigator.serviceWorker.register('/sw.js?v=40',{updateViaCache:'none'}).then(reg=>{
     reg.update().catch(()=>{});
     let refreshing=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{

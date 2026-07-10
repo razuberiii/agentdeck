@@ -17,7 +17,7 @@ test('one canonical brand system drives browser and PWA icons', async () => {
 test('application header renders the canonical vector mark', async () => {
   const source=await readFile(new URL('../client/src/main.tsx',import.meta.url),'utf8');
   assert.match(source,/function Brand/);
-  assert.match(source,/src="\/icons\/agentdeck\.svg"/);
+  assert.match(source,/className="brandGlyph"/);
   assert.doesNotMatch(source,/className="mark">AD/);
 });
 
@@ -25,7 +25,7 @@ test('PWA worker updates bypass the browser HTTP cache', async () => {
   const root=new URL('../client/public/',import.meta.url);
   const worker=await readFile(new URL('sw.js',root),'utf8');
   const source=await readFile(new URL('../client/src/main.tsx',import.meta.url),'utf8');
-  assert.match(worker,/agentdeck-v39/);
+  assert.match(worker,/agentdeck-v40/);
   assert.match(worker,/cache:'reload'/);
   assert.match(source,/updateViaCache:'none'/);
 });
