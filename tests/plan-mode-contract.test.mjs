@@ -83,3 +83,9 @@ test('runtime SSE events are consumed serially so terminal snapshots cannot over
   assert.match(runtimeClient,/let eventQueue = Promise\.resolve\(\)/);
   assert.match(runtimeClient,/eventQueue = eventQueue\.then\(\(\)=>onEvent\(event\)\)/);
 });
+
+test('terminal events reconcile the open conversation with the authoritative snapshot', () => {
+  assert.match(client,/function syncTerminalSnapshot/);
+  assert.match(client,/timeline\.liveMessages\.some\(isTerminalSignal\)/);
+  assert.match(client,/void load\(false,generation\)/);
+});
