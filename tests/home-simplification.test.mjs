@@ -41,10 +41,13 @@ test('home Agent label only exposes provider name plus short unavailable/login s
 
 test('work pulse only appears for active work and does not duplicate recent sessions', () => {
   const block=source.slice(source.indexOf('function WorkPulse'),source.indexOf('function AgentDock'));
-  assert.match(block,/if\(!running\.length\) return null/);
+  assert.match(block,/if\(!items\.length\) return null/);
   assert.doesNotMatch(block,/刚刚完成或更新/);
   assert.doesNotMatch(block,/const recent=/);
   assert.doesNotMatch(block,/\['running','active','waiting'\]/);
+  assert.match(block,/JUST FINISHED/);
+  assert.match(block,/10\*60_000/);
+  assert.match(block,/doneDot/);
 });
 
 test('editorial headline is randomized once per page visit instead of rotating', () => {
@@ -57,4 +60,10 @@ test('launch and conversation send actions share one signal-control language', (
   assert.match(styles,/\.launchButton,\.composer \.sendBtn\{/);
   assert.match(styles,/\.launchButton:before,\.composer \.sendBtn:before/);
   assert.match(styles,/background:var\(--signal\)!important/);
+});
+
+test('image viewer uses the editorial command bar instead of legacy rounded controls', () => {
+  assert.match(styles,/\.viewer header button,\.viewer header a\{/);
+  assert.match(styles,/border-radius:0!important/);
+  assert.match(styles,/\.viewer header a:before/);
 });
