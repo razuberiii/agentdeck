@@ -5900,7 +5900,8 @@ function compactCodexActivity(msg:any, base:Record<string,any> = {}) {
   }
   if (type === 'reasoning' || method.includes('reasoning')) {
     const detail = [...(item?.summary || []), ...(item?.content || [])].join(' ').replace(/\s+/g,' ').trim();
-    return { type:'activity', activityId, role:'reasoning', title:'正在梳理思路', detail:detail.slice(0,180) || '分析当前任务', phase:method.includes('completed')?'completed':'running', ...base };
+    if (!detail || detail === '[object Object]') return null;
+    return { type:'activity', activityId, role:'reasoning', title:'正在梳理思路', detail:detail.slice(0,180), phase:method.includes('completed')?'completed':'running', ...base };
   }
   return null;
 }
