@@ -1268,7 +1268,8 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   try { projectDir = await validateProject(req.body?.projectDir || DEFAULT_WORKSPACE_DIR, roots); }
   catch { return reply.code(400).send({error:'project path is outside allowed workspace roots'}); }
   const provider = normalizeProvider(req.body?.providerId) || (await appSettings()).activeProvider;
-  const title = String(req.body?.title || path.basename(projectDir));
+  const requestedTitle = String(req.body?.title || '').trim();
+  const title = sessionTitleFromTask(req.body?.initialTask, requestedTitle || path.basename(projectDir));
   const settings = await appSettings();
   const mode = normalizeMode(req.body?.mode) || settings.defaultMode;
   const statuses = await unifiedProviderStatuses();
@@ -4443,6 +4444,13 @@ function isHiddenGeminiUtilitySession(row:any) {
   return id.startsWith('gemini-login-verify-') || id.startsWith('gemini-smoke-') || title === 'Gemini login verification' || title === 'Gemini smoke test';
 }
 function projectNameFromPath(p:string){ return p.split(path.sep).filter(Boolean).pop() || p; }
+function sessionTitleFromTask(task:any,fallback:string){
+  const firstLine=String(task||'').replace(/\r/g,'').split('\n').map(line=>line.trim()).find(Boolean)||'';
+  const clean=firstLine.replace(/^[-*#>\s]+/,'').replace(/\s+/g,' ').trim();
+  if(!clean) return String(fallback||'New task').slice(0,72);
+  const chars=Array.from(clean);
+  return chars.length>72?chars.slice(0,71).join('')+'…':clean;
+}
 async function runtimeAdminState() {
   const url = `${process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852'}/admin/runtime/state`;
   const res = await fetch(url, { headers:runtimeAuthHeaders() });
