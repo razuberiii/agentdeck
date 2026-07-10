@@ -98,3 +98,11 @@ test('timeline refresh settles at the newest message while the reader is pinned'
   assert.match(client,/requestAnimationFrame\(\(\)=>\{ scroll\(\); requestAnimationFrame\(scroll\); \}\)/);
   assert.match(client,/window\.setTimeout\(scroll,120\)/);
 });
+
+test('a streaming answer keeps its first timeline position when a later user message arrives', () => {
+  const live=client.slice(client.indexOf('function liveEvents'),client.indexOf('function messageStatusLabel'));
+  assert.match(live,/const streamingIndex=new Map/);
+  assert.match(live,/streamingIndex\.set\(key,out\.length\)/);
+  assert.match(live,/out\[index\]=ev/);
+  assert.doesNotMatch(live,/for\(const \[key,text\] of deltas\)/);
+});

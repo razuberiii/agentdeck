@@ -443,7 +443,7 @@ function itemToEvent(item:any):DisplayEvent|null{
 }
 function liveEvents(items:any[]):DisplayEvent[]{
   const out:DisplayEvent[]=[];
-  const completed=new Set<string>();
+  const streamingIndex=new Map<string,number>();
   const messageStatuses=new Map<string,{status:string;error?:string}>();
   let started=false;
   let completedTurn=false;
@@ -463,22 +463,25 @@ function liveEvents(items:any[]):DisplayEvent[]{
       out.push({key:'artifact'+out.length,role:'image',text:'', [target]:[m.artifact]} as DisplayEvent);
     }
     if(m.type==='codex'){
-      if(m.method==='item/completed'){
-        if(item?.type==='agentMessage') completed.add(item.id);
+      if(m.method==='item/agentMessage/delta'){
+        const key=String(m.params?.itemId||'live-agent');
+        const delta=String(m.params?.delta||'');
+        if(delta){
+          const index=streamingIndex.get(key);
+          if(index==null){ streamingIndex.set(key,out.length); out.push({key,role:'assistant',text:delta,meta:'正在回复',images:extractMarkdownImages(delta),files:extractFileLinks(delta)}); }
+          else { const text=String(out[index].text||'')+delta; out[index]={...out[index],text,images:extractMarkdownImages(text),files:extractFileLinks(text)}; }
+        }
+      } else if(m.method==='item/completed'){
         const ev=itemToEvent(item);
-        if(ev&&item?.type!=='userMessage') out.push(ev);
+        if(ev&&item?.type!=='userMessage'){
+          const index=item?.type==='agentMessage'?streamingIndex.get(String(item.id)):undefined;
+          if(index==null) out.push(ev); else out[index]=ev;
+        }
       } else if(m.method==='turn/started') started=true;
       else if(m.method==='turn/completed') completedTurn=true;
     }
   }
-  const deltas=new Map<string,string>();
-  for(const m of items) if(m.type==='codex'&&m.method==='item/agentMessage/delta'){
-    const key=m.params?.itemId||'live-agent';
-    const delta=String(m.params?.delta||'');
-    if(delta.trim()&&!completed.has(key)) deltas.set(key,(deltas.get(key)||'')+delta);
-  }
-  for(const [key,text] of deltas) if(text.trim()) out.push({key,role:'assistant',text,meta:'正在回复',images:extractMarkdownImages(text),files:extractFileLinks(text)});
-  if(started && !completedTurn && !deltas.size) out.push({key:'running',role:'system',text:'正在执行'});
+  if(started && !completedTurn && !streamingIndex.size) out.push({key:'running',role:'system',text:'正在执行'});
   return out;
 }
 function messageStatusLabel(status?:string){
@@ -774,12 +777,12 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   const currentSessionId = String(location.hash || '').match(/^#\/s\/([^/?#]+)/)?.[1] || '';
   async function applyCurrentSessionModel(model:string){ if(!currentSessionId){ toast('info','当前没有打开的会话'); return; } try{ await api('/api/sessions/'+encodeURIComponent(currentSessionId),{method:'PATCH',body:JSON.stringify({model})}); haptic(); toast('success','已应用到当前会话'); } catch(e:any){ toast('error','应用失败：'+shortError(e)); } }
   async function saveDefaultAndApply(model:string){ await setDefaultModel(model); if(currentSessionId) await applyCurrentSessionModel(model); }
-  async function switchProfile(id:string){ try{ const result=await api(`/api/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id); applyFreshProviderStatus('codex',result.providerStatus); haptic(); toast('success','切换成功'); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } finally { await syncSettings(); } }
+  async function switchProfile(id:string){ markActiveProfile(id); try{ const result=await api(`/api/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('codex',result.providerStatus); haptic(); toast('success','切换成功'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function createClaudeProfile(){ try{ const body:any={name:claudeName,type:claudeProfileType}; if(claudeProfileType==='setup_token') body.token=claudeSecret; if(claudeProfileType==='api_key') body.apiKey=claudeSecret; await api('/api/claude/profiles',{method:'POST',body:JSON.stringify(body)}); setClaudeSecret(''); haptic(); toast('success','Claude profile 已添加'); await syncSettings(); } catch(e:any){ toast('error','添加失败：'+shortError(e)); } }
   async function loginClaudeCli(profile?:any){ try{ const r=await api('/api/claude/profiles/login',{method:'POST',body:JSON.stringify({profileId:profile?.id,name:profile?.name||'Claude Code Account'})}); setClaudeLoginJob(r.job); setClaudeLoginInput(''); toast('info','Claude CLI 登录已启动'); await syncSettings(); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function submitClaudeLoginInput(){ if(!claudeLoginJob?.id || !claudeLoginInput.trim()) return; try{ await api('/api/claude-login/'+claudeLoginJob.id+'/input',{method:'POST',body:JSON.stringify({text:claudeLoginInput.trim()})}); setClaudeLoginInput(''); toast('info','已提交，正在等待 Claude CLI'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
   async function cancelClaudeLogin(){ if(!claudeLoginJob?.id) return; try{ await api('/api/claude-login/'+claudeLoginJob.id,{method:'DELETE'}); setClaudeLoginJob(null); setClaudeLoginInput(''); toast('info','已取消登录'); await syncSettings(); } catch(e:any){ toast('error','取消失败：'+shortError(e)); } }
-  async function switchClaudeProfile(id:string){ try{ const result=await api(`/api/claude/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id,'claude'); applyFreshProviderStatus('claude',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchClaudeProfile(id:string){ markActiveProfile(id,'claude'); try{ const result=await api(`/api/claude/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('claude',result.providerStatus); haptic(); toast('success','切换成功'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function logoutClaudeProfile(profile:any){ try{ await api(`/api/claude/profiles/${profile.id}/logout`,{method:'POST'}); haptic(); toast('success','已退出登录'); await syncSettings(); } catch(e:any){ toast('error','退出失败：'+shortError(e)); } }
   async function removeClaudeProfile(profile:any){ setClaudeDeleteBusy(true); setClaudeDeleteError(''); try{ await api(`/api/claude/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteClaudeProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setClaudeDeleteError(msg); toast('error','删除失败：'+msg); } finally { setClaudeDeleteBusy(false); } }
   async function refreshCodexMetadata(id:string){ try{ const result=await api(`/api/profiles/${id}/metadata/refresh`,{method:'POST'}); await syncSettings(); toast(result.ok?'success':'error',result.ok?'账户信息已更新':'账户信息读取失败，可重试'); } catch(e:any){ toast('error','账户信息读取失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
@@ -808,10 +811,10 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   async function startGeminiLogin(methodId:string){ if(!geminiAuthProfile?.id) return; try{ const body:any={methodId}; if(methodId==='api_key' || methodId.toLowerCase().includes('api')) body.apiKey=geminiApiKey; const r=await api(`/api/gemini/profiles/${geminiAuthProfile.id}/login`,{method:'POST',body:JSON.stringify(body)}); setGeminiLoginJob(r.job); setGeminiApiKey(''); setGeminiAuthCode(''); toast('info','Gemini 登录已启动'); } catch(e:any){ toast('error','登录启动失败：'+shortError(e)); } }
   async function submitGeminiAuthCode(){ if(!geminiLoginJob?.id || !geminiAuthCode.trim()) return; try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id+'/input',{method:'POST',body:JSON.stringify({code:geminiAuthCode.trim()})}); setGeminiLoginJob((job:any)=>({...job,...(r.job||{}),codeSubmitted:true})); setGeminiAuthCode(''); toast('info','授权码已提交，正在确认登录'); } catch(e:any){ toast('error','提交失败：'+shortError(e)); } }
   async function cancelGeminiLogin(){ if(!geminiLoginJob?.id) return; try{ const r=await api('/api/gemini-login/'+geminiLoginJob.id+'/cancel',{method:'POST'}); setGeminiLoginJob(r.job); toast('info','已取消登录'); } catch(e:any){ toast('error','取消失败：'+shortError(e)); } }
-  async function switchGeminiProfile(id:string){ try{ const result=await api(`/api/gemini/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id,'gemini'); applyFreshProviderStatus('gemini',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchGeminiProfile(id:string){ markActiveProfile(id,'gemini'); try{ const result=await api(`/api/gemini/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('gemini',result.providerStatus); haptic(); toast('success','切换成功'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function logoutGeminiProfile(profile:any){ try{ await api(`/api/gemini/profiles/${profile.id}/logout`,{method:'POST'}); haptic(); toast('success','已退出登录'); await syncSettings(); } catch(e:any){ toast('error','退出失败：'+shortError(e)); } }
   async function removeGeminiProfile(profile:any){ setGeminiDeleteBusy(true); setGeminiDeleteError(''); try{ await api(`/api/gemini/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteGeminiProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setGeminiDeleteError(msg); toast('error','删除失败：'+msg); } finally { setGeminiDeleteBusy(false); } }
-  async function switchAntigravityProfile(id:string){ try{ const result=await api(`/api/antigravity/profiles/${id}/switch`,{method:'POST'}); markActiveProfile(id,'antigravity'); applyFreshProviderStatus('antigravity',result.providerStatus); haptic(); toast('success','切换成功'); await syncSettings(); } catch(e:any){ toast('error','切换失败：'+shortError(e)); } }
+  async function switchAntigravityProfile(id:string){ markActiveProfile(id,'antigravity'); try{ const result=await api(`/api/antigravity/profiles/${id}/switch`,{method:'POST'}); applyFreshProviderStatus('antigravity',result.providerStatus); haptic(); toast('success','切换成功'); syncSettings().catch(()=>{}); } catch(e:any){ toast('error','切换失败：'+shortError(e)); await syncSettings().catch(()=>{}); } }
   async function removeAntigravityProfile(profile:any){ setAntigravityDeleteBusy(true); setAntigravityDeleteError(''); try{ await api(`/api/antigravity/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteAntigravityProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setAntigravityDeleteError(msg); toast('error','删除失败：'+msg); } finally { setAntigravityDeleteBusy(false); } }
   async function removeProfile(profile:any){ setProfileDeleteBusy(true); setProfileDeleteError(''); try{ await api(`/api/profiles/${profile.id}`,{method:'DELETE'}); haptic(); toast('success','账户已删除'); setDeleteProfile(null); await syncSettings(); } catch(e:any){ const msg=shortError(e); setProfileDeleteError(msg); toast('error','删除失败：'+msg); } finally { setProfileDeleteBusy(false); } }
   const currentModel = localData?.settings?.defaultModels ? (localData.settings.defaultModels[activeProvider] || catalogCurrent(models)) : (localData?.settings?.defaultModel || catalogCurrent(models));
@@ -835,7 +838,7 @@ function SettingsSheet({data,loading,error,initialPage,onRetry,onChanged,onClose
   const subtitle = page==='main' ? '会话行为和账户' : page==='agent' ? undefined : page==='mode' ? modeLabel(localData?.settings?.defaultMode) : page==='model' ? (activeProviderStatus?.canListModels?`${providerLabel(activeProvider)} 模型`:providerAuthLabel(activeProviderStatus)) : accountSubtitle(activeProvider, activeProfile, activeGeminiProfile, activeAntigravityProfile, activeProviderStatus);
   const providerStatusById:any = { codex:codexProviderStatus, claude:claudeProviderStatus, antigravity:antigravityProviderStatus, gemini:geminiProviderStatus };
   const goBack = () => setPage(page==='geminiMethods'?'account':(['geminiGoogle','geminiApiKey','geminiVertex'].includes(page)?'geminiMethods':'main') as any);
-  return <Sheet onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button className="settingsBack" onClick={goBack}>返回</button>:undefined}>
+  return <Sheet className="settingsSheet" onClose={onClose} title={title} subtitle={subtitle} actions={page!=='main'?<button className="settingsBack" onClick={goBack}>返回</button>:undefined}>
     {error&&<ErrorState title="设置读取失败" detail={error} action="重试" onAction={onRetry}/>}
     {loading&&!localData&&<LoadingRows count={4}/>}
     {localData&&<div className="settingsGrid">

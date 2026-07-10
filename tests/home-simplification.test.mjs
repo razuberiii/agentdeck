@@ -67,3 +67,11 @@ test('image viewer uses the editorial command bar instead of legacy rounded cont
   assert.match(styles,/border-radius:0!important/);
   assert.match(styles,/\.viewer header a:before/);
 });
+
+test('settings choices, account actions, and message copy use the shared command language', () => {
+  assert.match(source,/className="settingsSheet"/);
+  assert.match(styles,/\.settingsSheet \.providerChoices button/);
+  assert.match(styles,/\.settingsSheet \.modeButtons button/);
+  assert.match(styles,/\.settingsSheet \.profileRow \.dangerText/);
+  assert.match(styles,/\.chatShell \.bubble \.copyBtn/);
+});
