@@ -7,11 +7,13 @@ const source = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 
 test('home is task-first and keeps provider switching in the Agent dock', () => {
   const homeBlock = source.slice(
     source.indexOf('<header className="homeTop">'),
-    source.indexOf('<section className="quickStart">')
+    source.indexOf('function SessionRow')
   );
   assert.match(homeBlock, /homeServerLabel/);
   assert.match(homeBlock, /className="taskPrompt"/);
-  assert.match(homeBlock, /今天想让 Agent/);
+  assert.match(homeBlock, /交给 Agent/);
+  assert.match(homeBlock, /<WorkPulse/);
+  assert.doesNotMatch(homeBlock, /MissionControl|OutputShelf|最近产物|最近 7 天/);
   assert.match(homeBlock, /<AgentDock/);
   assert.match(homeBlock, /onSwitch=\{switchProvider\}/);
   assert.match(homeBlock, /storageSet\(draftKey\(s\.id\),initialTask\.trim\(\)\)/);

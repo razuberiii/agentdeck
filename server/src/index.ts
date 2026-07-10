@@ -423,6 +423,7 @@ app.get('/api/status', async (req) => {
 });
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
 async function lightAppState() {
+  void unifiedProviderStatuses(false).catch(()=>{});
   const settings = await appSettings();
   const codexStatus = cachedCodexStatusSnapshot();
   const geminiStatus = cachedProviderStatusSnapshot('gemini', geminiStatusCache.value);
