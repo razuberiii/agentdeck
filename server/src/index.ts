@@ -14,7 +14,7 @@ import { execFile, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import { promisify } from 'node:util';
 import { constants, createWriteStream, realpathSync, existsSync, readFileSync } from 'node:fs';
-import { chmod, cp, lstat, mkdir, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, open, readFile, readdir, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { access } from 'node:fs/promises';
 import { rm } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
@@ -99,6 +99,8 @@ const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
 type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; receivedSequence:number; processingSequence:number; committedSequence:number; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
+const runtimeSubscriptionReleases=new Map<string,NodeJS.Timeout>();
+const RUNTIME_SUBSCRIPTION_IDLE_MS=Math.max(1000,Number(process.env.RUNTIME_SUBSCRIPTION_IDLE_MS||5000));
 // Loaded before the server starts accepting websocket joins.  This is the
 // durable owner cursor for the shared Runtime SSE, not a browser cursor.
 const persistedIngestionCursors = new Map<string,number>();
@@ -1776,9 +1778,8 @@ function cleanupWsConnection(ws:any) {
       app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers');
       if(!set.size&&!activeCodexSessions.has(sessionId)){
         clients.delete(sessionId);
-        const subscription=runtimeSubscriptions.get(sessionId);
-        if(subscription){runtimeSubscriptions.delete(sessionId);subscription.close();}
-        browserDelivery.releaseSession(sessionId);
+        const previous=runtimeSubscriptionReleases.get(sessionId);if(previous)clearTimeout(previous);
+        const timer=setTimeout(()=>{runtimeSubscriptionReleases.delete(sessionId);if(clients.get(sessionId)?.size||activeCodexSessions.has(sessionId))return;const subscription=runtimeSubscriptions.get(sessionId);if(subscription){runtimeSubscriptions.delete(sessionId);subscription.close();}browserDelivery.releaseSession(sessionId);},RUNTIME_SUBSCRIPTION_IDLE_MS);timer.unref?.();runtimeSubscriptionReleases.set(sessionId,timer);
       }
     }
   }
@@ -4587,6 +4588,7 @@ type JoinOptions={clientConnectionId?:string;recoverRuntimeGeneration?:boolean;r
 async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions={}){
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
+  const pendingRelease=runtimeSubscriptionReleases.get(threadId);if(pendingRelease){clearTimeout(pendingRelease);runtimeSubscriptionReleases.delete(threadId);}
   if(!clients.has(threadId)) clients.set(threadId,new Set());
   app.log.info({sessionId:id,threadId,connectionGeneration:ws.agentdeckGeneration||null,subscriberCount:clients.get(threadId)?.size||0,replayFrom:Number(lastSequence||0),browserAppliedSequence:options.browserAppliedSequence||0,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeGeneration:options.requestedRuntimeGeneration||null,recoveryEpoch:options.recoveryEpoch||0,joinRequestId:options.joinRequestId||null},'websocket joined session');
   if (row && normalizeProvider(row.provider_id) === 'antigravity') {
@@ -5636,8 +5638,9 @@ async function uploadMultipartAttachment(req:any, reply:any, row:any) {
   }
 }
 async function readFileHead(filePath:string, bytes:number) {
-  const buffer = await readFile(filePath);
-  return buffer.subarray(0, Math.min(bytes, buffer.length));
+  const handle=await open(filePath,'r');
+  try{const buffer=Buffer.allocUnsafe(Math.max(0,bytes));const {bytesRead}=await handle.read(buffer,0,buffer.length,0);return buffer.subarray(0,bytesRead);}
+  finally{await handle.close();}
 }
 function detectAttachmentType(head:Buffer, name:string, browserMime:string) {
   if (head.subarray(0, 8).equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]))) return { mime:'image/png', kind:'image', ext:'.png' };
@@ -5727,9 +5730,12 @@ function sanitizeThreadForMobile(thread:any){
 }
 async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string) {
   const canonicalUsers = await db.all(
-    `SELECT * FROM agent_messages
-     WHERE session_id=?1 AND role='user'
-     ORDER BY created_at ASC, id ASC`,
+    `SELECT * FROM (
+       SELECT * FROM agent_messages
+       WHERE session_id=?1 AND role='user'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 80
+     ) ORDER BY created_at ASC, id ASC`,
     [threadId]
   ).catch(()=>[]);
   if (!canonicalUsers.length) return;
