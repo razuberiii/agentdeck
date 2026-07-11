@@ -23,6 +23,7 @@ import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
 import { SessionCommandQueue } from './websocket-command-queue.js';
 import { runMigrations } from './migration-runner.js';
+import { deleteSessionRelations } from './session-lifecycle.js';
 import { AntigravityProvider, GeminiProvider } from './providers.js';
 import { ClaudeProvider } from './claude/claude-provider.js';
 import { ClaudeProfileStore } from './claude/claude-profile-store.js';
@@ -5435,13 +5436,9 @@ function sessionIdentitySet(...rows:any[]) {
 async function hardDeleteSessionData(ids:string[]) {
   const unique = [...new Set(ids.filter(Boolean))];
   const result = { ids:unique, webRows:0, runtimeRows:0, attachmentDirs:0, rolloutFiles:0 };
+  for(const id of unique) deleteSessionRelations(db,id,'DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1');
   for (const id of unique) {
-    await db.run('DELETE FROM events WHERE session_id=?1', [id]).catch(()=>{});
-    await db.run('DELETE FROM artifacts WHERE session_id=?1', [id]).catch(()=>{});
-    await db.run('DELETE FROM agent_messages WHERE session_id=?1', [id]).catch(()=>{});
-  }
-  for (const id of unique) {
-    result.webRows += await deleteSessionRows(db, id, false);
+    result.webRows++;
     if(USE_AGENT_RUNTIME)await runtime.deleteSession(id).catch((error:any)=>{if(error?.statusCode!==404)throw error;});
     try {
       if (await deleteSessionAttachmentDir(id)) result.attachmentDirs++;
@@ -5457,8 +5454,8 @@ async function hardDeleteSessionData(ids:string[]) {
   return result;
 }
 async function deleteSessionRows(database:Db, id:string, includeUpstream:boolean) {
-  const before = await database.get('SELECT COUNT(*) AS count FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1' + (includeUpstream ? ' OR upstream_thread_id=?1' : ''), [id]).catch(()=>({count:0} as any));
-  await database.run('DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1' + (includeUpstream ? ' OR upstream_thread_id=?1' : ''), [id]).catch(()=>{});
+  const before = await database.get('SELECT COUNT(*) AS count FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1' + (includeUpstream ? ' OR upstream_thread_id=?1' : ''), [id]);
+  await database.run('DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1' + (includeUpstream ? ' OR upstream_thread_id=?1' : ''), [id]);
   return Number(before?.count || 0);
 }
 async function deleteSessionAttachmentDir(id:string) {

@@ -19,6 +19,7 @@ import type { ClaudeProfile } from './claude/claude-types.js';
 import { DurableEventStore } from './event-store.js';
 import { EventSubscriptions } from './event-subscriptions.js';
 import { runMigrations } from './migration-runner.js';
+import { deleteSessionRelations } from './session-lifecycle.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -670,7 +671,7 @@ app.patch('/sessions/:id', async (req:any, reply) => {
   await runtime.request('thread/name/set', { threadId, name:title }).catch(()=>{});
   return { ok:true, session: await getSession(session.id) };
 });
-app.delete('/sessions/:id',async(req:any,reply)=>{const session=await getSession(String(req.params.id));if(!session)return reply.code(404).send({error:'not found'});if(session.active_turn_id||['running','submitting','planning'].includes(session.status))return reply.code(409).send({error:'turn_running'});db.transactionRun([{sql:'DELETE FROM events WHERE session_id=?1',params:[session.id]},{sql:'DELETE FROM artifacts WHERE session_id=?1',params:[session.id]},{sql:'DELETE FROM sessions WHERE id=?1',params:[session.id]}]);return{ok:true};});
+app.delete('/sessions/:id',async(req:any,reply)=>{const session=await getSession(String(req.params.id));if(!session)return reply.code(404).send({error:'not found'});if(session.active_turn_id||['running','submitting','planning'].includes(session.status))return reply.code(409).send({error:'turn_running'});deleteSessionRelations(db,session.id);return{ok:true};});
 
 app.get('/sessions/:id/events', async (req:any) => {
   const after = Number(req.query?.after || 0);
