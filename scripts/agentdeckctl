@@ -530,8 +530,8 @@ NODE
 candidate_db_mode() {
   local release_path="$1" override="${AGENTDECK_CANDIDATE_DB_MODE:-}" current_commit next_commit files
   case "$override" in minimal|copy) printf '%s\n' "$override"; return ;; '') ;; *) die "invalid AGENTDECK_CANDIDATE_DB_MODE: $override" ;; esac
-  next_commit="$(node -e 'const m=require(process.argv[1]);console.log(m.sourceCommit||"")' "$release_path/deploy-manifest.json" 2>/dev/null || true)"
-  current_commit="$(node -e 'const fs=require("fs");try{const m=JSON.parse(fs.readFileSync(process.argv[1]+"/deploy-manifest.json"));console.log(m.sourceCommit||"")}catch{}' "$(readlink -f "$CURRENT_RUNTIME_LINK" 2>/dev/null || true)" 2>/dev/null || true)"
+  next_commit="$(git -C "$release_path" rev-parse HEAD 2>/dev/null || true)"
+  current_commit="$(git -C "$(readlink -f "$CURRENT_RUNTIME_LINK" 2>/dev/null || true)" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$current_commit" ] && [ -n "$next_commit" ] || { printf 'copy\n'; return; }
   files="$(git -C "$SOURCE_ROOT" diff --name-only "$current_commit..$next_commit" 2>/dev/null)" || { printf 'copy\n'; return; }
   if printf '%s\n' "$files" | grep -Eq '(^|/)(migration|migrations|migration-runner|event-store|db)\.(ts|js|sql)$|(^|/)migrations/|package(-lock)?\.json$'; then printf 'copy\n'; return; fi
@@ -959,7 +959,9 @@ submit_job() {
   local worker_args=("$command" "$target" "--job-id=$job_id")
   [ "$force" = "1" ] && worker_args+=("--force")
   if command -v systemd-run >/dev/null 2>&1 && [ "${AGENTDECK_NO_SYSTEMD_RUN:-0}" != "1" ]; then
-    systemd-run --unit="agentdeck-deploy@$job_id" --collect --same-dir --property=WorkingDirectory="$SOURCE_ROOT" --setenv=AGENTDECK_DEPLOY_WORKER=1 --setenv=AGENTDECK_ROOT="$CONTROL_ROOT" --setenv=AGENTDECK_SOURCE_ROOT="$SOURCE_ROOT" --setenv=DATA_DIR="$DATA_DIR" --setenv=AGENTDECK_ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/scripts/agentdeckctl" "${worker_args[@]}" >/dev/null
+    local candidate_mode_args=()
+    [ -z "${AGENTDECK_CANDIDATE_DB_MODE:-}" ] || candidate_mode_args+=("--setenv=AGENTDECK_CANDIDATE_DB_MODE=$AGENTDECK_CANDIDATE_DB_MODE")
+    systemd-run --unit="agentdeck-deploy@$job_id" --collect --same-dir --property=WorkingDirectory="$SOURCE_ROOT" --setenv=AGENTDECK_DEPLOY_WORKER=1 --setenv=AGENTDECK_ROOT="$CONTROL_ROOT" --setenv=AGENTDECK_SOURCE_ROOT="$SOURCE_ROOT" --setenv=DATA_DIR="$DATA_DIR" --setenv=AGENTDECK_ENV_DIR="$ENV_DIR" "${candidate_mode_args[@]}" "$SOURCE_ROOT/scripts/agentdeckctl" "${worker_args[@]}" >/dev/null
   else
     AGENTDECK_DEPLOY_WORKER=1 "$SOURCE_ROOT/scripts/agentdeckctl" "${worker_args[@]}" >>"$log_file" 2>&1 &
   fi
