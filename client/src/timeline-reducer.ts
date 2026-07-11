@@ -6,6 +6,8 @@ export type TimelineDisplayEvent = {
   messageId?: string;
   attachments?: { id?: string; url?: string; name?: string; type?: string; size?: number }[];
   meta?: string;
+  deliveryStatus?: string;
+  deliveryError?: string;
 };
 
 export type TimelineState = {
@@ -280,6 +282,8 @@ function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T 
     text,
     attachments,
     meta: b.meta || a.meta,
+    deliveryStatus:b.deliveryStatus||a.deliveryStatus,
+    deliveryError:b.deliveryError||a.deliveryError,
   };
 }
 

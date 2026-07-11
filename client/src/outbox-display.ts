@@ -1,0 +1,4 @@
+import type{OutboxRecord}from'./browser-outbox';
+import type{DisplayEvent}from'./api/types';
+export function outboxDisplayEvents(records:OutboxRecord[]):DisplayEvent[]{return records.filter(record=>!!record.text.trim()||record.attachments.length>0).map(record=>({key:`outbox:${record.clientMessageId}`,clientMessageId:record.clientMessageId,role:'user',text:record.text,attachments:record.attachments.map(item=>({id:item.id,name:item.name,type:item.type||'application/octet-stream',size:Number(item.size||0),url:''})),meta:deliveryStatusLabel(record.status),deliveryStatus:record.status,deliveryError:record.lastError}));}
+export function deliveryStatusLabel(status?:string){return({draft:'草稿',uploading:'附件上传中',ready:'本地已保存',sent:'正在发送',received:'服务端已收到',persisted:'已持久化',accepted:'Agent 已接受',failed:'发送失败',cancelled:'已取消'}as Record<string,string>)[status||'']||'';}
