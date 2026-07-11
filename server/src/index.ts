@@ -97,6 +97,7 @@ const websocketJoinFlights=new WeakMap<any,Map<string,Promise<void>>>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
+const activeRuntimeProviderSessions = new Set<string>();
 type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; receivedSequence:number; processingSequence:number; committedSequence:number; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
 const runtimeSubscriptionReleases=new Map<string,NodeJS.Timeout>();
@@ -104,6 +105,7 @@ const RUNTIME_SUBSCRIPTION_IDLE_MS=Math.max(1000,Number(process.env.RUNTIME_SUBS
 // Loaded before the server starts accepting websocket joins.  This is the
 // durable owner cursor for the shared Runtime SSE, not a browser cursor.
 const persistedIngestionCursors = new Map<string,number>();
+const persistedIngestionGenerations = new Map<string,string>();
 const sessionCommandQueue=new SessionCommandQueue(Number(process.env.WS_SESSION_COMMAND_QUEUE_MAX||64));
 const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTurnState; assistantId:string; turnId:string }>();
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
@@ -217,7 +219,7 @@ let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
 await db.init();
-for (const row of await db.all('SELECT session_id,committed_sequence FROM runtime_ingestion_cursors')) persistedIngestionCursors.set(String(row.session_id),Number(row.committed_sequence||0));
+for (const row of await db.all('SELECT session_id,committed_sequence,runtime_generation FROM runtime_ingestion_cursors')){persistedIngestionCursors.set(String(row.session_id),Number(row.committed_sequence||0));persistedIngestionGenerations.set(String(row.session_id),String(row.runtime_generation||''));}
 await runMigrations(db,'web',[{version:1,name:'web_schema_baseline',statements:process.env.AGENTDECK_TEST_BAD_MIGRATION==='1'?['THIS IS INVALID SQL']:[]}]);
 await db.run('CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER, last_seen_at INTEGER, user_agent TEXT, ip_hint TEXT)').catch(()=>{});
 await db.run('CREATE INDEX IF NOT EXISTS auth_sessions_active ON auth_sessions(revoked_at,expires_at)').catch(()=>{});
@@ -1776,14 +1778,15 @@ function cleanupWsConnection(ws:any) {
   for (const [sessionId,set] of clients.entries()) {
     if (set.delete(ws)) {
       app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers');
-      if(!set.size&&!activeCodexSessions.has(sessionId)){
+      if(!set.size){
         clients.delete(sessionId);
-        const previous=runtimeSubscriptionReleases.get(sessionId);if(previous)clearTimeout(previous);
-        const timer=setTimeout(()=>{runtimeSubscriptionReleases.delete(sessionId);if(clients.get(sessionId)?.size||activeCodexSessions.has(sessionId))return;const subscription=runtimeSubscriptions.get(sessionId);if(subscription){runtimeSubscriptions.delete(sessionId);subscription.close();}browserDelivery.releaseSession(sessionId);},RUNTIME_SUBSCRIPTION_IDLE_MS);timer.unref?.();runtimeSubscriptionReleases.set(sessionId,timer);
+        scheduleRuntimeSubscriptionRelease(sessionId);
       }
     }
   }
 }
+function runtimeSessionActive(sessionId:string){return activeCodexSessions.has(sessionId)||activeRuntimeProviderSessions.has(sessionId);}
+function scheduleRuntimeSubscriptionRelease(sessionId:string){const previous=runtimeSubscriptionReleases.get(sessionId);if(previous)clearTimeout(previous);const timer=setTimeout(()=>{runtimeSubscriptionReleases.delete(sessionId);if(clients.get(sessionId)?.size)return;if(runtimeSessionActive(sessionId)){scheduleRuntimeSubscriptionRelease(sessionId);return;}const subscription=runtimeSubscriptions.get(sessionId);if(subscription){runtimeSubscriptions.delete(sessionId);subscription.close();}browserDelivery.releaseSession(sessionId);},RUNTIME_SUBSCRIPTION_IDLE_MS);timer.unref?.();runtimeSubscriptionReleases.set(sessionId,timer);}
 app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
   const ws = connection.socket || connection;
   ws.agentdeckGeneration = ++websocketConnectionGeneration;
@@ -4588,6 +4591,7 @@ type JoinOptions={clientConnectionId?:string;recoverRuntimeGeneration?:boolean;r
 async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions={}){
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
+  if(USE_AGENT_RUNTIME&&['running','submitting','planning','recovering','executing_approved_plan','waiting_approval','waiting_input','waiting_plan_approval'].includes(String(row?.active_turn_status||row?.status||'')))activeRuntimeProviderSessions.add(threadId);
   const pendingRelease=runtimeSubscriptionReleases.get(threadId);if(pendingRelease){clearTimeout(pendingRelease);runtimeSubscriptionReleases.delete(threadId);}
   if(!clients.has(threadId)) clients.set(threadId,new Set());
   app.log.info({sessionId:id,threadId,connectionGeneration:ws.agentdeckGeneration||null,subscriberCount:clients.get(threadId)?.size||0,replayFrom:Number(lastSequence||0),browserAppliedSequence:options.browserAppliedSequence||0,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeGeneration:options.requestedRuntimeGeneration||null,recoveryEpoch:options.recoveryEpoch||0,joinRequestId:options.joinRequestId||null},'websocket joined session');
@@ -4655,7 +4659,9 @@ function ensureRuntimePushSubscription(threadId:string) {
   if (existing?.connected || existing?.connecting) return existing;
   existing?.close?.();
   const committedSequence=Number(existing?.committedSequence || persistedIngestionCursors.get(threadId) || existing?.lastSequence || 0);
-  const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, receivedSequence:committedSequence, processingSequence:0, committedSequence, lastSequence:committedSequence, generation:existing?.generation, lastError:existing?.lastError, lastStatus:'checking' };
+  const subscribedGeneration=String(existing?.generation||persistedIngestionGenerations.get(threadId)||'');
+  let generationTransition=false;
+  const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, receivedSequence:committedSequence, processingSequence:0, committedSequence, lastSequence:committedSequence, generation:subscribedGeneration||undefined, lastError:existing?.lastError, lastStatus:'checking' };
   runtimeSubscriptions.set(threadId, state);
   runtimeDiagnostics.subscribeStarts++;
   app.log.info({ sessionId:threadId, threadId, after:state.lastSequence }, 'runtime sse subscribe starting');
@@ -4674,6 +4680,7 @@ function ensureRuntimePushSubscription(threadId:string) {
       state.committedSequence=sequence;
       state.lastSequence=sequence;
       persistedIngestionCursors.set(threadId,sequence);
+      persistedIngestionGenerations.set(threadId,state.generation||'');
       browserDelivery.publish(threadId,sequence,String(event.generation||state.generation||''),frames);
       state.processingSequence=0;
     } catch (error:any) {
@@ -4689,7 +4696,9 @@ function ensureRuntimePushSubscription(threadId:string) {
   }, async (status, error) => {
     if (status === 'transport_connected') {
       const connectedGeneration=String(error?.generation||'');
+      generationTransition=!!connectedGeneration&&!!subscribedGeneration&&connectedGeneration!==subscribedGeneration;
       if(connectedGeneration)state.generation=connectedGeneration;
+      if(generationTransition){browserDelivery.releaseSession(threadId);broadcast(threadId,{type:'runtimeConnection',status:'recovering',runtimeGeneration:connectedGeneration});}
       state.connecting = true;
       state.lastStatus = 'checking';
       return;
@@ -4698,13 +4707,11 @@ function ensureRuntimePushSubscription(threadId:string) {
       const connectedGeneration=String(error?.runtimeGeneration||error?.generation||'');
       if(connectedGeneration)state.generation=connectedGeneration;
       const authoritativeSequence=Math.max(0,Number(error?.caughtUpThrough ?? error?.currentLatestSequence ?? state.committedSequence));
-      if(authoritativeSequence!==state.committedSequence){
+      const generationChanged=generationTransition||!!connectedGeneration&&connectedGeneration!==subscribedGeneration;
+      if(authoritativeSequence!==state.committedSequence||generationChanged){
         await db.run('INSERT INTO runtime_ingestion_cursors (session_id,committed_sequence,runtime_generation,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET committed_sequence=excluded.committed_sequence,runtime_generation=excluded.runtime_generation,updated_at=excluded.updated_at',[threadId,authoritativeSequence,state.generation||null,Date.now()]);
-        state.receivedSequence=authoritativeSequence;
-        state.committedSequence=authoritativeSequence;
-        state.lastSequence=authoritativeSequence;
-        persistedIngestionCursors.set(threadId,authoritativeSequence);
-        browserDelivery.releaseSession(threadId);
+        state.receivedSequence=authoritativeSequence;state.committedSequence=authoritativeSequence;state.lastSequence=authoritativeSequence;persistedIngestionCursors.set(threadId,authoritativeSequence);persistedIngestionGenerations.set(threadId,state.generation||'');
+        if(authoritativeSequence!==Number(error?.requestedAfter??authoritativeSequence)&&!generationTransition)browserDelivery.releaseSession(threadId);
         app.log.warn({sessionId:threadId,requestedAfter:error?.requestedAfter,replayFrom:error?.replayFrom,authoritativeSequence,runtimeGeneration:state.generation||null},'runtime ingestion cursor rebased to authoritative watermark');
       }
       state.connecting=false; state.connected=true; state.lastStatus='connected';
@@ -4717,7 +4724,7 @@ function ensureRuntimePushSubscription(threadId:string) {
     state.connected = false;
     state.lastError = error?.message || undefined;
     state.lastStatus = status === 'error' ? 'unavailable' : 'recovering';
-    if (status === 'closed' && runtimeSubscriptions.get(threadId) === state && !(clients.get(threadId)?.size || activeCodexSessions.has(threadId))) {
+    if (status === 'closed' && runtimeSubscriptions.get(threadId) === state && !(clients.get(threadId)?.size || runtimeSessionActive(threadId))) {
       runtimeSubscriptions.delete(threadId);
     }
     runtimeDiagnostics.subscribeReconnects++;
@@ -4725,7 +4732,7 @@ function ensureRuntimePushSubscription(threadId:string) {
     broadcast(threadId, { type:'runtimeConnection', status:state.lastStatus, error:error?.message || undefined });
     if (runtimeSubscriptions.get(threadId) === state) {
       setTimeout(() => {
-        if (clients.get(threadId)?.size || activeCodexSessions.has(threadId)) ensureSessionSubscription(threadId, threadId);
+        if (clients.get(threadId)?.size || runtimeSessionActive(threadId)) ensureSessionSubscription(threadId, threadId);
       }, 1000).unref?.();
     }
   });
@@ -4807,11 +4814,13 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     await ack('persisted');
+    activeRuntimeProviderSessions.add(threadId);
     try {
       await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       await ack('accepted');
     } catch (e:any) {
+      activeRuntimeProviderSessions.delete(threadId);
       const message = e?.message || String(e);
       if (isGeminiAuthenticationErrorMessage(message)) await markGeminiProfileNeedsLogin(String(dto.id), message);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
@@ -4836,11 +4845,13 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     await ack('persisted');
+    activeRuntimeProviderSessions.add(threadId);
     try {
       await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, permissionMode:effectivePlanMode === 'plan' ? 'plan' : sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       await ack('accepted');
     } catch (e:any) {
+      activeRuntimeProviderSessions.delete(threadId);
       const message = e?.message || String(e);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
       await ack('failed', message);
@@ -5257,6 +5268,7 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
       const artifactTurnId = activeArtifactTurns.get(threadId) || activeTurns.get(threadId) || '';
       activeCodexSessions.delete(threadId);
+      activeRuntimeProviderSessions.delete(threadId);
       activeTurns.delete(threadId);
       activeArtifactTurns.delete(threadId);
       const row = await findSession(threadId);

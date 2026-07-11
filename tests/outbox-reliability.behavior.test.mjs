@@ -21,9 +21,9 @@ test('concurrent wake sources create one timer and deadline recovery fires once'
  const scheduler=new OutboxRetryScheduler(async()=>{await Promise.resolve();return[record];},async()=>{recoveries++;record.status='failed';},clock);
  await Promise.all([scheduler.wake(),scheduler.wake(),scheduler.wake()]);assert.equal(timers.size,1);now=100;for(const [id,{fn,at}]of[...timers])if(at<=now){timers.delete(id);fn();}await new Promise(r=>setTimeout(r,0));assert.equal(recoveries,1);assert.equal(timers.size,0);scheduler.stop();
 `));
-test('localStorage quota failure does not break the send path when IndexedDB is unavailable',()=>run(`
+test('localStorage quota failure is reported before an unpersisted message is sent',()=>run(`
  globalThis.indexedDB=undefined;globalThis.localStorage={getItem:()=>null,setItem:()=>{throw new DOMException('quota','QuotaExceededError')}};
- const outbox=new BrowserOutbox();await assert.doesNotReject(outbox.put({clientMessageId:'m',sessionId:'s',text:'x',attachments:[],planMode:'direct',createdAt:1,attempts:1,status:'ready'}));
+ const outbox=new BrowserOutbox();assert.equal(await outbox.put({clientMessageId:'m',sessionId:'s',text:'x',attachments:[],planMode:'direct',createdAt:1,attempts:1,status:'ready'}),false);
 `));
 test('a failed record can be manually returned to the retry queue',()=>run(`
  const storage=new Map();globalThis.indexedDB=undefined;globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};

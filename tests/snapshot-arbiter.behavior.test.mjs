@@ -17,3 +17,9 @@ test('latest authoritative snapshot can roll back a restored database generation
   const arbiter=new SnapshotArbiter(),request=arbiter.begin(1,200,'g1');
   assert.equal(arbiter.accepts(request,{sessionGeneration:1,appliedSequence:205,runtimeGeneration:'g1'},{coveredSequence:150,runtimeGeneration:'g2'}),true);
 });
+
+test('generation-only websocket progress rejects an old HTTP snapshot',()=>{
+  const arbiter=new SnapshotArbiter(),request=arbiter.begin(1,100,'g1');
+  assert.equal(arbiter.accepts(request,{sessionGeneration:1,appliedSequence:100,runtimeGeneration:'g2'},{coveredSequence:100,runtimeGeneration:'g1'}),false);
+  assert.equal(arbiter.accepts(request,{sessionGeneration:1,appliedSequence:100,runtimeGeneration:'g2'},{coveredSequence:90,runtimeGeneration:'g2'}),true);
+});
