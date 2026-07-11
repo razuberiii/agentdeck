@@ -89,7 +89,7 @@ export class RuntimeClient {
       });
       res.on('close', () => { void eventQueue.finally(() => { if (!damaged) onStatus?.('closed'); }); });
     });
-    req.on('error', err => onStatus?.('error', err));
+    req.on('error', err => {if(!damaged){damaged=true;onStatus?.('error',err);}});
     req.end();
     return () => req.destroy();
   }

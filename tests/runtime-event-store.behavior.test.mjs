@@ -78,3 +78,19 @@ test('gap in a buffer batch disconnects subscriber for durable recovery',()=>{
     await subscriptions.subscribe('s',raw,0,async()=>3,async()=>{subscriptions.publish(event(5));return[event(1),event(2),event(3)];});assert.equal(raw.destroyed,true);
   `]);
 });
+
+test('SSE paginates 2500 events before stream_ready',()=>{
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import assert from'node:assert/strict';import{EventEmitter}from'node:events';import{EventSubscriptions}from ${JSON.stringify(new URL('../server/dist/event-subscriptions.js',import.meta.url).href)};
+    class Raw extends EventEmitter{destroyed=false;output='';write(x){this.output+=x;return true;}destroy(){this.destroyed=true;this.emit('close');}off(...a){return super.off(...a);}}const event=n=>({session_id:'s',threadId:'s',generation:'g',sequence:n,event_type:'x',payload_json:'{}',created_at:n}),raw=new Raw(),subscriptions=new EventSubscriptions();
+    await subscriptions.subscribe('s',raw,0,async()=>2500,async after=>{const end=Math.min(after+1000,2500),events=[];for(let n=after+1;n<=end;n++)events.push(event(n));return{events,nextSequence:end,hasMore:end<2500};},'g');assert.equal([...raw.output.matchAll(/"sequence":(\\d+)/g)].length,2500);assert.match(raw.output,/event: stream_ready/);
+  `]);
+});
+
+test('second replay page failure sends no stream_ready and live gap closes subscriber',()=>{
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import assert from'node:assert/strict';import{EventEmitter}from'node:events';import{EventSubscriptions}from ${JSON.stringify(new URL('../server/dist/event-subscriptions.js',import.meta.url).href)};class Raw extends EventEmitter{destroyed=false;output='';write(x){this.output+=x;return true;}destroy(){this.destroyed=true;this.emit('close');}off(...a){return super.off(...a);}}const event=n=>({session_id:'s',threadId:'s',generation:'g',sequence:n,event_type:'x',payload_json:'{}',created_at:n});
+    const failed=new Raw(),a=new EventSubscriptions();await a.subscribe('s',failed,0,async()=>1500,async after=>{if(after)throw new Error('page two');return{events:Array.from({length:1000},(_,i)=>event(i+1)),nextSequence:1000,hasMore:true};});assert.equal(failed.output.includes('stream_ready'),false);assert.equal(failed.destroyed,true);
+    const live=new Raw(),b=new EventSubscriptions();await b.subscribe('s',live,0,async()=>0,async()=>({events:[],nextSequence:0,hasMore:false}));b.publish(event(2));await b.drain();assert.equal(live.destroyed,true);
+  `]);
+});

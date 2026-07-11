@@ -1392,8 +1392,13 @@ function threadFromSession(session:RuntimeSession) {
 }
 
 async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Number(session.last_sequence||0)) {
-  const rows:any[] = (await db.all('SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 ORDER BY sequence ASC',[session.id,snapshotWatermark])).map(row=>({...row,threadId:session.id,generation:RUNTIME_GENERATION}));
+  const rows:any[]=(await db.all(`SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+    SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream','approval/requested') ORDER BY sequence DESC LIMIT 80)
+    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='item/completed' AND length(payload_json)<300000 ORDER BY sequence DESC LIMIT 80)
+    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type IN ('item/agentMessage/delta','assistant/delta') ORDER BY sequence DESC LIMIT 1000)
+  ) ORDER BY sequence ASC`,[session.id,snapshotWatermark])).map(row=>({...row,threadId:session.id,generation:RUNTIME_GENERATION}));
   const items:any[] = [];
+  const completed=new Set<string>(),deltaText=new Map<string,string>(),deltaOrder:string[]=[];
   for (const event of rows) {
     const eventType = String(event.event_type || '');
     let payload:any = {};
@@ -1409,9 +1414,11 @@ async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Numb
     }
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
+      if(item?.id)completed.add(String(item.id));
       if (item && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) items.push(compactSnapshotItem(item));
       continue;
     }
+    if(eventType==='item/agentMessage/delta'||eventType==='assistant/delta'){const itemId=String(payload?.params?.itemId||payload?.itemId||'active-agent');const delta=String(payload?.params?.delta||payload?.delta||'');if(delta){if(!deltaText.has(itemId))deltaOrder.push(itemId);deltaText.set(itemId,(deltaText.get(itemId)||'')+delta);}continue;}
     if (eventType === 'turn/failed' || eventType === 'turn/interrupted') {
       const reason = payload?.reason || payload?.params?.reason || payload?.error?.message || payload?.params?.error?.message || '';
       items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage', text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
@@ -1421,6 +1428,7 @@ async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Numb
       items.push({ id:`upstream-rebuilt-${event.sequence}`, type:'agentMessage', text:String(payload?.warning || '上游会话已重建，部分模型上下文可能丢失'), phase:'final_answer' });
     }
   }
+  for(const itemId of deltaOrder)if(!completed.has(itemId))items.push({id:itemId,type:'agentMessage',text:deltaText.get(itemId)||'',status:'inProgress'});
   return { ...threadFromSession(session), turns:items.length ? [{ id:`snapshot-${session.id}`, items }] : [] };
 }
 
