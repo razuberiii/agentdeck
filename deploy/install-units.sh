@@ -129,18 +129,32 @@ if [ ! -f "$ENV_DIR/web.env" ]; then
   if [ -f "$ENV_DIR/.env" ]; then
     sudo cp "$ENV_DIR/.env" "$ENV_DIR/web.env"
   else
-    sudo install -m 0600 "$ROOT/deploy/systemd/env/web.env.example" "$ENV_DIR/web.env"
+    {
+      echo "HOST=127.0.0.1"; echo "PORT=3842"; echo "DATA_DIR=$DATA_DIR"
+      echo "ADMIN_PASSWORD=change-me-at-least-12-chars"; echo "COOKIE_SECRET=change-me-random-32-bytes"; echo "COOKIE_SECURE=true"
+      echo "ALLOWED_ORIGINS=https://agentdeck.example.com"; echo "USE_AGENT_RUNTIME=1"; echo "AGENT_RUNTIME_URL=http://127.0.0.1:3852"
+      echo "PATH=$DATA_DIR/provider-tools/bin:$AGENTDECK_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+      echo "PLAYWRIGHT_BROWSERS_PATH=$DATA_DIR/cache/ms-playwright"; echo "CLAUDE_PROFILE_ROOT=$DATA_DIR/claude/profiles"; echo "CLAUDE_CONFIG_DIR=$AGENTDECK_HOME/.claude"
+    } | sudo tee "$ENV_DIR/web.env" >/dev/null
+    sudo chmod 0600 "$ENV_DIR/web.env"
   fi
 fi
 
 if [ ! -f "$ENV_DIR/runtime.env" ]; then
-  sudo install -m 0600 "$ROOT/deploy/systemd/env/runtime.env.example" "$ENV_DIR/runtime.env"
+  {
+    echo "DATA_DIR=$DATA_DIR"; echo "AGENTDECK_SERVICE_USER=$RUN_USER"; echo "RUNTIME_DB=$DATA_DIR/agentdeck-runtime.sqlite3"
+    echo "RUNTIME_HOST=127.0.0.1"; echo "RUNTIME_PORT=3852"; echo "RUNTIME_INSTANCE_ID=runtime-main"
+    echo "CODEX_HOME=$DATA_DIR/profiles/default/.codex"; echo "CLAUDE_PROFILE_ROOT=$DATA_DIR/claude/profiles"; echo "CLAUDE_CONFIG_DIR=$AGENTDECK_HOME/.claude"
+    echo "HOME=$AGENTDECK_HOME"; echo "PATH=$DATA_DIR/provider-tools/bin:$AGENTDECK_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    echo "PLAYWRIGHT_BROWSERS_PATH=$DATA_DIR/cache/ms-playwright"; echo "CODEX_APP_SERVER_USER=$RUN_USER"; echo "CODEX_APP_SERVER_GROUP=$RUN_GROUP"
+  } | sudo tee "$ENV_DIR/runtime.env" >/dev/null
+  sudo chmod 0600 "$ENV_DIR/runtime.env"
 fi
 
 if [ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
   {
     echo "HOME=${AGENTDECK_HOME}"
-    echo "CODEX_HOME=${CODEX_HOME:-$DATA_DIR/profiles/default/.codex}"
+    echo "CODEX_HOME=${AGENTDECK_CODEX_HOME:-$DATA_DIR/profiles/default/.codex}"
     echo "CODEX_APP_SERVER_LISTEN=ws://127.0.0.1:4668"
   } | sudo tee "$ENV_DIR/agentdeck-app-server-default.env" >/dev/null
   sudo chmod 0600 "$ENV_DIR/agentdeck-app-server-default.env"

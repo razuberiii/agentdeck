@@ -28,6 +28,7 @@ const commonEnv = {
   AGENT_RUNTIME_TOKEN: runtimeToken,
   AGENT_RUNTIME_URL: `http://${host}:${runtimePort}`,
   COOKIE_SECRET: cookieSecret,
+  COOKIE_SECURE: 'false',
   ADMIN_PASSWORD: adminPassword,
   USE_AGENT_RUNTIME: '1',
   HOST: host,

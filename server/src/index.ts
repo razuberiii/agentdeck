@@ -373,8 +373,9 @@ app.addHook('preHandler', async (req, reply) => {
     if (!csrf || req.headers['x-csrf-token'] !== csrf) return reply.code(403).send({error:'csrf'});
   }
 });
-function secureCookie() { return { httpOnly:true, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
-function csrfCookie() { return { httpOnly:false, secure:true, sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
+function cookieIsSecure() { return String(process.env.COOKIE_SECURE ?? 'true').toLowerCase() !== 'false'; }
+function secureCookie() { return { httpOnly:true, secure:cookieIsSecure(), sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
+function csrfCookie() { return { httpOnly:false, secure:cookieIsSecure(), sameSite:'strict' as const, path:'/', maxAge: 60*60*24*14 }; }
 async function ensureAuth(req:any, reply:any) { if (!(await authSessionForRequest(req, reply))) return reply.code(401).send({error:'unauthorized'}); }
 async function isAuthenticated(req:any, reply?:any) {
   return !!(await authSessionForRequest(req, reply));
@@ -1890,8 +1891,13 @@ function maybeExitAfterDrain() {
 async function ensureAdmin() {
   const pw = process.env.ADMIN_PASSWORD;
   if (!pw) throw new Error('ADMIN_PASSWORD must be set');
-  if (pw.length < 12) {
-    console.warn('ADMIN_PASSWORD is shorter than 12 chars; rotate it when convenient');
+  if (pw === 'change-me-at-least-12-chars' || pw === 'change-me' || pw.length < 12) throw new Error('ADMIN_PASSWORD must be changed and contain at least 12 characters');
+  const secret = process.env.COOKIE_SECRET || '';
+  if (!secret || secret === 'change-me-random-32-bytes' || secret === 'change-me' || secret.length < 32) throw new Error('COOKIE_SECRET must be changed and contain at least 32 characters');
+  if (!cookieIsSecure()) {
+    const host = process.env.HOST || '127.0.0.1';
+    const loopback = ['127.0.0.1', 'localhost', '::1'].includes(host);
+    if (!loopback && process.env.ALLOW_INSECURE_TRUSTED_LAN !== '1') throw new Error('COOKIE_SECURE=false requires a loopback HOST or ALLOW_INSECURE_TRUSTED_LAN=1');
   }
   const row = await db.get('SELECT * FROM users WHERE username=?1',['admin']);
   const fingerprint = adminPasswordFingerprint();

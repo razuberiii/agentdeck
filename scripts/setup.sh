@@ -55,16 +55,6 @@ if getent passwd "$RUN_USER" >/dev/null; then
   chown -R "$RUN_USER:$RUN_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools"
 fi
 
-if [[ ! -f "$ENV_DIR/web.env" ]]; then
-  install -m 0600 "$ROOT/deploy/systemd/env/web.env.example" "$ENV_DIR/web.env"
-fi
-if [[ ! -f "$ENV_DIR/runtime.env" ]]; then
-  install -m 0600 "$ROOT/deploy/systemd/env/runtime.env.example" "$ENV_DIR/runtime.env"
-fi
-if [[ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]]; then
-  install -m 0600 "$ROOT/deploy/systemd/env/codex-app-server-default.env.example" "$ENV_DIR/agentdeck-app-server-default.env"
-fi
-
 AGENTDECK_INSTALL_PROFILE="$INSTALL_PROFILE" AGENTDECK_RUN_USER="$RUN_USER" AGENTDECK_HOME="$RUN_HOME" ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$ROOT/deploy/install-units.sh"
 
 if getent passwd "$RUN_USER" >/dev/null; then

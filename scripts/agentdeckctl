@@ -61,6 +61,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 json_escape() { node -e 'process.stdout.write(JSON.stringify(process.argv[1] || ""))' "$1"; }
 is_worker() { [ "${AGENTDECK_DEPLOY_WORKER:-0}" = "1" ]; }
 backup_dir() { printf '%s\n' "${AGENTDECK_BACKUP_DIR:-$DATA_DIR/backups}"; }
+env_value() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*['\"]\{0,1\}\([^'\"#]*\).*/\1/p" "$1" | tail -1; }
 
 resolve_service_user() {
   if [ -n "$SERVICE_USER" ]; then return 0; fi
@@ -324,10 +325,23 @@ run_check() {
   for name in web.env runtime.env agentdeck-app-server-default.env; do
     [ -f "$ENV_DIR/$name" ] || die "missing env file: $ENV_DIR/$name"
   done
+  local web_data runtime_data runtime_home runtime_user provider_home provider_bin admin_password cookie_secret
+  web_data="$(env_value "$ENV_DIR/web.env" DATA_DIR)"; runtime_data="$(env_value "$ENV_DIR/runtime.env" DATA_DIR)"
+  runtime_home="$(env_value "$ENV_DIR/runtime.env" HOME)"; runtime_user="$(env_value "$ENV_DIR/runtime.env" AGENTDECK_SERVICE_USER)"
+  provider_home="$(env_value "$ENV_DIR/agentdeck-app-server-default.env" HOME)"
+  admin_password="$(env_value "$ENV_DIR/web.env" ADMIN_PASSWORD)"; cookie_secret="$(env_value "$ENV_DIR/web.env" COOKIE_SECRET)"
+  [ "$web_data" = "$DATA_DIR" ] && [ "$runtime_data" = "$DATA_DIR" ] || die "Web/Runtime DATA_DIR mismatch: expected $DATA_DIR, web=$web_data runtime=$runtime_data"
+  [ "$runtime_user" = "$SERVICE_USER" ] || die "Runtime provider user mismatch: service=$SERVICE_USER configured=$runtime_user"
+  [ "$runtime_home" = "$SERVICE_HOME" ] && [ "$provider_home" = "$SERVICE_HOME" ] || die "HOME mismatch: service=$SERVICE_HOME runtime=$runtime_home provider=$provider_home"
+  getent passwd "$runtime_user" >/dev/null || die "Provider user does not exist: $runtime_user"
+  provider_bin="$(env_value "$ENV_DIR/runtime.env" CODEX_BIN)"; [ -z "$provider_bin" ] || [ -x "$provider_bin" ] || die "Provider binary is not executable: $provider_bin"
+  case "$admin_password" in change-me|change-me-at-least-12-chars|'') die "ADMIN_PASSWORD still uses an unsafe default" ;; esac
+  case "$cookie_secret" in change-me|change-me-random-32-bytes|'') die "COOKIE_SECRET still uses an unsafe default" ;; esac
   log "checking service user and data dirs"
   [ -d "$DATA_DIR" ] || die "data dir does not exist: $DATA_DIR"
   [ -d "$RELEASES_DIR" ] || die "releases dir does not exist: $RELEASES_DIR"
-  [ -L "$CURRENT_LINK" ] || die "current symlink is missing: $CURRENT_LINK"
+  [ -L "$CURRENT_WEB_LINK" ] || die "current-web symlink is missing: $CURRENT_WEB_LINK"
+  [ -L "$CURRENT_RUNTIME_LINK" ] || die "current-runtime symlink is missing: $CURRENT_RUNTIME_LINK"
   check_systemd_units "$SOURCE_ROOT" fail
   log "checking production health"
   wait_http "http://127.0.0.1:$WEB_PORT/api/status" 10

@@ -18,7 +18,7 @@ RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=@AGENTDECK_DATA_DIR@ @AGENTDECK_CURRENT_DIR@ /tmp /run
+ReadWritePaths=@AGENTDECK_DATA_DIR@ /tmp /run
 
 [Install]
 WantedBy=multi-user.target

@@ -194,6 +194,11 @@ test('install-units standard profile renders dedicated user and conservative Cod
     assert.match(appServer, /approval_policy=\\"on-request\\"/);
     assert.match(appServer, /sandbox_mode=\\"workspace-write\\"/);
     assert.doesNotMatch(appServer, /danger-full-access/);
+    for (const name of ['web.env', 'runtime.env', 'agentdeck-app-server-default.env']) {
+      const envFile = readFileSync(join(rendered.envDir, name), 'utf8');
+      assert.doesNotMatch(envFile, /(?:^|\/)ubuntu(?:\/|$)|\/home\/ubuntu/m);
+      assert.match(envFile, new RegExp(rendered.dataDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
   } finally {
     rmSync(rendered.dir, { recursive: true, force: true });
   }
