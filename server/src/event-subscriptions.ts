@@ -17,7 +17,7 @@ export class EventSubscriptions {
 
   snapshot() { return [...this.sessions.entries()].map(([sessionId,set])=>({sessionId,count:set.size})); }
 
-  async subscribe(sessionId:string, raw:ServerResponse, after:number, latestSequence:()=>Promise<number>, replay:(after:number,through:number)=>Promise<DurableRuntimeEvent[]>) {
+  async subscribe(sessionId:string, raw:ServerResponse, after:number, latestSequence:()=>Promise<number>, replayPage:(after:number)=>Promise<{events:DurableRuntimeEvent[];nextSequence:number;hasMore:boolean}|DurableRuntimeEvent[]>, generation='') {
     const set = this.sessions.get(sessionId) || new Set<Subscriber>();
     this.sessions.set(sessionId,set);
     const subscriber:Subscriber = { raw, state:'replaying', buffer:[], chain:Promise.resolve(), pendingPushes:0, close:()=>{} };
@@ -40,20 +40,33 @@ export class EventSubscriptions {
       // The subscriber is visible to publish() before the durable barrier is read.
       // Events committed during this await are buffered and reconciled below.
       const highWatermark = await latestSequence();
-      const replayed = await replay(after,highWatermark);
       let replayCursor=after;
-      for (const event of replayed.sort((a,b)=>a.sequence-b.sequence)) {
-        if(event.sequence<=replayCursor) continue;
-        if(event.sequence!==replayCursor+1) return this.disconnect(subscriber,'subscriber replay sequence gap');
-        await this.write(subscriber,event); replayCursor=event.sequence;
+      let pages=0,eventsSeen=0;
+      while(replayCursor<highWatermark){
+        if(++pages>1000 || eventsSeen>100_000) return this.disconnect(subscriber,'subscriber replay limit exceeded');
+        const pageStart=replayCursor;
+        const result=await replayPage(replayCursor);
+        // Keep the small in-process test/helper API compatible while the
+        // Runtime endpoint uses the paginated form.
+        const page=Array.isArray(result)?{events:result,nextSequence:result.reduce((max,event)=>Math.max(max,event.sequence),replayCursor),hasMore:false}:result;
+        const replayed=page.events.sort((a,b)=>a.sequence-b.sequence);
+        if(!replayed.length) return this.disconnect(subscriber,'subscriber replay incomplete');
+        for(const event of replayed){
+          if(event.sequence<=replayCursor) continue;
+          if(event.sequence>highWatermark) break;
+          if(event.sequence!==replayCursor+1) return this.disconnect(subscriber,'subscriber replay sequence gap');
+          await this.write(subscriber,event); replayCursor=event.sequence; eventsSeen++;
+        }
+        if(page.hasMore && Number(page.nextSequence)<=pageStart) return this.disconnect(subscriber,'subscriber replay did not advance');
+        if(!page.hasMore && replayCursor!==highWatermark) return this.disconnect(subscriber,'subscriber replay incomplete');
       }
       if (isClosed()) return;
-      let cursor=highWatermark;
+      let cursor=replayCursor;
       for (;;) {
         if(isClosed()) return;
         // publish() cannot interleave with this synchronous take-and-clear. Once
         // state becomes live, later events are chained instead of buffered.
-        if(!subscriber.buffer.length){subscriber.state='live';break;}
+        if(!subscriber.buffer.length){subscriber.state='live'; raw.write(`event: stream_ready\ndata: ${JSON.stringify({type:'stream_ready',sessionId,runtimeGeneration:generation,replayFrom:after,caughtUpThrough:cursor,currentLatestSequence:cursor})}\n\n`);break;}
         const batch=subscriber.buffer;
         subscriber.buffer=[];
         this.pendingBufferCount=Math.max(0,this.pendingBufferCount-batch.length);

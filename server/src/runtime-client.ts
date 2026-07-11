@@ -43,7 +43,7 @@ export class RuntimeClient {
   events(id:string, after = 0, includeDeltas = false) { return this.request('GET', `/sessions/${encodeURIComponent(id)}/events?after=${encodeURIComponent(String(after))}${includeDeltas ? '&includeDeltas=1' : ''}`); }
   startTurn(id:string, body:any) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/turns`, body); }
   stopTurn(id:string) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/stop`); }
-  subscribe(id:string, after:number, onEvent:(event:any)=>void|Promise<void>, onStatus?:(status:'connected'|'closed'|'error', error?:any)=>void) {
+  subscribe(id:string, after:number, onEvent:(event:any)=>void|Promise<void>, onStatus?:(status:'transport_connected'|'stream_ready'|'closed'|'error', error?:any)=>void) {
     const url = new URL(`/sessions/${encodeURIComponent(id)}/subscribe?after=${encodeURIComponent(String(after))}`, this.baseUrl);
     const req = http.request(url, { method:'GET', headers:{ accept:'text/event-stream', ...this.authHeaders() } });
     let buffer = '';
@@ -63,7 +63,9 @@ export class RuntimeClient {
         res.on('end', () => onStatus?.('error', new Error(Buffer.concat(chunks).toString('utf8') || `runtime subscribe ${res.statusCode}`)));
         return;
       }
-      onStatus?.('connected',{generation:String(res.headers['x-runtime-generation']||'')});
+      // HTTP success says only that the transport exists.  The runtime emits
+      // stream_ready after its replay/buffer handoff has become live.
+      onStatus?.('transport_connected',{generation:String(res.headers['x-runtime-generation']||'')});
       res.setEncoding('utf8');
       res.on('data', chunk => {
         buffer += chunk;
@@ -75,8 +77,12 @@ export class RuntimeClient {
           const data = raw.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
           if (data) {
             try {
-              const event = RuntimeEventEnvelopeSchema.parse(JSON.parse(data));
-              eventQueue = eventQueue.then(()=>onEvent(event)).catch(fail);
+              const parsed=JSON.parse(data);
+              if(parsed?.type==='stream_ready') onStatus?.('stream_ready',parsed);
+              else {
+                const event = RuntimeEventEnvelopeSchema.parse(parsed);
+                eventQueue = eventQueue.then(()=>onEvent(event)).catch(fail);
+              }
             } catch (error) { fail(new Error(`runtime SSE JSON parse failed: ${error instanceof Error ? error.message : String(error)}`)); }
           }
         }

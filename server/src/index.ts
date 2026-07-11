@@ -96,6 +96,9 @@ const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
 type RuntimeSubscriptionState = { close:()=>void; cursorBridge?:RuntimeCursorBridge; connected:boolean; connecting:boolean; generation?:string; receivedSequence:number; processingSequence:number; committedSequence:number; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
+// Loaded before the server starts accepting websocket joins.  This is the
+// durable owner cursor for the shared Runtime SSE, not a browser cursor.
+const persistedIngestionCursors = new Map<string,number>();
 const sessionCommandQueue=new SessionCommandQueue(Number(process.env.WS_SESSION_COMMAND_QUEUE_MAX||64));
 const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTurnState; assistantId:string; turnId:string }>();
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
@@ -209,6 +212,7 @@ let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
 await db.init();
+for (const row of await db.all('SELECT session_id,committed_sequence FROM runtime_ingestion_cursors')) persistedIngestionCursors.set(String(row.session_id),Number(row.committed_sequence||0));
 await runMigrations(db,'web',[{version:1,name:'web_schema_baseline',statements:process.env.AGENTDECK_TEST_BAD_MIGRATION==='1'?['THIS IS INVALID SQL']:[]}]);
 await db.run('CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER, last_seen_at INTEGER, user_agent TEXT, ip_hint TEXT)').catch(()=>{});
 await db.run('CREATE INDEX IF NOT EXISTS auth_sessions_active ON auth_sessions(revoked_at,expires_at)').catch(()=>{});
@@ -1456,14 +1460,15 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     if (runtimeRow?.status && runtimeRow.status !== row.status) {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [String(runtimeRow.status), Date.now(), threadId]).catch(()=>{});
     }
-    const thread = await runtimeThreadFromEvents(threadId, runtimeRow);
+    const snapshotWatermark=Number(runtimeRow?.last_sequence||0);
+    const thread = await runtimeThreadFromEvents(threadId, runtimeRow, snapshotWatermark);
     decorateThreadImages(thread, threadId, String(runtimeRow.project_dir || row.project_dir));
     const [branch] = await Promise.all([
       gitBranch(String(runtimeRow.project_dir || row.project_dir)).catch(()=>null),
       injectArtifacts(thread, threadId).catch(()=>{}),
     ]);
     sanitizeThreadForMobile(thread);
-    const coveredSequence = Number(runtimeRow?.last_sequence || 0);
+    const coveredSequence = snapshotWatermark;
     const snapshot = { coveredSequence, throughSequence:coveredSequence, latestSequence:coveredSequence, generation:String(runtimeRow?.upstream_generation || '') || null };
     app.log.info({ requestId, localSessionId:threadId, upstreamThreadId:String(runtimeRow?.upstream_thread_id || threadId), status:runtimeRow.status, latestSequence:Number(runtimeRow?.last_sequence || 0), operation:'GET /api/sessions/:id', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'web session snapshot returned');
     return { session: rowSessionDto(runtimeRow), thread, snapshot, branch, interrupted: (runtimeRow?.status === 'interrupted'), interactiveRequests: await listInteractiveRequests(threadId) };
@@ -4277,14 +4282,14 @@ function threadFromRow(row:any) {
     path: null,
   };
 }
-async function runtimeThreadFromEvents(threadId:string, row:any) {
+async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWatermark=Number(row?.last_sequence||0)) {
   const events = await runtimeDb.all(
     `SELECT session_id,sequence,event_type,payload_json,created_at
      FROM (
        SELECT session_id,sequence,event_type,payload_json,created_at FROM (
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
-         WHERE session_id=?1
+         WHERE session_id=?1 AND sequence<=?2
            AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
          ORDER BY sequence DESC
          LIMIT 80
@@ -4293,7 +4298,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
        SELECT session_id,sequence,event_type,payload_json,created_at FROM (
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
-         WHERE session_id=?1
+         WHERE session_id=?1 AND sequence<=?2
            AND event_type='item/completed'
            AND length(payload_json)<300000
            AND (
@@ -4308,7 +4313,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any) {
        )
       )
       ORDER BY sequence ASC`,
-    [threadId]
+    [threadId,snapshotWatermark]
   ).catch(()=>[]);
   const canonicalUsers = await db.all(
     `SELECT * FROM agent_messages
@@ -4553,24 +4558,36 @@ async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
   if(!clients.has(threadId)) clients.set(threadId,new Set());
-  clients.get(threadId)!.add(ws);
   app.log.info({sessionId:id,threadId,connectionGeneration:ws.agentdeckGeneration||null,subscriberCount:clients.get(threadId)?.size||0,replayFrom:Number(lastSequence||0),browserAppliedSequence:options.browserAppliedSequence||0,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeGeneration:options.requestedRuntimeGeneration||null,recoveryEpoch:options.recoveryEpoch||0,joinRequestId:options.joinRequestId||null},'websocket joined session');
   if (row && normalizeProvider(row.provider_id) === 'antigravity') {
+    clients.get(threadId)!.add(ws);
     ws.send(JSON.stringify({type:'joined',sessionId:threadId,runtimeConnection:'connected',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
     return;
   }
   if (USE_AGENT_RUNTIME) {
-    const existing=runtimeSubscriptions.get(threadId);
-    if(options.recoverRuntimeGeneration&&options.requestedRuntimeGeneration&&existing?.generation&&options.requestedRuntimeGeneration!==existing.generation)replaceRuntimePushSubscription(threadId,lastSequence);
+    // A stale browser generation must never replace the shared ingestion SSE.
+    // The subscription owns Runtime replay; this join owns no Runtime REST replay.
     const subscription = ensureSessionSubscription(id, threadId);
-    await replayRuntimeEventsToWs(threadId, ws, lastSequence);
-    const latest = await runtimeLatestSequence(threadId).catch(()=>Number(row?.last_sequence || 0));
+    await waitForRuntimeLive(subscription);
+    // Joining sockets are deliberately invisible during the shared SSE replay.
+    // Snapshot + the caught-up barrier form their handoff point.
+    clients.get(threadId)!.add(ws);
+    const latest = subscription.committedSequence;
     app.log.info({ sessionId:id, threadId, rowStatus:String(row?.status || ''), lastSequence:Number(lastSequence || 0), latestSequence:latest, subscriberCount:clients.get(threadId)?.size || 0, connectionGeneration:ws.agentdeckGeneration || null, runtimeConnection:runtimeConnectionStatus(subscription) }, 'codex session joined with runtime subscription');
     ws.send(JSON.stringify({type:'joined',sessionId:threadId,runtimeConnection:runtimeConnectionStatus(subscription),runtimeGeneration:subscription.generation||options.requestedRuntimeGeneration||null,joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0,browserAppliedSequence:options.browserAppliedSequence||lastSequence,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeReceivedSequence:subscription.receivedSequence}));
     return;
   }
   if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{});
+  clients.get(threadId)!.add(ws);
   ws.send(JSON.stringify({type:'joined',sessionId:threadId,joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
+}
+async function waitForRuntimeLive(state:RuntimeSubscriptionState){
+  const deadline=Date.now()+15_000;
+  while(!state.connected && Date.now()<deadline){
+    if(state.lastStatus==='unavailable') throw new Error('runtime stream unavailable');
+    await new Promise(resolve=>setTimeout(resolve,20));
+  }
+  if(!state.connected) throw new Error('runtime stream did not reach caught-up barrier');
 }
 function replaceRuntimePushSubscription(threadId:string,committedSequence:number){const existing=runtimeSubscriptions.get(threadId);if(existing){runtimeSubscriptions.delete(threadId);existing.close();}const cursor=Math.max(0,Number(committedSequence||0));runtimeSubscriptions.set(threadId,{close:()=>{},connected:false,connecting:false,receivedSequence:cursor,processingSequence:0,committedSequence:cursor,lastSequence:cursor,generation:undefined,lastStatus:'recovering'});}
 function broadcast(id:string, msg:any){
@@ -4604,7 +4621,7 @@ function ensureRuntimePushSubscription(threadId:string) {
   const existing = runtimeSubscriptions.get(threadId);
   if (existing?.connected || existing?.connecting) return existing;
   existing?.close?.();
-  const committedSequence=Number(existing?.committedSequence || existing?.lastSequence || 0);
+  const committedSequence=Number(existing?.committedSequence || persistedIngestionCursors.get(threadId) || existing?.lastSequence || 0);
   const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, receivedSequence:committedSequence, processingSequence:0, committedSequence, lastSequence:committedSequence, generation:existing?.generation, lastError:existing?.lastError, lastStatus:'checking' };
   state.cursorBridge=new RuntimeCursorBridge(frame=>broadcast(threadId,frame),{logger:(data,message)=>app.log.info(data,message),context:()=>({sessionId:threadId,runtimeReceivedSequence:state.receivedSequence,subscriberCount:clients.get(threadId)?.size||0})});
   runtimeSubscriptions.set(threadId, state);
@@ -4617,12 +4634,15 @@ function ensureRuntimePushSubscription(threadId:string) {
     state.processingSequence=sequence;
     runtimeDiagnostics.subscribeEvents++;
     try {
-      const messages = await runtimeEventMessages(threadId, event);
+      if(sequence!==state.committedSequence+1) throw new Error(`runtime live sequence gap: expected ${state.committedSequence+1}, got ${sequence}`);
+      const messages = await ingestRuntimeEvent(threadId, event);
       if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'explicitly_ignored_or_unmapped_runtime_event' }, 'runtime event produced no websocket messages');
       if(!messages.length)state.cursorBridge?.filtered(sequence,String(event.generation||state.generation||''));
       else {state.cursorBridge?.beforeVisible(sequence,String(event.generation||state.generation||''));for (const msg of messages) broadcast(threadId, msg);}
       state.committedSequence=Math.max(state.committedSequence,sequence);
       state.lastSequence=state.committedSequence;
+      persistedIngestionCursors.set(threadId,sequence);
+      await db.run('INSERT INTO runtime_ingestion_cursors (session_id,committed_sequence,runtime_generation,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET committed_sequence=excluded.committed_sequence,runtime_generation=excluded.runtime_generation,updated_at=excluded.updated_at',[threadId,sequence,state.generation||null,Date.now()]);
       state.processingSequence=0;
     } catch (error:any) {
       state.processingSequence=0;
@@ -4633,12 +4653,17 @@ function ensureRuntimePushSubscription(threadId:string) {
       throw error;
     }
   }, (status, error) => {
-    if (status === 'connected') {
+    if (status === 'transport_connected') {
       const connectedGeneration=String(error?.generation||'');
       if(connectedGeneration)state.generation=connectedGeneration;
-      state.connecting = false;
-      state.connected = true;
-      state.lastStatus = 'connected';
+      state.connecting = true;
+      state.lastStatus = 'checking';
+      return;
+    }
+    if (status === 'stream_ready') {
+      const connectedGeneration=String(error?.runtimeGeneration||error?.generation||'');
+      if(connectedGeneration)state.generation=connectedGeneration;
+      state.connecting=false; state.connected=true; state.lastStatus='connected';
       state.lastError = undefined;
       app.log.info({ sessionId:threadId, threadId, subscriberCount:clients.get(threadId)?.size || 0 }, 'runtime subscription restored');
       broadcast(threadId, { type:'runtimeConnection', status:'connected',runtimeGeneration:state.generation||null });
@@ -5026,7 +5051,7 @@ async function replayRuntimeEventsToWs(threadId:string, ws:any, after:number) {
     replayEvents += events.length;
     for (const event of events) {
       replayTo = Math.max(replayTo, Number(event.sequence || 0));
-      const messages = await runtimeEventMessages(threadId, event);
+      const messages = await runtimeEventFrames(threadId, event);
       if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'unmapped_replay_event' }, 'runtime replay event ignored');
       if(!messages.length)cursorBridge.filtered(Number(event.sequence||0),String(event.generation||''));
       else cursorBridge.beforeVisible(Number(event.sequence||0),String(event.generation||''));
@@ -5111,7 +5136,12 @@ async function inferredRuntimeStatus(threadId:string, fallback:string) {
   if (eventType === 'item/completed' && item?.type === 'agentMessage' && item?.phase === 'final_answer' && String(item.text || '').trim()) return 'idle';
   return fallback;
 }
-async function runtimeEventMessages(threadId:string, event:any) {
+// Only the ingestion lane may call this.  Browser delivery consumes the frames
+// it produced; it never calls Runtime or repeats these projections.
+async function ingestRuntimeEvent(threadId:string,event:any) {
+  return runtimeEventFrames(threadId,event);
+}
+async function runtimeEventFrames(threadId:string, event:any) {
   const eventType = String(event.event_type || '');
   const runtimeSequence = Number(event.sequence || 0);
   const runtimeGeneration = String(event.generation || '');

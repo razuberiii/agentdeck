@@ -641,7 +641,9 @@ app.get('/sessions/:id', async (req:any, reply) => {
   const sqliteStartedAt = Date.now();
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
-  const thread = await threadFromSnapshot(session);
+  // The content and advertised coverage are bound to one authoritative read.
+  const snapshotWatermark=Number(session.last_sequence||0);
+  const thread = await threadFromSnapshot(session,snapshotWatermark);
   const sqliteDurationMs = Date.now() - sqliteStartedAt;
   const fresh = await getSession(String(session.id)) || session;
   scheduleThreadReconcile(fresh, 'api_background_thread_read');
@@ -653,7 +655,7 @@ app.get('/sessions/:id', async (req:any, reply) => {
     sqliteDurationMs,
     totalDurationMs:Date.now() - startedAt,
   }, 'runtime session snapshot returned');
-  return { session:fresh, thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:Number(fresh.last_sequence || 0), error:fresh.upstream_status === 'missing' ? 'upstream_missing' : null } };
+  return { session:fresh, thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:snapshotWatermark, error:fresh.upstream_status === 'missing' ? 'upstream_missing' : null } };
 });
 
 app.patch('/sessions/:id', async (req:any, reply) => {
@@ -699,7 +701,12 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
     diagnostics.sseReconnectCount++;
     app.log.info({ sessionId, activeSubscribers:subscriptions.count(sessionId) }, 'runtime sse subscriber closed');
   });
-  await subscriptions.subscribe(sessionId,reply.raw,after,()=>latestEventSequence(sessionId),async (cursor,through)=>(await eventsAfter(sessionId,cursor,true)).filter(event=>Number(event.sequence)<=through) as any);
+  await subscriptions.subscribe(sessionId,reply.raw,after,()=>latestEventSequence(sessionId),async cursor=>{
+    const events=await eventsAfter(sessionId,cursor,true) as any[];
+    const latest=await latestEventSequence(sessionId);
+    const next=events.reduce((max,event)=>Math.max(max,Number(event.sequence||0)),cursor);
+    return {events,nextSequence:next,hasMore:next<latest};
+  },RUNTIME_GENERATION);
 });
 
 app.post('/sessions/:id/turns', async (req:any, reply) => {
@@ -1384,8 +1391,8 @@ function threadFromSession(session:RuntimeSession) {
   };
 }
 
-async function threadFromSnapshot(session:RuntimeSession) {
-  const rows = await eventsAfter(session.id, 0, false);
+async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Number(session.last_sequence||0)) {
+  const rows:any[] = (await db.all('SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 ORDER BY sequence ASC',[session.id,snapshotWatermark])).map(row=>({...row,threadId:session.id,generation:RUNTIME_GENERATION}));
   const items:any[] = [];
   for (const event of rows) {
     const eventType = String(event.event_type || '');
@@ -1462,10 +1469,9 @@ async function appendEvent(sessionId:string, eventType:string, payload:any) {
     return { session_id:sessionId, sequence:await latestEventSequence(sessionId), event_type:eventType, payload_json:'{}', created_at:Date.now(), suppressed:true };
   }
   const eventKey = eventKeyFor(eventType, payload);
-  if (eventKey) {
-    const existing = await db.get('SELECT sequence FROM events WHERE session_id=?1 AND event_key=?2', [sessionId, eventKey]);
-    if (existing) return { session_id:sessionId, sequence:Number(existing.sequence || 0), event_type:eventType, payload_json:JSON.stringify(payload), created_at:Date.now(), duplicate:true };
-  }
+  // event_key de-duplication is intentionally performed by DurableEventStore's
+  // per-session commit lane.  Checking here used to race concurrent callbacks
+  // and could allocate a sequence that was never committed.
   const event = await eventStore.append(sessionId,eventType,payload,eventKey,isCriticalEvent(eventType),isDeltaEvent(eventType));
   diagnostics.sqliteBatches=eventStore.metrics.sqliteBatches;
   diagnostics.sqliteRows=eventStore.metrics.sqliteRows;
