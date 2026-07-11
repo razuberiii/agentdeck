@@ -138,6 +138,10 @@ ensure_playwright_browsers() {
 
 ensure_dirs() {
   mkdir -p "$CONTROL_ROOT" "$DATA_DIR" "$STATE_DIR" "$RELEASES_DIR" "$JOBS_DIR" "$LOG_DIR"
+  if [ -L "$CURRENT_LINK" ]; then
+    [ -L "$CURRENT_WEB_LINK" ] || ln -sfn "$(readlink "$CURRENT_LINK")" "$CURRENT_WEB_LINK"
+    [ -L "$CURRENT_RUNTIME_LINK" ] || ln -sfn "$(readlink "$CURRENT_LINK")" "$CURRENT_RUNTIME_LINK"
+  fi
 }
 
 write_job() {

@@ -18,6 +18,8 @@ sudo AGENTDECK_INSTALL_PROFILE=hardened ./install.sh
 
 升级不会静默改变既有运行用户、数据目录、端口或权限档位。
 
+Web 与 Runtime 使用独立的 `current-web` 和 `current-runtime` 发布指针。首次升级会从旧的 `current` 指针自动初始化两者；之后 web-only 发布不会改变 Runtime 重启时使用的版本，runtime-only 发布同理。
+
 ## 自定义目录与用户
 
 ```bash

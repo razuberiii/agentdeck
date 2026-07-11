@@ -30,4 +30,4 @@ sudo agentdeckctl restore /path/to/agentdeck-backup.tar.zst --force
 sudo systemctl start agentdeck-runtime.service agentdeck-web.service
 ```
 
-恢复前保留目标机器当前备份；包含凭据的归档应加密保存并限制访问。
+恢复会先校验归档路径、文件 SHA-256 与两个 SQLite 的 `integrity_check`，再 Drain 并切换数据目录。启动或健康检查失败时会自动恢复原数据目录；成功后输出限时保留的 rollback snapshot 路径。包含凭据的归档应加密保存并限制访问。
