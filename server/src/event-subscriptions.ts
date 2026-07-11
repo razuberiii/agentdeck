@@ -1,4 +1,3 @@
-import { once } from 'node:events';
 import type { ServerResponse } from 'node:http';
 import type { DurableRuntimeEvent } from './event-store.js';
 
@@ -36,24 +35,35 @@ export class EventSubscriptions {
     raw.once('close', close);
     raw.once('error', close);
     set.add(subscriber);
+    const isClosed=()=>subscriber.state==='closed';
     try {
       // The subscriber is visible to publish() before the durable barrier is read.
       // Events committed during this await are buffered and reconciled below.
       const highWatermark = await latestSequence();
       const replayed = await replay(after,highWatermark);
-      for (const event of replayed) await this.write(subscriber,event);
-      if (subscriber.state === 'closed') return;
-      const merged = subscriber.buffer.filter(event=>event.sequence>highWatermark).sort((a,b)=>a.sequence-b.sequence);
-      this.pendingBufferCount = Math.max(0,this.pendingBufferCount-subscriber.buffer.length);
-      subscriber.buffer=[];
-      let cursor=highWatermark;
-      for (const event of merged) {
-        if (event.sequence<=cursor) continue;
-        if (event.sequence!==cursor+1) return this.disconnect(subscriber,'subscriber sequence gap');
-        await this.write(subscriber,event);
-        cursor=event.sequence;
+      let replayCursor=after;
+      for (const event of replayed.sort((a,b)=>a.sequence-b.sequence)) {
+        if(event.sequence<=replayCursor) continue;
+        if(event.sequence!==replayCursor+1) return this.disconnect(subscriber,'subscriber replay sequence gap');
+        await this.write(subscriber,event); replayCursor=event.sequence;
       }
-      subscriber.state='live';
+      if (isClosed()) return;
+      let cursor=highWatermark;
+      for (;;) {
+        if(isClosed()) return;
+        // publish() cannot interleave with this synchronous take-and-clear. Once
+        // state becomes live, later events are chained instead of buffered.
+        if(!subscriber.buffer.length){subscriber.state='live';break;}
+        const batch=subscriber.buffer;
+        subscriber.buffer=[];
+        this.pendingBufferCount=Math.max(0,this.pendingBufferCount-batch.length);
+        for(const event of batch.sort((a,b)=>a.sequence-b.sequence)){
+          if(isClosed()) return;
+          if(event.sequence<=cursor)continue;
+          if(event.sequence!==cursor+1)return this.disconnect(subscriber,'subscriber sequence gap');
+          await this.write(subscriber,event);cursor=event.sequence;
+        }
+      }
     } catch (error) {
       this.options.logger?.('warn',{sessionId,error},'runtime subscriber replay failed');
       this.disconnect(subscriber,'subscriber replay failed');
@@ -84,7 +94,11 @@ export class EventSubscriptions {
     this.pendingPushCount++;
     try {
       const ok=subscriber.raw.write(`event: runtime\ndata: ${JSON.stringify(event)}\n\n`);
-      if (!ok) await once(subscriber.raw,'drain');
+      if (!ok) await new Promise<void>((resolve,reject)=>{
+        const cleanup=()=>{subscriber.raw.off('drain',drain);subscriber.raw.off('close',onClose);subscriber.raw.off('error',failed);};
+        const drain=()=>{cleanup();resolve();};const onClose=()=>{cleanup();resolve();};const failed=(error:unknown)=>{cleanup();reject(error);};
+        subscriber.raw.once('drain',drain);subscriber.raw.once('close',onClose);subscriber.raw.once('error',failed);
+      });
     } finally { this.pendingPushCount=Math.max(0,this.pendingPushCount-1); }
   }
 

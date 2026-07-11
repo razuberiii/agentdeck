@@ -56,3 +56,25 @@ test('event committed while durable watermark is read is not lost',()=>{
     assert.deepEqual(sequences,[1]);
   `]);
 });
+
+test('events arriving during replay and buffered drain are fully drained before live',()=>{
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import assert from 'node:assert/strict';import {EventEmitter} from 'node:events';
+    import {EventSubscriptions} from ${JSON.stringify(new URL('../server/dist/event-subscriptions.js',import.meta.url).href)};
+    const event=n=>({session_id:'s',threadId:'s',generation:'g',sequence:n,event_type:'x',payload_json:'{}',created_at:n});
+    let subscriptions;
+    class Raw extends EventEmitter{destroyed=false;output='';write(chunk){this.output+=chunk;if(chunk.includes('"sequence":4')){queueMicrotask(()=>{subscriptions.publish(event(5));this.emit('drain');});return false;}return true;}destroy(){this.destroyed=true;this.emit('close');}off(...a){return super.off(...a);}}
+    const raw=new Raw();subscriptions=new EventSubscriptions({maxBuffer:10});
+    await subscriptions.subscribe('s',raw,0,async()=>{subscriptions.publish(event(1));return 3;},async()=>{subscriptions.publish(event(4));return[event(1),event(2),event(3)];});
+    const sequences=[...raw.output.matchAll(/"sequence":(\\d+)/g)].map(m=>Number(m[1]));assert.deepEqual(sequences,[1,2,3,4,5]);assert.equal(raw.destroyed,false);
+  `]);
+});
+
+test('gap in a buffer batch disconnects subscriber for durable recovery',()=>{
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import assert from 'node:assert/strict';import {EventEmitter} from 'node:events';import {EventSubscriptions} from ${JSON.stringify(new URL('../server/dist/event-subscriptions.js',import.meta.url).href)};
+    class Raw extends EventEmitter{destroyed=false;write(){return true;}destroy(){this.destroyed=true;this.emit('close');}off(...a){return super.off(...a);}}
+    const event=n=>({session_id:'s',threadId:'s',generation:'g',sequence:n,event_type:'x',payload_json:'{}',created_at:n}),raw=new Raw(),subscriptions=new EventSubscriptions();
+    await subscriptions.subscribe('s',raw,0,async()=>3,async()=>{subscriptions.publish(event(5));return[event(1),event(2),event(3)];});assert.equal(raw.destroyed,true);
+  `]);
+});
