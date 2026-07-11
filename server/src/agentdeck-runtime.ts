@@ -29,6 +29,7 @@ const HOST = process.env.RUNTIME_HOST || '127.0.0.1';
 const PORT = Number(process.env.RUNTIME_PORT || 3852);
 const RUNTIME_TOKEN = process.env.RUNTIME_TOKEN || '';
 const RUNTIME_MODE = process.env.RUNTIME_MODE === 'candidate' ? 'candidate' : 'active';
+const API_DTO_CONTRACT_VERSION=1;
 const RELEASE_INFO = releaseMetadata();
 const RELEASE_ID = process.env.AGENTDECK_RELEASE_ID || RELEASE_INFO.releaseId;
 const RELEASE_COMMIT = process.env.AGENTDECK_RELEASE_COMMIT || RELEASE_INFO.commit;
@@ -380,6 +381,7 @@ app.addHook('preHandler', async (req, reply) => {
 });
 
 app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle, mode:RUNTIME_MODE, releaseId:RELEASE_ID, commit:RELEASE_COMMIT }));
+app.get('/internal/deep-health',async()=>{const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='runtime'");const integrity=await db.get('PRAGMA integrity_check');return{ok:integrity?.integrity_check==='ok',component:'runtime',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion:Number(migration?.version||0),sqlite:integrity?.integrity_check==='ok',mode:RUNTIME_MODE,candidateRejectsTurns:RUNTIME_MODE==='candidate'};});
 app.get('/admin/runtime/state', async () => runtimeAdminState());
 app.post('/admin/runtime/drain', async (req:any) => startRuntimeDrain(req));
 app.post('/admin/runtime/undrain', async () => cancelRuntimeDrain());

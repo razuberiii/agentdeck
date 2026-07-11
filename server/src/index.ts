@@ -78,6 +78,7 @@ const runtime = new RuntimeClient();
 const USE_AGENT_RUNTIME = process.env.USE_AGENT_RUNTIME === '1';
 const RELEASE_INFO = releaseMetadata();
 const RELEASE_ID = process.env.AGENTDECK_RELEASE_ID || RELEASE_INFO.releaseId;
+const API_DTO_CONTRACT_VERSION=1;
 const RELEASE_COMMIT = process.env.AGENTDECK_RELEASE_COMMIT || RELEASE_INFO.commit;
 const antigravity = new AntigravityProvider();
 const geminiProvider = new GeminiProvider();
@@ -418,6 +419,7 @@ app.get('/api/status', async (req) => {
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
   return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
+app.get('/internal/deep-health',async(req:any,reply)=>{if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(String(req.ip||'')))return reply.code(403).send({error:'loopback_only'});const runtimeHealth=USE_AGENT_RUNTIME?await runtime.deepHealth():null;const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='web'");const integrity=await db.get('PRAGMA integrity_check');const sqlite=integrity?.integrity_check==='ok';const compatible=!!runtimeHealth&&Number(runtimeHealth.contractVersion)===API_DTO_CONTRACT_VERSION;return{ok:sqlite&&compatible,component:'web',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion:Number(migration?.version||0),sqlite,runtimeConnected:!!runtimeHealth?.ok,runtimeReleaseId:runtimeHealth?.releaseId||null,runtimeMode:runtimeHealth?.mode||null,runtimeContractVersion:runtimeHealth?.contractVersion||null,compatible};});
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
 async function lightAppState() {
   const settings = await appSettings();

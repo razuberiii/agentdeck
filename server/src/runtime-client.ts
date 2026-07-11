@@ -9,6 +9,7 @@ export class RuntimeClient {
   }
 
   health() { return this.request('GET', '/healthz'); }
+  deepHealth() { return this.request('GET', '/internal/deep-health'); }
   diagnostics() { return this.request('GET', '/diagnostics'); }
   ensureDefaultCodexAccount() { return this.request('POST', '/codex/accounts/default'); }
   restartDefaultCodexAccount(body:any) { return this.request('POST', '/codex/accounts/default/restart', body); }

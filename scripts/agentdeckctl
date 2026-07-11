@@ -500,6 +500,7 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
     e2e:'passed',
   },
   schemaVersion:1,
+  apiDtoContractVersion:1,
   compatibility:{ web:true, runtime:true },
 }, null, 2) + '\n');
 NODE
@@ -777,10 +778,14 @@ start_candidate_runtime() {
   run_as_service_user bash -c 'cd "$1"; RUNTIME_MODE=candidate DATA_DIR="$2" RUNTIME_DATA_DIR="$2" RUNTIME_DB="$2/agentdeck-runtime.sqlite3" RUNTIME_PORT="$3" RUNTIME_HOST=127.0.0.1 AGENTDECK_RELEASE_ID="$4" node server/dist/agentdeck-runtime.js >>"$5" 2>&1 & echo $! > "$6"' _ "$release_path" "$candidate_dir" "$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-runtime.log" "$pid_file"
   wait_http "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/healthz" 30
   curl -fsS "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/schema" >/dev/null
+  curl -fsS "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/internal/deep-health" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.ok||j.mode!=="candidate"||!j.candidateRejectsTurns||!j.sqlite)process.exit(1);})'
+  local turn_status
+  turn_status="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{"text":"candidate smoke must be rejected"}' "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/sessions/candidate-smoke/turns")"
+  [ "$turn_status" = "503" ] || die "candidate runtime accepted or mishandled a real turn: HTTP $turn_status"
 }
 
 start_candidate_web() {
-  local release_path="$1" job_id="$2" candidate_dir pid_file
+  local release_path="$1" job_id="$2" expected_runtime_release="$3" candidate_dir pid_file
   candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
   pid_file="$candidate_dir/web.pid"
   mkdir -p "$candidate_dir"
@@ -788,7 +793,18 @@ start_candidate_web() {
   sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$candidate_dir/agentdeck.sqlite3"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
   run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
-  wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/api/status" 30
+  wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/internal/deep-health" 30
+  curl -fsS "http://127.0.0.1:$WEB_CANDIDATE_PORT/internal/deep-health" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s),web=process.argv[1],runtime=process.argv[2];if(!j.ok||!j.sqlite||!j.runtimeConnected||!j.compatible||j.releaseId!==web||j.runtimeReleaseId!==runtime||j.runtimeMode!=="candidate")process.exit(1);})' "$(basename "$release_path")" "$expected_runtime_release"
+}
+
+validate_candidate_runtime_compatibility(){
+  local current_web expected
+  current_web="$(release_target "$CURRENT_WEB_LINK")"; [ -n "$current_web" ] || die "current Web release is missing"
+  expected="$(node - "$current_web/deploy-manifest.json" <<'NODE'
+const fs=require('node:fs');try{const m=JSON.parse(fs.readFileSync(process.argv[2]));process.stdout.write(String(m.apiDtoContractVersion||1));}catch{process.stdout.write('1');}
+NODE
+)"
+  curl -fsS "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/internal/deep-health" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.ok||Number(j.contractVersion)!==Number(process.argv[1]))process.exit(1);})' "$expected"
 }
 
 wait_http() {
@@ -962,11 +978,20 @@ worker_deploy() {
     write_job "$job_id" running "release built"
     assert_release_unit_requirement "$release_path" || exit $?
     check_systemd_units "$release_path" warn || true
+    local candidate_runtime_release
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       start_candidate_runtime "$release_path" "$job_id" || exit $?
+      candidate_runtime_release="$release_id"
+      [ "$target" != "runtime" ] || validate_candidate_runtime_compatibility || exit $?
+    elif [ "$target" = "web" ]; then
+      local current_runtime_release_path
+      current_runtime_release_path="$(release_target "$CURRENT_RUNTIME_LINK")"
+      [ -n "$current_runtime_release_path" ] || die "web-only validation requires current-runtime"
+      start_candidate_runtime "$current_runtime_release_path" "$job_id" || exit $?
+      candidate_runtime_release="$(basename "$current_runtime_release_path")"
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
-      start_candidate_web "$release_path" "$job_id" || exit $?
+      start_candidate_web "$release_path" "$job_id" "$candidate_runtime_release" || exit $?
     fi
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       drain_runtime || exit $?
