@@ -944,6 +944,7 @@ restart_target() {
 
 worker_deploy() {
   local job_id="$1" target="$2" force="$3"
+  local pointer_snapshot="$STATE_DIR/$job_id.pointers"
   export AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
   exec >>"$LOG_DIR/$job_id.log" 2>&1
   write_job "$job_id" running "deploy started"
@@ -951,59 +952,68 @@ worker_deploy() {
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path
-    DEPLOY_POINTER_SNAPSHOT="$STATE_DIR/$job_id.pointers"
-    snapshot_deploy_pointers "$DEPLOY_POINTER_SNAPSHOT"
-    make_release
+    snapshot_deploy_pointers "$pointer_snapshot"
+    make_release || exit $?
     release_id="$CREATED_RELEASE_ID"
     release_path="$(release_path_for "$release_id")"
     if [ "$target" = web ]||[ "$target" = all ];then ln -sfn "releases/$release_id" "$CANDIDATE_WEB_LINK";fi
     if [ "$target" = runtime ]||[ "$target" = all ];then ln -sfn "releases/$release_id" "$CANDIDATE_RUNTIME_LINK";fi
     export AGENTDECK_JOB_RELEASE="$release_id"
     write_job "$job_id" running "release built"
-    assert_release_unit_requirement "$release_path"
+    assert_release_unit_requirement "$release_path" || exit $?
     check_systemd_units "$release_path" warn || true
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
-      start_candidate_runtime "$release_path" "$job_id"
+      start_candidate_runtime "$release_path" "$job_id" || exit $?
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
-      start_candidate_web "$release_path" "$job_id"
+      start_candidate_web "$release_path" "$job_id" || exit $?
     fi
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
-      drain_runtime
-      wait_drain "$force"
-      switch_component runtime "$release_id"
-      systemctl restart agentdeck-runtime.service
-      wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45
+      drain_runtime || exit $?
+      wait_drain "$force" || exit $?
+      switch_component runtime "$release_id" || exit $?
+      systemctl restart agentdeck-runtime.service || exit $?
+      wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || exit $?
     else
-      switch_component web "$release_id"
+      switch_component web "$release_id" || exit $?
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
-      [ "$target" = "all" ] && switch_component web "$release_id"
-      systemctl restart agentdeck-web.service
-      wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45
+      if [ "$target" = "all" ]; then switch_component web "$release_id" || exit $?; fi
+      systemctl restart agentdeck-web.service || exit $?
+      wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || exit $?
     fi
     clear_candidate_release_links "$release_path"
-    rm -f "$DEPLOY_POINTER_SNAPSHOT"
+    rm -f "$pointer_snapshot"
     cleanup_releases
     write_job "$job_id" succeeded "deploy succeeded"
   ) 9>"$LOCK_FILE" || {
-    local code=$?
+    local code=$? failed_release_id="" failed_release_path="" recovery_failed=0
     undrain_runtime
-    if [ -n "${DEPLOY_POINTER_SNAPSHOT:-}" ] && [ -f "$DEPLOY_POINTER_SNAPSHOT" ]; then
+    failed_release_id="$(node - "$JOBS_DIR/$job_id.json" <<'NODE' 2>/dev/null || true
+const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));if(j.release)process.stdout.write(String(j.release));}catch{}
+NODE
+)"
+    if [ -f "$pointer_snapshot" ]; then
       log "deploy failed; restoring component release pointers"
-      restore_deploy_pointers "$DEPLOY_POINTER_SNAPSHOT"
+      restore_deploy_pointers "$pointer_snapshot"
       case "$target" in
-        runtime) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || true ;;
-        web) systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || true ;;
-        all) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || true ;;
+        runtime) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || recovery_failed=1 ;;
+        web) systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1 ;;
+        all) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1 ;;
       esac
-      rm -f "$DEPLOY_POINTER_SNAPSHOT"
+      if [ "$recovery_failed" = "1" ]; then
+        write_job "$job_id" failed "FATAL: deploy and old-version recovery failed; rollback state preserved"
+        log "FATAL: old-version recovery failed; preserving $pointer_snapshot and failed release"
+        return 70
+      fi
+      rm -f "$pointer_snapshot"
     fi
-    if [ -n "${CREATED_RELEASE_ID:-}" ] && valid_release_id "$CREATED_RELEASE_ID"; then
-      clear_candidate_release_links "$RELEASES_DIR/$CREATED_RELEASE_ID"
-      remove_release_if_unreferenced "$RELEASES_DIR/$CREATED_RELEASE_ID" || true
+    write_job "$job_id" failed "deploy failed; previous release restored and healthy"
+    if [ -n "$failed_release_id" ] && valid_release_id "$failed_release_id"; then
+      failed_release_path="$RELEASES_DIR/$failed_release_id"
+      clear_candidate_release_links "$failed_release_path"
+      remove_release_if_unreferenced "$failed_release_path"
     fi
-    write_job "$job_id" failed "deploy failed"
     exit "$code"
   }
 }
