@@ -1,16 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import {queueAndSendPendingTask} from '../client/src/pending-task-outbox.ts';
 
 test('home task composer creates a persistent session and auto-submits after join', async () => {
-  const source = await readFile(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
-  assert.match(source, /taskPrompt/);
-  assert.match(source, /storageSet\(pendingTaskKey\(s\.id\),initialTask\.trim\(\)\)/);
-  assert.match(source, /const pendingTask=storageGet\(pendingTaskKey\(id\)\)/);
-  assert.match(source, /const pendingMode=storageGet\(pendingTaskModeKey\(id\)\).*'plan':'direct'/);
-  assert.match(source, /const initialAttachments=loadDraftAttachments\(id\)/);
-  assert.match(source, /sendMessage\(ws,id,\{text:pendingTask\.trim\(\),attachments:initialAttachments,planMode:pendingMode\}\)/);
-  assert.match(source, /storageRemove\(pendingTaskKey\(id\)\)/);
+  const records=[];const sent=[];
+  const outbox={retryDelay:()=>500,async put(record){records.push({...record});},async update(id,patch){Object.assign(records.find(row=>row.clientMessageId===id),patch);}};
+  const id=await queueAndSendPendingTask({outbox,sessionId:'session-1',text:'first task',attachments:[],planMode:'plan',uuid:()=> 'message-1',now:()=>1,send:messageId=>sent.push(messageId)});
+  assert.equal(id,'message-1');assert.deepEqual(sent,['message-1']);assert.equal(records[0].status,'sent');assert.equal(records[0].planMode,'plan');
 });
 
 test('dashboard bootstrap replaces the separate home app-state request', async () => {

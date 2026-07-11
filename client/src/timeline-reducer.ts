@@ -71,6 +71,11 @@ export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: Time
   };
 }
 
+export function applyAuthoritativeTimelineSnapshot(state:TimelineState,snapshotEvents:TimelineDisplayEvent[],throughSequence:number):TimelineState{
+  const through=Math.max(0,Number(throughSequence||0));
+  return applyTimelineSnapshot(through<state.contiguousAppliedSequence?emptyTimelineState(through):state,snapshotEvents,through);
+}
+
 function liveUserKeys(msg: any): string[] {
   if (msg?.type !== 'user') return [];
   return userIdentityKeys({

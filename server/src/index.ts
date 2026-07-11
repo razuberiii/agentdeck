@@ -23,6 +23,7 @@ import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
 import { SessionCommandQueue } from './websocket-command-queue.js';
 import { BrowserDeliveryHub } from './browser-delivery.js';
+import { withReceiptFailure } from './message-receipt.js';
 import { runMigrations } from './migration-runner.js';
 import { deleteSessionRelations } from './session-lifecycle.js';
 import { AntigravityProvider, GeminiProvider } from './providers.js';
@@ -1771,7 +1772,15 @@ function cleanupWsConnection(ws:any) {
     websocketSessions.delete(ws);
   }
   for (const [sessionId,set] of clients.entries()) {
-    if (set.delete(ws)) app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers');
+    if (set.delete(ws)) {
+      app.log.info({ sessionId, connectionGeneration:ws.agentdeckGeneration, subscriberCount:set.size }, 'websocket removed from session subscribers');
+      if(!set.size&&!activeCodexSessions.has(sessionId)){
+        clients.delete(sessionId);
+        const subscription=runtimeSubscriptions.get(sessionId);
+        if(subscription){runtimeSubscriptions.delete(sessionId);subscription.close();}
+        browserDelivery.releaseSession(sessionId);
+      }
+    }
   }
 }
 app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
@@ -4334,9 +4343,12 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     [threadId,snapshotWatermark]
   ).catch(()=>[]);
   const canonicalUsers = await db.all(
-    `SELECT * FROM agent_messages
-     WHERE session_id=?1 AND role='user'
-     ORDER BY created_at ASC, id ASC`,
+    `SELECT * FROM (
+       SELECT * FROM agent_messages
+       WHERE session_id=?1 AND role='user'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 80
+     ) ORDER BY created_at ASC, id ASC`,
     [threadId]
   ).catch(()=>[]);
   let canonicalUserIndex = 0;
@@ -4725,6 +4737,15 @@ async function ensureRuntimeCodexSession(row:any) {
   });
 }
 async function sendTurn(id:string, text:string, attachments:any[] = [], clientMessageId = '', planMode:'direct'|'plan' = 'direct'){
+  const messageId=clientMessageId||crypto.randomUUID();
+  return withReceiptFailure(()=>sendTurnClaimed(id,text,attachments,messageId,planMode),async message=>{
+    const row=await findSession(id).catch(()=>null);
+    const threadId=String(row?.codex_thread_id||row?.id||id);
+    await updateMessageReceipt(threadId,messageId,'failed',message).catch(()=>{});
+    broadcast(threadId,{type:'messageStatus',clientMessageId:messageId,status:'failed',error:message});
+  });
+}
+async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], clientMessageId = '', planMode:'direct'|'plan' = 'direct'){
   const row = await findSession(id);
   if(!row) throw new Error('session not found');
   const threadId = String(row.codex_thread_id || row.id);

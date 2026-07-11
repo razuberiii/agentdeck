@@ -14,7 +14,7 @@ export function loadDraftAttachments(id:string):Attachment[]{
   } catch { return []; }
 }
 export function saveDraftAttachments(id:string, attachments:Attachment[]){
-  const serializable=attachments.filter(a=>!a.uploading&&!a.error&&a.id&&a.name).map(a=>({id:a.id,name:a.name,type:a.type,size:a.size,url:a.url,previewUrl:a.previewUrl}));
+  const serializable=attachments.filter(a=>!a.uploading&&!a.error&&a.id&&a.name).map(a=>({id:a.id,name:a.name,type:a.type,size:a.size,url:a.url,previewUrl:a.previewUrl?.startsWith('blob:')?undefined:a.previewUrl}));
   if(serializable.length) storageSet(draftAttachmentsKey(id), JSON.stringify(serializable));
   else storageRemove(draftAttachmentsKey(id));
 }
