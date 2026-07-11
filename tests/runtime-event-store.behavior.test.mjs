@@ -38,8 +38,21 @@ test('SSE replay barrier releases replay then buffered live events in order',()=
     class Raw extends EventEmitter { destroyed=false; output=''; write(chunk){this.output+=chunk; return true;} destroy(){this.destroyed=true;this.emit('close');} off(...a){return super.off(...a);} }
     const raw=new Raw(); const subscriptions=new EventSubscriptions({maxBuffer:10});
     const event=n=>({session_id:'s',threadId:'s',generation:'g',sequence:n,event_type:'x',payload_json:'{}',created_at:n});
-    await subscriptions.subscribe('s',raw,0,3,async()=>{subscriptions.publish(event(4)); return [event(1),event(2),event(3)];});
+    await subscriptions.subscribe('s',raw,0,async()=>3,async()=>{subscriptions.publish(event(4)); return [event(1),event(2),event(3)];});
     const sequences=[...raw.output.matchAll(/"sequence":(\\d+)/g)].map(match=>Number(match[1]));
     assert.deepEqual(sequences,[1,2,3,4]);
   `],{stdio:'pipe'});
+});
+
+test('event committed while durable watermark is read is not lost',()=>{
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import assert from 'node:assert/strict'; import {EventEmitter} from 'node:events';
+    import {EventSubscriptions} from ${JSON.stringify(new URL('../server/dist/event-subscriptions.js',import.meta.url).href)};
+    class Raw extends EventEmitter { destroyed=false; output=''; write(chunk){this.output+=chunk; return true;} destroy(){this.destroyed=true;this.emit('close');} off(...a){return super.off(...a);} }
+    const raw=new Raw(), subscriptions=new EventSubscriptions();
+    const event=n=>({session_id:'s',threadId:'s',generation:'g',sequence:n,event_type:'x',payload_json:'{}',created_at:n});
+    await subscriptions.subscribe('s',raw,0,async()=>{ subscriptions.publish(event(1)); return 1; },async()=>[event(1)]);
+    const sequences=[...raw.output.matchAll(/"sequence":(\\d+)/g)].map(m=>Number(m[1]));
+    assert.deepEqual(sequences,[1]);
+  `]);
 });

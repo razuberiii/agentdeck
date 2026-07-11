@@ -691,13 +691,12 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
     'X-Runtime-Generation':RUNTIME_GENERATION,
   });
   diagnostics.sseConnections++;
-  const highWatermark = await latestEventSequence(sessionId);
-  app.log.info({ sessionId, after, highWatermark, activeSubscribers:subscriptions.count(sessionId)+1 }, 'runtime sse subscriber connected');
+  app.log.info({ sessionId, after, activeSubscribers:subscriptions.count(sessionId)+1 }, 'runtime sse subscriber connected');
   reply.raw.on('close', () => {
     diagnostics.sseReconnectCount++;
     app.log.info({ sessionId, activeSubscribers:subscriptions.count(sessionId) }, 'runtime sse subscriber closed');
   });
-  await subscriptions.subscribe(sessionId,reply.raw,after,highWatermark,async (cursor,through)=>(await eventsAfter(sessionId,cursor,true)).filter(event=>Number(event.sequence)<=through) as any);
+  await subscriptions.subscribe(sessionId,reply.raw,after,()=>latestEventSequence(sessionId),async (cursor,through)=>(await eventsAfter(sessionId,cursor,true)).filter(event=>Number(event.sequence)<=through) as any);
 });
 
 app.post('/sessions/:id/turns', async (req:any, reply) => {

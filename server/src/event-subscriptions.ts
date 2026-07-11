@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import type { ServerResponse } from 'node:http';
 import type { DurableRuntimeEvent } from './event-store.js';
 
-type Subscriber = { raw:ServerResponse; state:'replaying'|'live'|'closed'; buffer:DurableRuntimeEvent[]; chain:Promise<void>; close:()=>void };
+type Subscriber = { raw:ServerResponse; state:'replaying'|'live'|'closed'; buffer:DurableRuntimeEvent[]; chain:Promise<void>; pendingPushes:number; close:()=>void };
 
 export class EventSubscriptions {
   private sessions = new Map<string,Set<Subscriber>>();
@@ -18,10 +18,10 @@ export class EventSubscriptions {
 
   snapshot() { return [...this.sessions.entries()].map(([sessionId,set])=>({sessionId,count:set.size})); }
 
-  async subscribe(sessionId:string, raw:ServerResponse, after:number, highWatermark:number, replay:(after:number,through:number)=>Promise<DurableRuntimeEvent[]>) {
+  async subscribe(sessionId:string, raw:ServerResponse, after:number, latestSequence:()=>Promise<number>, replay:(after:number,through:number)=>Promise<DurableRuntimeEvent[]>) {
     const set = this.sessions.get(sessionId) || new Set<Subscriber>();
     this.sessions.set(sessionId,set);
-    const subscriber:Subscriber = { raw, state:'replaying', buffer:[], chain:Promise.resolve(), close:()=>{} };
+    const subscriber:Subscriber = { raw, state:'replaying', buffer:[], chain:Promise.resolve(), pendingPushes:0, close:()=>{} };
     const close = () => {
       if (subscriber.state === 'closed') return;
       this.pendingBufferCount = Math.max(0, this.pendingBufferCount - subscriber.buffer.length);
@@ -37,6 +37,9 @@ export class EventSubscriptions {
     raw.once('error', close);
     set.add(subscriber);
     try {
+      // The subscriber is visible to publish() before the durable barrier is read.
+      // Events committed during this await are buffered and reconciled below.
+      const highWatermark = await latestSequence();
       const replayed = await replay(after,highWatermark);
       for (const event of replayed) await this.write(subscriber,event);
       if (subscriber.state === 'closed') return;
@@ -66,8 +69,8 @@ export class EventSubscriptions {
         continue;
       }
       if (subscriber.state==='live') {
-        if (this.pendingPushCount>=(this.options.maxPendingPushes||4096)) this.disconnect(subscriber,'subscriber backpressure limit');
-        else subscriber.chain=subscriber.chain.then(()=>this.write(subscriber,event)).catch(()=>this.disconnect(subscriber,'subscriber write failed'));
+        if (subscriber.pendingPushes>=(this.options.maxPendingPushes||4096)) this.disconnect(subscriber,'subscriber backpressure limit');
+        else { subscriber.pendingPushes++; subscriber.chain=subscriber.chain.then(()=>this.write(subscriber,event)).catch(()=>this.disconnect(subscriber,'subscriber write failed')).finally(()=>{subscriber.pendingPushes=Math.max(0,subscriber.pendingPushes-1);}); }
       }
     }
   }

@@ -56,6 +56,7 @@ export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: Time
     }
     return true;
   }));
+  const pendingSequenceBuffer = new Map([...state.pendingSequenceBuffer].filter(([sequence])=>sequence>coveredSequence));
   return {
     snapshotEvents,
     liveMessages: sortRuntimeMessages(next),
@@ -65,8 +66,8 @@ export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: Time
     contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,coveredSequence),
     highestSeenSequence:Math.max(state.highestSeenSequence,coveredSequence),
     runtimeGeneration:state.runtimeGeneration,
-    pendingSequenceBuffer:new Map([...state.pendingSequenceBuffer].filter(([sequence])=>sequence>coveredSequence)),
-    recovering:false,
+    pendingSequenceBuffer,
+    recovering:pendingSequenceBuffer.size>0,
   };
 }
 
