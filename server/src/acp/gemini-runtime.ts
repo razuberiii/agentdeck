@@ -18,6 +18,7 @@ import {
   type SessionUpdate,
 } from '@agentclientprotocol/sdk';
 import { Db } from '../db.js';
+import { readSessionTextFile, writeSessionTextFile, type FilePermissionMode } from '../secure-workspace-fs.js';
 
 export type GeminiRuntimeOptions = {
   db: Db;
@@ -43,6 +44,7 @@ type GeminiSessionState = {
   model: string | null;
   activePrompt: Promise<any> | null;
   promptController: AbortController | null;
+  permissionMode:FilePermissionMode;
 };
 
 export class GeminiModelSwitchUnsupportedError extends Error {
@@ -53,6 +55,7 @@ export class GeminiModelSwitchUnsupportedError extends Error {
     super(message);
   }
 }
+function normalizeFileMode(mode?:string):FilePermissionMode{return mode==='plan'?'plan':mode==='read-only'?'read-only':mode==='workspace-write'?'workspace-write':mode==='full-access'?'full-access':'yolo';}
 
 type PendingPermission = {
   requestId: string;
@@ -129,6 +132,7 @@ export class GeminiAcpRuntime {
       model: params.model || currentGeminiModelFromOptions(response.configOptions) || null,
       activePrompt: null,
       promptController: null,
+      permissionMode:normalizeFileMode(params.mode),
     };
     this.sessions.set(params.localSessionId, state);
     this.providerToLocal.set(response.sessionId, params.localSessionId);
@@ -302,14 +306,14 @@ export class GeminiAcpRuntime {
     return true;
   }
 
-  async recoverSession(localSessionId: string, providerSessionId: string | null, cwd: string) {
+  async recoverSession(localSessionId: string, providerSessionId: string | null, cwd: string, mode?:string) {
     await this.ensureInitialized();
     if (providerSessionId && this.initializeResponse?.agentCapabilities?.loadSession) {
       try {
         const response = await this.agent!.request(methods.agent.session.load, { sessionId:providerSessionId, cwd, mcpServers:[] } as any);
         if (response !== undefined) {
           const configOptions = Array.isArray((response as any)?.configOptions) ? (response as any).configOptions : [];
-          const state = { localSessionId, providerSessionId, cwd, configOptions, model:currentGeminiModelFromOptions(configOptions), activePrompt:null, promptController:null };
+          const state = { localSessionId, providerSessionId, cwd, configOptions, model:currentGeminiModelFromOptions(configOptions), activePrompt:null, promptController:null,permissionMode:normalizeFileMode(mode) };
           this.sessions.set(localSessionId, state);
           this.providerToLocal.set(providerSessionId, localSessionId);
           await this.options.appendEvent(localSessionId, 'runtime/recovering', { provider:'gemini', loaded:true, providerSessionId });
@@ -432,38 +436,16 @@ export class GeminiAcpRuntime {
   private async readTextFile(providerSessionId: string, requestedPath: string, line: number, limit: number | null) {
     const localSessionId = this.providerToLocal.get(providerSessionId);
     if (!localSessionId) throw new Error('unknown session');
-    const filePath = this.safeSessionPath(localSessionId, requestedPath, false);
-    const text = await readFile(filePath, 'utf8');
-    const lines = text.split(/\r?\n/);
-    const start = Math.max(0, line - 1);
-    const selected = lines.slice(start, limit ? start + Math.min(limit, 2000) : start + 2000).join('\n');
-    return { content: selected };
+    const session=this.sessions.get(localSessionId);if(!session)throw new Error('unknown session');
+    return { content:await readSessionTextFile(session.cwd,path.join(this.options.dataDir,'attachments',localSessionId),requestedPath,line,limit) };
   }
 
   private async writeTextFile(providerSessionId: string, requestedPath: string, content: string) {
     const localSessionId = this.providerToLocal.get(providerSessionId);
     if (!localSessionId) throw new Error('unknown session');
-    const filePath = this.safeSessionPath(localSessionId, requestedPath, true);
-    await mkdir(path.dirname(filePath), { recursive:true });
-    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tmp, content, { flag:'wx' });
-    await rename(tmp, filePath);
+    const session=this.sessions.get(localSessionId);if(!session)throw new Error('unknown session');
+    await writeSessionTextFile(session.cwd,requestedPath,content,session.permissionMode);
     return {};
-  }
-
-  private safeSessionPath(localSessionId: string, requestedPath: string, write: boolean) {
-    const session = this.sessions.get(localSessionId);
-    if (!session) throw new Error('unknown session');
-    const cwdRoot = realpathSync(session.cwd);
-    const attachmentRoot = path.join(this.options.dataDir, 'attachments', localSessionId);
-    const resolved = path.resolve(requestedPath);
-    const parent = existsSync(resolved) ? realpathSync(resolved) : realpathSync(path.dirname(resolved));
-    if (parent === cwdRoot || parent.startsWith(cwdRoot + path.sep)) return resolved;
-    if (!write && existsSync(attachmentRoot)) {
-      const ar = realpathSync(attachmentRoot);
-      if (parent === ar || parent.startsWith(ar + path.sep)) return resolved;
-    }
-    throw new Error('path outside allowed Gemini session roots');
   }
 
   private noteAuthError(error:any) {

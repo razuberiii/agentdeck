@@ -29,6 +29,7 @@ export type ProviderCapability = {
 };
 
 export type ProviderCapabilities = Record<ProviderCapabilityKey, ProviderCapability>;
+export type ProviderExecutionCapabilities={canCreateSession:boolean;canContinueSession:boolean;supportsResume:boolean;supportsApprovals:boolean;supportsPlanMode:boolean;enforcedReadOnly:boolean;supportsAttachments:boolean;supportsModelSwitch:boolean;supportsAccountSwitch:boolean;supportsCancellation:boolean};
 
 export type ProviderDefinition = {
   id: AgentProviderId;
@@ -146,6 +147,10 @@ export function providerDefinition(id: AgentProviderId) {
 
 export function providerCapabilitiesFor(id: AgentProviderId) {
   return providerDefinition(id).capabilities;
+}
+export function providerExecutionCapabilitiesFor(id:AgentProviderId):ProviderExecutionCapabilities{
+  const capabilities=providerCapabilitiesFor(id);
+  return {canCreateSession:true,canContinueSession:capabilities.sessionResume.supported,supportsResume:capabilities.sessionResume.supported,supportsApprovals:capabilities.approvals.supported,supportsPlanMode:id!=='antigravity',enforcedReadOnly:id==='codex'||id==='gemini',supportsAttachments:capabilities.attachments.supported,supportsModelSwitch:capabilities.modelSelection.supported,supportsAccountSwitch:capabilities.accountManagement.supported,supportsCancellation:capabilities.cancellation.supported};
 }
 
 export function providerDisplayName(id: AgentProviderId) {

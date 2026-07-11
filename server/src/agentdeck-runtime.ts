@@ -714,7 +714,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
         await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=?2,updated_at=?3 WHERE id=?4', [accountId, JSON.stringify(body.accountSnapshot || null), Date.now(), session.id]);
         prompt.unshift(context as any);
       } else {
-        await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir));
+        await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir),String(body.permissionMode || session.permission_mode));
         await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [accountId, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
       }
       await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || '') });
