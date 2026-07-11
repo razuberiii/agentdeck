@@ -658,7 +658,7 @@ app.get('/sessions/:id', async (req:any, reply) => {
     sqliteDurationMs,
     totalDurationMs:Date.now() - startedAt,
   }, 'runtime session snapshot returned');
-  return { session:fresh, thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:snapshotWatermark, error:fresh.upstream_status === 'missing' ? 'upstream_missing' : null } };
+  return { session:{...fresh,modelRevision:Number(fresh.model_revision||0)}, thread, snapshot:{ generation:RUNTIME_GENERATION, coveredSequence:snapshotWatermark, error:fresh.upstream_status === 'missing' ? 'upstream_missing' : null } };
 });
 
 app.patch('/sessions/:id', async (req:any, reply) => {

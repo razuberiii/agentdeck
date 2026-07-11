@@ -1,0 +1,2 @@
+export type ModelAuthority={model:string|null;revision:number};
+export function reconcileModelRevision<T extends{model?:string|null;modelRevision?:number}>(server:T,local:ModelAuthority|null){const serverRevision=Number(server.modelRevision||0),serverModel=server.model??null;if(!local||serverRevision>=local.revision)return{session:{...server,model:serverModel,modelRevision:serverRevision},authority:{model:serverModel,revision:serverRevision}};return{session:{...server,model:local.model,modelRevision:local.revision},authority:local};}
