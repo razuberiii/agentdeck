@@ -78,7 +78,7 @@ export class RuntimeClient {
           if (data) {
             try {
               const parsed=JSON.parse(data);
-              if(parsed?.type==='stream_ready') onStatus?.('stream_ready',parsed);
+              if(parsed?.type==='stream_ready') eventQueue=eventQueue.then(()=>onStatus?.('stream_ready',parsed));
               else {
                 const event = RuntimeEventEnvelopeSchema.parse(parsed);
                 eventQueue = eventQueue.then(()=>onEvent(event)).catch(fail);

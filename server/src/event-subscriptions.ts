@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 import type { DurableRuntimeEvent } from './event-store.js';
 
-type Subscriber = { raw:ServerResponse; state:'replaying'|'live'|'closed'; buffer:DurableRuntimeEvent[]; chain:Promise<void>; pendingPushes:number; close:()=>void };
+type Subscriber = { raw:ServerResponse; state:'replaying'|'live'|'closed'; buffer:DurableRuntimeEvent[]; chain:Promise<void>; pendingPushes:number; lastDeliveredSequence:number; close:()=>void };
 
 export class EventSubscriptions {
   private sessions = new Map<string,Set<Subscriber>>();
@@ -20,7 +20,7 @@ export class EventSubscriptions {
   async subscribe(sessionId:string, raw:ServerResponse, after:number, latestSequence:()=>Promise<number>, replayPage:(after:number)=>Promise<{events:DurableRuntimeEvent[];nextSequence:number;hasMore:boolean}|DurableRuntimeEvent[]>, generation='') {
     const set = this.sessions.get(sessionId) || new Set<Subscriber>();
     this.sessions.set(sessionId,set);
-    const subscriber:Subscriber = { raw, state:'replaying', buffer:[], chain:Promise.resolve(), pendingPushes:0, close:()=>{} };
+    const subscriber:Subscriber = { raw, state:'replaying', buffer:[], chain:Promise.resolve(), pendingPushes:0,lastDeliveredSequence:after, close:()=>{} };
     const close = () => {
       if (subscriber.state === 'closed') return;
       this.pendingBufferCount = Math.max(0, this.pendingBufferCount - subscriber.buffer.length);
@@ -66,7 +66,7 @@ export class EventSubscriptions {
         if(isClosed()) return;
         // publish() cannot interleave with this synchronous take-and-clear. Once
         // state becomes live, later events are chained instead of buffered.
-        if(!subscriber.buffer.length){subscriber.state='live'; raw.write(`event: stream_ready\ndata: ${JSON.stringify({type:'stream_ready',sessionId,runtimeGeneration:generation,replayFrom:after,caughtUpThrough:cursor,currentLatestSequence:cursor})}\n\n`);break;}
+        if(!subscriber.buffer.length){subscriber.state='live'; await this.writeControl(subscriber,'stream_ready',{type:'stream_ready',sessionId,runtimeGeneration:generation,replayFrom:after,caughtUpThrough:cursor,currentLatestSequence:cursor});break;}
         const batch=subscriber.buffer;
         subscriber.buffer=[];
         this.pendingBufferCount=Math.max(0,this.pendingBufferCount-batch.length);
@@ -93,7 +93,7 @@ export class EventSubscriptions {
       }
       if (subscriber.state==='live') {
         if (subscriber.pendingPushes>=(this.options.maxPendingPushes||4096)) this.disconnect(subscriber,'subscriber backpressure limit');
-        else { subscriber.pendingPushes++; subscriber.chain=subscriber.chain.then(()=>this.write(subscriber,event)).catch(()=>this.disconnect(subscriber,'subscriber write failed')).finally(()=>{subscriber.pendingPushes=Math.max(0,subscriber.pendingPushes-1);}); }
+        else { subscriber.pendingPushes++; subscriber.chain=subscriber.chain.then(()=>{if(event.sequence!==subscriber.lastDeliveredSequence+1)throw new Error('subscriber live sequence gap');return this.write(subscriber,event);}).catch(()=>this.disconnect(subscriber,'subscriber write failed')).finally(()=>{subscriber.pendingPushes=Math.max(0,subscriber.pendingPushes-1);}); }
       }
     }
   }
@@ -104,9 +104,15 @@ export class EventSubscriptions {
 
   private async write(subscriber:Subscriber,event:DurableRuntimeEvent) {
     if (subscriber.state==='closed') return;
+    if(event.sequence!==subscriber.lastDeliveredSequence+1) throw new Error('subscriber sequence gap');
+    await this.writeControl(subscriber,'runtime',event);
+    subscriber.lastDeliveredSequence=event.sequence;
+  }
+  private async writeControl(subscriber:Subscriber,name:string,payload:unknown) {
+    if (subscriber.state==='closed') return;
     this.pendingPushCount++;
     try {
-      const ok=subscriber.raw.write(`event: runtime\ndata: ${JSON.stringify(event)}\n\n`);
+      const ok=subscriber.raw.write(`event: ${name}\ndata: ${JSON.stringify(payload)}\n\n`);
       if (!ok) await new Promise<void>((resolve,reject)=>{
         const cleanup=()=>{subscriber.raw.off('drain',drain);subscriber.raw.off('close',onClose);subscriber.raw.off('error',failed);};
         const drain=()=>{cleanup();resolve();};const onClose=()=>{cleanup();resolve();};const failed=(error:unknown)=>{cleanup();reject(error);};
