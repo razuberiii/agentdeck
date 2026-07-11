@@ -18,7 +18,7 @@ import { ClaudeProfileStore } from './claude/claude-profile-store.js';
 import type { ClaudeProfile } from './claude/claude-types.js';
 import { DurableEventStore } from './event-store.js';
 import { EventSubscriptions } from './event-subscriptions.js';
-import { runMigrations } from './migration-runner.js';
+import { migrateRuntimeSchema, RUNTIME_SCHEMA_VERSION } from './schema-migrations.js';
 import { deleteSessionRelations } from './session-lifecycle.js';
 
 const execFileAsync = promisify(execFile);
@@ -187,7 +187,7 @@ class CodexAccountRuntime extends EventEmitter {
 
 const db = new Db(DB_FILE);
 await db.init();
-await runMigrations(db,'runtime',[{version:1,name:'runtime_schema_baseline',statements:process.env.AGENTDECK_TEST_BAD_MIGRATION==='1'?['THIS IS INVALID SQL']:[]}]);
+await migrateRuntimeSchema(db);
 await initRuntimeSchema();
 const claudeProfileStore = new ClaudeProfileStore(db, DATA_DIR, process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'));
 class GeminiRuntimeManager {
@@ -383,7 +383,7 @@ app.addHook('preHandler', async (req, reply) => {
 });
 
 app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle, mode:RUNTIME_MODE, releaseId:RELEASE_ID, commit:RELEASE_COMMIT }));
-app.get('/internal/deep-health',async()=>{const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='runtime'");const integrity=await db.get('PRAGMA integrity_check');return{ok:integrity?.integrity_check==='ok',component:'runtime',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion:Number(migration?.version||0),sqlite:integrity?.integrity_check==='ok',mode:RUNTIME_MODE,candidateRejectsTurns:RUNTIME_MODE==='candidate'};});
+app.get('/internal/deep-health',async()=>{const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='runtime'");const integrity=await db.get('PRAGMA integrity_check');const schemaMigrationVersion=Number(migration?.version||0),schemaCompatible=schemaMigrationVersion===RUNTIME_SCHEMA_VERSION;return{ok:integrity?.integrity_check==='ok'&&schemaCompatible,component:'runtime',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,schemaCompatible,sqlite:integrity?.integrity_check==='ok',mode:RUNTIME_MODE,candidateRejectsTurns:RUNTIME_MODE==='candidate'};});
 app.get('/admin/runtime/state', async () => runtimeAdminState());
 app.post('/admin/runtime/drain', async (req:any) => startRuntimeDrain(req));
 app.post('/admin/runtime/undrain', async () => cancelRuntimeDrain());
@@ -896,46 +896,7 @@ setInterval(() => {
 }, 5000).unref();
 
 async function initRuntimeSchema() {
-  await db.run('CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, provider TEXT NOT NULL, codex_home TEXT, runtime_instance_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
-  await db.run('CREATE TABLE IF NOT EXISTS runtime_instances (instance_id TEXT PRIMARY KEY, pid INTEGER, started_at INTEGER NOT NULL, heartbeat_at INTEGER NOT NULL)');
-  await db.run("CREATE TABLE IF NOT EXISTS claude_profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, profile_dir TEXT NOT NULL UNIQUE, config_dir TEXT NOT NULL UNIQUE, type TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'not_configured', credential_summary TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  await db.run("CREATE TABLE IF NOT EXISTS plan_tasks (plan_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, original_user_task TEXT NOT NULL, approved_plan_text TEXT, plan_assistant_message_id TEXT, execution_turn_id TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL, approved_at INTEGER, executed_at INTEGER, cancelled_at INTEGER, provider TEXT, model TEXT, diff_summary TEXT, changed_files_json TEXT, policy_violation TEXT)").catch(()=>{});
-  await db.run('CREATE INDEX IF NOT EXISTS plan_tasks_session_status ON plan_tasks(session_id,status,created_at)').catch(()=>{});
   await db.run('INSERT INTO runtime_instances (instance_id,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?3) ON CONFLICT(instance_id) DO UPDATE SET pid=excluded.pid, heartbeat_at=excluded.heartbeat_at', [INSTANCE_ID, process.pid, Date.now()]);
-  await db.run('ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT \'codex\'').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN model_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN model_revision INTEGER NOT NULL DEFAULT 0').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN workspace_path TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN provider_session_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN provider TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN upstream_thread_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN upstream_generation TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN upstream_status TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN active_turn_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN interruption_reason TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN provider_profile_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN provider_capabilities TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN provider_metadata TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN last_execution_account_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN current_upstream_account_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN account_snapshot_json TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN creator_profile_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN selected_profile_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN executing_profile_id TEXT').catch(()=>{});
-  await db.run('ALTER TABLE sessions ADD COLUMN upstream_binding_profile_id TEXT').catch(()=>{});
-  await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
-  await db.run('ALTER TABLE events ADD COLUMN sequence INTEGER').catch(()=>{});
-  await db.run('ALTER TABLE events ADD COLUMN event_type TEXT').catch(()=>{});
-  await db.run('ALTER TABLE events ADD COLUMN payload_json TEXT').catch(()=>{});
-  await db.run('ALTER TABLE events ADD COLUMN created_at INTEGER').catch(()=>{});
-  await db.run('ALTER TABLE events ADD COLUMN event_key TEXT').catch(()=>{});
-  await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_sequence ON events(session_id, sequence)');
-  await db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_key ON events(session_id, event_key)');
-  await db.run('CREATE INDEX IF NOT EXISTS idx_events_session_type_sequence ON events(session_id, event_type, sequence)');
-  await db.run('CREATE INDEX IF NOT EXISTS idx_sessions_upstream_thread_id ON sessions(upstream_thread_id)');
 }
 
 function validateClaudeProfileForRuntime(raw:any, fallbackId?:any): ClaudeProfile {
