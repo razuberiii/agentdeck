@@ -30,6 +30,7 @@ SYSTEMD_UNIT_VERSION=1
 SERVICE_USER=""
 SERVICE_HOME=""
 CREATED_RELEASE_ID=""
+DEPLOY_POINTER_SNAPSHOT=""
 PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$DATA_DIR/cache/ms-playwright}"
 NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$DATA_DIR/cache/npm}"
 export PATH="$DATA_DIR/provider-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -104,7 +105,10 @@ run_as_service_user() {
 ensure_service_owned_dirs() {
   resolve_service_user
   mkdir -p "$DATA_DIR/cache" "$PLAYWRIGHT_BROWSERS_PATH" "$NPM_CONFIG_CACHE" "$DATA_DIR/provider-tools/bin" "$DATA_DIR/deploy-candidates" "$RELEASES_DIR" "$LOG_DIR"
-  chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools" "$DATA_DIR/deploy-candidates" "$RELEASES_DIR" "$LOG_DIR"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools" "$DATA_DIR/deploy-candidates" "$LOG_DIR"
+  # Releases are immutable build products.  The builder needs to create entries in
+  # the parent, but a running Web/Runtime process must never own existing releases.
+  chown "$SERVICE_USER:$SERVICE_USER" "$RELEASES_DIR"
 }
 
 valid_release_id() {
@@ -221,19 +225,21 @@ require_git_source_root() {
 
 status_json() {
   ensure_dirs
-  local current previous candidate web runtime last_job db
+  local current previous candidate current_web previous_web candidate_web current_runtime previous_runtime candidate_runtime web runtime last_job db
   current="$(release_target "$CURRENT_LINK")"
   previous="$(release_target "$PREVIOUS_LINK")"
   candidate="$(release_target "$CANDIDATE_LINK")"
+  current_web="$(release_target "$CURRENT_WEB_LINK")"; previous_web="$(release_target "$PREVIOUS_WEB_LINK")"; candidate_web="$(release_target "$CANDIDATE_WEB_LINK")"
+  current_runtime="$(release_target "$CURRENT_RUNTIME_LINK")"; previous_runtime="$(release_target "$PREVIOUS_RUNTIME_LINK")"; candidate_runtime="$(release_target "$CANDIDATE_RUNTIME_LINK")"
   web="$(curl_json "http://127.0.0.1:$WEB_PORT/api/status" 2>/dev/null || echo '{}')"
   runtime="$(runtime_state)"
   last_job="$(latest_job_file)"
   db="${RUNTIME_DB:-$DATA_DIR/agentdeck-runtime.sqlite3}"
-  node - "$current" "$previous" "$candidate" "$web" "$runtime" "$last_job" "$db" "$CURRENT_LINK" "$SOURCE_ROOT" <<'NODE'
+  node - "$current" "$previous" "$candidate" "$current_web" "$previous_web" "$candidate_web" "$current_runtime" "$previous_runtime" "$candidate_runtime" "$web" "$runtime" "$last_job" "$db" "$CURRENT_LINK" "$SOURCE_ROOT" <<'NODE'
 const fs = require('node:fs');
 const cp = require('node:child_process');
 const path = require('node:path');
-const [current, previous, candidate, webRaw, runtimeRaw, lastJobFile, db, currentLink, sourceRoot] = process.argv.slice(2);
+const [current, previous, candidate, currentWeb, previousWeb, candidateWeb, currentRuntime, previousRuntime, candidateRuntime, webRaw, runtimeRaw, lastJobFile, db, currentLink, sourceRoot] = process.argv.slice(2);
 const parse = s => { try { return JSON.parse(s || '{}'); } catch { return {}; } };
 let lastJob = null;
 if (lastJobFile) try { lastJob = JSON.parse(fs.readFileSync(lastJobFile, 'utf8')); } catch {}
@@ -258,6 +264,10 @@ console.log(JSON.stringify({
   currentRelease: current || null,
   previousRelease: previous || null,
   candidateRelease: candidate || null,
+  componentReleases: {
+    web:{current:currentWeb||null,previous:previousWeb||null,candidate:candidateWeb||null},
+    runtime:{current:currentRuntime||null,previous:previousRuntime||null,candidate:candidateRuntime||null},
+  },
   currentSymlink: currentLink,
   gitCommit: currentCommit,
   sourceRoot: currentManifest.sourceRoot || sourceRoot || null,
@@ -289,6 +299,7 @@ const s = JSON.parse(process.argv[2]);
 console.log(`current:  ${s.currentRelease || '-'}`);
 console.log(`previous: ${s.previousRelease || '-'}`);
 console.log(`candidate:${s.candidateRelease || '-'}`);
+for (const name of ['web','runtime']) { const r=s.componentReleases[name]; console.log(`${name} releases: current=${r.current||'-'} previous=${r.previous||'-'} candidate=${r.candidate||'-'}`); }
 console.log(`commit:   ${s.gitCommit || '-'}`);
 console.log(`source:   ${s.sourceRoot || '-'}`);
 if (s.originMainCommit) console.log(`origin:   ${s.originMainCommit}`);
@@ -749,7 +760,7 @@ start_candidate_web() {
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
   sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$candidate_dir/agentdeck.sqlite3"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
-  run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
+  run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
   wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/api/status" 30
 }
 
@@ -774,13 +785,59 @@ switch_component() {
   ln -sfn "releases/$release_id" "$current.tmp"
   mv -Tf "$current.tmp" "$current"
 }
+
+snapshot_deploy_pointers() {
+  local out="$1" link
+  : > "$out"
+  for link in "$CURRENT_WEB_LINK" "$PREVIOUS_WEB_LINK" "$CURRENT_RUNTIME_LINK" "$PREVIOUS_RUNTIME_LINK"; do
+    if [ -L "$link" ]; then printf '%s\t%s\n' "$link" "$(readlink "$link")" >> "$out"; else printf '%s\t\n' "$link" >> "$out"; fi
+  done
+}
+
+restore_deploy_pointers() {
+  local snapshot="$1" link target
+  [ -f "$snapshot" ] || return 0
+  while IFS=$'\t' read -r link target; do
+    case "$link" in "$CONTROL_ROOT"/*) ;; *) die "unsafe pointer snapshot entry: $link" ;; esac
+    if [ -n "${target:-}" ]; then ln -sfn "$target" "$link.tmp"; mv -Tf "$link.tmp" "$link"; else rm -f "$link" "$link.tmp"; fi
+  done < "$snapshot"
+}
+
+release_is_referenced() {
+  local release="$1" link job job_release target
+  release="$(realpath -m "$release")"
+  for link in "$CURRENT_LINK" "$PREVIOUS_LINK" "$CANDIDATE_LINK" "$CURRENT_WEB_LINK" "$PREVIOUS_WEB_LINK" "$CANDIDATE_WEB_LINK" "$CURRENT_RUNTIME_LINK" "$PREVIOUS_RUNTIME_LINK" "$CANDIDATE_RUNTIME_LINK"; do
+    [ -L "$link" ] || continue
+    target="$(realpath -m "$(dirname "$link")/$(readlink "$link")")"
+    [ "$target" = "$release" ] && return 0
+  done
+  for job in "$JOBS_DIR"/*.json; do
+    [ -f "$job" ] || continue
+    read -r job_release < <(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));if(["accepted","running"].includes(j.status)&&j.release)process.stdout.write(j.release)' "$job" 2>/dev/null || true)
+    [ -n "${job_release:-}" ] && [ "$(realpath -m "$RELEASES_DIR/$job_release")" = "$release" ] && return 0
+  done
+  return 1
+}
+
+remove_release_if_unreferenced() {
+  local release="$1"
+  release_is_referenced "$release" && { log "keeping referenced release: $release"; return 0; }
+  safe_rm_tree "$release" "$RELEASES_DIR"
+}
+
+clear_candidate_release_links() {
+  local release="$1" link
+  release="$(realpath -m "$release")"
+  for link in "$CANDIDATE_LINK" "$CANDIDATE_WEB_LINK" "$CANDIDATE_RUNTIME_LINK"; do
+    [ -L "$link" ] || continue
+    [ "$(realpath -m "$(dirname "$link")/$(readlink "$link")")" = "$release" ] && rm -f "$link"
+  done
+}
 rollback_component(){ local component="$1" current previous current_target previous_target; if [ "$component" = web ];then current="$CURRENT_WEB_LINK";previous="$PREVIOUS_WEB_LINK";else current="$CURRENT_RUNTIME_LINK";previous="$PREVIOUS_RUNTIME_LINK";fi; [ -L "$previous" ]||die "previous $component release is not set";previous_target="$(readlink "$previous")";current_target="$(readlink "$current" 2>/dev/null||true)";ln -sfn "$previous_target" "$current.tmp";mv -Tf "$current.tmp" "$current";[ -z "$current_target" ]||{ ln -sfn "$current_target" "$previous.tmp";mv -Tf "$previous.tmp" "$previous";}; }
 
 cleanup_releases() {
   ls -1dt "$RELEASES_DIR"/* 2>/dev/null | tail -n +"$((KEEP_RELEASES + 1))" | while read -r old; do
-    [ "$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)" = "$(readlink -f "$old")" ] && continue
-    [ "$(readlink -f "$PREVIOUS_LINK" 2>/dev/null || true)" = "$(readlink -f "$old")" ] && continue
-    safe_rm_tree "$old" "$RELEASES_DIR"
+    remove_release_if_unreferenced "$old"
   done
 }
 
@@ -867,6 +924,8 @@ worker_deploy() {
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path
+    DEPLOY_POINTER_SNAPSHOT="$STATE_DIR/$job_id.pointers"
+    snapshot_deploy_pointers "$DEPLOY_POINTER_SNAPSHOT"
     make_release
     release_id="$CREATED_RELEASE_ID"
     release_path="$(release_path_for "$release_id")"
@@ -896,13 +955,26 @@ worker_deploy() {
       systemctl restart agentdeck-web.service
       wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45
     fi
+    clear_candidate_release_links "$release_path"
+    rm -f "$DEPLOY_POINTER_SNAPSHOT"
     cleanup_releases
     write_job "$job_id" succeeded "deploy succeeded"
   ) 9>"$LOCK_FILE" || {
     local code=$?
     undrain_runtime
+    if [ -n "${DEPLOY_POINTER_SNAPSHOT:-}" ] && [ -f "$DEPLOY_POINTER_SNAPSHOT" ]; then
+      log "deploy failed; restoring component release pointers"
+      restore_deploy_pointers "$DEPLOY_POINTER_SNAPSHOT"
+      case "$target" in
+        runtime) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || true ;;
+        web) systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || true ;;
+        all) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || true ;;
+      esac
+      rm -f "$DEPLOY_POINTER_SNAPSHOT"
+    fi
     if [ -n "${CREATED_RELEASE_ID:-}" ] && valid_release_id "$CREATED_RELEASE_ID"; then
-      safe_rm_tree "$RELEASES_DIR/$CREATED_RELEASE_ID" "$RELEASES_DIR" || true
+      clear_candidate_release_links "$RELEASES_DIR/$CREATED_RELEASE_ID"
+      remove_release_if_unreferenced "$RELEASES_DIR/$CREATED_RELEASE_ID" || true
     fi
     write_job "$job_id" failed "deploy failed"
     exit "$code"
