@@ -33,6 +33,7 @@ import { claudeAuthLogout, claudeAuthState, claudeAuthStatus } from './claude/cl
 import { claudeProfileEnv, claudeSafeEnvSummary } from './claude/claude-profile-env.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
+import { buildArtifactManifest } from './artifact-manifest.js';
 import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, type AgentProviderId } from './provider-registry.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
@@ -5775,11 +5776,11 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
   if (!baseline) return [];
   const root = realpathSync(projectDir);
   const before = baseline.manifest || {};
-  const after = await artifactManifest(root);
+  const after = await artifactManifest(root,before);
   const saved:any[] = [];
   const changed = Object.values(after).map((f:any) => {
     const old = before[f.relativePath];
-    const operation = !old ? 'created' : (old.size !== f.size || old.contentHash !== f.contentHash ? 'modified' : '');
+    const operation = !old ? 'created' : (old.size !== f.size || old.modifiedAt !== f.modifiedAt || old.contentHash !== f.contentHash ? 'modified' : '');
     return operation ? { ...f, operation } : null;
   }).filter(Boolean).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
   for (const f of changed as any[]) {
@@ -5808,37 +5809,7 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
   }
   return saved;
 }
-async function artifactManifest(root:string) {
-  const out:any[] = [];
-  await walkArtifacts(root, root, out);
-  return Object.fromEntries(out.map(f=>[f.relativePath, f]));
-}
-async function walkArtifacts(root:string, dir:string, out:any[], depth = 0){
-  if (depth > 5 || out.length > 200) return;
-  let entries:any[] = [];
-  try { entries = await readdir(dir, { withFileTypes:true }); } catch { return; }
-  for (const entry of entries) {
-    if (entry.name.startsWith('.') && entry.name !== '.codex') continue;
-    if (entry.isDirectory()) {
-      if (!ARTIFACT_SKIP_DIRS.has(entry.name)) await walkArtifacts(root, path.join(dir, entry.name), out, depth + 1);
-      continue;
-    }
-    if (!entry.isFile()) continue;
-    const filePath = path.join(dir, entry.name);
-    const ext = artifactExt(filePath);
-    const mime = ARTIFACT_TYPES[ext];
-    if (!mime) continue;
-    const relativePath = path.relative(root, filePath);
-    if (artifactPathIsInternal(relativePath)) continue;
-    let st:any;
-    try { st = await stat(filePath); } catch { continue; }
-    if (st.size <= 0 || st.size > 25 * 1024 * 1024) continue;
-    const rp = realpathSync(filePath);
-    if (!rp.startsWith(root + path.sep)) continue;
-    const contentHash = crypto.createHash('sha256').update(await readFile(rp)).digest('hex');
-    out.push({ path:rp, relativePath:path.relative(root, rp), name:path.basename(rp), mime, size:st.size, contentHash, modifiedAt:Math.floor(st.mtimeMs) });
-  }
-}
+async function artifactManifest(root:string,previous?:Record<string,any>){return buildArtifactManifest(root,{types:ARTIFACT_TYPES,skipDirs:ARTIFACT_SKIP_DIRS,isInternal:artifactPathIsInternal,previous});}
 function artifactPathIsInternal(relativePath:string) {
   const parts = String(relativePath || '').split(path.sep).filter(Boolean);
   const base = parts[parts.length - 1] || '';

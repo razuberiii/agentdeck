@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 const server = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const client = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
+const schema = readFileSync(new URL('../server/src/schema-migrations.ts', import.meta.url), 'utf8');
 
 test('canonical user messages do not persist provider attachment prompts', () => {
   assert.match(server, /function saveCanonicalUserMessage/);
@@ -23,15 +24,14 @@ test('legacy internal attachment prompts are hidden from snapshots and UI', () =
 });
 
 test('artifacts are registered from persisted turn baselines', () => {
-  assert.match(server, /CREATE TABLE IF NOT EXISTS artifact_baselines/);
-  assert.match(server, /ALTER TABLE artifacts ADD COLUMN operation TEXT NOT NULL DEFAULT 'created'/);
+  assert.match(schema, /operation:"TEXT NOT NULL DEFAULT 'created'"/);
   assert.match(server, /recordArtifactBaseline/);
   assert.match(server, /scanArtifactsForTurn/);
   assert.match(server, /content_hash/);
   assert.match(server, /relative_path/);
   assert.match(server, /turn_id/);
   assert.match(server, /if \(!anchorItemId \|\| !turnId\) return \[\]/);
-  assert.match(server, /const operation = !old \? 'created' : \(old\.size !== f\.size \|\| old\.contentHash !== f\.contentHash \? 'modified' : ''\)/);
+  assert.match(server, /const operation = !old \? 'created' : \(old\.size !== f\.size \|\| old\.modifiedAt !== f\.modifiedAt \|\| old\.contentHash !== f\.contentHash \? 'modified' : ''\)/);
   assert.match(server, /ON CONFLICT\(session_id, turn_id, relative_path, operation\) DO UPDATE/);
   assert.doesNotMatch(server, /artifactScanStarts/);
 });
@@ -65,7 +65,7 @@ test('artifact ownership excludes internal files and does not scan with missing 
 });
 
 test('session restore reconciles canonical user messages with attachments', () => {
-  assert.match(server, /CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message/);
+  assert.match(schema, /CREATE UNIQUE INDEX IF NOT EXISTS agent_messages_session_client_message/);
   assert.match(server, /ON CONFLICT\(session_id,client_message_id\) WHERE client_message_id IS NOT NULL DO UPDATE/);
   assert.match(server, /canonicalUserMessageItem/);
   assert.match(server, /ensureCanonicalUsersInThreadSnapshot/);
