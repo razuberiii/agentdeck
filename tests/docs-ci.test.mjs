@@ -30,9 +30,8 @@ test('README points users to VPN/private-network deployment and profile docs', (
 
 test('CI runs the required validation commands without systemd install', () => {
   const ci = read('.github/workflows/ci.yml');
-  for (const command of ['npm ci', 'npm run typecheck', 'npm run lint', 'npm test', 'npm run build']) {
+  for (const command of ['npm ci', 'npm run typecheck', 'npm run lint', 'npm test', 'npm run build', 'npm run test:e2e', 'bash -n']) {
     assert.match(ci, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
-  assert.doesNotMatch(ci, /systemctl|install-units|sudo/);
+  assert.doesNotMatch(ci, /systemctl|sudo|(?:^|\s)(?:\.\/)?deploy\/install-units\.sh(?:\s|$)/m);
 });
-
