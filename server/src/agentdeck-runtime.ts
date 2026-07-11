@@ -717,7 +717,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
         await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir));
         await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [accountId, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
       }
-      await appendEvent(session.id, 'user', { input });
+      await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || '') });
       const running = gemini.prompt(session.id, prompt as any[]);
       running.catch(e => app.log.warn({ err:e, sessionId:session.id }, 'gemini prompt failed'));
       return { ok:true, provider:'gemini' };
@@ -738,7 +738,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
     if (!text.trim() && !input.length) return reply.code(400).send({ error:'empty message' });
     const turnId = String(body.turnId || crypto.randomUUID());
     await db.run('UPDATE sessions SET selected_profile_id=?1,executing_profile_id=?1,current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [profile.id, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
-    await appendEvent(session.id, 'user', { input, provider:'claude', profileId:profile.id, profileSwitched });
+    await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || ''), provider:'claude', profileId:profile.id, profileSwitched });
     if (profileSwitched) await appendEvent(session.id, 'system', { provider:'claude', text:'已切换 Claude Code profile；下一轮使用本地历史在新 profile 下继续。', previousProfileId, profileId:profile.id });
     const permissionMode = claudePermissionMode(body.permissionMode || session.permission_mode);
     const task = claudeManager.startTurn({
@@ -790,6 +790,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
   );
   await appendEvent(session.id, 'user', {
     input,
+    clientMessageId:String(body.clientMessageId || ''),
     selectedProfileId:body.executionContext?.selectedProfileId || accountId,
     executingProfileId:accountId,
     upstreamBindingProfileId:accountId,

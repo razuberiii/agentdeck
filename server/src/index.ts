@@ -21,6 +21,7 @@ import { pipeline } from 'node:stream/promises';
 import { Db } from './db.js';
 import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
+import { SessionCommandQueue } from './websocket-command-queue.js';
 import { AntigravityProvider, GeminiProvider } from './providers.js';
 import { ClaudeProvider } from './claude/claude-provider.js';
 import { ClaudeProfileStore } from './claude/claude-profile-store.js';
@@ -91,6 +92,7 @@ const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
 type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; receivedSequence:number; processingSequence:number; committedSequence:number; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
+const sessionCommandQueue=new SessionCommandQueue(Number(process.env.WS_SESSION_COMMAND_QUEUE_MAX||64));
 const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTurnState; assistantId:string; turnId:string }>();
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
@@ -1688,6 +1690,14 @@ app.post('/api/approvals/:requestId', { preHandler: ensureAuth }, async (req:any
   codex.respond(pending.id, approvalResponse(pending.method, decision));
   return {ok:true};
 });
+app.get('/api/sessions/:id/messages/:clientMessageId/status',{preHandler:ensureAuth},async(req:any,reply)=>{
+  const session=await findSession(String(req.params.id));
+  if(!session)return reply.code(404).send({code:'session_not_found'});
+  const sessionId=String(session.codex_thread_id||session.id);
+  const row=await db.get('SELECT status,error,created_at,updated_at FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,String(req.params.clientMessageId)]);
+  if(!row)return reply.code(404).send({code:'message_not_found',clientMessageId:String(req.params.clientMessageId)});
+  return{clientMessageId:String(req.params.clientMessageId),sessionId,status:String(row.status),error:row.error||null,createdAt:Number(row.created_at),updatedAt:Number(row.updated_at)};
+});
 app.get('/api/wireguard/config/:name', { preHandler: ensureAuth }, async (req:any, reply) => {
   const name = String(req.params.name || '');
   if (!/^[A-Za-z0-9_.-]+\.conf$/.test(name)) return reply.code(404).send({error:'not found'});
@@ -1777,16 +1787,18 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
     }
     if (!validateWsMessage(msg)) return wsClose(ws, 1008, 'invalid_message');
     try {
+      const sessionId=String(msg.sessionId);
+      await sessionCommandQueue.run(sessionId,async()=>{
       if (msg.type === 'join') {
-        const sessionId = String(msg.sessionId);
         if (!registerWsSession(ws, sessionId)) return wsClose(ws, 1008, 'too_many_session_connections');
         await joinAndResume(sessionId, ws, Number(msg.lastSequence || 0));
       }
-      if (msg.type === 'send') await sendTurn(String(msg.sessionId), String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct');
+      if (msg.type === 'send') await sendTurn(sessionId, String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct');
       if (msg.type === 'sendChunkStart') startChunkedMessage(msg);
       if (msg.type === 'sendChunk') appendChunkedMessage(msg);
       if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg);
-      if (msg.type === 'stop') await stopTurn(String(msg.sessionId));
+      if (msg.type === 'stop') await stopTurn(sessionId);
+      });
     } catch (e:any) {
       await failPlanningTask(String(msg.sessionId || ''), e?.message || String(e)).catch(()=>{});
       if (ws.readyState === 1) ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable}));
@@ -4650,22 +4662,29 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const row = await findSession(id);
   if(!row) throw new Error('session not found');
   const threadId = String(row.codex_thread_id || row.id);
+  clientMessageId=clientMessageId||crypto.randomUUID();
+  const claimed=await claimMessageReceipt(threadId,clientMessageId);
+  if(!claimed.created){
+    broadcast(threadId,{type:'messageStatus',clientMessageId,status:claimed.status,error:claimed.error||undefined});
+    return;
+  }
   const submission = parsePlanSubmission(text, planMode);
   const originalText = submission.originalText;
   const effectivePlanMode = submission.planMode;
   const providerText = effectivePlanMode === 'plan' ? planOnlyPrompt(originalText) : originalText;
   const planTurnOptions = effectivePlanMode === 'plan' ? { approvalPolicy:'on-request', sandboxMode:'read-only' } : null;
   const planId = effectivePlanMode === 'plan' ? await createPlanTask(threadId, originalText, row) : '';
-  const ack = (status:string, error?:string) => {
-    if (clientMessageId) broadcast(threadId, { type:'messageStatus', clientMessageId, status, error });
+  const ack = async (status:string, error?:string) => {
+    await updateMessageReceipt(threadId,clientMessageId,status,error);
+    broadcast(threadId, { type:'messageStatus', clientMessageId, status, error });
   };
-  ack('received');
+  await ack('received');
   const turnId = clientMessageId || crypto.randomUUID();
   if (planId) await db.run('UPDATE plan_tasks SET execution_turn_id=?1 WHERE plan_id=?2', [turnId, planId]).catch(()=>{});
   activeArtifactTurns.set(threadId, turnId);
   if (normalizeProvider(row.provider_id) === 'antigravity') {
     await sendAntigravityTurn(row, providerText, attachments, turnId, clientMessageId, effectivePlanMode, originalText);
-    ack('accepted');
+    await ack('accepted');
     return;
   }
   if (normalizeProvider(row.provider_id) === 'gemini') {
@@ -4680,16 +4699,16 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
-    ack('persisted');
+    await ack('persisted');
     try {
-      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
-      ack('accepted');
+      await ack('accepted');
     } catch (e:any) {
       const message = e?.message || String(e);
       if (isGeminiAuthenticationErrorMessage(message)) await markGeminiProfileNeedsLogin(String(dto.id), message);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
-      ack('failed', message);
+      await ack('failed', message);
       broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
       throw e;
     }
@@ -4709,15 +4728,15 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
-    ack('persisted');
+    await ack('persisted');
     try {
-      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, permissionMode:effectivePlanMode === 'plan' ? 'plan' : sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, permissionMode:effectivePlanMode === 'plan' ? 'plan' : sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
-      ack('accepted');
+      await ack('accepted');
     } catch (e:any) {
       const message = e?.message || String(e);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
-      ack('failed', message);
+      await ack('failed', message);
       broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
       throw e;
     }
@@ -4728,7 +4747,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
   const continuePreflight = await codexContinueSessionPreflight();
   if (!continuePreflight.ok) {
-    ack('failed', continuePreflight.body.message);
+    await ack('failed', continuePreflight.body.message);
     throw Object.assign(new Error(continuePreflight.body.message), { statusCode:continuePreflight.statusCode, body:continuePreflight.body });
   }
   const activeProfile:any = continuePreflight.profile;
@@ -4753,7 +4772,7 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     activeCodexSessions.add(threadId);
     await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
     broadcast(threadId, userMessage);
-    ack('persisted');
+    await ack('persisted');
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     try {
       app.log.info({
@@ -4768,14 +4787,14 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
         codexHome:execution.runtime.codexHome,
         account:execution.accountSnapshot,
       }, 'codex sendTurn execution profile selected');
-      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || opts.approvalPolicy, sandboxMode:planTurnOptions?.sandboxMode || opts.sandboxMode, model:opts.model });
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || opts.approvalPolicy, sandboxMode:planTurnOptions?.sandboxMode || opts.sandboxMode, model:opts.model });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
-      ack('accepted');
+      await ack('accepted');
     } catch(e:any) {
       const message = e?.message || String(e);
       activeCodexSessions.delete(threadId);
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
-      ack('failed', message);
+      await ack('failed', message);
       broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
       maybeExitAfterDrain();
       throw e;
@@ -4796,17 +4815,27 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
   await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
   broadcast(threadId, userMessage);
-  ack('persisted');
+  await ack('persisted');
   try {
     await codex.startTurn(threadId, input, String(row.project_dir), planTurnOptions ? { ...opts, ...planTurnOptions } : opts);
-    ack('accepted');
+    await ack('accepted');
   } catch(e:any) {
     activeCodexSessions.delete(threadId);
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
-    ack('failed', e?.message || String(e));
+    await ack('failed', e?.message || String(e));
     maybeExitAfterDrain();
     throw e;
   }
+}
+async function claimMessageReceipt(sessionId:string,clientMessageId:string){
+  const now=Date.now();
+  const result=await db.run("INSERT OR IGNORE INTO message_receipts(session_id,client_message_id,status,created_at,updated_at) VALUES (?1,?2,'received',?3,?3)",[sessionId,clientMessageId,now]);
+  if(result.changes)return{created:true,status:'received',error:null};
+  const row=await db.get('SELECT status,error FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,clientMessageId]);
+  return{created:false,status:String(row?.status||'received'),error:row?.error||null};
+}
+async function updateMessageReceipt(sessionId:string,clientMessageId:string,status:string,error?:string){
+  await db.run('UPDATE message_receipts SET status=?1,error=?2,updated_at=?3 WHERE session_id=?4 AND client_message_id=?5',[status,error||null,Date.now(),sessionId,clientMessageId]);
 }
 async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const active = activeAntigravityTurns.get(threadId); if (active) { active.state='interrupted'; try { active.child.kill('SIGTERM'); } catch {} } activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [], turnId:string = crypto.randomUUID(), clientMessageId = '', planMode:'direct'|'plan' = 'direct', originalText = text) {
