@@ -54,3 +54,14 @@ test('websocket connection counts are limited per IP and session', () => {
   assert.match(server, /too_many_session_connections/);
   assert.match(server, /cleanupWsConnection/);
 });
+
+test('websocket transport sends mobile-safe heartbeat pings and cleans them up', () => {
+  const routeStart = server.indexOf("app.get('/ws'");
+  const routeEnd = server.indexOf('app.setNotFoundHandler', routeStart);
+  const route = server.slice(routeStart, routeEnd);
+  assert.match(route, /setInterval\(\(\) =>/);
+  assert.match(route, /ws\.ping\(\)/);
+  assert.match(route, /15_000/);
+  assert.match(route, /clearInterval\(heartbeat\)/);
+  assert.match(route, /websocket closed/);
+});

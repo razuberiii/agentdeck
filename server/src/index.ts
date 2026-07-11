@@ -1774,6 +1774,14 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
   }
   websocketConnectionIps.set(ws, ip);
   app.log.info({ connectionGeneration:ws.agentdeckGeneration }, 'websocket connected');
+  // Mobile carriers and handset proxies commonly reap an otherwise healthy
+  // WebSocket after roughly 30 seconds of silence. Protocol ping frames keep
+  // the transport alive while an agent is thinking without producing events.
+  const heartbeat = setInterval(() => {
+    if (ws.readyState !== 1) return;
+    try { ws.ping(); } catch {}
+  }, 15_000);
+  heartbeat.unref?.();
   ws.on('message', async (raw:Buffer) => {
     if (Buffer.byteLength(raw) > WS_MAX_MESSAGE_BYTES) return wsClose(ws, 1009, 'message_too_large');
     let msg:any;
@@ -1801,7 +1809,11 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
       if (ws.readyState === 1) ws.send(JSON.stringify({type:'error', error:e?.body?.code || e?.code || e.message, code:e?.body?.code || e?.code || null, retryable:!!e?.body?.retryable}));
     }
   });
-  ws.on('close', () => cleanupWsConnection(ws));
+  ws.on('close', (code:number, reason:Buffer) => {
+    clearInterval(heartbeat);
+    app.log.info({ connectionGeneration:ws.agentdeckGeneration, code, reason:String(reason || '') }, 'websocket closed');
+    cleanupWsConnection(ws);
+  });
 });
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
 codex.on('notification', async (msg:any) => {
