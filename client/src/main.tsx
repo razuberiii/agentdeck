@@ -121,6 +121,16 @@ function ToastProvider({children}:{children:React.ReactNode}){
   return <ToastContext.Provider value={push}>{children}<div className="toasts" aria-live="polite">{toasts.map(t=><div className={`toast ${t.kind}`} key={t.id}>{t.text}</div>)}</div></ToastContext.Provider>;
 }
 function useToast(){ return useContext(ToastContext); }
+function useDismissableMenu(selector:string, open:boolean, close:()=>void){
+  useEffect(()=>{
+    if(!open) return;
+    const onPointerDown=(event:PointerEvent)=>{ if(!(event.target as Element)?.closest?.(selector)) close(); };
+    const onKeyDown=(event:KeyboardEvent)=>{ if(event.key==='Escape') close(); };
+    document.addEventListener('pointerdown',onPointerDown,true);
+    document.addEventListener('keydown',onKeyDown);
+    return()=>{document.removeEventListener('pointerdown',onPointerDown,true);document.removeEventListener('keydown',onKeyDown);};
+  },[open,selector,close]);
+}
 
 type IconName='pulse'|'settings'|'quota'|'refresh'|'spark'|'folder'|'search'|'archive'|'arrow'|'stop'|'attach'|'send'|'more'|'back';
 function Icon({name,size=18}:{name:IconName;size?:number}){
@@ -205,6 +215,7 @@ function Home(){
   const [dashboard,setDashboard]=useState<Dashboard|null>(null); const [commandOpen,setCommandOpen]=useState(false);
   const [taskText,setTaskText]=useState('');
   const [launchAttachMenu,setLaunchAttachMenu]=useState(false);
+  useDismissableMenu('.launchAttachControl',launchAttachMenu,()=>setLaunchAttachMenu(false));
   const [launchFiles,setLaunchFiles]=useState<{id:string;file:File;previewUrl?:string;error?:string}[]>([]);const launchFilesRef=useRef(launchFiles);launchFilesRef.current=launchFiles;const launchImageRef=useRef<HTMLInputElement|null>(null);const launchFileRef=useRef<HTMLInputElement|null>(null);
   const [launchMode,setLaunchMode]=useState<'direct'|'plan'>('direct');
   const [workspaceOverride,setWorkspaceOverride]=useState('');
@@ -321,6 +332,7 @@ function SessionView({id}:{id:string}){
   const [loading,setLoading]=useState(true);
   const [text,setText]=useState(''); const [attachments,setAttachments]=useState<Attachment[]>([]); const [status,setStatus]=useState<Status|null>(null);
   const [busy,setBusy]=useState(''); const [online,setOnline]=useState(navigator.onLine); const [browserConnection,setBrowserConnection]=useState<'connected'|'reconnecting'|'offline'>(navigator.onLine?'reconnecting':'offline'); const [runtimeConnection,setRuntimeConnection]=useState<RuntimeConnection>('checking'); const [turnStatus,setTurnStatus]=useState<TurnUiStatus>('unknown'); const [diff,setDiff]=useState(''); const [menu,setMenu]=useState(false); const [attachMenu,setAttachMenu]=useState(false); const [modelOpen,setModelOpen]=useState(false); const [models,setModels]=useState<any>(null); const [modelsProvider,setModelsProvider]=useState<string>(''); const [confirmDelete,setConfirmDelete]=useState(false); const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [viewer,setViewer]=useState<Attachment|null>(null); const [showBottom,setShowBottom]=useState(false); const [drag,setDrag]=useState(false); const [approvals,setApprovals]=useState<ApprovalRequest[]>([]); const [plans,setPlans]=useState<PlanRequest[]>([]); const [sendMode,setSendMode]=useState<'direct'|'plan'>('direct');
+  useDismissableMenu('.attachControl',attachMenu,()=>setAttachMenu(false));
   const [menuPage,setMenuPage]=useState<'main'|'mode'|'manage'>('main');
   const outboxTimerRef=useRef<number|null>(null);
   const wsRef=useRef<WebSocket|null>(null); const reconnectRef=useRef<number|null>(null); const outboxSchedulerRef=useRef<OutboxRetryScheduler|null>(null); const outboxSendingRef=useRef<Set<string>>(new Set()); const joinTimeoutRef=useRef<number|null>(null); const terminalSyncRef=useRef<number|null>(null); const mountedRef=useRef(false); const hydratedRef=useRef(false); const sessionGenerationRef=useRef(0); const connectionGenerationRef=useRef(0); const shellRef=useRef<HTMLElement|null>(null); const composerRef=useRef<HTMLElement|null>(null); const feedRef=useRef<HTMLElement|null>(null); const textareaRef=useRef<HTMLTextAreaElement|null>(null); const imageFileRef=useRef<HTMLInputElement|null>(null); const fileRef=useRef<HTMLInputElement|null>(null); const nearBottomRef=useRef(true); const clientAppliedSequenceRef=useRef(0); const snapshotCoveredSequenceRef=useRef(0); const joinSentAtRef=useRef(0); const pendingMessagesRef=useRef<Map<string,{text:string;attachments:Attachment[]}>>(new Map()); const runtimeGenerationRef=useRef(''); const recoveryEpochRef=useRef(0); const runtimeRecoveryRef=useRef<{epoch:number;joinRequestId:string;targetGeneration:string;cursor:number;connectionGeneration:number;promise:Promise<void>;resolve:()=>void;timer:number}|null>(null); const runtimeRecoveryNeededRef=useRef(false); const joinedOnceRef=useRef(false);
