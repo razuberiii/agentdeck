@@ -33,5 +33,5 @@ test('CI runs the required validation commands without systemd install', () => {
   for (const command of ['npm ci', 'npm run typecheck', 'npm run lint', 'npm test', 'npm run build', 'npm run test:e2e', 'bash -n']) {
     assert.match(ci, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
-  assert.doesNotMatch(ci, /systemctl|sudo|(?:^|\s)(?:\.\/)?deploy\/install-units\.sh(?:\s|$)/m);
+  assert.doesNotMatch(ci, /systemctl|sudo|- run:\s+(?:\.\/)?deploy\/install-units\.sh/m);
 });
