@@ -600,6 +600,7 @@ function PlanReviewCard({req,busy,onAnswer}:{req:PlanRequest;busy:boolean;onAnsw
   const cancel=req.options.find(o=>o.id==='cancel');
   return <article className="approvalCard planReviewCard" role="group" aria-label="计划审核">
     <div className="reviewIndex">PLAN / 01</div><div className="approvalHead"><b>{req.title || '路线已经画好'}</b><span>确认后才会修改工作区。你也可以先补充约束。</span></div>
+    {!!String(req.body||'').trim()&&<div className="planBody"><Markdown text={String(req.body)}/></div>}
     {editing&&<div className="planRevision"><textarea autoFocus className="planNote" rows={3} value={note} onChange={e=>setNote(e.target.value)} placeholder="哪里需要换条路？"/><div><button disabled={busy||!note.trim()} onClick={()=>onAnswer(req,'revise',note)}>提交调整</button><button disabled={busy} onClick={()=>setEditing(false)}>收起</button></div></div>}
     <div className="planSecondary"><button disabled={busy} onClick={()=>setEditing(value=>!value)}>调整计划</button>{regenerate&&<button disabled={busy} onClick={()=>onAnswer(req,regenerate.id,note)}>{regenerate.label}</button>}{cancel&&<button className="dangerText" disabled={busy} onClick={()=>onAnswer(req,cancel.id,note)}>{cancel.label}</button>}</div>
     {primary&&<button className="planApprove" disabled={busy} onClick={()=>onAnswer(req,primary.id,note)}><span>{busy?'正在接棒':'开始实现'}</span><Icon name="arrow" size={18}/></button>}
@@ -1145,7 +1146,7 @@ function ConfirmDialog({title,detail,confirm,cancel='取消',busy=false,error=''
 function EmptyState({title,detail}:{title:string;detail:string}){ return <div className="empty"><b>{title}</b><span>{detail}</span></div>; }
 function LoadingRows({count=4}:{count?:number}){ return <div className="loadingRows" aria-label="正在加载">{Array.from({length:count}).map((_,i)=><div className="skeletonRow" key={i}><i/><span/><small/></div>)}</div>; }
 function ErrorState({title,detail,action,onAction}:{title:string;detail:string;action:string;onAction:()=>void}){ return <div className="errorState"><b>{title}</b><span>{detail}</span><button onClick={onAction}>{action}</button></div>; }
-function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){ return <div className={`notice ${tone}`}>{text}</div>; }
+function InlineNotice({tone,text}:{tone:'error'|'info';text:string}){return <div className={`notice ${tone}`} role="status"><i aria-hidden="true"/><span><small>{tone==='error'?'ATTENTION':'SYSTEM'}</small><b>{text}</b></span></div>;}
 
 createRoot(document.getElementById('root')!).render(<ToastProvider><App/></ToastProvider>);
 if('serviceWorker' in navigator) {

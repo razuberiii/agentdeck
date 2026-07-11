@@ -794,7 +794,7 @@ start_candidate_web() {
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
   sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$candidate_dir/agentdeck.sqlite3"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
-  run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
+  run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" ADMIN_PASSWORD=agentdeck-candidate-smoke-only SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
   wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/internal/deep-health" 30
   curl -fsS "http://127.0.0.1:$WEB_CANDIDATE_PORT/internal/deep-health" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s),web=process.argv[1],runtime=process.argv[2];if(!j.ok||!j.sqlite||!j.runtimeConnected||!j.compatible||j.releaseId!==web||j.runtimeReleaseId!==runtime||j.runtimeMode!=="candidate")process.exit(1);})' "$(basename "$release_path")" "$expected_runtime_release"
 }

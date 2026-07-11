@@ -1895,7 +1895,7 @@ function maybeExitAfterDrain() {
 async function ensureAdmin() {
   const pw = process.env.ADMIN_PASSWORD;
   if (!pw) throw new Error('ADMIN_PASSWORD must be set');
-  if (pw === 'change-me-at-least-12-chars' || pw === 'change-me' || pw.length < 12) throw new Error('ADMIN_PASSWORD must be changed and contain at least 12 characters');
+  if (pw === 'change-me-at-least-12-chars' || pw === 'change-me' || pw.length < 8) throw new Error('ADMIN_PASSWORD must be changed and contain at least 8 characters');
   const secret = process.env.COOKIE_SECRET || '';
   if (!secret || secret === 'change-me-random-32-bytes' || secret === 'change-me' || secret.length < 32) throw new Error('COOKIE_SECRET must be changed and contain at least 32 characters');
   if (!cookieIsSecure()) {
@@ -4691,6 +4691,14 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   const turnId = clientMessageId || crypto.randomUUID();
   if (planId) await db.run('UPDATE plan_tasks SET execution_turn_id=?1 WHERE plan_id=?2', [turnId, planId]).catch(()=>{});
   activeArtifactTurns.set(threadId, turnId);
+  const generatedTitle=autoTitle(originalText,String(row.project_dir),String(row.title||''));
+  if(generatedTitle){
+    if(USE_AGENT_RUNTIME)await runtime.setSessionTitle(threadId,generatedTitle).catch(()=>{});
+    else if(normalizeProvider(row.provider_id)==='codex')await codex.setName(threadId,generatedTitle).catch(()=>{});
+    await db.run('UPDATE sessions SET title=?1,updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[generatedTitle,Date.now(),threadId]);
+    row.title=generatedTitle;
+    broadcast(threadId,{type:'sessionTitle',title:generatedTitle});
+  }
   if (normalizeProvider(row.provider_id) === 'antigravity') {
     await sendAntigravityTurn(row, providerText, attachments, turnId, clientMessageId, effectivePlanMode, originalText);
     await ack('accepted');
@@ -4752,7 +4760,6 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     return;
   }
   const input = await buildTurnInput(threadId, providerText, attachments);
-  const title = autoTitle(originalText, String(row.project_dir), String(row.title || ''));
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
   const continuePreflight = await codexContinueSessionPreflight();
   if (!continuePreflight.ok) {
@@ -4766,11 +4773,6 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
   if (USE_AGENT_RUNTIME) {
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
-    if (title) {
-      await runtime.setSessionTitle(threadId, title).catch(()=>{});
-      await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]);
-      broadcast(threadId,{type:'sessionTitle', title});
-    }
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(async () => {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]);
     });
@@ -4811,11 +4813,6 @@ async function sendTurn(id:string, text:string, attachments:any[] = [], clientMe
     return;
   }
   await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null);
-  if (title) {
-    await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[title,Date.now(),threadId]);
-    await codex.setName(threadId, title).catch(()=>{});
-    broadcast(threadId,{type:'sessionTitle', title});
-  }
   await db.run(
     'UPDATE sessions SET status=?1,selected_profile_id=?2,executing_profile_id=?2,last_execution_account_id=?2,account_snapshot_json=?3,updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',
     [effectivePlanMode === 'plan' ? 'planning' : 'running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
@@ -5269,7 +5266,7 @@ function latestAgentItemIdFromThread(thread:any){
 }
 
 function cleanTitle(value:any, cwd:string){ const raw = String(value || '').split(/\r?\n/)[0].trim(); return (raw ? raw.slice(0, 120) : path.basename(cwd)); }
-function autoTitle(text:string, cwd:string, current:string){ const base = path.basename(cwd); const generic = new Set([base, 'Default Workspace', 'default-workspace', 'Session']); if (!generic.has(current.trim())) return null; const raw = text.split(/\r?\n/).map(s=>s.trim()).find(Boolean) || ''; const cleaned = raw.replace(/\s+/g, ' ').replace(/^#+\s*/, '').trim(); if (!cleaned) return null; return cleaned.slice(0, 42); }
+function autoTitle(text:string,cwd:string,current:string){const base=path.basename(cwd).trim().toLocaleLowerCase();const value=current.trim().toLocaleLowerCase();const generic=new Set([base,'default workspace','default-workspace','session','new task','new-task','untitled','新任务']);if(!generic.has(value))return null;const raw=text.split(/\r?\n/).map(s=>s.trim()).find(Boolean)||'';const cleaned=raw.replace(/\s+/g,' ').replace(/^#+\s*/,'').trim();if(!cleaned)return null;return cleaned.slice(0,42);}
 function startChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const sessionId = String(msg.sessionId || ''); if (!id || !sessionId) throw new Error('bad chunked message'); chunkedMessages.set(id, { sessionId, clientMessageId:String(msg.clientMessageId || id), chunks: [], size: 0, createdAt: Date.now() }); cleanupChunkedMessages(); }
 function appendChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); const chunk = String(msg.chunk || ''); state.size += Buffer.byteLength(chunk); if (state.size > 25 * 1024 * 1024) { chunkedMessages.delete(id); throw new Error('message too large'); } state.chunks.push(chunk); }
 async function finishChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); chunkedMessages.delete(id); const payload = JSON.parse(state.chunks.join('')); await sendTurn(state.sessionId, String(payload.text || ''), Array.isArray(payload.attachments) ? payload.attachments : [], state.clientMessageId, payload.planMode === 'plan' ? 'plan' : 'direct'); }

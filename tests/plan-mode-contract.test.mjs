@@ -53,6 +53,8 @@ test('mobile UI exposes plan mode and a lightweight plan review card', () => {
   assert.match(client, /sessionSendModeKey/);
   assert.match(client, /pendingTaskModeKey/);
   assert.match(client, /PlanReviewCard/);
+  assert.match(client, /className="planBody"/);
+  assert.match(client, /Markdown text=\{String\(req\.body\)\}/);
   assert.match(client, /计划已生成，等待确认/);
   assert.match(client, /answerPlan/);
   assert.doesNotMatch(client, /先给计划/);
