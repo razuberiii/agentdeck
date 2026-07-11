@@ -40,7 +40,12 @@ export class EventSubscriptions {
       // The subscriber is visible to publish() before the durable barrier is read.
       // Events committed during this await are buffered and reconciled below.
       const highWatermark = await latestSequence();
-      let replayCursor=after;
+      // `after` belongs to the caller's view of the database.  A restored or
+      // replaced Runtime database can legitimately have a lower watermark.
+      // Never seed delivery ordering from a cursor the Runtime cannot prove.
+      const effectiveAfter=Math.min(Math.max(0,after),highWatermark);
+      subscriber.lastDeliveredSequence=effectiveAfter;
+      let replayCursor=effectiveAfter;
       let pages=0,eventsSeen=0;
       while(replayCursor<highWatermark){
         if(++pages>1000 || eventsSeen>100_000) return this.disconnect(subscriber,'subscriber replay limit exceeded');
@@ -66,7 +71,7 @@ export class EventSubscriptions {
         if(isClosed()) return;
         // publish() cannot interleave with this synchronous take-and-clear. Once
         // state becomes live, later events are chained instead of buffered.
-        if(!subscriber.buffer.length){subscriber.state='live'; await this.writeControl(subscriber,'stream_ready',{type:'stream_ready',sessionId,runtimeGeneration:generation,replayFrom:after,caughtUpThrough:cursor,currentLatestSequence:cursor});break;}
+        if(!subscriber.buffer.length){subscriber.state='live'; await this.writeControl(subscriber,'stream_ready',{type:'stream_ready',sessionId,runtimeGeneration:generation,requestedAfter:after,replayFrom:effectiveAfter,cursorRebased:effectiveAfter!==after,caughtUpThrough:cursor,currentLatestSequence:cursor});break;}
         const batch=subscriber.buffer;
         subscriber.buffer=[];
         this.pendingBufferCount=Math.max(0,this.pendingBufferCount-batch.length);

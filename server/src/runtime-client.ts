@@ -44,7 +44,7 @@ export class RuntimeClient {
   events(id:string, after = 0, includeDeltas = false) { return this.request('GET', `/sessions/${encodeURIComponent(id)}/events?after=${encodeURIComponent(String(after))}${includeDeltas ? '&includeDeltas=1' : ''}`); }
   startTurn(id:string, body:any) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/turns`, body); }
   stopTurn(id:string) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/stop`); }
-  subscribe(id:string, after:number, onEvent:(event:any)=>void|Promise<void>, onStatus?:(status:'transport_connected'|'stream_ready'|'closed'|'error', error?:any)=>void) {
+  subscribe(id:string, after:number, onEvent:(event:any)=>void|Promise<void>, onStatus?:(status:'transport_connected'|'stream_ready'|'closed'|'error', error?:any)=>void|Promise<void>) {
     const url = new URL(`/sessions/${encodeURIComponent(id)}/subscribe?after=${encodeURIComponent(String(after))}`, this.baseUrl);
     const req = http.request(url, { method:'GET', headers:{ accept:'text/event-stream', ...this.authHeaders() } });
     let buffer = '';
@@ -79,7 +79,7 @@ export class RuntimeClient {
           if (data) {
             try {
               const parsed=JSON.parse(data);
-              if(parsed?.type==='stream_ready') eventQueue=eventQueue.then(()=>onStatus?.('stream_ready',parsed));
+              if(parsed?.type==='stream_ready') eventQueue=eventQueue.then(()=>onStatus?.('stream_ready',parsed)).catch(fail);
               else {
                 const event = RuntimeEventEnvelopeSchema.parse(parsed);
                 eventQueue = eventQueue.then(()=>onEvent(event)).catch(fail);

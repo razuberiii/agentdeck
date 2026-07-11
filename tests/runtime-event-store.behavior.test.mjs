@@ -94,3 +94,14 @@ test('second replay page failure sends no stream_ready and live gap closes subsc
     const live=new Raw(),b=new EventSubscriptions();await b.subscribe('s',live,0,async()=>0,async()=>({events:[],nextSequence:0,hasMore:false}));b.publish(event(2));await b.drain();assert.equal(live.destroyed,true);
   `]);
 });
+
+test('subscriber rebases an after cursor beyond Runtime latest and delivers the next live event',()=>{
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import assert from'node:assert/strict';import{EventEmitter}from'node:events';import{EventSubscriptions}from ${JSON.stringify(new URL('../server/dist/event-subscriptions.js',import.meta.url).href)};
+    class Raw extends EventEmitter{destroyed=false;output='';write(x){this.output+=x;return true;}destroy(){this.destroyed=true;this.emit('close');}off(...a){return super.off(...a);}}
+    const warnings=[],raw=new Raw(),subscriptions=new EventSubscriptions({logger:(_level,data)=>warnings.push(data)}),event=n=>({session_id:'old-session',threadId:'old-session',generation:'runtime-restored',sequence:n,event_type:'x',payload_json:'{}',created_at:n});
+    await subscriptions.subscribe('old-session',raw,200,async()=>150,async()=>({events:[],nextSequence:150,hasMore:false}),'runtime-restored');
+    assert.match(raw.output,/event: stream_ready/);assert.match(raw.output,/"requestedAfter":200/);assert.match(raw.output,/"replayFrom":150/);assert.match(raw.output,/"cursorRebased":true/);
+    subscriptions.publish(event(151));await subscriptions.drain();assert.match(raw.output,/"sequence":151/);assert.equal(raw.destroyed,false);assert.equal(warnings.some(item=>item?.reason?.includes('sequence gap')),false);
+  `]);
+});

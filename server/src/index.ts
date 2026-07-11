@@ -4684,7 +4684,7 @@ function ensureRuntimePushSubscription(threadId:string) {
       queueMicrotask(()=>state.close());
       throw error;
     }
-  }, (status, error) => {
+  }, async (status, error) => {
     if (status === 'transport_connected') {
       const connectedGeneration=String(error?.generation||'');
       if(connectedGeneration)state.generation=connectedGeneration;
@@ -4695,6 +4695,16 @@ function ensureRuntimePushSubscription(threadId:string) {
     if (status === 'stream_ready') {
       const connectedGeneration=String(error?.runtimeGeneration||error?.generation||'');
       if(connectedGeneration)state.generation=connectedGeneration;
+      const authoritativeSequence=Math.max(0,Number(error?.caughtUpThrough ?? error?.currentLatestSequence ?? state.committedSequence));
+      if(authoritativeSequence!==state.committedSequence){
+        await db.run('INSERT INTO runtime_ingestion_cursors (session_id,committed_sequence,runtime_generation,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET committed_sequence=excluded.committed_sequence,runtime_generation=excluded.runtime_generation,updated_at=excluded.updated_at',[threadId,authoritativeSequence,state.generation||null,Date.now()]);
+        state.receivedSequence=authoritativeSequence;
+        state.committedSequence=authoritativeSequence;
+        state.lastSequence=authoritativeSequence;
+        persistedIngestionCursors.set(threadId,authoritativeSequence);
+        browserDelivery.releaseSession(threadId);
+        app.log.warn({sessionId:threadId,requestedAfter:error?.requestedAfter,replayFrom:error?.replayFrom,authoritativeSequence,runtimeGeneration:state.generation||null},'runtime ingestion cursor rebased to authoritative watermark');
+      }
       state.connecting=false; state.connected=true; state.lastStatus='connected';
       state.lastError = undefined;
       app.log.info({ sessionId:threadId, threadId, subscriberCount:clients.get(threadId)?.size || 0 }, 'runtime subscription restored');
