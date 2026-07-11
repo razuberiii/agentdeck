@@ -6,10 +6,11 @@ const indexSource = readFileSync(new URL('../server/src/index.ts', import.meta.u
 const runtimeSource = readFileSync(new URL('../server/src/acp/gemini-runtime.ts', import.meta.url), 'utf8');
 const agentRuntimeSource = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
+const schemaSource = readFileSync(new URL('../server/src/schema-migrations.ts', import.meta.url), 'utf8');
 
 test('Gemini profiles store model defaults independently from global settings', () => {
-  assert.match(indexSource, /ALTER TABLE gemini_profiles ADD COLUMN default_model_mode/);
-  assert.match(indexSource, /ALTER TABLE gemini_profiles ADD COLUMN default_model TEXT/);
+  assert.match(schemaSource, /default_model_mode:"TEXT NOT NULL DEFAULT 'auto'"/);
+  assert.match(schemaSource, /default_model:'TEXT'/);
   assert.match(indexSource, /setActiveGeminiDefaultModel/);
   assert.match(indexSource, /UPDATE gemini_profiles SET default_model_mode=\?1, default_model=\?2/);
   assert.doesNotMatch(indexSource, /modelProvider === 'gemini' \? 'defaultModelGemini'/);

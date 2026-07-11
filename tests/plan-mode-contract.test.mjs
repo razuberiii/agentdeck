@@ -13,7 +13,7 @@ test('plan mode sends a provider-agnostic plan-only prompt without storing it as
   assert.match(web, /\$plan/);
   assert.match(web, /AgentDeck Plan Mode is active/);
   assert.match(web, /Inspect the repository and reason about the task/);
-  assert.match(web, /CREATE TABLE IF NOT EXISTS plan_tasks/);
+  assert.match(web, /await migrateWebSchema\(db\)/);
   assert.match(db, /CREATE TABLE IF NOT EXISTS plan_tasks/);
   assert.match(web, /parsePlanSubmission/);
   assert.match(web, /saveCanonicalUserMessage\(threadId, originalText/);
