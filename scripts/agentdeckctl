@@ -598,9 +598,14 @@ NODE
 }
 
 backup_manifest() {
-  local file="$1" include_secrets="$2" root="$3" checksums="$root/checksums.tsv"
+  local file="$1" include_secrets="$2" root="$3" checksums
+  checksums="$root/checksums.tsv"
   : > "$checksums"
-  while IFS= read -r -d '' entry; do rel="${entry#$root/}"; printf '%s\t%s\t%s\n' "$rel" "$(stat -c %s "$entry")" "$(sha256sum "$entry" | cut -d' ' -f1)" >> "$checksums"; done < <(find "$root" -type f ! -name manifest.json ! -name checksums.tsv -print0 | sort -z)
+  while IFS= read -r -d '' entry; do
+    rel="${entry#$root/}"; mode="$(stat -c %a "$entry")"
+    if [ -d "$entry" ]; then printf '%s\tdirectory\t%s\t0\t-\n' "$rel" "$mode" >> "$checksums"
+    else printf '%s\tfile\t%s\t%s\t%s\n' "$rel" "$mode" "$(stat -c %s "$entry")" "$(sha256sum "$entry" | cut -d' ' -f1)" >> "$checksums"; fi
+  done < <(find "$root" -mindepth 1 ! -name manifest.json ! -name checksums.tsv -print0 | sort -z)
   node - "$file" "$SOURCE_ROOT" "$DATA_DIR" "$include_secrets" "${AGENTDECK_INSTALL_PROFILE:-personal}" "$checksums" <<'NODE'
 const fs = require('node:fs');
 const cp = require('node:child_process');
@@ -615,7 +620,7 @@ fs.writeFileSync(file, JSON.stringify({
   profile:profile || 'personal',
   data_dir:dataDir,
   included_secrets:includeSecrets === '1',
-  files:fs.readFileSync(checksums,'utf8').trim().split(/\n/).filter(Boolean).map(line=>{const [path,size,sha256]=line.split('\t');return{path,size:Number(size),sha256};}),
+  entries:fs.readFileSync(checksums,'utf8').trim().split(/\n/).filter(Boolean).map(line=>{const [path,type,mode,size,sha256]=line.split('\t');return{path,type,mode,size:Number(size),...(type==='file'?{sha256}:{})};}),
 }, null, 2) + '\n');
 NODE
   rm -f "$checksums"
@@ -669,7 +674,7 @@ run_backup() {
   fi
   sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$tmp/data/agentdeck.sqlite3"
   sqlite_file_backup "${RUNTIME_DB:-$DATA_DIR/agentdeck-runtime.sqlite3}" "$tmp/data/agentdeck-runtime.sqlite3"
-  for rel in attachments artifacts shared/generated_images; do
+  for rel in attachments artifacts shared/generated_images provider-tools; do
     copy_backup_dir_if_present "$rel" "$tmp"
   done
   if [ "$include_secrets" = "1" ]; then
@@ -677,8 +682,8 @@ run_backup() {
       copy_backup_dir_if_present "$rel" "$tmp"
     done
   fi
-  backup_manifest "$tmp/manifest.json" "$include_secrets" "$tmp"
   redacted_env_summary "$tmp/redacted-env-summary.json"
+  backup_manifest "$tmp/manifest.json" "$include_secrets" "$tmp"
   tar -C "$tmp" --zstd -cf "$archive" .
   tar --zstd -tf "$archive" >/dev/null
   [ "$include_secrets" = "1" ] && chmod 0600 "$archive" || chmod 0640 "$archive"
@@ -705,7 +710,9 @@ run_restore() {
   [ -f "$tmp/manifest.json" ] || { rm -rf "$tmp"; die "backup manifest.json is missing"; }
   node - "$tmp/manifest.json" "$tmp" <<'NODE'
 const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');const [manifestFile,root]=process.argv.slice(2);const manifest=JSON.parse(fs.readFileSync(manifestFile));
-for(const file of manifest.files||[]){if(path.isAbsolute(file.path)||file.path.split(path.sep).includes('..'))throw new Error('unsafe manifest path');const target=path.join(root,file.path);const data=fs.readFileSync(target);if(data.length!==file.size||crypto.createHash('sha256').update(data).digest('hex')!==file.sha256)throw new Error(`backup checksum mismatch: ${file.path}`);}
+const declared=new Set(['manifest.json']);
+for(const entry of manifest.entries||[]){if(path.isAbsolute(entry.path)||entry.path.split(/[\\/]/).includes('..'))throw new Error('unsafe manifest path');declared.add(entry.path);const target=path.join(root,entry.path);const st=fs.lstatSync(target);if(entry.type==='directory'){if(!st.isDirectory())throw new Error(`backup type mismatch: ${entry.path}`);}else{if(!st.isFile())throw new Error(`backup type mismatch: ${entry.path}`);const data=fs.readFileSync(target);if(data.length!==entry.size||crypto.createHash('sha256').update(data).digest('hex')!==entry.sha256)throw new Error(`backup checksum mismatch: ${entry.path}`);}if((st.mode&0o777).toString(8)!==String(entry.mode).replace(/^0+/,''))throw new Error(`backup mode mismatch: ${entry.path}`);}
+function walk(dir){for(const name of fs.readdirSync(dir)){const full=path.join(dir,name),rel=path.relative(root,full).split(path.sep).join('/');if(!declared.has(rel))throw new Error(`undeclared backup entry: ${rel}`);if(fs.lstatSync(full).isDirectory())walk(full);}}walk(root);
 NODE
   for database in "$tmp/data/agentdeck.sqlite3" "$tmp/data/agentdeck-runtime.sqlite3"; do [ ! -f "$database" ] || node - "$database" <<'NODE'
 const Database=require('better-sqlite3');const db=new Database(process.argv[2],{readonly:true,fileMustExist:true});const result=db.pragma('integrity_check');db.close();if(result.length!==1||result[0].integrity_check!=='ok')throw new Error('sqlite integrity_check failed');
@@ -723,6 +730,7 @@ console.log(m.included_secrets ? '1' : '0');
 NODE
 )"
   if [ "$dry_run" = "1" ]; then
+    if [ "$included_secrets" = "1" ]; then echo "Secrets policy: replace all managed secret paths from the archive."; else echo "Secrets policy: preserve existing profiles, provider account stores, and shared/sessions; restore no secrets from this archive."; fi
     rm -rf "$tmp"
     return 0
   fi
@@ -734,20 +742,25 @@ NODE
   echo "WARNING: restoring will overwrite AgentDeck data in $DATA_DIR." >&2
   [ "$force" = "1" ] || { rm -rf "$tmp"; die "restore requires --force"; }
   resolve_service_user
-  staging="$tmp/restore-root"; mkdir -p "$staging"; cp -a "$DATA_DIR/." "$staging/"; cp -a "$tmp/data/." "$staging/"
+  staging="$tmp/restore-root"; mkdir -p "$staging"
+  if [ "$included_secrets" != "1" ] && [ -d "$DATA_DIR" ]; then
+    for rel in profiles claude/profiles gemini/profiles antigravity-profiles shared/sessions; do
+      if [ -e "$DATA_DIR/$rel" ]; then mkdir -p "$staging/$(dirname "$rel")"; cp -a "$DATA_DIR/$rel" "$staging/$rel"; fi
+    done
+  fi
+  cp -a "$tmp/data/." "$staging/"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$staging"
-  find "$staging" -type d -exec chmod 0750 {} +; find "$staging" -type f -exec chmod 0640 {} +
   rollback_root="${DATA_DIR}.rollback-$(date -u +%Y%m%d-%H%M%S)"
   drain_runtime
   wait_drain 0
   systemctl stop agentdeck-web.service agentdeck-runtime.service
-  mv "$DATA_DIR" "$rollback_root"
+  if [ -e "$DATA_DIR" ]; then mv "$DATA_DIR" "$rollback_root"; else mkdir -p "$(dirname "$DATA_DIR")"; rollback_root=""; fi
   if mv "$staging" "$DATA_DIR" && systemctl start agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl start agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45; then
-    echo "Restore complete. Rollback snapshot: $rollback_root"
+    echo "Restore complete. Rollback snapshot: ${rollback_root:-none (target was empty)}"
   else
     systemctl stop agentdeck-web.service agentdeck-runtime.service || true
     rm -rf "$DATA_DIR"
-    mv "$rollback_root" "$DATA_DIR"
+    [ -z "$rollback_root" ] || mv "$rollback_root" "$DATA_DIR"
     systemctl start agentdeck-runtime.service agentdeck-web.service || true
     die "restore health check failed; original data restored"
   fi
