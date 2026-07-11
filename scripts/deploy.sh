@@ -52,6 +52,7 @@ for (const file of files) {
   if (/^(docs|tests|README|.*\.md$)/.test(file)) continue;
   if (/^(client|public)\//.test(file)) components.add('web');
   else if (/^(server|deploy|scripts)\//.test(file)) { components.add('web'); components.add('runtime'); }
+  else { components.add('web'); components.add('runtime'); }
 }
 console.log(components.size ? [...components].join(',') : 'none');
 NODE

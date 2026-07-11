@@ -39,7 +39,8 @@ test('agentdeckctl deploy all does not install systemd units during cutover', ()
   assert.match(workerDeploy, /make_release/);
   assert.match(workerDeploy, /start_candidate_web/);
   assert.match(workerDeploy, /drain_runtime/);
-  assert.match(workerDeploy, /switch_current "\$release_id"/);
+  assert.match(workerDeploy, /switch_component runtime "\$release_id"/);
+  assert.match(workerDeploy, /switch_component web "\$release_id"/);
   assert.match(workerDeploy, /systemctl restart agentdeck-runtime\.service/);
   assert.match(workerDeploy, /systemctl restart agentdeck-web\.service/);
   assert.match(workerDeploy, /check_systemd_units "\$release_path" warn \|\| true/);
@@ -143,7 +144,8 @@ test('install-units renders default ubuntu user and paths into final units', () 
       assert.match(unit, new RegExp(`^EnvironmentFile=${rendered.envDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`, 'm'));
       assert.doesNotMatch(unit, /@AGENTDECK_/);
     }
-    assert.match(web, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current$/m);
+    assert.match(web, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current-web$/m);
+    assert.match(runtime, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current-runtime$/m);
     assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
     assert.match(runtime, /^Environment=CODEX_BIN=\/home\/ubuntu\/\.local\/bin\/codex$/m);
     assert.match(web, /^Environment=PATH=.*\/home\/ubuntu\/\.local\/bin:\/usr\/local\/bin/m);

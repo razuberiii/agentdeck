@@ -10,6 +10,12 @@ RELEASES_DIR="$CONTROL_ROOT/releases"
 CURRENT_LINK="$CONTROL_ROOT/current"
 PREVIOUS_LINK="$CONTROL_ROOT/previous"
 CANDIDATE_LINK="$CONTROL_ROOT/candidate"
+CURRENT_WEB_LINK="$CONTROL_ROOT/current-web"
+PREVIOUS_WEB_LINK="$CONTROL_ROOT/previous-web"
+CANDIDATE_WEB_LINK="$CONTROL_ROOT/candidate-web"
+CURRENT_RUNTIME_LINK="$CONTROL_ROOT/current-runtime"
+PREVIOUS_RUNTIME_LINK="$CONTROL_ROOT/previous-runtime"
+CANDIDATE_RUNTIME_LINK="$CONTROL_ROOT/candidate-runtime"
 JOBS_DIR="$STATE_DIR/jobs"
 LOG_DIR="$STATE_DIR/logs"
 LOCK_FILE="$STATE_DIR/deploy.lock"
@@ -512,11 +518,7 @@ db.backup(dest).then(() => {
   process.exit(1);
 });
 NODE
-  then
-    log "live sqlite backup failed; candidate runtime will initialize an empty validation database"
-    rm -f "$dest_db" "$dest_db-shm" "$dest_db-wal"
-    : > "$dest_db"
-  fi
+  then die "live sqlite backup failed; candidate validation cancelled"; fi
 }
 
 sqlite_file_backup() {
@@ -539,16 +541,17 @@ NODE
   then
     return 0
   fi
-  log "sqlite online backup failed for $source_db; falling back to file copy"
-  cp -a "$source_db" "$dest_db"
+  die "sqlite online backup failed for $source_db"
 }
 
 backup_manifest() {
-  local file="$1" include_secrets="$2"
-  node - "$file" "$SOURCE_ROOT" "$DATA_DIR" "$include_secrets" "${AGENTDECK_INSTALL_PROFILE:-personal}" <<'NODE'
+  local file="$1" include_secrets="$2" root="$3" checksums="$root/checksums.tsv"
+  : > "$checksums"
+  while IFS= read -r -d '' entry; do rel="${entry#$root/}"; printf '%s\t%s\t%s\n' "$rel" "$(stat -c %s "$entry")" "$(sha256sum "$entry" | cut -d' ' -f1)" >> "$checksums"; done < <(find "$root" -type f ! -name manifest.json ! -name checksums.tsv -print0 | sort -z)
+  node - "$file" "$SOURCE_ROOT" "$DATA_DIR" "$include_secrets" "${AGENTDECK_INSTALL_PROFILE:-personal}" "$checksums" <<'NODE'
 const fs = require('node:fs');
 const cp = require('node:child_process');
-const [file, sourceRoot, dataDir, includeSecrets, profile] = process.argv.slice(2);
+const [file, sourceRoot, dataDir, includeSecrets, profile, checksums] = process.argv.slice(2);
 const pkg = JSON.parse(fs.readFileSync(`${sourceRoot}/package.json`, 'utf8'));
 let commit = '';
 try { commit = cp.execFileSync('git', ['-c', `safe.directory=${sourceRoot}`, '-C', sourceRoot, 'rev-parse', 'HEAD'], { encoding:'utf8', stdio:['ignore','pipe','ignore'] }).trim(); } catch {}
@@ -559,8 +562,10 @@ fs.writeFileSync(file, JSON.stringify({
   profile:profile || 'personal',
   data_dir:dataDir,
   included_secrets:includeSecrets === '1',
+  files:fs.readFileSync(checksums,'utf8').trim().split(/\n/).filter(Boolean).map(line=>{const [path,size,sha256]=line.split('\t');return{path,size:Number(size),sha256};}),
 }, null, 2) + '\n');
 NODE
+  rm -f "$checksums"
 }
 
 redacted_env_summary() {
@@ -603,6 +608,7 @@ run_backup() {
   stamp="$(date -u +%Y%m%d-%H%M%S)"
   archive="$out_dir/agentdeck-backup-$stamp.tar.zst"
   tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
   mkdir -p "$out_dir" "$tmp/data"
   if [ "$include_secrets" = "1" ]; then
     echo "WARNING: --include-secrets will include provider tokens, OAuth state, API keys, and local profile secrets." >&2
@@ -618,10 +624,11 @@ run_backup() {
       copy_backup_dir_if_present "$rel" "$tmp"
     done
   fi
-  backup_manifest "$tmp/manifest.json" "$include_secrets"
+  backup_manifest "$tmp/manifest.json" "$include_secrets" "$tmp"
   redacted_env_summary "$tmp/redacted-env-summary.json"
   tar -C "$tmp" --zstd -cf "$archive" .
-  rm -rf "$tmp"
+  tar --zstd -tf "$archive" >/dev/null
+  [ "$include_secrets" = "1" ] && chmod 0600 "$archive" || chmod 0640 "$archive"
   echo "$archive"
 }
 
@@ -635,12 +642,22 @@ restore_content_list() {
 }
 
 run_restore() {
-  local archive="$1" dry_run="$2" force="$3" tmp included_secrets
+  local archive="$1" dry_run="$2" force="$3" tmp included_secrets rollback_root staging
   [ -n "$archive" ] || { restore_usage; exit 2; }
   [ -f "$archive" ] || die "backup file not found: $archive"
   tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  if tar --zstd -tvf "$archive" | awk '{p=$NF; if(p ~ /^\// || p ~ /(^|\/)\.\.($|\/)/ || $1 ~ /^[lbcps]/) bad=1} END{exit bad?1:0}'; then :; else die "backup contains unsafe path, link, or special file"; fi
   tar -C "$tmp" --zstd -xf "$archive"
   [ -f "$tmp/manifest.json" ] || { rm -rf "$tmp"; die "backup manifest.json is missing"; }
+  node - "$tmp/manifest.json" "$tmp" <<'NODE'
+const fs=require('node:fs'),crypto=require('node:crypto'),path=require('node:path');const [manifestFile,root]=process.argv.slice(2);const manifest=JSON.parse(fs.readFileSync(manifestFile));
+for(const file of manifest.files||[]){if(path.isAbsolute(file.path)||file.path.split(path.sep).includes('..'))throw new Error('unsafe manifest path');const target=path.join(root,file.path);const data=fs.readFileSync(target);if(data.length!==file.size||crypto.createHash('sha256').update(data).digest('hex')!==file.sha256)throw new Error(`backup checksum mismatch: ${file.path}`);}
+NODE
+  for database in "$tmp/data/agentdeck.sqlite3" "$tmp/data/agentdeck-runtime.sqlite3"; do [ ! -f "$database" ] || node - "$database" <<'NODE'
+const Database=require('better-sqlite3');const db=new Database(process.argv[2],{readonly:true,fileMustExist:true});const result=db.pragma('integrity_check');db.close();if(result.length!==1||result[0].integrity_check!=='ok')throw new Error('sqlite integrity_check failed');
+NODE
+  done
   echo "Backup manifest:"
   cat "$tmp/manifest.json"
   echo
@@ -663,25 +680,24 @@ NODE
   done
   echo "WARNING: restoring will overwrite AgentDeck data in $DATA_DIR." >&2
   [ "$force" = "1" ] || { rm -rf "$tmp"; die "restore requires --force"; }
-  mkdir -p "$DATA_DIR"
-  for rel in agentdeck.sqlite3 agentdeck-runtime.sqlite3 attachments artifacts shared/generated_images; do
-    if [ -e "$tmp/data/$rel" ]; then
-      mkdir -p "$DATA_DIR/$(dirname "$rel")"
-      rm -rf "$DATA_DIR/$rel"
-      cp -a "$tmp/data/$rel" "$DATA_DIR/$rel"
-    fi
-  done
-  if [ "$included_secrets" = "1" ]; then
-    for rel in profiles claude/profiles gemini/profiles antigravity-profiles shared/sessions; do
-      if [ -e "$tmp/data/$rel" ]; then
-        mkdir -p "$DATA_DIR/$(dirname "$rel")"
-        rm -rf "$DATA_DIR/$rel"
-        cp -a "$tmp/data/$rel" "$DATA_DIR/$rel"
-      fi
-    done
+  resolve_service_user
+  staging="$tmp/restore-root"; mkdir -p "$staging"; cp -a "$DATA_DIR/." "$staging/"; cp -a "$tmp/data/." "$staging/"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$staging"
+  find "$staging" -type d -exec chmod 0750 {} +; find "$staging" -type f -exec chmod 0640 {} +
+  rollback_root="${DATA_DIR}.rollback-$(date -u +%Y%m%d-%H%M%S)"
+  drain_runtime
+  wait_drain 0
+  systemctl stop agentdeck-web.service agentdeck-runtime.service
+  mv "$DATA_DIR" "$rollback_root"
+  if mv "$staging" "$DATA_DIR" && systemctl start agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl start agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45; then
+    echo "Restore complete. Rollback snapshot: $rollback_root"
+  else
+    systemctl stop agentdeck-web.service agentdeck-runtime.service || true
+    rm -rf "$DATA_DIR"
+    mv "$rollback_root" "$DATA_DIR"
+    systemctl start agentdeck-runtime.service agentdeck-web.service || true
+    die "restore health check failed; original data restored"
   fi
-  rm -rf "$tmp"
-  echo "Restore complete. Restart AgentDeck services after reviewing the restored data."
 }
 
 start_candidate_runtime() {
@@ -703,7 +719,9 @@ start_candidate_web() {
   pid_file="$candidate_dir/web.pid"
   mkdir -p "$candidate_dir"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
-  run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$DATA_DIR" "http://127.0.0.1:$RUNTIME_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
+  sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$candidate_dir/agentdeck.sqlite3"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
+  run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
   wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/api/status" 30
 }
 
@@ -726,17 +744,19 @@ wait_http() {
   done
 }
 
-switch_current() {
-  local release_id="$1"
+switch_component() {
+  local component="$1" release_id="$2" current previous
+  if [ "$component" = "web" ]; then current="$CURRENT_WEB_LINK"; previous="$PREVIOUS_WEB_LINK"; else current="$CURRENT_RUNTIME_LINK"; previous="$PREVIOUS_RUNTIME_LINK"; fi
   local current_target
-  current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  current_target="$(readlink "$current" 2>/dev/null || true)"
   if [ -n "$current_target" ]; then
-    ln -sfn "$current_target" "$PREVIOUS_LINK.tmp"
-    mv -Tf "$PREVIOUS_LINK.tmp" "$PREVIOUS_LINK"
+    ln -sfn "$current_target" "$previous.tmp"
+    mv -Tf "$previous.tmp" "$previous"
   fi
-  ln -sfn "releases/$release_id" "$CURRENT_LINK.tmp"
-  mv -Tf "$CURRENT_LINK.tmp" "$CURRENT_LINK"
+  ln -sfn "releases/$release_id" "$current.tmp"
+  mv -Tf "$current.tmp" "$current"
 }
+rollback_component(){ local component="$1" current previous current_target previous_target; if [ "$component" = web ];then current="$CURRENT_WEB_LINK";previous="$PREVIOUS_WEB_LINK";else current="$CURRENT_RUNTIME_LINK";previous="$PREVIOUS_RUNTIME_LINK";fi; [ -L "$previous" ]||die "previous $component release is not set";previous_target="$(readlink "$previous")";current_target="$(readlink "$current" 2>/dev/null||true)";ln -sfn "$previous_target" "$current.tmp";mv -Tf "$current.tmp" "$current";[ -z "$current_target" ]||{ ln -sfn "$current_target" "$previous.tmp";mv -Tf "$previous.tmp" "$previous";}; }
 
 cleanup_releases() {
   ls -1dt "$RELEASES_DIR"/* 2>/dev/null | tail -n +"$((KEEP_RELEASES + 1))" | while read -r old; do
@@ -831,6 +851,8 @@ worker_deploy() {
     make_release
     release_id="$CREATED_RELEASE_ID"
     release_path="$(release_path_for "$release_id")"
+    if [ "$target" = web ]||[ "$target" = all ];then ln -sfn "releases/$release_id" "$CANDIDATE_WEB_LINK";fi
+    if [ "$target" = runtime ]||[ "$target" = all ];then ln -sfn "releases/$release_id" "$CANDIDATE_RUNTIME_LINK";fi
     export AGENTDECK_JOB_RELEASE="$release_id"
     write_job "$job_id" running "release built"
     assert_release_unit_requirement "$release_path"
@@ -844,13 +866,14 @@ worker_deploy() {
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       drain_runtime
       wait_drain "$force"
-      switch_current "$release_id"
+      switch_component runtime "$release_id"
       systemctl restart agentdeck-runtime.service
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45
     else
-      switch_current "$release_id"
+      switch_component web "$release_id"
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
+      [ "$target" = "all" ] && switch_component web "$release_id"
       systemctl restart agentdeck-web.service
       wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45
     fi
@@ -876,17 +899,13 @@ worker_rollback() {
   write_job "$job_id" running "rollback started"
   (
     flock -n 9 || die "another deploy/rollback job is running"
-    [ -L "$PREVIOUS_LINK" ] || die "previous release is not set"
     local previous_target current_target
-    previous_target="$(readlink "$PREVIOUS_LINK")"
-    current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       drain_runtime
       wait_drain "$force"
     fi
-    ln -sfn "$previous_target" "$CURRENT_LINK.tmp"
-    mv -Tf "$CURRENT_LINK.tmp" "$CURRENT_LINK"
-    [ -n "$current_target" ] && { ln -sfn "$current_target" "$PREVIOUS_LINK.tmp"; mv -Tf "$PREVIOUS_LINK.tmp" "$PREVIOUS_LINK"; }
+    if [ "$target" = runtime ]||[ "$target" = all ];then rollback_component runtime;fi
+    if [ "$target" = web ]||[ "$target" = all ];then rollback_component web;fi
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       systemctl restart agentdeck-runtime.service
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45

@@ -9,7 +9,7 @@ StartLimitBurst=3
 Type=simple
 User=@AGENTDECK_RUN_USER@
 Group=@AGENTDECK_RUN_GROUP@
-WorkingDirectory=@AGENTDECK_CURRENT_DIR@
+WorkingDirectory=@AGENTDECK_CURRENT_DIR@-web
 Environment=HOME=@AGENTDECK_HOME@
 Environment=DATA_DIR=@AGENTDECK_DATA_DIR@
 Environment=CODEX_BIN=@CODEX_BIN@
@@ -18,13 +18,13 @@ Environment=PLAYWRIGHT_BROWSERS_PATH=@AGENTDECK_DATA_DIR@/cache/ms-playwright
 Environment=USE_AGENT_RUNTIME=1
 Environment=AGENT_RUNTIME_URL=http://127.0.0.1:3852
 EnvironmentFile=@AGENTDECK_ENV_DIR@/web.env
-ExecStart=/usr/bin/node @AGENTDECK_CURRENT_DIR@/server/dist/index.js
+ExecStart=/usr/bin/node @AGENTDECK_CURRENT_DIR@-web/server/dist/index.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=@AGENTDECK_DATA_DIR@ @AGENTDECK_CURRENT_DIR@ /tmp /run
+ReadWritePaths=@AGENTDECK_DATA_DIR@ @AGENTDECK_CURRENT_DIR@-web /tmp /run
 
 [Install]
 WantedBy=multi-user.target

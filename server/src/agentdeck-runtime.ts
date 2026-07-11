@@ -18,6 +18,7 @@ import { ClaudeProfileStore } from './claude/claude-profile-store.js';
 import type { ClaudeProfile } from './claude/claude-types.js';
 import { DurableEventStore } from './event-store.js';
 import { EventSubscriptions } from './event-subscriptions.js';
+import { runMigrations } from './migration-runner.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -182,6 +183,7 @@ class CodexAccountRuntime extends EventEmitter {
 
 const db = new Db(DB_FILE);
 await db.init();
+await runMigrations(db,'runtime',[{version:1,name:'runtime_schema_baseline',statements:process.env.AGENTDECK_TEST_BAD_MIGRATION==='1'?['THIS IS INVALID SQL']:[]}]);
 await initRuntimeSchema();
 const claudeProfileStore = new ClaudeProfileStore(db, DATA_DIR, process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || '', '.claude'));
 class GeminiRuntimeManager {

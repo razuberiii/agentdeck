@@ -58,17 +58,16 @@ test('deploy supports component scoped web runtime provider and changed modes', 
   assert.match(ctl, /worker_rollback\(\)/);
 });
 
-test('candidate runtime sqlite backup is bounded and falls back for validation', () => {
+test('candidate runtime sqlite backup is bounded and fails closed', () => {
   assert.match(ctl, /sqlite backup timed out/);
-  assert.match(ctl, /live sqlite backup failed; candidate runtime will initialize an empty validation database/);
-  assert.match(ctl, /rm -f "\$dest_db" "\$dest_db-shm" "\$dest_db-wal"/);
+  assert.match(ctl, /live sqlite backup failed; candidate validation cancelled/);
 });
 
 test('web-only deploy does not restart runtime or providers', () => {
   const workerBody = ctl.slice(ctl.indexOf('worker_deploy()'), ctl.indexOf('worker_rollback()'));
   assert.match(workerBody, /if \[ "\$target" = "web" \] \|\| \[ "\$target" = "all" \]/);
   assert.match(workerBody, /systemctl restart agentdeck-web\.service/);
-  assert.match(workerBody, /else\s+switch_current "\$release_id"/);
+  assert.match(workerBody, /else\s+switch_component web "\$release_id"/);
   assert.doesNotMatch(workerBody, /agentdeck-app-server/);
   assert.doesNotMatch(workerBody, /check_active_turns/);
 });

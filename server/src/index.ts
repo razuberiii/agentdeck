@@ -22,6 +22,7 @@ import { Db } from './db.js';
 import { CodexBridge } from './codex.js';
 import { RuntimeClient } from './runtime-client.js';
 import { SessionCommandQueue } from './websocket-command-queue.js';
+import { runMigrations } from './migration-runner.js';
 import { AntigravityProvider, GeminiProvider } from './providers.js';
 import { ClaudeProvider } from './claude/claude-provider.js';
 import { ClaudeProfileStore } from './claude/claude-profile-store.js';
@@ -205,6 +206,7 @@ let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
 await db.init();
+await runMigrations(db,'web',[{version:1,name:'web_schema_baseline',statements:process.env.AGENTDECK_TEST_BAD_MIGRATION==='1'?['THIS IS INVALID SQL']:[]}]);
 await db.run('CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER, last_seen_at INTEGER, user_agent TEXT, ip_hint TEXT)').catch(()=>{});
 await db.run('CREATE INDEX IF NOT EXISTS auth_sessions_active ON auth_sessions(revoked_at,expires_at)').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0').catch(()=>{});
