@@ -55,7 +55,7 @@ if getent passwd "$RUN_USER" >/dev/null; then
   chown -R "$RUN_USER:$RUN_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools"
 fi
 
-AGENTDECK_INSTALL_PROFILE="$INSTALL_PROFILE" AGENTDECK_RUN_USER="$RUN_USER" AGENTDECK_HOME="$RUN_HOME" ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$ROOT/deploy/install-units.sh"
+env AGENTDECK_INSTALL_PROFILE="$INSTALL_PROFILE" AGENTDECK_RUN_USER="$RUN_USER" AGENTDECK_HOME="$RUN_HOME" ROOT="$ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$ROOT/deploy/install-units.sh"
 
 if getent passwd "$RUN_USER" >/dev/null; then
   echo "Preparing Playwright Chromium cache in $DATA_DIR/cache/ms-playwright ..."

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2012,SC2015,SC2016,SC2295
 set -euo pipefail
 
 CONTROL_ROOT="${AGENTDECK_ROOT:-/opt/stacks/agentdeck}"
@@ -30,7 +31,6 @@ SYSTEMD_UNIT_VERSION=1
 SERVICE_USER=""
 SERVICE_HOME=""
 CREATED_RELEASE_ID=""
-DEPLOY_POINTER_SNAPSHOT=""
 PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$DATA_DIR/cache/ms-playwright}"
 NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$DATA_DIR/cache/npm}"
 export PATH="$DATA_DIR/provider-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
@@ -94,12 +94,14 @@ service_env() {
 
 run_as_service_user() {
   resolve_service_user
+  local -a env_args=()
+  mapfile -t env_args < <(service_env)
   if [ "$(id -un)" = "$SERVICE_USER" ]; then
-    env $(service_env) "$@"
+    env "${env_args[@]}" "$@"
   elif command -v runuser >/dev/null 2>&1; then
-    runuser -u "$SERVICE_USER" -- env $(service_env) "$@"
+    runuser -u "$SERVICE_USER" -- env "${env_args[@]}" "$@"
   else
-    sudo -H -u "$SERVICE_USER" env $(service_env) "$@"
+    sudo -H -u "$SERVICE_USER" env "${env_args[@]}" "$@"
   fi
 }
 
@@ -964,7 +966,8 @@ worker_deploy() {
   export AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
   exec >>"$LOG_DIR/$job_id.log" 2>&1
   write_job "$job_id" running "deploy started"
-  trap "cleanup_candidate_job '$job_id' || true" EXIT HUP INT TERM
+  export AGENTDECK_CANDIDATE_JOB_ID="$job_id"
+  trap 'cleanup_candidate_job "$AGENTDECK_CANDIDATE_JOB_ID" || true' EXIT HUP INT TERM
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path

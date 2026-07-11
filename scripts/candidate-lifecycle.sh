@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2015
 
 candidate_job_path() {
   local job_id="${1:-}" root target real_root real_target
