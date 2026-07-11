@@ -41,12 +41,12 @@ export function runtimeMessageKey(msg: any): string {
 export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: TimelineDisplayEvent[], throughSequence: number): TimelineState {
   const coveredSequence = Math.max(state.coveredSequence, Number(throughSequence || 0));
   const snapshotUserKeys = new Set(snapshotEvents.filter(e => e.role === 'user').flatMap(userIdentityKeys));
-  const snapshotUserLooseTextKeys = new Set(snapshotEvents.filter(e => e.role === 'user').map(userLooseTextKey).filter(Boolean));
+  const snapshotUserLooseTextKeys = new Set(snapshotEvents.filter(e => e.role === 'user' && !hasStableUserId(e)).map(userLooseTextKey).filter(Boolean));
   const next = dedupeRuntimeMessages(state.liveMessages.filter(msg => {
     const seq = runtimeMessageSequence(msg);
     if (seq && seq <= coveredSequence) return false;
     if (msg?.type === 'user' && liveUserKeys(msg).some(key => snapshotUserKeys.has(key))) return false;
-    if (msg?.type === 'user') {
+    if (msg?.type === 'user' && !hasStableUserId(msg)) {
       const loose = userLooseTextKey({
         role: 'user',
         text: String(msg.text || ''),
@@ -212,10 +212,11 @@ function userIdentityKeys(e: TimelineDisplayEvent): string[] {
   const keys: string[] = [];
   if (e.clientMessageId) keys.push(`client:${e.clientMessageId}`);
   if (e.messageId) keys.push(`message:${e.messageId}`);
-  const contentKey = userContentIdentityKey(e);
-  if (contentKey) keys.push(contentKey);
+  if (!hasStableUserId(e)) { const contentKey = userContentIdentityKey(e) || userLooseTextKey(e); if (contentKey) keys.push(contentKey); }
   return keys;
 }
+
+function hasStableUserId(e:TimelineDisplayEvent):boolean { return !!(e.clientMessageId || e.messageId); }
 
 function userContentIdentityKey(e: TimelineDisplayEvent): string {
   const text = normalizeUserText(e.text || '');
