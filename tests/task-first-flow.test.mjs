@@ -8,7 +8,8 @@ test('home task composer creates a persistent session and auto-submits after joi
   assert.match(source, /storageSet\(pendingTaskKey\(s\.id\),initialTask\.trim\(\)\)/);
   assert.match(source, /const pendingTask=storageGet\(pendingTaskKey\(id\)\)/);
   assert.match(source, /const pendingMode=storageGet\(pendingTaskModeKey\(id\)\).*'plan':'direct'/);
-  assert.match(source, /sendMessage\(ws,id,\{text:pendingTask\.trim\(\),attachments:\[\],planMode:pendingMode\}\)/);
+  assert.match(source, /const initialAttachments=loadDraftAttachments\(id\)/);
+  assert.match(source, /sendMessage\(ws,id,\{text:pendingTask\.trim\(\),attachments:initialAttachments,planMode:pendingMode\}\)/);
   assert.match(source, /storageRemove\(pendingTaskKey\(id\)\)/);
 });
 

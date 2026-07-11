@@ -1,0 +1,2 @@
+import type {Attachment} from './api/types';
+export async function uploadInitialTaskAttachments(sessionId:string,files:File[],request:(path:string,init:any)=>Promise<Attachment>){const uploaded:Attachment[]=[],failed:string[]=[];for(const file of files){try{const form=new FormData();form.append('file',file,file.name);uploaded.push(await request(`/api/sessions/${sessionId}/attachments`,{method:'POST',body:form,headers:{}}));}catch{failed.push(file.name);}}return{uploaded,failed,shouldAutoSend:failed.length===0};}
