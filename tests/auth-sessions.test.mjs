@@ -7,7 +7,7 @@ const db = readFileSync(new URL('../server/src/db.ts', import.meta.url), 'utf8')
 
 test('auth sessions are stored server-side with hashed tokens only', () => {
   assert.match(db, /CREATE TABLE IF NOT EXISTS auth_sessions/);
-  assert.match(server, /CREATE TABLE IF NOT EXISTS auth_sessions/);
+  assert.match(server, /await migrateWebSchema\(db\)/);
   assert.match(server, /function authTokenHash\(token:string\)/);
   assert.match(server, /INSERT INTO auth_sessions \(id,token_hash,created_at,expires_at,last_seen_at,user_agent,ip_hint\)/);
   assert.match(server, /\[id, authTokenHash\(token\), now, expiresAt, now/);

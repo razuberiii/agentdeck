@@ -9,7 +9,7 @@ const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.
 
 test('provider login attempts have a dedicated table separate from formal profiles', () => {
   assert.match(dbSource, /CREATE TABLE IF NOT EXISTS provider_login_attempts/);
-  assert.match(serverSource, /CREATE TABLE IF NOT EXISTS provider_login_attempts/);
+  assert.match(serverSource, /await migrateWebSchema\(db\)/);
   assert.match(serverSource, /type ProviderLoginAttemptStatus = 'starting'\|'waiting_authorization'\|'waiting_code'\|'verifying'\|'failed'\|'cancelled'\|'done'/);
 });
 
