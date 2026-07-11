@@ -33,6 +33,7 @@ CREATED_RELEASE_ID=""
 PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$DATA_DIR/cache/ms-playwright}"
 NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$DATA_DIR/cache/npm}"
 export PATH="$DATA_DIR/provider-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+source "$SOURCE_ROOT/scripts/candidate-lifecycle.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -526,6 +527,28 @@ NODE
   then log "live sqlite backup failed; candidate validation cancelled"; return 1; fi
 }
 
+candidate_db_mode() {
+  local release_path="$1" override="${AGENTDECK_CANDIDATE_DB_MODE:-}" current_commit next_commit files
+  case "$override" in minimal|copy) printf '%s\n' "$override"; return ;; '') ;; *) die "invalid AGENTDECK_CANDIDATE_DB_MODE: $override" ;; esac
+  next_commit="$(node -e 'const m=require(process.argv[1]);console.log(m.sourceCommit||"")' "$release_path/deploy-manifest.json" 2>/dev/null || true)"
+  current_commit="$(node -e 'const fs=require("fs");try{const m=JSON.parse(fs.readFileSync(process.argv[1]+"/deploy-manifest.json"));console.log(m.sourceCommit||"")}catch{}' "$(readlink -f "$CURRENT_RUNTIME_LINK" 2>/dev/null || true)" 2>/dev/null || true)"
+  [ -n "$current_commit" ] && [ -n "$next_commit" ] || { printf 'copy\n'; return; }
+  files="$(git -C "$SOURCE_ROOT" diff --name-only "$current_commit..$next_commit" 2>/dev/null)" || { printf 'copy\n'; return; }
+  if printf '%s\n' "$files" | grep -Eq '(^|/)(migration|migrations|migration-runner|event-store|db)\.(ts|js|sql)$|(^|/)migrations/|package(-lock)?\.json$'; then printf 'copy\n'; return; fi
+  if printf '%s\n' "$files" | grep -qx 'server/src/agentdeck-runtime.ts' && git -C "$SOURCE_ROOT" diff -U0 "$current_commit..$next_commit" -- server/src/agentdeck-runtime.ts | grep -Eq '^\+.*(CREATE TABLE|ALTER TABLE|CREATE (UNIQUE )?INDEX|schema_migrations|payload_json|last_sequence|event_type)'; then printf 'copy\n'; else printf 'minimal\n'; fi
+}
+
+prepare_candidate_runtime_db() {
+  local release_path="$1" candidate_dir="$2" mode
+  mode="$(candidate_db_mode "$release_path")"
+  log "candidate runtime database mode: $mode"
+  case "$mode" in
+    minimal) rm -f "$candidate_dir/agentdeck-runtime.sqlite3"* ;;
+    copy) sqlite_backup "$candidate_dir/agentdeck-runtime.sqlite3" ;;
+    *) die "unsupported candidate database mode: $mode" ;;
+  esac
+}
+
 sqlite_file_backup() {
   local source_db="$1" dest_db="$2"
   mkdir -p "$(dirname "$dest_db")"
@@ -711,7 +734,7 @@ start_candidate_runtime() {
   pid_file="$candidate_dir/runtime.pid"
   mkdir -p "$candidate_dir"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
-  sqlite_backup "$candidate_dir/agentdeck-runtime.sqlite3"
+  prepare_candidate_runtime_db "$release_path" "$candidate_dir"
   chown "$SERVICE_USER:$SERVICE_USER" "$candidate_dir/agentdeck-runtime.sqlite3" 2>/dev/null || true
   run_as_service_user bash -c 'cd "$1"; RUNTIME_MODE=candidate DATA_DIR="$2" RUNTIME_DATA_DIR="$2" RUNTIME_DB="$2/agentdeck-runtime.sqlite3" RUNTIME_PORT="$3" RUNTIME_HOST=127.0.0.1 AGENTDECK_RELEASE_ID="$4" node server/dist/agentdeck-runtime.js >>"$5" 2>&1 & echo $! > "$6"' _ "$release_path" "$candidate_dir" "$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-runtime.log" "$pid_file"
   wait_http "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT/healthz" 30
@@ -728,16 +751,6 @@ start_candidate_web() {
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
   run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
   wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/api/status" 30
-}
-
-stop_candidate_processes() {
-  local job_id="$1" candidate_dir
-  candidate_dir="$DATA_DIR/deploy-candidates/$job_id"
-  for name in web runtime; do
-    if [ -f "$candidate_dir/$name.pid" ]; then
-      kill "$(cat "$candidate_dir/$name.pid")" 2>/dev/null || true
-    fi
-  done
 }
 
 wait_http() {
@@ -850,6 +863,7 @@ worker_deploy() {
   export AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
   exec >>"$LOG_DIR/$job_id.log" 2>&1
   write_job "$job_id" running "deploy started"
+  trap 'cleanup_candidate_job "$job_id" || true' EXIT HUP INT TERM
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path
@@ -882,12 +896,10 @@ worker_deploy() {
       systemctl restart agentdeck-web.service
       wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45
     fi
-    stop_candidate_processes "$job_id"
     cleanup_releases
     write_job "$job_id" succeeded "deploy succeeded"
   ) 9>"$LOCK_FILE" || {
     local code=$?
-    stop_candidate_processes "$job_id" || true
     undrain_runtime
     if [ -n "${CREATED_RELEASE_ID:-}" ] && valid_release_id "$CREATED_RELEASE_ID"; then
       safe_rm_tree "$RELEASES_DIR/$CREATED_RELEASE_ID" "$RELEASES_DIR" || true
@@ -931,6 +943,7 @@ worker_rollback() {
 submit_job() {
   local command="$1" target="$2" wait="$3" force="$4" job_id log_file
   ensure_dirs
+  cleanup_stale_candidate_jobs
   if [ "$wait" = "1" ] && [ "$force" != "1" ] && { [ "$target" = "runtime" ] || [ "$target" = "all" ]; }; then
     local turns count
     if turns="$(active_turns 2>/dev/null)" && count="$(printf '%s' "$turns" | active_turn_count_from_json 2>/dev/null)" && [ "$count" != "0" ]; then
@@ -970,6 +983,7 @@ wait_job() {
   done
 }
 
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 COMMAND="${1:-}"
 [ -n "$COMMAND" ] || { usage; exit 2; }
 shift || true

@@ -59,7 +59,7 @@ test('deploy supports component scoped web runtime provider and changed modes', 
 });
 
 test('candidate runtime sqlite backup is bounded and fails closed', () => {
-  assert.match(ctl, /sqlite backup timed out/);
+  assert.match(ctl, /sqlite backup stalled for 30 seconds/);
   assert.match(ctl, /live sqlite backup failed; candidate validation cancelled/);
 });
 
