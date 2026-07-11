@@ -92,6 +92,7 @@ const websocketSessions = new Map<any, Set<string>>();
 const websocketConnectionIps = new Map<any, string>();
 const websocketIpCounts = new Map<string, number>();
 const websocketSessionCounts = new Map<string, number>();
+const websocketJoinFlights=new WeakMap<any,Map<string,Promise<void>>>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
@@ -222,6 +223,7 @@ await db.run('ALTER TABLE sessions ADD COLUMN model TEXT').catch(()=>{});
 await db.run("ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'codex'").catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN model_id TEXT').catch(()=>{});
+await db.run('ALTER TABLE sessions ADD COLUMN model_revision INTEGER NOT NULL DEFAULT 0').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN workspace_path TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN provider_session_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
@@ -1517,10 +1519,13 @@ app.patch('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply
         });
       }
       const appliedModel = cleanAgentModel(changed?.model) || model || null;
-      await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[appliedModel, Date.now(), threadId]);
-      return { ok:true, model:appliedModel, supported:true };
+      const revision=Number(changed?.modelRevision||0);await db.run('UPDATE sessions SET model=?1,model_id=?1,model_revision=MAX(COALESCE(model_revision,0)+1,?2),updated_at=?3 WHERE codex_thread_id=?4 OR id=?4',[appliedModel,revision,Date.now(),threadId]);
+      return {ok:true,model:appliedModel,modelId:appliedModel,modelRevision:revision||Number((await findSession(threadId))?.model_revision||0),supported:true};
     }
-    await db.run('UPDATE sessions SET model=?1, model_id=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model || null, Date.now(), threadId]);
+    if(provider==='antigravity'){await db.run('UPDATE sessions SET model=?1,model_id=?1,model_revision=COALESCE(model_revision,0)+1,updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[model||null,Date.now(),threadId]);const applied=await findSession(threadId);return{ok:true,model:applied?.model||null,modelId:applied?.model_id||applied?.model||null,modelRevision:Number(applied?.model_revision||0),supported:true};}
+    if(!USE_AGENT_RUNTIME)return reply.code(409).send({error:'model_switch_requires_runtime',supported:false});
+    const changed=await runtime.setSessionModel(threadId,model||null);
+    const appliedModel=(provider==='codex'?cleanModel(changed?.model):cleanAgentModel(changed?.model))||model||null;const revision=Number(changed?.modelRevision||0);await db.run('UPDATE sessions SET model=?1,model_id=?1,model_revision=MAX(COALESCE(model_revision,0)+1,?2),updated_at=?3 WHERE codex_thread_id=?4 OR id=?4',[appliedModel,revision,Date.now(),threadId]);return{ok:true,model:appliedModel,modelId:appliedModel,modelRevision:revision||Number((await findSession(threadId))?.model_revision||0),supported:true};
   }
   return {ok:true};
 });
@@ -1734,7 +1739,7 @@ function validateWsMessage(msg:any) {
   const type = String(msg.type || '');
   if (!['join','send','sendChunkStart','sendChunk','sendChunkEnd','stop'].includes(type)) return false;
   if (!msg.sessionId || typeof msg.sessionId !== 'string') return false;
-  if (type === 'join') return (!('lastSequence' in msg) || Number.isFinite(Number(msg.lastSequence)))&&(!('joinRequestId'in msg)||typeof msg.joinRequestId==='string')&&(!('recoveryEpoch'in msg)||Number.isSafeInteger(Number(msg.recoveryEpoch)));
+  if (type === 'join') return (!('lastSequence' in msg)||Number.isFinite(Number(msg.lastSequence)))&&typeof msg.joinRequestId==='string'&&msg.joinRequestId.length<=128&&typeof msg.clientConnectionId==='string'&&msg.clientConnectionId.length>=8&&msg.clientConnectionId.length<=128&&(!('recoveryEpoch'in msg)||Number.isSafeInteger(Number(msg.recoveryEpoch)));
   if (type === 'send') return typeof msg.text === 'string' && (!('attachments' in msg) || Array.isArray(msg.attachments));
   if (type === 'sendChunkStart') return typeof msg.messageId === 'string';
   if (type === 'sendChunk') return typeof msg.messageId === 'string' && typeof msg.chunk === 'string';
@@ -1800,11 +1805,12 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
     if (!validateWsMessage(msg)) return wsClose(ws, 1008, 'invalid_message');
     try {
       const sessionId=String(msg.sessionId);
-      await sessionCommandQueue.run(sessionId,async()=>{
       if (msg.type === 'join') {
         if (!registerWsSession(ws, sessionId)) return wsClose(ws, 1008, 'too_many_session_connections');
-        await joinAndResume(sessionId,ws,Number(msg.lastSequence||0),{recoverRuntimeGeneration:msg.runtimeGenerationRecovery===true,requestedRuntimeGeneration:String(msg.runtimeGeneration||''),joinRequestId:String(msg.joinRequestId||''),recoveryEpoch:Number(msg.recoveryEpoch||0),browserAppliedSequence:Number(msg.clientAppliedSequence||msg.lastSequence||0),snapshotCoveredSequence:Number(msg.snapshotCoveredSequence||0)});
+        startJoinSingleFlight(ws,sessionId,{clientConnectionId:String(msg.clientConnectionId),joinRequestId:String(msg.joinRequestId),recoveryEpoch:Number(msg.recoveryEpoch||0)},()=>joinAndResume(sessionId,ws,Number(msg.lastSequence||0),{clientConnectionId:String(msg.clientConnectionId),recoverRuntimeGeneration:msg.runtimeGenerationRecovery===true,requestedRuntimeGeneration:String(msg.runtimeGeneration||''),joinRequestId:String(msg.joinRequestId||''),recoveryEpoch:Number(msg.recoveryEpoch||0),browserAppliedSequence:Number(msg.clientAppliedSequence||msg.lastSequence||0),snapshotCoveredSequence:Number(msg.snapshotCoveredSequence||0)}));
+        return;
       }
+      await sessionCommandQueue.run(sessionId,async()=>{
       if (msg.type === 'send') await sendTurn(sessionId, String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct');
       if (msg.type === 'sendChunkStart') startChunkedMessage(msg);
       if (msg.type === 'sendChunk') appendChunkedMessage(msg);
@@ -1822,6 +1828,7 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
     cleanupWsConnection(ws);
   });
 });
+function startJoinSingleFlight(ws:any,sessionId:string,identity:{clientConnectionId:string;joinRequestId:string;recoveryEpoch:number},run:()=>Promise<void>){let map=websocketJoinFlights.get(ws);if(!map){map=new Map();websocketJoinFlights.set(ws,map);}if(!ws.agentdeckJoinIdentity)ws.agentdeckJoinIdentity=new Map();const identityKey=`${identity.clientConnectionId}:${identity.joinRequestId}:${identity.recoveryEpoch}`;ws.agentdeckJoinIdentity.set(sessionId,identityKey);const task=run().catch((error:any)=>{if(ws.readyState===1&&ws.agentdeckJoinIdentity?.get(sessionId)===identityKey)browserDelivery.sendDirect(ws,{type:'recovery_error',sessionId,...identity,error:String(error?.message||error)});}).finally(()=>{if(map?.get(sessionId)===task)map.delete(sessionId);});map.set(sessionId,task);}
 app.setNotFoundHandler(async (req, reply) => req.url.startsWith('/api/') ? reply.code(404).send({error:'not found'}) : reply.sendFile('index.html'));
 codex.on('notification', async (msg:any) => {
   const sid = await sessionIdForThread(msg.params?.threadId || msg.params?.thread?.id);
@@ -4564,7 +4571,7 @@ function releaseMetadata() {
     return { releaseId:path.basename(process.cwd()), commit:'' };
   }
 }
-type JoinOptions={recoverRuntimeGeneration?:boolean;requestedRuntimeGeneration?:string;joinRequestId?:string;recoveryEpoch?:number;browserAppliedSequence?:number;snapshotCoveredSequence?:number};
+type JoinOptions={clientConnectionId?:string;recoverRuntimeGeneration?:boolean;requestedRuntimeGeneration?:string;joinRequestId?:string;recoveryEpoch?:number;browserAppliedSequence?:number;snapshotCoveredSequence?:number};
 async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions={}){
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
@@ -4572,7 +4579,7 @@ async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions
   app.log.info({sessionId:id,threadId,connectionGeneration:ws.agentdeckGeneration||null,subscriberCount:clients.get(threadId)?.size||0,replayFrom:Number(lastSequence||0),browserAppliedSequence:options.browserAppliedSequence||0,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeGeneration:options.requestedRuntimeGeneration||null,recoveryEpoch:options.recoveryEpoch||0,joinRequestId:options.joinRequestId||null},'websocket joined session');
   if (row && normalizeProvider(row.provider_id) === 'antigravity') {
     clients.get(threadId)!.add(ws);
-    ws.send(JSON.stringify({type:'joined',sessionId:threadId,runtimeConnection:'connected',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
+    ws.send(JSON.stringify({type:'joined',sessionId:threadId,runtimeConnection:'connected',clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
     return;
   }
   if (USE_AGENT_RUNTIME) {
@@ -4580,9 +4587,10 @@ async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions
     // The subscription owns Runtime replay; this join owns no Runtime REST replay.
     const subscription = ensureSessionSubscription(id, threadId);
     await waitForRuntimeLive(subscription);
+    const identityKey=`${options.clientConnectionId||''}:${options.joinRequestId||''}:${options.recoveryEpoch||0}`;if(ws.agentdeckJoinIdentity?.get(threadId)!==identityKey)return;
     const latest=subscription.committedSequence;
-    const replay=browserDelivery.beginReplay(ws,threadId,{connectionGeneration:Number(ws.agentdeckGeneration||0),joinRequestId:options.joinRequestId||'',recoveryEpoch:options.recoveryEpoch||0},Number(lastSequence||0),latest);
-    if(!replay){browserDelivery.sendDirect(ws,{type:'resnapshot_required',sessionId:threadId,latestSequence:latest,runtimeGeneration:subscription.generation||null,joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0});return;}
+    const replay=browserDelivery.beginReplay(ws,threadId,{clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||'',recoveryEpoch:options.recoveryEpoch||0},Number(lastSequence||0),latest);
+    if(!replay){browserDelivery.sendDirect(ws,{type:'resnapshot_required',sessionId:threadId,latestSequence:latest,runtimeGeneration:subscription.generation||null,clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0});return;}
     clients.get(threadId)!.add(ws);
     app.log.info({ sessionId:id, threadId, rowStatus:String(row?.status || ''), lastSequence:Number(lastSequence || 0), latestSequence:latest, subscriberCount:clients.get(threadId)?.size || 0, connectionGeneration:ws.agentdeckGeneration || null, runtimeConnection:runtimeConnectionStatus(subscription) }, 'codex session joined with runtime subscription');
     await browserDelivery.finishReplay(ws,threadId,replay.state,replay.groups,{type:'joined',sessionId:threadId,runtimeConnection:runtimeConnectionStatus(subscription),runtimeGeneration:subscription.generation||options.requestedRuntimeGeneration||null,joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0,browserAppliedSequence:options.browserAppliedSequence||lastSequence,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeReceivedSequence:subscription.receivedSequence,replayThrough:latest});
@@ -4590,7 +4598,7 @@ async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions
   }
   if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{});
   clients.get(threadId)!.add(ws);
-  ws.send(JSON.stringify({type:'joined',sessionId:threadId,joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
+  ws.send(JSON.stringify({type:'joined',sessionId:threadId,clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
 }
 async function waitForRuntimeLive(state:RuntimeSubscriptionState){
   const deadline=Date.now()+15_000;

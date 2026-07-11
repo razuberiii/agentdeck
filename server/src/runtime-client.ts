@@ -38,6 +38,7 @@ export class RuntimeClient {
   listSessions(archived = false) { return this.request('GET', `/sessions?archived=${archived ? '1' : '0'}`); }
   readSession(id:string) { return this.request('GET', `/sessions/${encodeURIComponent(id)}`); }
   setSessionTitle(id:string, title:string) { return this.request('PATCH', `/sessions/${encodeURIComponent(id)}`, { title }); }
+  setSessionModel(id:string,model:string|null){return this.request('PATCH',`/sessions/${encodeURIComponent(id)}`,{model});}
   setSessionArchived(id:string,archived:boolean){return this.request('PATCH',`/sessions/${encodeURIComponent(id)}`,{archived});}
   deleteSession(id:string){return this.request('DELETE',`/sessions/${encodeURIComponent(id)}`);}
   events(id:string, after = 0, includeDeltas = false) { return this.request('GET', `/sessions/${encodeURIComponent(id)}/events?after=${encodeURIComponent(String(after))}${includeDeltas ? '&includeDeltas=1' : ''}`); }

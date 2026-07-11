@@ -77,6 +77,8 @@ type RuntimeSession = {
   approval_policy:string;
   sandbox_mode:string;
   model:string | null;
+  model_id?:string|null;
+  model_revision?:number;
   provider_id?: string | null;
   provider_session_id?: string | null;
   creator_profile_id?: string | null;
@@ -588,7 +590,8 @@ app.post('/gemini/sessions/:id/model', async (req:any, reply) => {
   try {
     const gemini = await geminiManager.get(accountId);
     const result = await gemini.setSessionModel(String(session.id), model);
-    return { ok:true, session:await getSession(String(session.id)), ...result };
+    const appliedModel=cleanModel(result?.model)||model;await db.run('UPDATE sessions SET model=?1,model_id=?1,model_revision=COALESCE(model_revision,0)+1,updated_at=?2 WHERE id=?3',[appliedModel,Date.now(),session.id]);const applied=await getSession(String(session.id));
+    return { ok:true, session:applied, ...result,model:appliedModel,modelId:appliedModel,modelRevision:Number(applied?.model_revision||0),supported:true };
   } catch (e:any) {
     const message = e?.message || String(e);
     const statusCode = e instanceof GeminiModelSwitchUnsupportedError || e?.code === 'gemini_model_switch_unsupported'
@@ -665,6 +668,7 @@ app.patch('/sessions/:id', async (req:any, reply) => {
     await db.run('UPDATE sessions SET archived=?1,archived_at=?2,updated_at=?3 WHERE id=?4',[req.body.archived?1:0,req.body.archived?Date.now():null,Date.now(),session.id]);
     return{ok:true,session:await getSession(session.id)};
   }
+  if(Object.prototype.hasOwnProperty.call(req.body||{},'model')){const provider=String(session.provider_id||session.provider||'codex');if(!['codex','claude'].includes(provider))return reply.code(409).send({error:'model_switch_unsupported',supported:false});const model=provider==='codex'?cleanModel(req.body?.model):(String(req.body?.model||'').trim()||null);await db.run('UPDATE sessions SET model=?1,model_id=?1,model_revision=COALESCE(model_revision,0)+1,updated_at=?2 WHERE id=?3 OR upstream_thread_id=?3 OR codex_thread_id=?3',[model,Date.now(),session.id]);const applied=await getSession(session.id);return{ok:true,model:applied?.model||null,modelId:applied?.model_id||applied?.model||null,modelRevision:Number(applied?.model_revision||0),supported:true};}
   const title = cleanTitle(req.body?.title, session.project_dir);
   if (!title) return reply.code(400).send({ error:'title required' });
   const account = await getAccount(String(session.current_upstream_account_id || session.last_execution_account_id || session.executing_profile_id || session.account_id || ''));
@@ -901,6 +905,7 @@ async function initRuntimeSchema() {
   await db.run('ALTER TABLE sessions ADD COLUMN provider_id TEXT NOT NULL DEFAULT \'codex\'').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN account_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN model_id TEXT').catch(()=>{});
+  await db.run('ALTER TABLE sessions ADD COLUMN model_revision INTEGER NOT NULL DEFAULT 0').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN workspace_path TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN provider_session_id TEXT').catch(()=>{});
   await db.run('ALTER TABLE sessions ADD COLUMN provider TEXT').catch(()=>{});
