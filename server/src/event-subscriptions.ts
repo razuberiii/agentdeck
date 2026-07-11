@@ -1,0 +1,93 @@
+import { once } from 'node:events';
+import type { ServerResponse } from 'node:http';
+import type { DurableRuntimeEvent } from './event-store.js';
+
+type Subscriber = { raw:ServerResponse; state:'replaying'|'live'|'closed'; buffer:DurableRuntimeEvent[]; chain:Promise<void>; close:()=>void };
+
+export class EventSubscriptions {
+  private sessions = new Map<string,Set<Subscriber>>();
+  pendingPushCount = 0;
+  pendingBufferCount = 0;
+
+  constructor(private options:{ maxBuffer?:number; maxPendingPushes?:number; logger?:(level:'warn'|'info', data:unknown, message:string)=>void } = {}) {}
+
+  count(sessionId?:string) {
+    if (sessionId) return this.sessions.get(sessionId)?.size || 0;
+    return [...this.sessions.values()].reduce((sum,set)=>sum+set.size,0);
+  }
+
+  snapshot() { return [...this.sessions.entries()].map(([sessionId,set])=>({sessionId,count:set.size})); }
+
+  async subscribe(sessionId:string, raw:ServerResponse, after:number, highWatermark:number, replay:(after:number,through:number)=>Promise<DurableRuntimeEvent[]>) {
+    const set = this.sessions.get(sessionId) || new Set<Subscriber>();
+    this.sessions.set(sessionId,set);
+    const subscriber:Subscriber = { raw, state:'replaying', buffer:[], chain:Promise.resolve(), close:()=>{} };
+    const close = () => {
+      if (subscriber.state === 'closed') return;
+      this.pendingBufferCount = Math.max(0, this.pendingBufferCount - subscriber.buffer.length);
+      subscriber.buffer.length = 0;
+      subscriber.state = 'closed';
+      set.delete(subscriber);
+      raw.off('close', close);
+      raw.off('error', close);
+      if (!set.size) this.sessions.delete(sessionId);
+    };
+    subscriber.close = close;
+    raw.once('close', close);
+    raw.once('error', close);
+    set.add(subscriber);
+    try {
+      const replayed = await replay(after,highWatermark);
+      for (const event of replayed) await this.write(subscriber,event);
+      if (subscriber.state === 'closed') return;
+      const merged = subscriber.buffer.filter(event=>event.sequence>highWatermark).sort((a,b)=>a.sequence-b.sequence);
+      this.pendingBufferCount = Math.max(0,this.pendingBufferCount-subscriber.buffer.length);
+      subscriber.buffer=[];
+      let cursor=highWatermark;
+      for (const event of merged) {
+        if (event.sequence<=cursor) continue;
+        if (event.sequence!==cursor+1) return this.disconnect(subscriber,'subscriber sequence gap');
+        await this.write(subscriber,event);
+        cursor=event.sequence;
+      }
+      subscriber.state='live';
+    } catch (error) {
+      this.options.logger?.('warn',{sessionId,error},'runtime subscriber replay failed');
+      this.disconnect(subscriber,'subscriber replay failed');
+    }
+  }
+
+  publish(event:DurableRuntimeEvent) {
+    for (const subscriber of this.sessions.get(event.session_id) || []) {
+      if (subscriber.state==='replaying') {
+        subscriber.buffer.push(event);
+        this.pendingBufferCount++;
+        if (subscriber.buffer.length>(this.options.maxBuffer||2048)) this.disconnect(subscriber,'subscriber replay buffer full');
+        continue;
+      }
+      if (subscriber.state==='live') {
+        if (this.pendingPushCount>=(this.options.maxPendingPushes||4096)) this.disconnect(subscriber,'subscriber backpressure limit');
+        else subscriber.chain=subscriber.chain.then(()=>this.write(subscriber,event)).catch(()=>this.disconnect(subscriber,'subscriber write failed'));
+      }
+    }
+  }
+
+  async drain() { await Promise.all([...this.sessions.values()].flatMap(set=>[...set].map(sub=>sub.chain))); }
+
+  closeAll() { for (const set of this.sessions.values()) for (const subscriber of set) this.disconnect(subscriber,'runtime closing'); }
+
+  private async write(subscriber:Subscriber,event:DurableRuntimeEvent) {
+    if (subscriber.state==='closed') return;
+    this.pendingPushCount++;
+    try {
+      const ok=subscriber.raw.write(`event: runtime\ndata: ${JSON.stringify(event)}\n\n`);
+      if (!ok) await once(subscriber.raw,'drain');
+    } finally { this.pendingPushCount=Math.max(0,this.pendingPushCount-1); }
+  }
+
+  private disconnect(subscriber:Subscriber,reason:string) {
+    this.options.logger?.('warn',{reason},'runtime subscriber disconnected for recovery');
+    subscriber.close();
+    if (!subscriber.raw.destroyed) subscriber.raw.destroy();
+  }
+}

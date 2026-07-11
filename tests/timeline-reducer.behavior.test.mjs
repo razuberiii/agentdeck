@@ -70,11 +70,36 @@ test('overlapping replay pages advance by actual sequence without duplicates', (
 
 test('duplicate websocket event is idempotent', () => {
   runReducerScenario(`
-    let state = emptyTimelineState(0);
+    let state = emptyTimelineState(9);
     const event = {...msg(10), eventId:'evt-10'};
     state = applyTimelineMessage(state, event);
     state = applyTimelineMessage(state, event);
     assert.equal(state.liveMessages.length, 1);
+  `);
+});
+
+test('persistent cursor advances only through contiguous runtime sequences', () => {
+  runReducerScenario(`
+    let state=emptyTimelineState(98);
+    state=applyTimelineMessage(state,msg(100));
+    assert.equal(state.highestSeenSequence,100);
+    assert.equal(state.contiguousAppliedSequence,98);
+    assert.equal(state.recovering,true);
+    state=applyTimelineMessage(state,msg(99));
+    assert.equal(state.contiguousAppliedSequence,100);
+    assert.equal(state.recovering,false);
+    assert.deepEqual(state.liveMessages.map(x=>x.runtimeSequence),[99,100]);
+  `);
+});
+
+test('runtime generation change does not mix old and new sequence cursors', () => {
+  runReducerScenario(`
+    let state=emptyTimelineState(9);
+    state=applyTimelineMessage(state,msg(10));
+    state=applyTimelineMessage(state,{...msg(1),runtimeGeneration:'g2'});
+    assert.equal(state.runtimeGeneration,'g2');
+    assert.equal(state.contiguousAppliedSequence,1);
+    assert.equal(state.liveMessages.length,1);
   `);
 });
 
@@ -91,7 +116,7 @@ test('streaming deltas and live activity stay coalesced instead of growing per t
 
 test('streaming answer keeps its first position when a user sends during generation', () => {
   runReducerScenario(`
-    let state = emptyTimelineState(0);
+    let state = emptyTimelineState(9);
     state = applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:10,runtimeGeneration:'g1',params:{itemId:'answer-1',delta:'first'}});
     state = applyTimelineMessage(state,{type:'user',clientMessageId:'client-2',runtimeSequence:11,text:'follow up',attachments:[]});
     state = applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:12,runtimeGeneration:'g1',params:{itemId:'answer-1',delta:' second'}});

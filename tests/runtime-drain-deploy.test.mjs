@@ -29,7 +29,9 @@ test('runtime exposes lifecycle draining and rejects new work while draining', (
 test('draining waits for active turns, submitting turns, and pending event pushes', () => {
   assert.match(runtime, /activeTurnCount/);
   assert.match(runtime, /submittingTurnCount/);
-  assert.match(runtime, /pendingEventWriteCount:diagnostics\.runtimePendingPushCount/);
+  assert.match(runtime, /pendingEventWriteCount:eventStore\.metrics\.appendQueueCount/);
+  assert.match(runtime, /deltaQueueEventCount:eventStore\.metrics\.deltaQueueEventCount/);
+  assert.match(runtime, /pendingSqliteWriteCount:eventStore\.metrics\.pendingSqliteWriteCount/);
   assert.match(runtime, /waitForDrain/);
   assert.match(runtime, /process\.once\('SIGTERM'/);
   assert.match(ctl, /active_turn_count_from_json/);

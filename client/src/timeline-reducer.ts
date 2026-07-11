@@ -13,11 +13,17 @@ export type TimelineState = {
   liveMessages: any[];
   coveredSequence: number;
   appliedSequence: number;
+  runtimeGeneration: string;
+  highestSeenSequence: number;
+  contiguousAppliedSequence: number;
+  snapshotCoveredSequence: number;
+  pendingSequenceBuffer: Map<number,any[]>;
+  recovering: boolean;
 };
 export type TurnUiStatus = 'idle'|'running'|'waiting_approval'|'waiting_input'|'cancelling'|'completed'|'interrupted'|'failed'|'unknown';
 
 export function emptyTimelineState(appliedSequence = 0): TimelineState {
-  return { snapshotEvents: [], liveMessages: [], coveredSequence: 0, appliedSequence };
+  return { snapshotEvents: [], liveMessages: [], coveredSequence: 0, appliedSequence, runtimeGeneration:'', highestSeenSequence:appliedSequence, contiguousAppliedSequence:appliedSequence, snapshotCoveredSequence:0, pendingSequenceBuffer:new Map(), recovering:false };
 }
 
 export function runtimeMessageSequence(msg: any): number {
@@ -55,6 +61,12 @@ export function applyTimelineSnapshot(state: TimelineState, snapshotEvents: Time
     liveMessages: sortRuntimeMessages(next),
     coveredSequence,
     appliedSequence: Math.max(state.appliedSequence, coveredSequence),
+    snapshotCoveredSequence:coveredSequence,
+    contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,coveredSequence),
+    highestSeenSequence:Math.max(state.highestSeenSequence,coveredSequence),
+    runtimeGeneration:state.runtimeGeneration,
+    pendingSequenceBuffer:new Map([...state.pendingSequenceBuffer].filter(([sequence])=>sequence>coveredSequence)),
+    recovering:false,
   };
 }
 
@@ -71,19 +83,49 @@ function liveUserKeys(msg: any): string[] {
 
 export function applyTimelineMessage(state: TimelineState, msg: any): TimelineState {
   const seq = runtimeMessageSequence(msg);
+  const generation=String(msg?.runtimeGeneration || msg?.generation || '');
+  if (generation && state.runtimeGeneration && generation!==state.runtimeGeneration) {
+    state={...emptyTimelineState(0),snapshotEvents:state.snapshotEvents,runtimeGeneration:generation,recovering:true};
+  } else if (generation && !state.runtimeGeneration) state={...state,runtimeGeneration:generation};
   if (seq && seq <= state.coveredSequence) {
-    return { ...state, appliedSequence: Math.max(state.appliedSequence, seq) };
+    return { ...state, appliedSequence: Math.max(state.appliedSequence, seq),contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,seq),highestSeenSequence:Math.max(state.highestSeenSequence,seq) };
   }
+  if (seq>state.contiguousAppliedSequence+1) {
+    const pending=new Map(state.pendingSequenceBuffer);
+    pending.set(seq,[...(pending.get(seq)||[]),msg]);
+    return {...state,highestSeenSequence:Math.max(state.highestSeenSequence,seq),pendingSequenceBuffer:pending,recovering:true};
+  }
+  return applyContiguousMessage(state,msg);
+}
+
+function applyContiguousMessage(state:TimelineState,msg:any):TimelineState {
+  const seq=runtimeMessageSequence(msg);
   const key = runtimeMessageKey(msg);
   if (state.liveMessages.some(item => runtimeMessageKey(item) === key)) {
-    return { ...state, appliedSequence: Math.max(state.appliedSequence, seq) };
+    return advancePending({...state,appliedSequence:Math.max(state.appliedSequence,seq),contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,seq),highestSeenSequence:Math.max(state.highestSeenSequence,seq)});
   }
   const coalesced = coalesceLiveMessage(state.liveMessages, msg);
-  return {
+  return advancePending({
     ...state,
     liveMessages: sortRuntimeMessages(dedupeRuntimeMessages(coalesced)),
     appliedSequence: Math.max(state.appliedSequence, seq),
-  };
+    contiguousAppliedSequence:seq ? Math.max(state.contiguousAppliedSequence,seq) : state.contiguousAppliedSequence,
+    highestSeenSequence:Math.max(state.highestSeenSequence,seq),
+  });
+}
+
+function advancePending(state:TimelineState):TimelineState {
+  let next=state;
+  for (;;) {
+    const sequence=next.contiguousAppliedSequence+1;
+    const buffered=next.pendingSequenceBuffer.get(sequence);
+    if (!buffered?.length) break;
+    const pending=new Map(next.pendingSequenceBuffer);
+    pending.delete(sequence);
+    next={...next,pendingSequenceBuffer:pending};
+    for (const message of buffered) next=applyContiguousMessage(next,message);
+  }
+  return {...next,recovering:next.pendingSequenceBuffer.size>0};
 }
 
 function coalesceLiveMessage(items:any[], msg:any):any[] {

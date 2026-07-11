@@ -44,6 +44,14 @@ export class RuntimeClient {
     const req = http.request(url, { method:'GET', headers:{ accept:'text/event-stream', ...this.authHeaders() } });
     let buffer = '';
     let eventQueue = Promise.resolve();
+    let damaged = false;
+    const fail = (error:unknown) => {
+      if (damaged) return;
+      damaged = true;
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      onStatus?.('error', normalized);
+      req.destroy(normalized);
+    };
     req.on('response', res => {
       if ((res.statusCode || 500) >= 400) {
         const chunks:Buffer[] = [];
@@ -64,12 +72,12 @@ export class RuntimeClient {
           if (data) {
             try {
               const event = JSON.parse(data);
-              eventQueue = eventQueue.then(()=>onEvent(event)).catch(()=>{});
-            } catch {}
+              eventQueue = eventQueue.then(()=>onEvent(event)).catch(fail);
+            } catch (error) { fail(new Error(`runtime SSE JSON parse failed: ${error instanceof Error ? error.message : String(error)}`)); }
           }
         }
       });
-      res.on('close', () => onStatus?.('closed'));
+      res.on('close', () => { if (!damaged) onStatus?.('closed'); });
     });
     req.on('error', err => onStatus?.('error', err));
     req.end();

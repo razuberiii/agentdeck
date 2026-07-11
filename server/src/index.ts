@@ -89,7 +89,7 @@ const websocketSessionCounts = new Map<string, number>();
 const pendingApprovals = new Map<string, { id:string|number; method:string; createdAt:number }>();
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
-type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
+type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; receivedSequence:number; processingSequence:number; committedSequence:number; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
 const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTurnState; assistantId:string; turnId:string }>();
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
@@ -4575,17 +4575,32 @@ function ensureRuntimePushSubscription(threadId:string) {
   const existing = runtimeSubscriptions.get(threadId);
   if (existing?.connected || existing?.connecting) return existing;
   existing?.close?.();
-  const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, lastSequence:Number(existing?.lastSequence || 0), generation:existing?.generation, lastError:existing?.lastError, lastStatus:'checking' };
+  const committedSequence=Number(existing?.committedSequence || existing?.lastSequence || 0);
+  const state:RuntimeSubscriptionState = { close:()=>{}, connected:false, connecting:true, receivedSequence:committedSequence, processingSequence:0, committedSequence, lastSequence:committedSequence, generation:existing?.generation, lastError:existing?.lastError, lastStatus:'checking' };
   runtimeSubscriptions.set(threadId, state);
   runtimeDiagnostics.subscribeStarts++;
   app.log.info({ sessionId:threadId, threadId, after:state.lastSequence }, 'runtime sse subscribe starting');
   const close = runtime.subscribe(threadId, state.lastSequence, async (event:any) => {
     state.generation = String(event.generation || '');
-    state.lastSequence = Math.max(state.lastSequence, Number(event.sequence || 0));
+    const sequence=Number(event.sequence || 0);
+    state.receivedSequence=Math.max(state.receivedSequence,sequence);
+    state.processingSequence=sequence;
     runtimeDiagnostics.subscribeEvents++;
-    const messages = await runtimeEventMessages(threadId, event);
-    if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'unmapped_runtime_event' }, 'runtime event ignored');
-    for (const msg of messages) broadcast(threadId, msg);
+    try {
+      const messages = await runtimeEventMessages(threadId, event);
+      if (!messages.length) app.log.warn({ sessionId:threadId, threadId, sequence:event.sequence || null, eventType:event.event_type || 'unknown', reason:'explicitly_ignored_or_unmapped_runtime_event' }, 'runtime event produced no websocket messages');
+      for (const msg of messages) broadcast(threadId, msg);
+      state.committedSequence=Math.max(state.committedSequence,sequence);
+      state.lastSequence=state.committedSequence;
+      state.processingSequence=0;
+    } catch (error:any) {
+      state.processingSequence=0;
+      state.lastStatus='recovering';
+      state.lastError=String(error?.message || error).slice(0,500);
+      app.log.error({sessionId:threadId,sequence,eventType:String(event.event_type||'unknown'),error:state.lastError},'runtime event processing failed; reconnecting from committed sequence');
+      queueMicrotask(()=>state.close());
+      throw error;
+    }
   }, (status, error) => {
     if (status === 'connected') {
       state.connecting = false;

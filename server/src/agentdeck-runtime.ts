@@ -16,6 +16,8 @@ import { GeminiAcpRuntime, GeminiModelSwitchUnsupportedError } from './acp/gemin
 import { ClaudeRuntimeManager } from './claude/claude-runtime-manager.js';
 import { ClaudeProfileStore } from './claude/claude-profile-store.js';
 import type { ClaudeProfile } from './claude/claude-types.js';
+import { DurableEventStore } from './event-store.js';
+import { EventSubscriptions } from './event-subscriptions.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -309,14 +311,9 @@ const claudeManager = new ClaudeRuntimeManager(db, claudeProfileStore, {
   },
 });
 
-const subscriptions = new Map<string, Set<any>>();
 const runtimes = new Map<string, CodexAccountRuntime>();
 const runtimeForAccountInFlight = new Map<string, Promise<CodexAccountRuntime>>();
 const codexAppServerEnsureInFlight = new Map<string, Promise<void>>();
-const eventAppendChains = new Map<string, Promise<any>>();
-const sequenceCache = new Map<string, number>();
-const deltaPersistQueues = new Map<string, any[]>();
-const deltaPersistTimers = new Map<string, NodeJS.Timeout>();
 const resumeInFlight = new Map<string, Promise<{ threadId:string; recovered:boolean }>>();
 const reconcileInFlight = new Map<string, Promise<void>>();
 const lastReconcileAt = new Map<string, number>();
@@ -347,6 +344,17 @@ const RUNTIME_GENERATION = INSTANCE_ID;
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 eventLoopDelay.enable();
 const app = Fastify({ logger:{ redact:['req.headers.authorization','token','secret','password'] }, bodyLimit:25 * 1024 * 1024 });
+const subscriptions = new EventSubscriptions({
+  maxBuffer:Number(process.env.RUNTIME_SSE_REPLAY_BUFFER_MAX || 2048),
+  maxPendingPushes:Number(process.env.RUNTIME_SSE_PENDING_PUSH_MAX || 4096),
+  logger:(level,data,message)=>app.log[level](data,message),
+});
+const eventStore = new DurableEventStore(db,RUNTIME_GENERATION,{
+  windowMs:Number(process.env.RUNTIME_DELTA_FLUSH_MS || 32),
+  maxEvents:Number(process.env.RUNTIME_DELTA_FLUSH_EVENTS || 128),
+  maxBytes:Number(process.env.RUNTIME_DELTA_FLUSH_BYTES || 262144),
+  onCommitted:event=>subscriptions.publish(event),
+});
 app.setErrorHandler((err:any, req, reply) => {
   if (err instanceof StructuredRuntimeError) {
     const body = { ...err.body, requestId:String(req.id || '') };
@@ -379,10 +387,10 @@ app.get('/diagnostics', async () => ({
   drainStartedAt,
   drainTimeoutMs:DRAIN_TIMEOUT_MS,
   drainState:await drainState(),
-  activeSseSubscribers:[...subscriptions.entries()].map(([sessionId,set]) => ({ sessionId, count:set.size })),
-  activeSseSubscriberTotal:[...subscriptions.values()].reduce((sum,set)=>sum+set.size,0),
+  activeSseSubscribers:subscriptions.snapshot(),
+  activeSseSubscriberTotal:subscriptions.count(),
   activeRuntimeRpcCount:diagnostics.activeRuntimeRpcCount,
-  activeSseSubscriberCount:[...subscriptions.values()].reduce((sum,set)=>sum+set.size,0),
+  activeSseSubscriberCount:subscriptions.count(),
   sseReconnectCount:diagnostics.sseReconnectCount,
   resumeInFlightCount:resumeInFlight.size,
   runtimePendingPushCount:diagnostics.runtimePendingPushCount,
@@ -674,20 +682,14 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
   });
-  const set = subscriptions.get(sessionId) || new Set();
-  subscriptions.set(sessionId, set);
-  set.add(reply.raw);
   diagnostics.sseConnections++;
-  app.log.info({ sessionId, after, activeSubscribers:set.size }, 'runtime sse subscriber connected');
-  for (const event of await eventsAfter(sessionId, after)) {
-    reply.raw.write(`event: runtime\n`);
-    reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
-  }
+  const highWatermark = await latestEventSequence(sessionId);
+  app.log.info({ sessionId, after, highWatermark, activeSubscribers:subscriptions.count(sessionId)+1 }, 'runtime sse subscriber connected');
   reply.raw.on('close', () => {
-    set.delete(reply.raw);
     diagnostics.sseReconnectCount++;
-    app.log.info({ sessionId, activeSubscribers:set.size }, 'runtime sse subscriber closed');
+    app.log.info({ sessionId, activeSubscribers:subscriptions.count(sessionId) }, 'runtime sse subscriber closed');
   });
+  await subscriptions.subscribe(sessionId,reply.raw,after,highWatermark,async (cursor,through)=>(await eventsAfter(sessionId,cursor,true)).filter(event=>Number(event.sequence)<=through) as any);
 });
 
 app.post('/sessions/:id/turns', async (req:any, reply) => {
@@ -1443,41 +1445,25 @@ function scheduleThreadReconcile(session:RuntimeSession, source:string) {
 }
 
 async function appendEvent(sessionId:string, eventType:string, payload:any) {
-  const previous = eventAppendChains.get(sessionId) || Promise.resolve();
-  const next = previous.then(() => appendEventUnlocked(sessionId, eventType, payload), () => appendEventUnlocked(sessionId, eventType, payload));
-  eventAppendChains.set(sessionId, next.catch(()=>undefined));
-  return next;
-}
-
-async function appendEventUnlocked(sessionId:string, eventType:string, payload:any) {
   const startedAt = Date.now();
   if (isProviderOnlyRecoveryEvent(eventType, payload)) {
     app.log.warn({ sessionId, eventType }, 'provider-only recovery context event suppressed');
-    return { session_id:sessionId, sequence:Number(sequenceCache.get(sessionId) || 0), event_type:eventType, payload_json:'{}', created_at:Date.now(), suppressed:true };
+    return { session_id:sessionId, sequence:await latestEventSequence(sessionId), event_type:eventType, payload_json:'{}', created_at:Date.now(), suppressed:true };
   }
   const eventKey = eventKeyFor(eventType, payload);
   if (eventKey) {
     const existing = await db.get('SELECT sequence FROM events WHERE session_id=?1 AND event_key=?2', [sessionId, eventKey]);
     if (existing) return { session_id:sessionId, sequence:Number(existing.sequence || 0), event_type:eventType, payload_json:JSON.stringify(payload), created_at:Date.now(), duplicate:true };
   }
-  const sequence = await nextSequence(sessionId);
-  const now = Date.now();
-  const event = { session_id:sessionId, threadId:sessionId, generation:RUNTIME_GENERATION, sequence, event_type:eventType, payload_json:JSON.stringify(payload), created_at:now };
-  if (isTerminalEvent(eventType)) await flushDeltaEvents(sessionId);
-  if (isCriticalEvent(eventType)) await persistEvent(event, eventKey);
-  let pushed = 0;
-  for (const raw of subscriptions.get(sessionId) || []) {
-    diagnostics.runtimePendingPushCount++;
-    raw.write('event: runtime\n');
-    raw.write(`data: ${JSON.stringify(event)}\n\n`);
-    diagnostics.runtimePendingPushCount = Math.max(0, diagnostics.runtimePendingPushCount - 1);
-    pushed++;
-  }
-  if (isDeltaEvent(eventType)) diagnostics.deltasSsePushed += pushed;
+  const event = await eventStore.append(sessionId,eventType,payload,eventKey,isCriticalEvent(eventType),isDeltaEvent(eventType));
+  diagnostics.sqliteBatches=eventStore.metrics.sqliteBatches;
+  diagnostics.sqliteRows=eventStore.metrics.sqliteRows;
+  diagnostics.sqliteMs=eventStore.metrics.sqliteMs;
+  diagnostics.runtimePendingPushCount=subscriptions.pendingPushCount;
+  if (isDeltaEvent(eventType)) diagnostics.deltasSsePushed += subscriptions.count(sessionId);
   if (isDeltaEvent(eventType) || eventType === 'turn/completed' || eventType === 'item/completed') {
-    app.log.info({ localSessionId:sessionId, operation:'runtime SSE push', eventType, runtimePendingPushCount:diagnostics.runtimePendingPushCount, activeSseSubscriberCount:subscriptions.get(sessionId)?.size || 0, durationMs:Date.now() - startedAt }, 'runtime event pushed');
+    app.log.info({ localSessionId:sessionId, operation:'runtime durable append and SSE push', eventType, runtimePendingPushCount:subscriptions.pendingPushCount, activeSseSubscriberCount:subscriptions.count(sessionId), durationMs:Date.now() - startedAt }, 'runtime event committed');
   }
-  if (!isCriticalEvent(eventType)) persistEvent(event, eventKey).catch(e => app.log.error({ err:e, sessionId, eventType }, 'event persist failed'));
   return event;
 }
 
@@ -1516,57 +1502,8 @@ function visibleInputText(input:any) {
     .trim();
 }
 
-async function nextSequence(sessionId:string) {
-  const cached = sequenceCache.get(sessionId);
-  if (cached !== undefined) {
-    const next = cached + 1;
-    sequenceCache.set(sessionId, next);
-    return next;
-  }
-  const row = await db.get('SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE session_id=?1', [sessionId]);
-  const next = Number(row?.seq || 0) + 1;
-  sequenceCache.set(sessionId, next);
-  return next;
-}
-
-async function persistEvent(event:any, eventKey:string|null) {
-  if (isDeltaEvent(event.event_type)) {
-    const queue = deltaPersistQueues.get(event.session_id) || [];
-    queue.push({ event, eventKey });
-    deltaPersistQueues.set(event.session_id, queue);
-    if (!deltaPersistTimers.has(event.session_id)) {
-      const timer = setTimeout(() => flushDeltaEvents(event.session_id).catch(e => app.log.error({ err:e }, 'delta flush failed')), 50);
-      (timer as any).unref?.();
-      deltaPersistTimers.set(event.session_id, timer);
-    }
-    return;
-  }
-  await insertEvents([{ event, eventKey }]);
-}
-
 async function flushDeltaEvents(sessionId:string) {
-  const timer = deltaPersistTimers.get(sessionId);
-  if (timer) clearTimeout(timer);
-  deltaPersistTimers.delete(sessionId);
-  const batch = deltaPersistQueues.get(sessionId) || [];
-  deltaPersistQueues.delete(sessionId);
-  if (batch.length) await insertEvents(batch);
-}
-
-async function insertEvents(batch:{ event:any; eventKey:string|null }[]) {
-  const startedAt = Date.now();
-  const statements:string[] = ['BEGIN'];
-  for (const { event, eventKey } of batch) {
-    statements.push(`INSERT OR IGNORE INTO events (session_id,ts,kind,payload,sequence,event_type,payload_json,created_at,event_key) VALUES (${q(event.session_id)},${Number(event.created_at)},${q(event.event_type)},${q(event.payload_json)},${Number(event.sequence)},${q(event.event_type)},${q(event.payload_json)},${Number(event.created_at)},${q(eventKey)})`);
-    statements.push(`UPDATE sessions SET last_sequence=${Number(event.sequence)}, updated_at=${Number(event.created_at)} WHERE (id=${q(event.session_id)} OR codex_thread_id=${q(event.session_id)}) AND COALESCE(last_sequence,0)<${Number(event.sequence)}`);
-  }
-  statements.push('COMMIT');
-  await db.run(statements.join(';\n'));
-  const elapsed = Date.now() - startedAt;
-  diagnostics.sqliteBatches++;
-  diagnostics.sqliteRows += batch.length;
-  diagnostics.sqliteMs += elapsed;
-  if (elapsed > 100 || batch.length > 100) app.log.warn({ sessionId:batch[0]?.event?.session_id, batchSize:batch.length, elapsedMs:elapsed }, 'runtime sqlite event batch slow');
+  await eventStore.flush(sessionId);
 }
 
 function isDeltaEvent(eventType:string) {
@@ -1942,16 +1879,21 @@ async function drainState() {
   expireRuntimeDrain();
   const row = await db.get(
     `SELECT
-       SUM(CASE WHEN status IN ('running','active','planning','waiting_plan_approval','executing_approved_plan') OR active_turn_id IS NOT NULL THEN 1 ELSE 0 END) AS activeTurnCount,
+       SUM(CASE WHEN status IN ('running','active','planning','executing_approved_plan','output_draining','cancelling') THEN 1 ELSE 0 END) AS activeTurnCount,
        SUM(CASE WHEN status='submitting' THEN 1 ELSE 0 END) AS submittingTurnCount
      FROM sessions`
   ).catch(()=>null);
   return {
     activeTurnCount:Number(row?.activeTurnCount || 0),
     submittingTurnCount:Number(row?.submittingTurnCount || 0),
-    pendingEventWriteCount:diagnostics.runtimePendingPushCount,
+    appendQueueCount:eventStore.metrics.appendQueueCount,
+    deltaQueueEventCount:eventStore.metrics.deltaQueueEventCount,
+    deltaQueueBytes:eventStore.metrics.deltaQueueBytes,
+    pendingSqliteWriteCount:eventStore.metrics.pendingSqliteWriteCount,
+    subscriberPendingBufferCount:subscriptions.pendingBufferCount,
+    pendingEventWriteCount:eventStore.metrics.appendQueueCount+eventStore.metrics.deltaQueueEventCount+eventStore.metrics.pendingSqliteWriteCount+subscriptions.pendingPushCount,
     accepting:runtimeLifecycle === 'accepting',
-    drained:Number(row?.activeTurnCount || 0) === 0 && Number(row?.submittingTurnCount || 0) === 0 && diagnostics.runtimePendingPushCount === 0,
+    drained:Number(row?.activeTurnCount || 0) === 0 && Number(row?.submittingTurnCount || 0) === 0 && eventStore.metrics.appendQueueCount === 0 && eventStore.metrics.deltaQueueEventCount === 0 && eventStore.metrics.pendingSqliteWriteCount === 0 && subscriptions.pendingPushCount === 0,
   };
 }
 function releaseMetadata() {
@@ -1986,6 +1928,9 @@ async function shutdownGracefully(signal:string) {
     app.log.warn({ signal, error:e?.message || String(e), drainState:await drainState().catch(()=>null) }, 'runtime drain timed out before shutdown');
   }
   runtimeLifecycle = 'stopping';
+  await eventStore.drain();
+  await subscriptions.drain();
+  subscriptions.closeAll();
   await app.close().catch(()=>{});
   db.close();
   process.exit(0);
