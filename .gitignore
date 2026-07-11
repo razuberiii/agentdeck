@@ -7,6 +7,12 @@ test-artifacts/
 candidate
 current
 previous
+candidate-web
+candidate-runtime
+current-web
+current-runtime
+previous-web
+previous-runtime
 deploy-state/
 releases/
 

@@ -507,22 +507,23 @@ const Database = require('better-sqlite3');
 const source = process.argv[2], dest = process.argv[3];
 const db = new Database(source, { readonly:true, fileMustExist:true });
 db.pragma('busy_timeout = 1000');
-const timeout = setTimeout(() => {
-  try { db.close(); } catch {}
-  console.error('sqlite backup timed out');
+let lastProgress = Date.now();
+const watchdog = setInterval(() => {
+  if (Date.now() - lastProgress < 30000) return;
+  console.error('sqlite backup stalled for 30 seconds');
   process.exit(1);
-}, 30000);
-db.backup(dest).then(() => {
-  clearTimeout(timeout);
+}, 1000);
+db.backup(dest, { progress(){ lastProgress=Date.now(); return 100; } }).then(() => {
+  clearInterval(watchdog);
   db.close();
 }).catch(err => {
-  clearTimeout(timeout);
+  clearInterval(watchdog);
   try { db.close(); } catch {}
   console.error(err.message);
   process.exit(1);
 });
 NODE
-  then die "live sqlite backup failed; candidate validation cancelled"; fi
+  then log "live sqlite backup failed; candidate validation cancelled"; return 1; fi
 }
 
 sqlite_file_backup() {
