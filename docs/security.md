@@ -20,6 +20,8 @@ ALLOWED_ORIGINS=https://agentdeck.example.internal,http://100.64.0.10:3842
 
 浏览器 Cookie 只保存随机会话令牌，服务端保存令牌哈希。修改 `ADMIN_PASSWORD` 会撤销已有会话。
 
+`ADMIN_PASSWORD` 与 `COOKIE_SECRET` 使用示例默认值会导致生产启动和检查失败。Cookie 默认启用 Secure；仅 localhost HTTP 可直接配置 `COOKIE_SECURE=false`，可信内网 HTTP 还必须显式设置 `ALLOW_INSECURE_TRUSTED_LAN=1`。反向代理应终止 HTTPS，并保持 Secure Cookie。
+
 ## 凭据与日志
 
 Provider 凭据保存在 `DATA_DIR` 下的受限文件或专用状态中，不应写入 Git、普通日志或浏览器事件。诊断与安装日志在进入界面前会脱敏。

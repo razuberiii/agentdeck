@@ -276,7 +276,7 @@ function ProjectPicker({projects,loading,onRefresh,onClose,onPick}:{projects:Pro
 }
 
 function WorkPulse({dashboard,sessions}:{dashboard:Dashboard;sessions:Session[]}){
-  const running=sessions.filter(session=>['running','planning','submitting','executing_approved_plan','waiting_approval','waiting_input','waiting_plan_approval'].includes(String(session.activeTurn?.status || session.status))).slice(0,3);
+  const running=sessions.filter(session=>['running','active','planning','submitting','recovering','executing_approved_plan','waiting_approval','waiting_input','waiting_plan_approval'].includes(String(session.activeTurn?.status || session.status))).slice(0,3);
   const runningIds=new Set(running.map(session=>session.id));
   // `idle` only means the latest turn ended. Showing every recently touched idle
   // session makes one stack look as if several tasks completed at once.

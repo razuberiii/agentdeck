@@ -18,6 +18,10 @@ sudo AGENTDECK_INSTALL_PROFILE=hardened ./install.sh
 
 升级不会静默改变既有运行用户、数据目录、端口或权限档位。
 
+安装器只在配置文件缺失时生成 `web.env`、`runtime.env` 和 app-server env，并使用同一组解析后的用户、HOME 与 DATA_DIR；升级不会覆盖维护者已有的键值。`agentdeckctl check` 会拒绝 Web/Runtime 数据根不一致、服务用户与 HOME 不一致、Provider 用户不存在或配置的二进制不可执行。
+
+首次启动前必须替换 `ADMIN_PASSWORD` 和 `COOKIE_SECRET` 的 `change-me` 默认值，否则 Web 会拒绝启动。HTTPS 保持 `COOKIE_SECURE=true`。仅 loopback HTTP 可设为 `COOKIE_SECURE=false`；明确接受可信内网 HTTP 风险时，还需同时设置 `ALLOW_INSECURE_TRUSTED_LAN=1`。公网或不可信网络不得使用该组合。
+
 Web 与 Runtime 使用独立的 `current-web` 和 `current-runtime` 发布指针。首次升级会从旧的 `current` 指针自动初始化两者；之后 web-only 发布不会改变 Runtime 重启时使用的版本，runtime-only 发布同理。
 
 ## 自定义目录与用户

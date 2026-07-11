@@ -1236,7 +1236,7 @@ app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
   const now = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
   const startOfToday = new Date(new Date(now).toDateString()).getTime();
-  const runningStates = new Set(['running','planning','submitting','recovering','inProgress']);
+  const runningStates = new Set(['running','active','planning','submitting','recovering','executing_approved_plan','waiting_approval','waiting_input','waiting_plan_approval','inProgress']);
   const waitingStates = new Set(['waiting_approval','waiting_plan_approval','waiting_input']);
   const projects = new Map<string,{path:string;name:string;sessions:number;lastActiveAt:number}>();
   for (const session of sessions) {
@@ -1271,13 +1271,13 @@ app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
 });
 async function dashboardArtifacts(){
   const sql='SELECT id,session_id,name,mime,size,created_at,modified_at FROM artifacts ORDER BY COALESCE(modified_at,created_at) DESC LIMIT 12';
-  const [webRows,runtimeRows,webCount,runtimeCount]=await Promise.all([db.all(sql).catch(()=>[]),runtimeDb.all(sql).catch(()=>[]),db.get('SELECT COUNT(*) count FROM artifacts').catch(()=>null),runtimeDb.get('SELECT COUNT(*) count FROM artifacts').catch(()=>null)]);
+  const [webRows,runtimeRows,webIds,runtimeIds]=await Promise.all([db.all(sql).catch(()=>[]),runtimeDb.all(sql).catch(()=>[]),db.all('SELECT id FROM artifacts').catch(()=>[]),runtimeDb.all('SELECT id FROM artifacts').catch(()=>[])]);
   const byId=new Map<string,any>();
   for(const row of [...runtimeRows,...webRows]) if(!byId.has(String(row.id))) byId.set(String(row.id),row);
   const items=[...byId.values()].sort((a,b)=>Number(b.modified_at||b.created_at||0)-Number(a.modified_at||a.created_at||0)).slice(0,8).map(row=>({
     id:String(row.id),sessionId:String(row.session_id),name:String(row.name),type:String(row.mime||'application/octet-stream'),size:Number(row.size||0),updatedAt:Number(row.modified_at||row.created_at||0),url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}`,
   }));
-  return { total:Math.max(Number(webCount?.count||0),Number(runtimeCount?.count||0),byId.size), items };
+  return { total:new Set([...webIds,...runtimeIds].map(row=>String(row.id))).size, items };
 }
 app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => {
   let projectDir:string;

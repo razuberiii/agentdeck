@@ -19,4 +19,5 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
-
+      - run: npm run test:e2e
+      - run: bash -n scripts/agentdeckctl scripts/deploy.sh scripts/setup.sh scripts/candidate-lifecycle.sh deploy/install-units.sh
