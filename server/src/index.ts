@@ -5124,7 +5124,7 @@ async function runtimeEventMessages(threadId:string, event:any) {
     return out;
   }
   if (eventType === 'reasoning/delta') {
-    out.push({ type:'codex', method:'item/agentMessage/delta', params:{ itemId:payload?.itemId || `claude-thinking-${threadId}`, delta:String(payload?.delta || '') }, ...base });
+    out.push({ type:'activity', activityId:payload?.itemId || `thinking-${threadId}`, role:'reasoning', title:'正在思考', detail:'分析上下文并整理下一步', phase:'running', ...base });
     return out;
   }
   if (eventType === 'assistant/message') {

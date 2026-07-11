@@ -421,7 +421,7 @@ function itemToEvent(item:any):DisplayEvent|null{
     const parsedFiles = artifacts.length ? [] : extractFileLinks(text);
     return {key:item.id,role:'assistant',text,meta:item.phase==='final_answer'?'最终回答':'回复',images:[...parsedImages,...artifactImages],files:[...parsedFiles,...artifactFiles]};
   }
-  if(item.type==='reasoning') return {key:item.id,role:'reasoning',title:'思考',text:[...(item.summary||[]),...(item.content||[])].join('\n')||'正在思考',open:false};
+  if(item.type==='reasoning') return {key:item.id,role:'reasoning',title:'思考摘要',text:[...(item.summary||[]),...(item.content||[])].join('\n')||'正在思考',open:false};
   if(item.type==='plan') return {key:item.id,role:'reasoning',title:'计划',text:item.text||'',open:true};
   if(item.type==='commandExecution') {
     const output = String(item.aggregatedOutput || '').trim();
@@ -577,7 +577,7 @@ function EventCard({e,onImage,onMediaLoad}:{e:DisplayEvent;onImage:(a:Attachment
   return <details className={`event ${e.role}`} open={e.open}><summary><b>{e.title||e.role}</b>{e.meta&&<span>{e.meta}</span>}</summary><CopyButton text={e.text} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制':'复制失败')}/><pre>{e.text}</pre></details>;
 }
 function LiveTrace({events}:{events:DisplayEvent[]}){
-  return <aside className="liveTrace" aria-live="polite"><header><span>WORKING / NOW</span><b>正在处理这件事</b><i/></header><div>{events.map((event,index)=><article className={event.role} key={event.key||index}><em>{event.role==='command'?'RUN':event.role==='file'?'FILE':'THINK'}</em><span><b>{event.title||event.meta||'处理中'}</b><small>{String(event.text||event.meta||'').replace(/\s+/g,' ').slice(0,180)}</small></span></article>)}</div></aside>;
+  return <aside className="liveTrace" aria-live="polite"><header><span>LIVE / CONTEXT</span><b>正在推进这件事</b><i/></header><div>{events.map((event,index)=><article className={event.role} key={event.key||index}><em>{event.role==='command'?'RUN':event.role==='file'?'FILE':'THINK'}</em><span><b>{event.title||event.meta||'处理中'}</b><small>{String(event.text||event.meta||'').replace(/\s+/g,' ').slice(0,180)}</small></span></article>)}</div></aside>;
 }
 function PlanReviewCard({req,busy,onAnswer}:{req:PlanRequest;busy:boolean;onAnswer:(req:PlanRequest,optionId:string,note:string)=>void}){
   const [note,setNote]=useState('');
