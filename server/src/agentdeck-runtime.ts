@@ -1594,7 +1594,9 @@ function eventKeyFor(eventType:string, payload:any) {
 
 async function eventsAfter(sessionId:string, after:number, includeDeltas = false) {
   const decorate = (rows:any[]) => rows.map(row => ({ ...row, threadId:sessionId, generation:RUNTIME_GENERATION }));
-  if (after <= 0) {
+  // Compact history is only for snapshot-oriented reads. Durable subscribers
+  // must see every sequence so Web can emit either a visible frame or a cursor advance.
+  if (after <= 0 && !includeDeltas) {
     return decorate(await db.all(
       `SELECT session_id,sequence,event_type,payload_json,created_at
        FROM (
@@ -1643,7 +1645,6 @@ async function eventsAfter(sessionId:string, after:number, includeDeltas = false
      FROM events
      WHERE session_id=?1
        AND COALESCE(sequence,0)>?2
-       AND event_type<>'thread/read'
      ORDER BY sequence ASC
      LIMIT 1000`,
     [sessionId, after]

@@ -88,6 +88,7 @@ export function applyTimelineMessage(state: TimelineState, msg: any): TimelineSt
   if (generation && state.runtimeGeneration && generation!==state.runtimeGeneration) {
     state=beginTimelineGeneration(state,generation);
   } else if (generation && !state.runtimeGeneration) state={...state,runtimeGeneration:generation};
+  if(msg?.type==='runtime_cursor')return applyCursorRange(state,msg);
   if (seq && seq <= state.coveredSequence) {
     return { ...state, appliedSequence: Math.max(state.appliedSequence, seq),contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,seq),highestSeenSequence:Math.max(state.highestSeenSequence,seq) };
   }
@@ -97,6 +98,22 @@ export function applyTimelineMessage(state: TimelineState, msg: any): TimelineSt
     return {...state,highestSeenSequence:Math.max(state.highestSeenSequence,seq),pendingSequenceBuffer:pending,recovering:true};
   }
   return applyContiguousMessage(state,msg);
+}
+
+function applyCursorRange(state:TimelineState,msg:any):TimelineState{
+  const originalFrom=Number(msg?.fromSequence||0);
+  const through=Number(msg?.throughSequence||0);
+  if(!Number.isSafeInteger(originalFrom)||!Number.isSafeInteger(through)||originalFrom<=0||through<originalFrom)return state;
+  if(through<=state.contiguousAppliedSequence||through<=state.snapshotCoveredSequence)return state;
+  const from=Math.max(originalFrom,state.contiguousAppliedSequence+1,state.snapshotCoveredSequence+1);
+  if(from>state.contiguousAppliedSequence+1){
+    const pending=new Map(state.pendingSequenceBuffer);
+    const key=runtimeMessageKey(msg);
+    const existing=pending.get(originalFrom)||[];
+    if(!existing.some(item=>runtimeMessageKey(item)===key))pending.set(originalFrom,[...existing,msg]);
+    return {...state,highestSeenSequence:Math.max(state.highestSeenSequence,through),pendingSequenceBuffer:pending,recovering:true};
+  }
+  return advancePending({...state,appliedSequence:Math.max(state.appliedSequence,through),contiguousAppliedSequence:through,highestSeenSequence:Math.max(state.highestSeenSequence,through)});
 }
 
 export function beginTimelineGeneration(state:TimelineState,generation:string):TimelineState{
@@ -124,12 +141,13 @@ function advancePending(state:TimelineState):TimelineState {
   let next=state;
   for (;;) {
     const sequence=next.contiguousAppliedSequence+1;
-    const buffered=next.pendingSequenceBuffer.get(sequence);
+    const pendingKey=[...next.pendingSequenceBuffer.keys()].sort((a,b)=>a-b).find(key=>key<=sequence&&next.pendingSequenceBuffer.get(key)?.some(msg=>msg?.type==='runtime_cursor'&&Number(msg.throughSequence)>=sequence))??sequence;
+    const buffered=next.pendingSequenceBuffer.get(pendingKey);
     if (!buffered?.length) break;
     const pending=new Map(next.pendingSequenceBuffer);
-    pending.delete(sequence);
+    pending.delete(pendingKey);
     next={...next,pendingSequenceBuffer:pending};
-    for (const message of buffered) next=applyContiguousMessage(next,message);
+    for (const message of buffered) next=message?.type==='runtime_cursor'?applyCursorRange(next,message):applyContiguousMessage(next,message);
   }
   return {...next,recovering:next.pendingSequenceBuffer.size>0};
 }

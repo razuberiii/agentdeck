@@ -93,6 +93,18 @@ test('persistent cursor advances only through contiguous runtime sequences', () 
   `);
 });
 
+test('cursor control frames fill filtered sequences without creating timeline items',()=>{
+  runReducerScenario(`
+    let state=emptyTimelineState(513);
+    state=applyTimelineMessage(state,msg(514));
+    state=applyTimelineMessage(state,{type:'runtime_cursor',fromSequence:515,throughSequence:519,runtimeGeneration:'g1'});
+    state=applyTimelineMessage(state,msg(520));
+    assert.equal(state.contiguousAppliedSequence,520);
+    assert.equal(state.recovering,false);
+    assert.deepEqual(state.liveMessages.map(x=>x.runtimeSequence),[514,520]);
+  `);
+});
+
 test('snapshot through 500 lets new runtime generation sequence 501 display immediately', () => {
   runReducerScenario(`
     let state=applyTimelineSnapshot(emptyTimelineState(0),[progress],500);
