@@ -688,6 +688,7 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
+    'X-Runtime-Generation':RUNTIME_GENERATION,
   });
   diagnostics.sseConnections++;
   const highWatermark = await latestEventSequence(sessionId);

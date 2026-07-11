@@ -8,6 +8,7 @@ function runReducerScenario(source) {
     import {
       applyTimelineMessage,
       applyTimelineSnapshot,
+      beginTimelineGeneration,
       emptyTimelineState,
       reconcileTimelineEvents,
       resolveTurnUiStatus,
@@ -92,14 +93,31 @@ test('persistent cursor advances only through contiguous runtime sequences', () 
   `);
 });
 
-test('runtime generation change does not mix old and new sequence cursors', () => {
+test('snapshot through 500 lets new runtime generation sequence 501 display immediately', () => {
   runReducerScenario(`
-    let state=emptyTimelineState(9);
-    state=applyTimelineMessage(state,msg(10));
-    state=applyTimelineMessage(state,{...msg(1),runtimeGeneration:'g2'});
+    let state=applyTimelineSnapshot(emptyTimelineState(0),[progress],500);
+    state={...state,runtimeGeneration:'g1'};
+    state=beginTimelineGeneration(state,'g2');
+    state=applyTimelineMessage(state,{...msg(501),runtimeGeneration:'g2'});
     assert.equal(state.runtimeGeneration,'g2');
-    assert.equal(state.contiguousAppliedSequence,1);
+    assert.equal(state.contiguousAppliedSequence,501);
     assert.equal(state.liveMessages.length,1);
+    assert.equal(state.recovering,false);
+  `);
+});
+
+test('runtime restart recovery snapshot resumes turn deltas before terminal completion',()=>{
+  runReducerScenario(`
+    let state=applyTimelineSnapshot(emptyTimelineState(0),[progress],500);
+    state={...state,runtimeGeneration:'g1'};
+    state=beginTimelineGeneration(state,'g2');
+    state=applyTimelineSnapshot(state,[progress],507);
+    state=applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:508,runtimeGeneration:'g2',params:{itemId:'running-answer',delta:'live '}});
+    state=applyTimelineMessage(state,{type:'codex',method:'item/agentMessage/delta',runtimeSequence:509,runtimeGeneration:'g2',params:{itemId:'running-answer',delta:'again'}});
+    assert.equal(state.contiguousAppliedSequence,509);
+    assert.equal(state.liveMessages.length,1);
+    assert.equal(state.liveMessages[0].params.delta,'live again');
+    assert.equal(state.recovering,false);
   `);
 });
 

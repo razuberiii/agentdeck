@@ -1783,7 +1783,7 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
       await sessionCommandQueue.run(sessionId,async()=>{
       if (msg.type === 'join') {
         if (!registerWsSession(ws, sessionId)) return wsClose(ws, 1008, 'too_many_session_connections');
-        await joinAndResume(sessionId, ws, Number(msg.lastSequence || 0));
+        await joinAndResume(sessionId, ws, Number(msg.lastSequence || 0),msg.runtimeGenerationRecovery===true);
       }
       if (msg.type === 'send') await sendTurn(sessionId, String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct');
       if (msg.type === 'sendChunkStart') startChunkedMessage(msg);
@@ -4526,7 +4526,7 @@ function releaseMetadata() {
     return { releaseId:path.basename(process.cwd()), commit:'' };
   }
 }
-async function joinAndResume(id:string, ws:any, lastSequence = 0){
+async function joinAndResume(id:string, ws:any, lastSequence = 0,recoverRuntimeGeneration=false){
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
   if(!clients.has(threadId)) clients.set(threadId,new Set());
@@ -4537,16 +4537,18 @@ async function joinAndResume(id:string, ws:any, lastSequence = 0){
     return;
   }
   if (USE_AGENT_RUNTIME) {
+    if(recoverRuntimeGeneration)replaceRuntimePushSubscription(threadId,lastSequence);
     const subscription = ensureSessionSubscription(id, threadId);
     await replayRuntimeEventsToWs(threadId, ws, lastSequence);
     const latest = await runtimeLatestSequence(threadId).catch(()=>Number(row?.last_sequence || 0));
     app.log.info({ sessionId:id, threadId, rowStatus:String(row?.status || ''), lastSequence:Number(lastSequence || 0), latestSequence:latest, subscriberCount:clients.get(threadId)?.size || 0, connectionGeneration:ws.agentdeckGeneration || null, runtimeConnection:runtimeConnectionStatus(subscription) }, 'codex session joined with runtime subscription');
-    ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:runtimeConnectionStatus(subscription)}));
+    ws.send(JSON.stringify({type:'joined', sessionId:threadId, runtimeConnection:runtimeConnectionStatus(subscription),runtimeGeneration:subscription.generation||null}));
     return;
   }
   if (row?.project_dir) await codex.resumeThread(threadId, String(row.project_dir), modeOptions(sessionMode(row), await effectiveModel(row))).catch(()=>{});
   ws.send(JSON.stringify({type:'joined', sessionId:threadId}));
 }
+function replaceRuntimePushSubscription(threadId:string,committedSequence:number){const existing=runtimeSubscriptions.get(threadId);if(existing){runtimeSubscriptions.delete(threadId);existing.close();}const cursor=Math.max(0,Number(committedSequence||0));runtimeSubscriptions.set(threadId,{close:()=>{},connected:false,connecting:false,receivedSequence:cursor,processingSequence:0,committedSequence:cursor,lastSequence:cursor,generation:undefined,lastStatus:'recovering'});}
 function broadcast(id:string, msg:any){
   const set = clients.get(id);
   if (!set?.size) {
@@ -4606,12 +4608,14 @@ function ensureRuntimePushSubscription(threadId:string) {
     }
   }, (status, error) => {
     if (status === 'connected') {
+      const connectedGeneration=String(error?.generation||'');
+      if(connectedGeneration)state.generation=connectedGeneration;
       state.connecting = false;
       state.connected = true;
       state.lastStatus = 'connected';
       state.lastError = undefined;
       app.log.info({ sessionId:threadId, threadId, subscriberCount:clients.get(threadId)?.size || 0 }, 'runtime subscription restored');
-      broadcast(threadId, { type:'runtimeConnection', status:'connected' });
+      broadcast(threadId, { type:'runtimeConnection', status:'connected',runtimeGeneration:state.generation||null });
       return;
     }
     state.connecting = false;

@@ -62,7 +62,7 @@ export class RuntimeClient {
         res.on('end', () => onStatus?.('error', new Error(Buffer.concat(chunks).toString('utf8') || `runtime subscribe ${res.statusCode}`)));
         return;
       }
-      onStatus?.('connected');
+      onStatus?.('connected',{generation:String(res.headers['x-runtime-generation']||'')});
       res.setEncoding('utf8');
       res.on('data', chunk => {
         buffer += chunk;

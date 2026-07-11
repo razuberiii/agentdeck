@@ -85,7 +85,7 @@ export function applyTimelineMessage(state: TimelineState, msg: any): TimelineSt
   const seq = runtimeMessageSequence(msg);
   const generation=String(msg?.runtimeGeneration || msg?.generation || '');
   if (generation && state.runtimeGeneration && generation!==state.runtimeGeneration) {
-    state={...emptyTimelineState(0),snapshotEvents:state.snapshotEvents,runtimeGeneration:generation,recovering:true};
+    state=beginTimelineGeneration(state,generation);
   } else if (generation && !state.runtimeGeneration) state={...state,runtimeGeneration:generation};
   if (seq && seq <= state.coveredSequence) {
     return { ...state, appliedSequence: Math.max(state.appliedSequence, seq),contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,seq),highestSeenSequence:Math.max(state.highestSeenSequence,seq) };
@@ -96,6 +96,11 @@ export function applyTimelineMessage(state: TimelineState, msg: any): TimelineSt
     return {...state,highestSeenSequence:Math.max(state.highestSeenSequence,seq),pendingSequenceBuffer:pending,recovering:true};
   }
   return applyContiguousMessage(state,msg);
+}
+
+export function beginTimelineGeneration(state:TimelineState,generation:string):TimelineState{
+  const covered=Math.max(state.snapshotCoveredSequence,state.coveredSequence);
+  return {...state,liveMessages:[],coveredSequence:covered,appliedSequence:covered,runtimeGeneration:generation,highestSeenSequence:covered,contiguousAppliedSequence:covered,snapshotCoveredSequence:covered,pendingSequenceBuffer:new Map(),recovering:true};
 }
 
 function applyContiguousMessage(state:TimelineState,msg:any):TimelineState {
