@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {RuntimeEventEnvelopeSchema}from'./contracts.js';
 
 export class RuntimeClient {
   constructor(private baseUrl = process.env.AGENT_RUNTIME_URL || 'http://127.0.0.1:3852') {}
@@ -36,6 +37,8 @@ export class RuntimeClient {
   listSessions(archived = false) { return this.request('GET', `/sessions?archived=${archived ? '1' : '0'}`); }
   readSession(id:string) { return this.request('GET', `/sessions/${encodeURIComponent(id)}`); }
   setSessionTitle(id:string, title:string) { return this.request('PATCH', `/sessions/${encodeURIComponent(id)}`, { title }); }
+  setSessionArchived(id:string,archived:boolean){return this.request('PATCH',`/sessions/${encodeURIComponent(id)}`,{archived});}
+  deleteSession(id:string){return this.request('DELETE',`/sessions/${encodeURIComponent(id)}`);}
   events(id:string, after = 0, includeDeltas = false) { return this.request('GET', `/sessions/${encodeURIComponent(id)}/events?after=${encodeURIComponent(String(after))}${includeDeltas ? '&includeDeltas=1' : ''}`); }
   startTurn(id:string, body:any) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/turns`, body); }
   stopTurn(id:string) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/stop`); }
@@ -71,7 +74,7 @@ export class RuntimeClient {
           const data = raw.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
           if (data) {
             try {
-              const event = JSON.parse(data);
+              const event = RuntimeEventEnvelopeSchema.parse(JSON.parse(data));
               eventQueue = eventQueue.then(()=>onEvent(event)).catch(fail);
             } catch (error) { fail(new Error(`runtime SSE JSON parse failed: ${error instanceof Error ? error.message : String(error)}`)); }
           }

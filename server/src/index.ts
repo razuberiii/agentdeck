@@ -227,20 +227,11 @@ await db.run('ALTER TABLE sessions ADD COLUMN creator_profile_id TEXT').catch(()
 await db.run('ALTER TABLE sessions ADD COLUMN selected_profile_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN executing_profile_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE sessions ADD COLUMN upstream_binding_profile_id TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN archived_at INTEGER').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN last_execution_account_id TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN current_upstream_account_id TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN account_snapshot_json TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN creator_profile_id TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN selected_profile_id TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN executing_profile_id TEXT').catch(()=>{});
-await runtimeDb.run('ALTER TABLE sessions ADD COLUMN upstream_binding_profile_id TEXT').catch(()=>{});
 await db.run("UPDATE sessions SET provider_id='codex' WHERE provider_id IS NULL OR provider_id=''").catch(()=>{});
 await db.run('UPDATE sessions SET provider_session_id=codex_thread_id WHERE provider_session_id IS NULL AND codex_thread_id IS NOT NULL').catch(()=>{});
 await db.run('UPDATE sessions SET workspace_path=project_dir WHERE workspace_path IS NULL').catch(()=>{});
 await db.run('UPDATE sessions SET model_id=model WHERE model_id IS NULL AND model IS NOT NULL').catch(()=>{});
 await db.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
-await runtimeDb.run('UPDATE sessions SET archived_at=updated_at WHERE archived=1 AND archived_at IS NULL').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN anchor_item_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN turn_id TEXT').catch(()=>{});
 await db.run('ALTER TABLE artifacts ADD COLUMN relative_path TEXT').catch(()=>{});
@@ -973,7 +964,6 @@ app.delete('/api/gemini/profiles/:id', { preHandler: ensureAuth }, async (req:an
   await step('stopDisposeAcp', () => runtime.disposeGeminiProfile(String(profile.id)).catch(()=>null));
   await step('dbDelete', async () => {
     await db.run("UPDATE sessions SET account_snapshot_json=COALESCE(account_snapshot_json, ?1) WHERE provider_id='gemini' AND account_id=?2", [JSON.stringify(snapshot), String(profile.id)]).catch(()=>{});
-    await runtimeDb.run("UPDATE sessions SET account_snapshot_json=COALESCE(account_snapshot_json, ?1) WHERE (provider_id='gemini' OR provider='gemini') AND account_id=?2", [JSON.stringify(snapshot), String(profile.id)]).catch(()=>{});
     await db.run('DELETE FROM gemini_profiles WHERE id=?1', [String(profile.id)]);
   });
   await step('chooseActive', () => ensureGeminiActiveProfile());
@@ -1529,7 +1519,7 @@ app.post('/api/sessions/:id/archive', { preHandler: ensureAuth }, async (req:any
   const now = Date.now();
   if (!USE_AGENT_RUNTIME) await codex.archive(threadId).catch((e:any)=>app.log.warn({err:e.message}, 'official thread archive failed; archiving local index only'));
   await db.run('UPDATE sessions SET archived=1, archived_at=?1, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2', [now, threadId]);
-  await runtimeDb.run('UPDATE sessions SET archived=1, archived_at=?1, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2 OR upstream_thread_id=?2', [now, threadId]).catch(()=>{});
+  if(USE_AGENT_RUNTIME)await runtime.setSessionArchived(threadId,true);
   return {ok:true};
 });
 app.post('/api/sessions/:id/unarchive', { preHandler: ensureAuth }, async (req:any) => {
@@ -1538,7 +1528,7 @@ app.post('/api/sessions/:id/unarchive', { preHandler: ensureAuth }, async (req:a
   const now = Date.now();
   if (!USE_AGENT_RUNTIME) await codex.unarchive(threadId).catch((e:any)=>app.log.warn({err:e.message}, 'official thread unarchive failed; restoring local index only'));
   await db.run('UPDATE sessions SET archived=0, archived_at=NULL, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2', [now, threadId]);
-  await runtimeDb.run('UPDATE sessions SET archived=0, archived_at=NULL, updated_at=?1 WHERE codex_thread_id=?2 OR id=?2 OR provider_session_id=?2 OR upstream_thread_id=?2', [now, threadId]).catch(()=>{});
+  if(USE_AGENT_RUNTIME)await runtime.setSessionArchived(threadId,false);
   return {ok:true};
 });
 app.post('/api/sessions/:id/fork', { preHandler: ensureAuth }, async (req:any, reply) => { if (USE_AGENT_RUNTIME) return reply.code(409).send({error:'runtime 模式暂不支持 Fork，未创建重复会话'}); const row = await findSession(req.params.id); const threadId = String(row?.codex_thread_id || req.params.id); const mode = sessionMode(row); const model = await effectiveModel(row); const forked = await codex.fork(threadId, row?.project_dir ? String(row.project_dir) : undefined, modeOptions(mode, model)); await upsertThread(forked.thread, { status:'idle', model, ...modeFields(mode) }); return sessionDto(forked.thread, { model, ...modeFields(mode) }); });
@@ -2657,7 +2647,6 @@ async function ensureGeminiProfiles() {
   }
   await ensureGeminiActiveProfile();
   await db.run("UPDATE sessions SET account_id='default' WHERE provider_id='gemini' AND (account_id IS NULL OR account_id='')").catch(()=>{});
-  await runtimeDb.run("UPDATE sessions SET account_id='default' WHERE (provider_id='gemini' OR provider='gemini') AND (account_id IS NULL OR account_id='')").catch(()=>{});
 }
 async function reconcileGeminiProfilesOnStartup() {
   if (!USE_AGENT_RUNTIME) return;
@@ -5440,12 +5429,10 @@ async function hardDeleteSessionData(ids:string[]) {
     await db.run('DELETE FROM events WHERE session_id=?1', [id]).catch(()=>{});
     await db.run('DELETE FROM artifacts WHERE session_id=?1', [id]).catch(()=>{});
     await db.run('DELETE FROM agent_messages WHERE session_id=?1', [id]).catch(()=>{});
-    await runtimeDb.run('DELETE FROM events WHERE session_id=?1', [id]).catch(()=>{});
-    await runtimeDb.run('DELETE FROM artifacts WHERE session_id=?1', [id]).catch(()=>{});
   }
   for (const id of unique) {
     result.webRows += await deleteSessionRows(db, id, false);
-    result.runtimeRows += await deleteSessionRows(runtimeDb, id, true);
+    if(USE_AGENT_RUNTIME)await runtime.deleteSession(id).catch((error:any)=>{if(error?.statusCode!==404)throw error;});
     try {
       if (await deleteSessionAttachmentDir(id)) result.attachmentDirs++;
     } catch (e:any) {

@@ -656,6 +656,10 @@ app.get('/sessions/:id', async (req:any, reply) => {
 app.patch('/sessions/:id', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
+  if(typeof req.body?.archived==='boolean'){
+    await db.run('UPDATE sessions SET archived=?1,archived_at=?2,updated_at=?3 WHERE id=?4',[req.body.archived?1:0,req.body.archived?Date.now():null,Date.now(),session.id]);
+    return{ok:true,session:await getSession(session.id)};
+  }
   const title = cleanTitle(req.body?.title, session.project_dir);
   if (!title) return reply.code(400).send({ error:'title required' });
   const account = await getAccount(String(session.current_upstream_account_id || session.last_execution_account_id || session.executing_profile_id || session.account_id || ''));
@@ -666,6 +670,7 @@ app.patch('/sessions/:id', async (req:any, reply) => {
   await runtime.request('thread/name/set', { threadId, name:title }).catch(()=>{});
   return { ok:true, session: await getSession(session.id) };
 });
+app.delete('/sessions/:id',async(req:any,reply)=>{const session=await getSession(String(req.params.id));if(!session)return reply.code(404).send({error:'not found'});if(session.active_turn_id||['running','submitting','planning'].includes(session.status))return reply.code(409).send({error:'turn_running'});db.transactionRun([{sql:'DELETE FROM events WHERE session_id=?1',params:[session.id]},{sql:'DELETE FROM artifacts WHERE session_id=?1',params:[session.id]},{sql:'DELETE FROM sessions WHERE id=?1',params:[session.id]}]);return{ok:true};});
 
 app.get('/sessions/:id/events', async (req:any) => {
   const after = Number(req.query?.after || 0);
