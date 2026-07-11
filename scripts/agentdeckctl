@@ -863,7 +863,7 @@ worker_deploy() {
   export AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
   exec >>"$LOG_DIR/$job_id.log" 2>&1
   write_job "$job_id" running "deploy started"
-  trap 'cleanup_candidate_job "$job_id" || true' EXIT HUP INT TERM
+  trap "cleanup_candidate_job '$job_id' || true" EXIT HUP INT TERM
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path
