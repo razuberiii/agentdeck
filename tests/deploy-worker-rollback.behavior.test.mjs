@@ -18,7 +18,7 @@ function scenario(target,failAt,keepReference=false){
     ln -s releases/old-web "$CURRENT_WEB_LINK"; ln -s releases/old-prev-web "$PREVIOUS_WEB_LINK"
     ln -s releases/old-runtime "$CURRENT_RUNTIME_LINK"; ln -s releases/old-prev-runtime "$PREVIOUS_RUNTIME_LINK"
     make_release(){ mkdir -p "$RELEASES_DIR/${releaseId}"; CREATED_RELEASE_ID=${releaseId}; }
-    assert_release_unit_requirement(){ :; }; check_systemd_units(){ :; }; start_candidate_runtime(){ :; }; start_candidate_web(){ :; }
+    assert_release_unit_requirement(){ :; }; check_systemd_units(){ :; }; start_candidate_runtime(){ :; }; start_candidate_web(){ :; }; validate_candidate_runtime_compatibility(){ :; }
     drain_runtime(){ :; }; undrain_runtime(){ :; }; wait_drain(){ :; }; cleanup_releases(){ :; }
     systemctl(){ echo "$*" >> "$SYSTEMCTL_LOG"; }
     echo 0 > "$ROOT/wait-calls"
