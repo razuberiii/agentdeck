@@ -527,9 +527,33 @@ const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 console.log(Number(manifest.requiredSystemdUnitVersion || 0));
 NODE
 )"
-  if [ "$required" -gt "$SYSTEMD_UNIT_VERSION" ]; then
-    die "release requires systemd unit version >= $required; current agentdeckctl supports $SYSTEMD_UNIT_VERSION. Run: sudo agentdeckctl install-units"
+  verify_runtime_systemd_contract "$required"
+}
+
+verify_runtime_systemd_contract() {
+  local required="${1:-$SYSTEMD_UNIT_VERSION}" properties fragment dropins timeout_us environment actual_version=""
+  properties="$(systemctl show agentdeck-runtime.service -p FragmentPath -p DropInPaths -p TimeoutStopUSec -p Environment 2>/dev/null)" || die "cannot read effective agentdeck-runtime.service contract"
+  fragment="$(printf '%s\n' "$properties" | sed -n 's/^FragmentPath=//p')"
+  dropins="$(printf '%s\n' "$properties" | sed -n 's/^DropInPaths=//p')"
+  timeout_us="$(printf '%s\n' "$properties" | sed -n 's/^TimeoutStopUSec=//p')"
+  environment="$(printf '%s\n' "$properties" | sed -n 's/^Environment=//p')"
+  actual_version="$(printf '%s\n' "$environment" | sed -n 's/.*AGENTDECK_SYSTEMD_UNIT_VERSION=\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$fragment" ] || die "effective Runtime unit has no FragmentPath (daemon-reload may be required)"
+  if ! [[ "$timeout_us" =~ ^[0-9]+$ ]]; then
+    timeout_us="$(node - "$timeout_us" <<'NODE' 2>/dev/null || true
+const value=process.argv[2]?.trim();
+const units={us:1,'µs':1,ms:1e3,s:1e6,min:60e6,h:3600e6,d:86400e6};
+let total=0,end=0,match;const re=/(\d+(?:\.\d+)?)\s*(us|µs|ms|min|s|h|d)/g;
+while((match=re.exec(value))){if(value.slice(end,match.index).trim())process.exit(1);total+=Number(match[1])*units[match[2]];end=re.lastIndex;}
+if(!end||value.slice(end).trim()||!Number.isFinite(total))process.exit(1);process.stdout.write(String(Math.round(total)));
+NODE
+)"
   fi
+  [[ "$timeout_us" =~ ^[0-9]+$ ]] || die "effective Runtime TimeoutStopUSec is invalid: ${timeout_us:-missing}"
+  [ "$timeout_us" -gt $((DRAIN_TIMEOUT_SECONDS * 1000000)) ] || die "effective Runtime TimeoutStopUSec=$timeout_us must exceed drain timeout $((DRAIN_TIMEOUT_SECONDS * 1000000))us"
+  [[ "$actual_version" =~ ^[0-9]+$ ]] || die "effective Runtime unit contract version is missing (fragment=$fragment drop-ins=${dropins:-none}); run daemon-reload after install-units"
+  [ "$actual_version" -ge "$required" ] || die "effective Runtime unit contract version $actual_version is older than required $required (fragment=$fragment drop-ins=${dropins:-none})"
+  log "effective Runtime contract ok: version=$actual_version timeoutStopUSec=$timeout_us fragment=$fragment drop-ins=${dropins:-none}"
 }
 
 sqlite_backup() {
@@ -857,6 +881,21 @@ restore_deploy_pointers() {
   done < "$snapshot"
 }
 
+restore_component_pointer_snapshot() {
+  local snapshot="$1" component="$2" link target
+  [ -f "$snapshot" ] || return 0
+  while IFS=$'\t' read -r link target; do
+    case "$component:$link" in
+      web:"$CURRENT_WEB_LINK"|web:"$PREVIOUS_WEB_LINK"|runtime:"$CURRENT_RUNTIME_LINK"|runtime:"$PREVIOUS_RUNTIME_LINK") ;;
+      *) continue ;;
+    esac
+    if [ -n "${target:-}" ]; then ln -sfn "$target" "$link.tmp"; mv -Tf "$link.tmp" "$link"; else rm -f "$link" "$link.tmp"; fi
+  done < "$snapshot"
+}
+
+deploy_stage_set() { printf '%s=1\n' "$2" >> "$1"; }
+deploy_stage_has() { grep -qx "$2=1" "$1" 2>/dev/null; }
+
 release_is_referenced() {
   local release="$1" link job job_release target
   release="$(realpath -m "$release")"
@@ -980,6 +1019,7 @@ restart_target() {
 worker_deploy() {
   local job_id="$1" target="$2" force="$3"
   local pointer_snapshot="$STATE_DIR/$job_id.pointers"
+  local stage_state="$STATE_DIR/$job_id.stages"
   export AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET="$target" AGENTDECK_JOB_LOG="$LOG_DIR/$job_id.log"
   exec >>"$LOG_DIR/$job_id.log" 2>&1
   write_job "$job_id" running "deploy started"
@@ -988,8 +1028,11 @@ worker_deploy() {
   (
     flock -n 9 || die "another deploy/rollback job is running"
     local release_id release_path
+    : > "$stage_state"
     snapshot_deploy_pointers "$pointer_snapshot"
+    if [ "$target" = runtime ] || [ "$target" = all ]; then verify_runtime_systemd_contract "$SYSTEMD_UNIT_VERSION" || exit $?; fi
     make_release || exit $?
+    deploy_stage_set "$stage_state" release_built
     release_id="$CREATED_RELEASE_ID"
     release_path="$(release_path_for "$release_id")"
     if [ "$target" = web ]||[ "$target" = all ];then ln -sfn "releases/$release_id" "$CANDIDATE_WEB_LINK";fi
@@ -1018,18 +1061,24 @@ worker_deploy() {
       if ! wait_drain "$force"; then rm -f "$pointer_snapshot"; exit 1; fi
       if ! require_runtime_drained; then rm -f "$pointer_snapshot"; exit 1; fi
       switch_component runtime "$release_id" || exit $?
+      deploy_stage_set "$stage_state" runtime_pointer_switched
       systemctl restart agentdeck-runtime.service || exit $?
+      deploy_stage_set "$stage_state" runtime_restarted
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || exit $?
     else
       switch_component web "$release_id" || exit $?
+      deploy_stage_set "$stage_state" web_pointer_switched
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
       if [ "$target" = "all" ]; then switch_component web "$release_id" || exit $?; fi
+      if [ "$target" = "all" ]; then deploy_stage_set "$stage_state" web_pointer_switched; fi
       systemctl restart agentdeck-web.service || exit $?
+      deploy_stage_set "$stage_state" web_restarted
       wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || exit $?
     fi
     clear_candidate_release_links "$release_path"
     rm -f "$pointer_snapshot"
+    rm -f "$stage_state"
     cleanup_releases
     write_job "$job_id" succeeded "deploy succeeded"
   ) 9>"$LOCK_FILE" || {
@@ -1039,27 +1088,36 @@ worker_deploy() {
 const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));if(j.release)process.stdout.write(String(j.release));}catch{}
 NODE
 )"
-    if [ -f "$pointer_snapshot" ]; then
-      log "deploy failed; restoring component release pointers"
-      restore_deploy_pointers "$pointer_snapshot"
-      case "$target" in
-        runtime) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || recovery_failed=1 ;;
-        web) systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1 ;;
-        all) systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1 ;;
-      esac
+    printf 'original_exit_code=%s\n' "$code" >> "$stage_state"
+    if deploy_stage_has "$stage_state" runtime_pointer_switched; then
+      log "deploy failed; restoring Runtime release pointer"
+      restore_component_pointer_snapshot "$pointer_snapshot" runtime || recovery_failed=1
+      if deploy_stage_has "$stage_state" runtime_restarted; then
+        systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || recovery_failed=1
+      fi
+    fi
+    if deploy_stage_has "$stage_state" web_pointer_switched; then
+      log "deploy failed; restoring Web release pointer"
+      restore_component_pointer_snapshot "$pointer_snapshot" web || recovery_failed=1
+      if deploy_stage_has "$stage_state" web_restarted; then
+        systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1
+      fi
+    fi
+    if deploy_stage_has "$stage_state" runtime_pointer_switched || deploy_stage_has "$stage_state" web_pointer_switched; then
       if [ "$recovery_failed" = "1" ]; then
-        write_job "$job_id" failed "FATAL: deploy and old-version recovery failed; rollback state preserved"
-        log "FATAL: old-version recovery failed; preserving $pointer_snapshot and failed release"
+        write_job "$job_id" failed "FATAL: deploy failed (exit $code) and old-version recovery failed; diagnostic state preserved"
+        log "FATAL: old-version recovery failed after original deploy exit $code; preserving $pointer_snapshot, $stage_state and failed release"
         return 70
       fi
       rm -f "$pointer_snapshot"
     fi
-    write_job "$job_id" failed "deploy failed; previous release restored and healthy"
+    write_job "$job_id" failed "deploy failed (exit $code); applied stages recovered"
     if [ -n "$failed_release_id" ] && valid_release_id "$failed_release_id"; then
       failed_release_path="$RELEASES_DIR/$failed_release_id"
       clear_candidate_release_links "$failed_release_path"
       remove_release_if_unreferenced "$failed_release_path"
     fi
+    rm -f "$pointer_snapshot" "$stage_state"
     exit "$code"
   }
 }

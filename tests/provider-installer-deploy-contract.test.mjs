@@ -63,7 +63,7 @@ test('deploy worker uses service user for build checks and candidate processes',
 
 test('deploy release id is not captured from noisy build stdout and cleanup is bounded', () => {
   assert.match(ctlSource, /CREATED_RELEASE_ID=""/);
-  assert.match(ctlSource, /make_release \|\| exit \$\?\n\s+release_id="\$CREATED_RELEASE_ID"/);
+  assert.match(ctlSource, /make_release \|\| exit \$\?\n\s+deploy_stage_set "\$stage_state" release_built\n\s+release_id="\$CREATED_RELEASE_ID"/);
   assert.doesNotMatch(ctlSource, /release_id="\$\(make_release\)"/);
   assert.match(ctlSource, /valid_release_id\(\)/);
   assert.match(ctlSource, /release_path_for\(\)/);
