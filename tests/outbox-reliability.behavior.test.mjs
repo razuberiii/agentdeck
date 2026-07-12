@@ -8,6 +8,11 @@ test('newer fallback terminal state wins over stale IndexedDB sent state',()=>ru
  const outbox=new BrowserOutbox();outbox.openDb=async()=>({transaction:()=>({objectStore:()=>({getAll(){const req={};queueMicrotask(()=>{req.result=[{...base,status:'sent',updatedAt:10}];req.onsuccess?.();});return req;}})}),close(){}});
  assert.equal((await outbox.list())[0].status,'failed');
 `));
+test('older fallback terminal state also wins over a newer lower IndexedDB state',()=>run(`
+ const storage=new Map();globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
+ const base={clientMessageId:'m',sessionId:'s',text:'secret',attachments:[],planMode:'direct',createdAt:1,attempts:1};storage.set('agentdeck:outbox:fallback',JSON.stringify([{...base,status:'failed',lastError:'boom',updatedAt:10}]));
+ const outbox=new BrowserOutbox();outbox.openDb=async()=>({transaction:()=>({objectStore:()=>({getAll(){const req={};queueMicrotask(()=>{req.result=[{...base,status:'received',updatedAt:20}];req.onsuccess?.();});return req;}})}),close(){}});const row=(await outbox.list())[0];assert.equal(row.status,'failed');assert.equal(row.lastError,'boom');
+`));
 test('accepted and persisted clear body while failed and max-attempt records stay terminal',()=>run(`
  const storage=new Map();globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};globalThis.indexedDB=undefined;
  const outbox=new BrowserOutbox(),base={sessionId:'s',text:'secret',attachments:[],planMode:'direct',createdAt:1,attempts:1};
@@ -29,7 +34,14 @@ test('outbox subscribers observe receipt status changes immediately',()=>run(`
  const storage=new Map();globalThis.indexedDB=undefined;globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
  const outbox=new BrowserOutbox(),seen=[];const unsubscribe=outbox.subscribe(()=>seen.push('changed'));const base={clientMessageId:'m',sessionId:'s',text:'retry me',attachments:[],planMode:'direct',createdAt:1,attempts:1,status:'sent'};
  await outbox.put(base);for(const status of['received','persisted','accepted','failed'])await outbox.update('m',{status,lastError:status==='failed'?'boom':undefined});unsubscribe();await outbox.update('m',{status:'received'});
- assert.equal(seen.length,5);assert.equal((await outbox.list())[0].status,'received');
+ assert.equal(seen.length,5);assert.equal((await outbox.list())[0].status,'failed');
+`));
+test('concurrent receipt updates cannot roll a message status backward',()=>run(`
+ const storage=new Map();globalThis.indexedDB=undefined;globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
+ const outbox=new BrowserOutbox(),base={clientMessageId:'m',sessionId:'s',text:'x',attachments:[],planMode:'direct',createdAt:1,attempts:1,status:'sent'};await outbox.put(base);
+ const originalList=outbox.list.bind(outbox),gates=[];outbox.list=async(...args)=>{const rows=await originalList(...args);await new Promise(resolve=>gates.push(resolve));return rows;};
+ const stale=outbox.update('m',{status:'received'}),terminal=outbox.update('m',{status:'failed',lastError:'boom'});while(gates.length<2)await new Promise(r=>setTimeout(r,0));gates[1]();await terminal;gates[0]();await stale;
+ const row=(await originalList())[0];assert.equal(row.status,'failed');assert.equal(row.lastError,'boom');
 `));
 test('failed retry uses new lineage id and concurrent double click sends once',()=>run(`
  const storage=new Map();globalThis.indexedDB=undefined;globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
