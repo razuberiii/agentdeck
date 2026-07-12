@@ -24,6 +24,7 @@ import { RuntimeClient } from './runtime-client.js';
 import { SessionCommandQueue } from './websocket-command-queue.js';
 import { BrowserDeliveryHub } from './browser-delivery.js';
 import { withReceiptFailure } from './message-receipt.js';
+import { claimRetryReceipt } from './message-retry-claim.js';
 import { migrateWebSchema, RUNTIME_SCHEMA_VERSION, WEB_SCHEMA_VERSION, verifyWebSchema } from './schema-migrations.js';
 import { deleteSessionRelations } from './session-lifecycle.js';
 import { AntigravityProvider, GeminiProvider } from './providers.js';
@@ -371,7 +372,7 @@ app.get('/api/status', async (req) => {
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
   return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
-app.get('/internal/deep-health',async(req:any,reply)=>{if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(String(req.ip||'')))return reply.code(403).send({error:'loopback_only'});const runtimeHealth=USE_AGENT_RUNTIME?await runtime.deepHealth():null;const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='web'");const integrity=await db.get('PRAGMA integrity_check');const sqlite=integrity?.integrity_check==='ok',schemaMigrationVersion=Number(migration?.version||0),webSchemaShapeCompatible=await verifyWebSchema(db).then(()=>true).catch(()=>false),webSchemaCompatible=schemaMigrationVersion===WEB_SCHEMA_VERSION&&webSchemaShapeCompatible,runtimeSchemaCompatible=!!runtimeHealth&&Number(runtimeHealth.schemaMigrationVersion)===RUNTIME_SCHEMA_VERSION&&runtimeHealth.schemaShapeCompatible!==false;const compatible=!!runtimeHealth&&Number(runtimeHealth.contractVersion)===API_DTO_CONTRACT_VERSION&&runtimeSchemaCompatible;return{ok:sqlite&&webSchemaCompatible&&compatible&&!!runtimeHealth?.ok,component:'web',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,expectedSchemaMigrationVersion:WEB_SCHEMA_VERSION,webSchemaCompatible,webSchemaShapeCompatible,runtimeSchemaCompatible,sqlite,runtimeConnected:!!runtimeHealth?.ok,runtimeReleaseId:runtimeHealth?.releaseId||null,runtimeMode:runtimeHealth?.mode||null,runtimeContractVersion:runtimeHealth?.contractVersion||null,runtimeSchemaMigrationVersion:runtimeHealth?.schemaMigrationVersion||null,compatible};});
+app.get('/internal/deep-health',async(req:any,reply)=>{if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(String(req.ip||'')))return reply.code(403).send({error:'loopback_only'});const runtimeHealth=USE_AGENT_RUNTIME?await runtime.deepHealth():null;const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='web'");const integrity=await db.get('PRAGMA integrity_check');const sqlite=integrity?.integrity_check==='ok',schemaMigrationVersion=Number(migration?.version||0),webSchemaShapeCompatible=await verifyWebSchema(db).then(()=>true).catch(()=>false),webSchemaCompatible=schemaMigrationVersion===WEB_SCHEMA_VERSION&&webSchemaShapeCompatible,runtimeSchemaCompatible=!!runtimeHealth&&Number(runtimeHealth.schemaMigrationVersion)===RUNTIME_SCHEMA_VERSION&&runtimeHealth.schemaShapeCompatible===true;const compatible=!!runtimeHealth&&Number(runtimeHealth.contractVersion)===API_DTO_CONTRACT_VERSION&&runtimeSchemaCompatible;return{ok:sqlite&&webSchemaCompatible&&compatible&&!!runtimeHealth?.ok,component:'web',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,expectedSchemaMigrationVersion:WEB_SCHEMA_VERSION,webSchemaCompatible,webSchemaShapeCompatible,runtimeSchemaCompatible,sqlite,runtimeConnected:!!runtimeHealth?.ok,runtimeReleaseId:runtimeHealth?.releaseId||null,runtimeMode:runtimeHealth?.mode||null,runtimeContractVersion:runtimeHealth?.contractVersion||null,runtimeSchemaMigrationVersion:runtimeHealth?.schemaMigrationVersion||null,compatible};});
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
 async function lightAppState() {
   const settings = await appSettings();
@@ -4710,7 +4711,8 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   clientMessageId=clientMessageId||crypto.randomUUID();
   const claimed=await claimMessageReceipt(threadId,clientMessageId,retryOf);
   if(!claimed.created){
-    broadcast(threadId,{type:'messageStatus',clientMessageId,status:claimed.status,error:claimed.error||undefined});
+    if(claimed.canonicalClientMessageId&&claimed.canonicalClientMessageId!==clientMessageId)broadcast(threadId,{type:'messageStatus',clientMessageId,status:'cancelled',retryOf,canonicalClientMessageId:claimed.canonicalClientMessageId});
+    broadcast(threadId,{type:'messageStatus',clientMessageId:claimed.canonicalClientMessageId||clientMessageId,status:claimed.status,error:claimed.error||undefined,retryOf:retryOf||undefined});
     return;
   }
   const submission = parsePlanSubmission(text, planMode);
@@ -4874,11 +4876,12 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   }
 }
 async function claimMessageReceipt(sessionId:string,clientMessageId:string,retryOf=''){
+  if(retryOf)return claimRetryReceipt(db,sessionId,clientMessageId,retryOf);
   const now=Date.now();
   const result=await db.run("INSERT OR IGNORE INTO message_receipts(session_id,client_message_id,status,retry_of,created_at,updated_at) VALUES (?1,?2,'received',?3,?4,?4)",[sessionId,clientMessageId,retryOf||null,now]);
-  if(result.changes)return{created:true,status:'received',error:null};
+  if(result.changes)return{created:true,status:'received',error:null,canonicalClientMessageId:clientMessageId};
   const row=await db.get('SELECT status,error FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,clientMessageId]);
-  return{created:false,status:String(row?.status||'received'),error:row?.error||null};
+  return{created:false,status:String(row?.status||'received'),error:row?.error||null,canonicalClientMessageId:clientMessageId};
 }
 async function updateMessageReceipt(sessionId:string,clientMessageId:string,status:string,error?:string){
   await db.run('UPDATE message_receipts SET status=?1,error=?2,updated_at=?3 WHERE session_id=?4 AND client_message_id=?5',[status,error||null,Date.now(),sessionId,clientMessageId]);
