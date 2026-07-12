@@ -273,6 +273,7 @@ function normalizeUserAttachments(attachments: TimelineDisplayEvent['attachments
 function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T {
   const attachments = dedupeTimelineAttachments([...(a.attachments || []), ...(b.attachments || [])]);
   const text = String(b.text || '').trim() ? b.text : a.text;
+  const retried = a.deliveryStatus === 'retried' || b.deliveryStatus === 'retried';
   return {
     ...a,
     ...b,
@@ -281,9 +282,9 @@ function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T 
     messageId: a.messageId || b.messageId,
     text,
     attachments,
-    meta: b.meta || a.meta,
-    deliveryStatus:b.deliveryStatus||a.deliveryStatus,
-    deliveryError:b.deliveryError||a.deliveryError,
+    meta: retried ? '已重试' : b.meta || a.meta,
+    deliveryStatus:retried ? 'retried' : b.deliveryStatus||a.deliveryStatus,
+    deliveryError:retried ? undefined : b.deliveryError||a.deliveryError,
   };
 }
 
