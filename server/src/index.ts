@@ -1646,9 +1646,9 @@ app.get('/api/sessions/:id/messages/:clientMessageId/status',{preHandler:ensureA
   const session=await findSession(String(req.params.id));
   if(!session)return reply.code(404).send({code:'session_not_found'});
   const sessionId=String(session.codex_thread_id||session.id);
-  const row=await db.get('SELECT status,error,created_at,updated_at FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,String(req.params.clientMessageId)]);
+  const row=await db.get('SELECT status,error,retry_of,created_at,updated_at FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,String(req.params.clientMessageId)]);
   if(!row)return reply.code(404).send({code:'message_not_found',clientMessageId:String(req.params.clientMessageId)});
-  return{clientMessageId:String(req.params.clientMessageId),sessionId,status:String(row.status),error:row.error||null,createdAt:Number(row.created_at),updatedAt:Number(row.updated_at)};
+  return{clientMessageId:String(req.params.clientMessageId),sessionId,status:String(row.status),error:row.error||null,retryOf:row.retry_of||null,createdAt:Number(row.created_at),updatedAt:Number(row.updated_at)};
 });
 app.get('/api/wireguard/config/:name', { preHandler: ensureAuth }, async (req:any, reply) => {
   const name = String(req.params.name || '');
@@ -1684,7 +1684,7 @@ function validateWsMessage(msg:any) {
   if (!['join','send','sendChunkStart','sendChunk','sendChunkEnd','stop'].includes(type)) return false;
   if (!msg.sessionId || typeof msg.sessionId !== 'string') return false;
   if (type === 'join') return (!('lastSequence' in msg)||Number.isFinite(Number(msg.lastSequence)))&&typeof msg.joinRequestId==='string'&&msg.joinRequestId.length<=128&&typeof msg.clientConnectionId==='string'&&msg.clientConnectionId.length>=8&&msg.clientConnectionId.length<=128&&(!('recoveryEpoch'in msg)||Number.isSafeInteger(Number(msg.recoveryEpoch)));
-  if (type === 'send') return typeof msg.text === 'string' && (!('attachments' in msg) || Array.isArray(msg.attachments));
+  if (type === 'send') return typeof msg.text === 'string' && (!('attachments' in msg) || Array.isArray(msg.attachments))&&(!('retryOf'in msg)||typeof msg.retryOf==='string');
   if (type === 'sendChunkStart') return typeof msg.messageId === 'string';
   if (type === 'sendChunk') return typeof msg.messageId === 'string' && typeof msg.chunk === 'string';
   if (type === 'sendChunkEnd') return typeof msg.messageId === 'string';
@@ -1763,7 +1763,7 @@ app.get('/ws', { websocket: true }, async (connection:any, req:any) => {
         return;
       }
       await sessionCommandQueue.run(sessionId,async()=>{
-      if (msg.type === 'send') await sendTurn(sessionId, String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct');
+      if (msg.type === 'send') await sendTurn(sessionId, String(msg.text || ''), Array.isArray(msg.attachments) ? msg.attachments : [], String(msg.clientMessageId || ''), msg.planMode === 'plan' ? 'plan' : 'direct',String(msg.retryOf||''));
       if (msg.type === 'sendChunkStart') startChunkedMessage(msg);
       if (msg.type === 'sendChunk') appendChunkedMessage(msg);
       if (msg.type === 'sendChunkEnd') await finishChunkedMessage(msg);
@@ -4694,21 +4694,21 @@ async function ensureRuntimeCodexSession(row:any) {
     sandboxMode: row.sandbox_mode,
   });
 }
-async function sendTurn(id:string, text:string, attachments:any[] = [], clientMessageId = '', planMode:'direct'|'plan' = 'direct'){
+async function sendTurn(id:string, text:string, attachments:any[] = [], clientMessageId = '', planMode:'direct'|'plan' = 'direct',retryOf=''){
   const messageId=clientMessageId||crypto.randomUUID();
-  return withReceiptFailure(()=>sendTurnClaimed(id,text,attachments,messageId,planMode),async message=>{
+  return withReceiptFailure(()=>sendTurnClaimed(id,text,attachments,messageId,planMode,retryOf),async message=>{
     const row=await findSession(id).catch(()=>null);
     const threadId=String(row?.codex_thread_id||row?.id||id);
     await updateMessageReceipt(threadId,messageId,'failed',message).catch(()=>{});
     broadcast(threadId,{type:'messageStatus',clientMessageId:messageId,status:'failed',error:message});
   });
 }
-async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], clientMessageId = '', planMode:'direct'|'plan' = 'direct'){
+async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], clientMessageId = '', planMode:'direct'|'plan' = 'direct',retryOf=''){
   const row = await findSession(id);
   if(!row) throw new Error('session not found');
   const threadId = String(row.codex_thread_id || row.id);
   clientMessageId=clientMessageId||crypto.randomUUID();
-  const claimed=await claimMessageReceipt(threadId,clientMessageId);
+  const claimed=await claimMessageReceipt(threadId,clientMessageId,retryOf);
   if(!claimed.created){
     broadcast(threadId,{type:'messageStatus',clientMessageId,status:claimed.status,error:claimed.error||undefined});
     return;
@@ -4873,9 +4873,9 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     throw e;
   }
 }
-async function claimMessageReceipt(sessionId:string,clientMessageId:string){
+async function claimMessageReceipt(sessionId:string,clientMessageId:string,retryOf=''){
   const now=Date.now();
-  const result=await db.run("INSERT OR IGNORE INTO message_receipts(session_id,client_message_id,status,created_at,updated_at) VALUES (?1,?2,'received',?3,?3)",[sessionId,clientMessageId,now]);
+  const result=await db.run("INSERT OR IGNORE INTO message_receipts(session_id,client_message_id,status,retry_of,created_at,updated_at) VALUES (?1,?2,'received',?3,?4,?4)",[sessionId,clientMessageId,retryOf||null,now]);
   if(result.changes)return{created:true,status:'received',error:null};
   const row=await db.get('SELECT status,error FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,clientMessageId]);
   return{created:false,status:String(row?.status||'received'),error:row?.error||null};
@@ -5273,7 +5273,7 @@ function cleanTitle(value:any, cwd:string){ const raw = String(value || '').spli
 function autoTitle(text:string,cwd:string,current:string){const base=path.basename(cwd).trim().toLocaleLowerCase();const value=current.trim().toLocaleLowerCase();const generic=new Set([base,'default workspace','default-workspace','session','new task','new-task','untitled','新任务']);if(!generic.has(value))return null;const raw=text.split(/\r?\n/).map(s=>s.trim()).find(Boolean)||'';const cleaned=raw.replace(/\s+/g,' ').replace(/^#+\s*/,'').trim();if(!cleaned)return null;return cleaned.slice(0,42);}
 function startChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const sessionId = String(msg.sessionId || ''); if (!id || !sessionId) throw new Error('bad chunked message'); chunkedMessages.set(id, { sessionId, clientMessageId:String(msg.clientMessageId || id), chunks: [], size: 0, createdAt: Date.now() }); cleanupChunkedMessages(); }
 function appendChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); const chunk = String(msg.chunk || ''); state.size += Buffer.byteLength(chunk); if (state.size > 25 * 1024 * 1024) { chunkedMessages.delete(id); throw new Error('message too large'); } state.chunks.push(chunk); }
-async function finishChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); chunkedMessages.delete(id); const payload = JSON.parse(state.chunks.join('')); await sendTurn(state.sessionId, String(payload.text || ''), Array.isArray(payload.attachments) ? payload.attachments : [], state.clientMessageId, payload.planMode === 'plan' ? 'plan' : 'direct'); }
+async function finishChunkedMessage(msg:any){ const id = String(msg.messageId || ''); const state = chunkedMessages.get(id); if (!state) throw new Error('chunked message not found'); chunkedMessages.delete(id); const payload = JSON.parse(state.chunks.join('')); await sendTurn(state.sessionId, String(payload.text || ''), Array.isArray(payload.attachments) ? payload.attachments : [], state.clientMessageId, payload.planMode === 'plan' ? 'plan' : 'direct',String(payload.retryOf||'')); }
 function cleanupChunkedMessages(){ const cutoff = Date.now() - 10 * 60 * 1000; for (const [id, state] of chunkedMessages) if (state.createdAt < cutoff) chunkedMessages.delete(id); }
 function cleanupPendingApprovals(){ const cutoff = Date.now() - 10 * 60 * 1000; for (const [id, state] of pendingApprovals) if (state.createdAt < cutoff) pendingApprovals.delete(id); }
 function statusName(status:any){ if (!status) return 'idle'; const value = rawStatusName(status); return value === 'active' ? 'idle' : value; }

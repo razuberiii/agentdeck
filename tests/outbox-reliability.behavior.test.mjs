@@ -25,7 +25,15 @@ test('localStorage quota failure is reported before an unpersisted message is se
  globalThis.indexedDB=undefined;globalThis.localStorage={getItem:()=>null,setItem:()=>{throw new DOMException('quota','QuotaExceededError')}};
  const outbox=new BrowserOutbox();assert.equal(await outbox.put({clientMessageId:'m',sessionId:'s',text:'x',attachments:[],planMode:'direct',createdAt:1,attempts:1,status:'ready'}),false);
 `));
-test('a failed record can be manually returned to the retry queue',()=>run(`
+test('outbox subscribers observe receipt status changes immediately',()=>run(`
  const storage=new Map();globalThis.indexedDB=undefined;globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
- const outbox=new BrowserOutbox();await outbox.put({clientMessageId:'m',sessionId:'s',text:'retry me',attachments:[],planMode:'direct',createdAt:1,attempts:3,status:'failed'});await outbox.update('m',{status:'ready',attempts:4,lastError:undefined,nextAttemptAt:2});const row=(await outbox.list())[0];assert.equal(row.status,'ready');assert.equal(row.text,'retry me');assert.equal(row.attempts,4);
+ const outbox=new BrowserOutbox(),seen=[];const unsubscribe=outbox.subscribe(()=>seen.push('changed'));const base={clientMessageId:'m',sessionId:'s',text:'retry me',attachments:[],planMode:'direct',createdAt:1,attempts:1,status:'sent'};
+ await outbox.put(base);for(const status of['received','persisted','accepted','failed'])await outbox.update('m',{status,lastError:status==='failed'?'boom':undefined});unsubscribe();await outbox.update('m',{status:'received'});
+ assert.equal(seen.length,5);assert.equal((await outbox.list())[0].status,'received');
+`));
+test('failed retry uses new lineage id and concurrent double click sends once',()=>run(`
+ const storage=new Map();globalThis.indexedDB=undefined;globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
+ const outbox=new BrowserOutbox(),original={clientMessageId:'old',sessionId:'s',text:'retry me',attachments:[],planMode:'direct',createdAt:1,attempts:3,status:'failed'},active=new Set();await outbox.put(original);let sends=0;
+ async function retry(){if(active.has('old'))return;active.add('old');try{const record=(await outbox.list('s')).find(row=>row.clientMessageId==='old');if(record?.status!=='failed')return;const retry={...record,clientMessageId:'new',retryOf:'old',status:'ready',attempts:1,createdAt:2};await new Promise(r=>setTimeout(r,10));await outbox.put(retry);await outbox.update('old',{status:'cancelled'});sends++;await outbox.update('new',{status:'sent'});}finally{active.delete('old');}}
+ await Promise.all([retry(),retry()]);await retry();const rows=await outbox.list('s');assert.equal(sends,1);assert.equal(rows.find(row=>row.clientMessageId==='new').retryOf,'old');assert.equal(rows.find(row=>row.clientMessageId==='old').status,'cancelled');
 `));
