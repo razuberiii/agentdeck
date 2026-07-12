@@ -35,7 +35,7 @@ for(const [name,target,failAt] of [['runtime cutover health failure','runtime',1
   const result=scenario(target,failAt);try{
     assert.deepEqual(result.links,{web:'releases/old-web',previousWeb:'releases/old-prev-web',runtime:'releases/old-runtime',previousRuntime:'releases/old-prev-runtime'});
     assert.match(result.systemctl,/restart agentdeck-runtime\.service/);if(target==='all')assert.match(result.systemctl,/restart agentdeck-web\.service/);
-    assert.equal(result.job.status,'failed');assert.match(result.job.message,/applied stages recovered/);assert.equal(result.releaseExists,false);
+    assert.equal(result.job.status,'failed');assert.match(result.job.message,/started operations recovered/);assert.equal(result.releaseExists,false);
   }finally{rmSync(result.root,{recursive:true,force:true});}
 });
 
@@ -55,3 +55,47 @@ test('recovery failure preserves original exit and stage diagnostics',()=>{
   const child=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,ROOT:root,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
   try{assert.equal(child.status,70);const job=JSON.parse(readFileSync(join(root,'state/jobs/test.json'),'utf8'));assert.match(job.message,/deploy failed \(exit 31\).*recovery failed/);assert.match(readFileSync(join(root,'state/test.stages'),'utf8'),/original_exit_code=31/);}finally{rmSync(root,{recursive:true,force:true});}
 });
+
+function crashScenario(mode){
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-crash-journal-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs
+for r in old-runtime old-prev-runtime;do mkdir -p "$RELEASES_DIR/$r";done
+ln -s releases/old-runtime "$CURRENT_RUNTIME_LINK";ln -s releases/old-prev-runtime "$PREVIOUS_RUNTIME_LINK"
+make_release(){ mkdir -p "$RELEASES_DIR/${releaseId}";CREATED_RELEASE_ID=${releaseId}; }
+verify_runtime_systemd_contract(){ :; };assert_release_unit_requirement(){ :; };check_systemd_units(){ :; };start_candidate_runtime(){ :; };validate_candidate_runtime_compatibility(){ :; }
+drain_runtime(){ :; };undrain_runtime(){ :; };wait_drain(){ :; };require_runtime_drained(){ :; };wait_http(){ :; };cleanup_releases(){ :; }
+original_stage='';eval "$(declare -f deploy_stage_set | sed '1s/deploy_stage_set/original_stage_set/')"
+deploy_stage_set(){
+  if [ "$MODE" = completed-gap ] && [ "$2" = runtime_pointer_switch_completed ];then exit 42;fi
+  if [ "$MODE" = term ] && [ "$2" = runtime_pointer_switch_completed ];then kill -TERM $$;fi
+  original_stage_set "$@"
+}
+mv_failed=0
+mv(){
+  if [ "$MODE" = partial-pointer ] && [ "$mv_failed" = 0 ] && [ "${'${!#}'}" = "$CURRENT_RUNTIME_LINK" ];then mv_failed=1;return 41;fi
+  command mv "$@"
+}
+restart_calls=0
+systemctl(){
+  restart_calls=$((restart_calls+1));echo "$restart_calls:$*" >> "$ROOT/systemctl.log"
+  if [ "$restart_calls" = 1 ] && { [ "$MODE" = restart-side-effect ] || [ "$MODE" = restart-not-applied ]; };then
+    [ "$MODE" = restart-side-effect ] && echo side-effect >> "$ROOT/restart-effects"
+    return 43
+  fi
+}
+write_job test accepted accepted;worker_deploy test runtime 0`;
+  const child=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,ROOT:root,MODE:mode,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  return {root,child,current:readlinkSync(join(root,'current-runtime')),previous:readlinkSync(join(root,'previous-runtime')),journal:readFileSync(join(root,'state/test.stages'),'utf8'),systemctl:existsSync(join(root,'systemctl.log'))?readFileSync(join(root,'systemctl.log'),'utf8'):''};
+}
+
+for(const [mode,name] of [
+  ['partial-pointer','previous pointer changed before current pointer write fails'],
+  ['completed-gap','pointer switched before completed journal write'],
+  ['restart-side-effect','restart has a side effect but returns non-zero'],
+  ['term','TERM after pointer switch'],
+  ['restart-not-applied','restart started although the first restart did not happen'],
+])test(name,()=>{const result=crashScenario(mode);try{
+  assert.notEqual(result.child.status,0,result.child.stderr);assert.equal(result.current,'releases/old-runtime');assert.equal(result.previous,'releases/old-prev-runtime');
+  assert.match(result.journal,/runtime_pointer_switch_started=1/);assert.match(result.journal,/recovery_completed=1/);
+  if(mode.startsWith('restart-'))assert.equal((result.systemctl.match(/restart agentdeck-runtime\.service/g)||[]).length,2);
+}finally{rmSync(result.root,{recursive:true,force:true});}});

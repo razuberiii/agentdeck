@@ -894,8 +894,65 @@ restore_component_pointer_snapshot() {
   done < "$snapshot"
 }
 
-deploy_stage_set() { printf '%s=1\n' "$2" >> "$1"; }
+deploy_stage_set() {
+  printf '%s=1\n' "$2" >> "$1"
+  sync -f "$1" 2>/dev/null || true
+}
 deploy_stage_has() { grep -qx "$2=1" "$1" 2>/dev/null; }
+
+deploy_recover_once() {
+  local job_id="$1" target="$2" pointer_snapshot="$3" stage_state="$4" code="$5"
+  local failed_release_id="" failed_release_path="" recovery_failed=0
+  [ -f "$stage_state" ] || return 0
+  deploy_stage_has "$stage_state" deploy_succeeded && return 0
+  deploy_stage_has "$stage_state" recovery_started && return 0
+  printf 'original_exit_code=%s\n' "$code" >> "$stage_state"
+  deploy_stage_set "$stage_state" recovery_started
+  undrain_runtime
+  failed_release_id="$(node - "$JOBS_DIR/$job_id.json" <<'NODE' 2>/dev/null || true
+const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));if(j.release)process.stdout.write(String(j.release));}catch{}
+NODE
+)"
+  if deploy_stage_has "$stage_state" runtime_pointer_switch_started; then
+    log "deploy failed; restoring Runtime release pointers"
+    restore_component_pointer_snapshot "$pointer_snapshot" runtime || recovery_failed=1
+    if deploy_stage_has "$stage_state" runtime_restart_started; then
+      systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || recovery_failed=1
+    fi
+  fi
+  if deploy_stage_has "$stage_state" web_pointer_switch_started; then
+    log "deploy failed; restoring Web release pointers"
+    restore_component_pointer_snapshot "$pointer_snapshot" web || recovery_failed=1
+    if deploy_stage_has "$stage_state" web_restart_started; then
+      systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1
+    fi
+  fi
+  if [ "$recovery_failed" = "1" ]; then
+    deploy_stage_set "$stage_state" recovery_failed
+    write_job "$job_id" failed "FATAL: deploy failed (exit $code) and old-version recovery failed; diagnostic state preserved"
+    log "FATAL: old-version recovery failed after original deploy exit $code; preserving $pointer_snapshot, $stage_state and failed release"
+    return 70
+  fi
+  deploy_stage_set "$stage_state" recovery_completed
+  write_job "$job_id" failed "deploy failed (exit $code); started operations recovered"
+  if [ -n "$failed_release_id" ] && valid_release_id "$failed_release_id"; then
+    failed_release_path="$RELEASES_DIR/$failed_release_id"
+    clear_candidate_release_links "$failed_release_path"
+    remove_release_if_unreferenced "$failed_release_path"
+  fi
+  return 0
+}
+
+deploy_worker_exit_trap() {
+  local code="$1" job_id="$2" target="$3" pointer_snapshot="$4" stage_state="$5" recovery_code=0
+  trap - EXIT HUP INT TERM
+  cleanup_candidate_job "${AGENTDECK_CANDIDATE_JOB_ID:-}" || true
+  if [ "$code" -ne 0 ]; then
+    deploy_recover_once "$job_id" "$target" "$pointer_snapshot" "$stage_state" "$code" || recovery_code=$?
+    [ "$recovery_code" -eq 70 ] && code=70
+  fi
+  exit "$code"
+}
 
 release_is_referenced() {
   local release="$1" link job job_release target
@@ -1025,12 +1082,16 @@ worker_deploy() {
   exec >>"$LOG_DIR/$job_id.log" 2>&1
   write_job "$job_id" running "deploy started"
   export AGENTDECK_CANDIDATE_JOB_ID="$job_id"
-  trap 'cleanup_candidate_job "$AGENTDECK_CANDIDATE_JOB_ID" || true' EXIT HUP INT TERM
-  (
-    flock -n 9 || die "another deploy/rollback job is running"
-    local release_id release_path
-    : > "$stage_state"
-    snapshot_deploy_pointers "$pointer_snapshot"
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'deploy_worker_exit_trap "$?" "'$job_id'" "'$target'" "'$pointer_snapshot'" "'$stage_state'"' EXIT
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || return $?
+  local release_id release_path
+  : > "$stage_state"
+  snapshot_deploy_pointers "$pointer_snapshot"
+  sync -f "$pointer_snapshot" 2>/dev/null || true
     if [ "$target" = runtime ] || [ "$target" = all ]; then verify_runtime_systemd_contract "$SYSTEMD_UNIT_VERSION" || exit $?; fi
     make_release || exit $?
     deploy_stage_set "$stage_state" release_built
@@ -1059,68 +1120,36 @@ worker_deploy() {
     fi
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       drain_runtime || exit $?
-      if ! wait_drain "$force"; then rm -f "$pointer_snapshot"; exit 1; fi
-      if ! require_runtime_drained; then rm -f "$pointer_snapshot"; exit 1; fi
-      switch_component runtime "$release_id" || exit $?
-      deploy_stage_set "$stage_state" runtime_pointer_switched
-      systemctl restart agentdeck-runtime.service || exit $?
-      deploy_stage_set "$stage_state" runtime_restarted
+      if ! wait_drain "$force"; then exit 1; fi
+      if ! require_runtime_drained; then exit 1; fi
+      deploy_stage_set "$stage_state" runtime_pointer_switch_started
+      switch_component runtime "$release_id" || return $?
+      deploy_stage_set "$stage_state" runtime_pointer_switch_completed
+      deploy_stage_set "$stage_state" runtime_restart_started
+      systemctl restart agentdeck-runtime.service || return $?
+      deploy_stage_set "$stage_state" runtime_restart_completed
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || exit $?
     else
-      switch_component web "$release_id" || exit $?
-      deploy_stage_set "$stage_state" web_pointer_switched
+      deploy_stage_set "$stage_state" web_pointer_switch_started
+      switch_component web "$release_id" || return $?
+      deploy_stage_set "$stage_state" web_pointer_switch_completed
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
-      if [ "$target" = "all" ]; then switch_component web "$release_id" || exit $?; fi
-      if [ "$target" = "all" ]; then deploy_stage_set "$stage_state" web_pointer_switched; fi
-      systemctl restart agentdeck-web.service || exit $?
-      deploy_stage_set "$stage_state" web_restarted
+      if [ "$target" = "all" ]; then
+        deploy_stage_set "$stage_state" web_pointer_switch_started
+        switch_component web "$release_id" || return $?
+        deploy_stage_set "$stage_state" web_pointer_switch_completed
+      fi
+      deploy_stage_set "$stage_state" web_restart_started
+      systemctl restart agentdeck-web.service || return $?
+      deploy_stage_set "$stage_state" web_restart_completed
       wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || exit $?
     fi
-    clear_candidate_release_links "$release_path"
-    rm -f "$pointer_snapshot"
-    rm -f "$stage_state"
-    cleanup_releases
-    write_job "$job_id" succeeded "deploy succeeded"
-  ) 9>"$LOCK_FILE" || {
-    local code=$? failed_release_id="" failed_release_path="" recovery_failed=0
-    undrain_runtime
-    failed_release_id="$(node - "$JOBS_DIR/$job_id.json" <<'NODE' 2>/dev/null || true
-const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));if(j.release)process.stdout.write(String(j.release));}catch{}
-NODE
-)"
-    printf 'original_exit_code=%s\n' "$code" >> "$stage_state"
-    if deploy_stage_has "$stage_state" runtime_pointer_switched; then
-      log "deploy failed; restoring Runtime release pointer"
-      restore_component_pointer_snapshot "$pointer_snapshot" runtime || recovery_failed=1
-      if deploy_stage_has "$stage_state" runtime_restarted; then
-        systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || recovery_failed=1
-      fi
-    fi
-    if deploy_stage_has "$stage_state" web_pointer_switched; then
-      log "deploy failed; restoring Web release pointer"
-      restore_component_pointer_snapshot "$pointer_snapshot" web || recovery_failed=1
-      if deploy_stage_has "$stage_state" web_restarted; then
-        systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || recovery_failed=1
-      fi
-    fi
-    if deploy_stage_has "$stage_state" runtime_pointer_switched || deploy_stage_has "$stage_state" web_pointer_switched; then
-      if [ "$recovery_failed" = "1" ]; then
-        write_job "$job_id" failed "FATAL: deploy failed (exit $code) and old-version recovery failed; diagnostic state preserved"
-        log "FATAL: old-version recovery failed after original deploy exit $code; preserving $pointer_snapshot, $stage_state and failed release"
-        return 70
-      fi
-      rm -f "$pointer_snapshot"
-    fi
-    write_job "$job_id" failed "deploy failed (exit $code); applied stages recovered"
-    if [ -n "$failed_release_id" ] && valid_release_id "$failed_release_id"; then
-      failed_release_path="$RELEASES_DIR/$failed_release_id"
-      clear_candidate_release_links "$failed_release_path"
-      remove_release_if_unreferenced "$failed_release_path"
-    fi
-    rm -f "$pointer_snapshot" "$stage_state"
-    exit "$code"
-  }
+  clear_candidate_release_links "$release_path"
+  cleanup_releases
+  write_job "$job_id" succeeded "deploy succeeded"
+  deploy_stage_set "$stage_state" deploy_succeeded
+  rm -f "$pointer_snapshot" "$stage_state"
 }
 
 worker_rollback() {
