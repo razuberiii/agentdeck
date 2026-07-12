@@ -5,6 +5,7 @@ import test from 'node:test';
 const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const deploy = readFileSync(new URL('../scripts/deploy.sh', import.meta.url), 'utf8');
 const ctl = readFileSync(new URL('../scripts/agentdeckctl', import.meta.url), 'utf8');
+const runtimeUnit = readFileSync(new URL('../deploy/systemd/agentdeck-runtime.service', import.meta.url), 'utf8');
 
 test('runtime exposes lifecycle draining and rejects new work while draining', () => {
   assert.match(runtime, /type RuntimeLifecycle = 'starting' \| 'accepting' \| 'draining' \| 'stopping'/);
@@ -29,19 +30,27 @@ test('runtime exposes lifecycle draining and rejects new work while draining', (
 test('draining waits for active turns, submitting turns, and pending event pushes', () => {
   assert.match(runtime, /activeTurnCount/);
   assert.match(runtime, /submittingTurnCount/);
-  assert.match(runtime, /pendingEventWriteCount:eventStore\.metrics\.appendQueueCount/);
+  assert.match(runtime, /pendingEventWriteCount/);
   assert.match(runtime, /deltaQueueEventCount:eventStore\.metrics\.deltaQueueEventCount/);
   assert.match(runtime, /pendingSqliteWriteCount:eventStore\.metrics\.pendingSqliteWriteCount/);
+  assert.match(runtime, /claudeActiveTurnCount=claudeManager\.activeTurnCount\(\)/);
+  assert.match(runtime, /geminiActivePromptCount=geminiManager\.activePromptCount\(\)/);
+  assert.match(runtime, /subscriberPendingBufferCount/);
   assert.match(runtime, /waitForDrain/);
   assert.match(runtime, /process\.once\('SIGTERM'/);
-  assert.match(ctl, /active_turn_count_from_json/);
-  assert.match(ctl, /runtime active-turn query failed during drain/);
+  assert.match(ctl, /drain_status/);
+  assert.match(ctl, /drained_from_json/);
+  assert.match(ctl, /missing drained boolean/);
   assert.match(ctl, /DRAIN_LEASE_SECONDS/);
   assert.match(ctl, /ttlMs/);
   assert.match(ctl, /DRAIN_LEASE_SECONDS \* 1000/);
   assert.match(ctl, /refusing unsafe restart/);
   assert.doesNotMatch(ctl, /active-turns" 2>\/dev\/null \|\| echo '\{"activeTurnCount":0/);
 });
+
+test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
+
+test('runtime systemd stop timeout exceeds the application drain timeout',()=>{const seconds=Number(runtimeUnit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]||0);assert.ok(seconds>600);});
 
 test('deploy supports component scoped web runtime provider and changed modes', () => {
   assert.match(deploy, /--components web,runtime\|--changed/);

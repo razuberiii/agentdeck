@@ -82,6 +82,8 @@ export class GeminiAcpRuntime {
 
   constructor(private options: GeminiRuntimeOptions) {}
 
+  activePromptCount() { return [...this.sessions.values()].filter(state => !!state.activePrompt).length; }
+
   status() {
     return {
       installed: existsSync(this.geminiBin()),

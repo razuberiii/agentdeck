@@ -148,6 +148,7 @@ test('install-units renders default ubuntu user and paths into final units', () 
     assert.match(runtime, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current-runtime$/m);
     assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
     assert.match(runtime, /^Environment=CODEX_BIN=\/home\/ubuntu\/\.local\/bin\/codex$/m);
+    assert.match(runtime, /^TimeoutStopSec=660$/m);
     assert.match(web, /^Environment=PATH=.*\/home\/ubuntu\/\.local\/bin:\/usr\/local\/bin/m);
     assert.match(appServer, /approval_policy=\\"never\\"/);
     assert.match(appServer, /sandbox_mode=\\"danger-full-access\\"/);

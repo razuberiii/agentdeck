@@ -20,6 +20,7 @@ import { DurableEventStore } from './event-store.js';
 import { EventSubscriptions } from './event-subscriptions.js';
 import { migrateRuntimeSchema, RUNTIME_SCHEMA_VERSION, verifyRuntimeSchema } from './schema-migrations.js';
 import { deleteSessionRelations } from './session-lifecycle.js';
+import { runtimeIsDrained } from './runtime-drain-state.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -193,6 +194,8 @@ const claudeProfileStore = new ClaudeProfileStore(db, DATA_DIR, process.env.CLAU
 class GeminiRuntimeManager {
   private runtimes = new Map<string, GeminiAcpRuntime>();
   private inFlight = new Map<string, Promise<GeminiAcpRuntime>>();
+
+  activePromptCount() { return [...this.runtimes.values()].reduce((total,runtime)=>total+runtime.activePromptCount(),0); }
 
   async get(profileId:string) {
     const id = normalizeGeminiProfileId(profileId);
@@ -1047,16 +1050,13 @@ async function handleCodexNotification(account:Account, msg:any) {
   }
   if (msg.method === 'thread/status/changed') {
     const rawStatus = rawStatusName(msg.params?.status);
-    const nextStatus = rawStatus === 'active' && session.active_turn_id ? 'running' : statusName(rawStatus);
-    const nextActiveTurnId = nextStatus === 'running' ? session.active_turn_id : null;
+    const nextStatus = session.active_turn_id ? 'running' : statusName(rawStatus);
+    const nextActiveTurnId = session.active_turn_id || null;
     await db.run('UPDATE sessions SET status=?1,active_turn_id=?2,updated_at=?3 WHERE id=?4', [nextStatus, nextActiveTurnId, Date.now(), session.id]);
   }
-  if (msg.method === 'turn/completed') {
-    const nextStatus = turnTerminalStatus(msg.params?.turn);
+  if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
+    const nextStatus = msg.method === 'turn/completed' ? turnTerminalStatus(msg.params?.turn) : 'interrupted';
     await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,interruption_reason=?2,updated_at=?3 WHERE id=?4', [nextStatus, nextStatus === 'interrupted' ? 'turn_failed_or_interrupted' : null, Date.now(), session.id]);
-  }
-  if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
-    await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,updated_at=?2 WHERE id=?3', ['idle', Date.now(), session.id]);
   }
 }
 
@@ -1147,14 +1147,6 @@ async function reconcileStaleRunningSessions(id?:string) {
     id ? [id] : []
   );
   for (const row of rows) {
-    const final = await db.get(
-      "SELECT sequence FROM events WHERE session_id=?1 AND event_type='item/completed' AND payload_json LIKE '%\"phase\":\"final_answer\"%' ORDER BY sequence DESC LIMIT 1",
-      [String(row.id)]
-    );
-    if (final) {
-      await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, updated_at=?2 WHERE id=?3', ['idle', Date.now(), row.id]);
-      continue;
-    }
     const last = await db.get('SELECT MAX(created_at) AS ts FROM events WHERE session_id=?1', [String(row.id)]);
     const lastEventAt = Number(last?.ts || row.updated_at || 0);
     if (lastEventAt > cutoff) continue;
@@ -1871,21 +1863,28 @@ async function drainState() {
   expireRuntimeDrain();
   const row = await db.get(
     `SELECT
-       SUM(CASE WHEN status IN ('running','active','planning','executing_approved_plan','output_draining','cancelling') THEN 1 ELSE 0 END) AS activeTurnCount,
+       SUM(CASE WHEN active_turn_id IS NOT NULL OR status IN ('running','active','planning','waiting_plan_approval','executing_approved_plan','output_draining','cancelling') THEN 1 ELSE 0 END) AS activeTurnCount,
        SUM(CASE WHEN status='submitting' THEN 1 ELSE 0 END) AS submittingTurnCount
      FROM sessions`
   ).catch(()=>null);
+  const claudeActiveTurnCount=claudeManager.activeTurnCount();
+  const geminiActivePromptCount=geminiManager.activePromptCount();
+  const subscriberPendingBufferCount=subscriptions.pendingBufferCount;
+  const pendingEventWriteCount=eventStore.metrics.appendQueueCount+eventStore.metrics.deltaQueueEventCount+eventStore.metrics.pendingSqliteWriteCount+subscriptions.pendingPushCount+subscriberPendingBufferCount;
+  const drained=runtimeIsDrained({activeTurnCount:Number(row?.activeTurnCount||0),submittingTurnCount:Number(row?.submittingTurnCount||0),claudeActiveTurnCount,geminiActivePromptCount,appendQueueCount:eventStore.metrics.appendQueueCount,deltaQueueEventCount:eventStore.metrics.deltaQueueEventCount,pendingSqliteWriteCount:eventStore.metrics.pendingSqliteWriteCount,pendingPushCount:subscriptions.pendingPushCount,subscriberPendingBufferCount});
   return {
     activeTurnCount:Number(row?.activeTurnCount || 0),
     submittingTurnCount:Number(row?.submittingTurnCount || 0),
+    claudeActiveTurnCount,
+    geminiActivePromptCount,
     appendQueueCount:eventStore.metrics.appendQueueCount,
     deltaQueueEventCount:eventStore.metrics.deltaQueueEventCount,
     deltaQueueBytes:eventStore.metrics.deltaQueueBytes,
     pendingSqliteWriteCount:eventStore.metrics.pendingSqliteWriteCount,
-    subscriberPendingBufferCount:subscriptions.pendingBufferCount,
-    pendingEventWriteCount:eventStore.metrics.appendQueueCount+eventStore.metrics.deltaQueueEventCount+eventStore.metrics.pendingSqliteWriteCount+subscriptions.pendingPushCount,
+    subscriberPendingBufferCount,
+    pendingEventWriteCount,
     accepting:runtimeLifecycle === 'accepting',
-    drained:Number(row?.activeTurnCount || 0) === 0 && Number(row?.submittingTurnCount || 0) === 0 && eventStore.metrics.appendQueueCount === 0 && eventStore.metrics.deltaQueueEventCount === 0 && eventStore.metrics.pendingSqliteWriteCount === 0 && subscriptions.pendingPushCount === 0,
+    drained,
   };
 }
 function releaseMetadata() {

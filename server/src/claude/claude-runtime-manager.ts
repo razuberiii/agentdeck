@@ -33,6 +33,8 @@ export class ClaudeRuntimeManager {
     },
   ) {}
 
+  activeTurnCount() { return this.active.size; }
+
   async startTurn(input: ClaudeTurnInput) {
     if (this.active.has(input.localSessionId)) throw new Error('Claude turn already running');
     const controller = new AbortController();

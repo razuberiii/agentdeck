@@ -27,7 +27,7 @@ RUNTIME_CANDIDATE_PORT="${AGENTDECK_RUNTIME_CANDIDATE_PORT:-3952}"
 DRAIN_TIMEOUT_SECONDS="${AGENTDECK_DRAIN_TIMEOUT_SECONDS:-7200}"
 DRAIN_LEASE_SECONDS="${AGENTDECK_DRAIN_LEASE_SECONDS:-120}"
 KEEP_RELEASES="${AGENTDECK_KEEP_RELEASES:-5}"
-SYSTEMD_UNIT_VERSION=1
+SYSTEMD_UNIT_VERSION=2
 SERVICE_USER=""
 SERVICE_HOME=""
 CREATED_RELEASE_ID=""
@@ -211,6 +211,14 @@ active_turns() {
 
 active_turn_count_from_json() {
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s); if(!Number.isFinite(Number(j.activeTurnCount))) throw new Error("missing activeTurnCount"); console.log(Number(j.activeTurnCount));}catch(e){console.error(`active-turn query parse failed: ${e.message}`); process.exit(1);}})'
+}
+
+drain_status() {
+  curl_json "http://127.0.0.1:$RUNTIME_PORT/drain/status"
+}
+
+drained_from_json() {
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);if(typeof j.drained!=="boolean")throw new Error("missing drained boolean");console.log(j.drained?"true":"false");}catch(e){console.error(`drain status parse failed: ${e.message}`);process.exit(1);}})'
 }
 
 release_target() {
@@ -756,6 +764,7 @@ NODE
   rollback_root="${DATA_DIR}.rollback-$(date -u +%Y%m%d-%H%M%S)"
   drain_runtime
   wait_drain 0
+  require_runtime_drained
   systemctl stop agentdeck-web.service agentdeck-runtime.service
   if [ -e "$DATA_DIR" ]; then mv "$DATA_DIR" "$rollback_root"; else mkdir -p "$(dirname "$DATA_DIR")"; rollback_root=""; fi
   if mv "$staging" "$DATA_DIR" && systemctl start agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 && systemctl start agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45; then
@@ -895,29 +904,37 @@ undrain_runtime() {
 }
 
 wait_drain() {
-  local force="$1" start count turns
+  local force="$1" start state drained
   start="$(date +%s)"
   while true; do
-    if ! turns="$(active_turns 2>&1)"; then
+    if ! state="$(drain_status 2>&1)"; then
       undrain_runtime
-      die "runtime active-turn query failed during drain: $turns"
+      echo "ERROR: runtime drain-status query failed during drain: $state" >&2
+      return 1
     fi
-    if ! count="$(printf '%s' "$turns" | active_turn_count_from_json)"; then
+    if ! drained="$(printf '%s' "$state" | drained_from_json)"; then
       undrain_runtime
-      die "runtime active-turn response was invalid during drain"
+      echo "ERROR: runtime drain-status response was invalid during drain" >&2
+      return 1
     fi
-    [ "$count" = "0" ] && return
+    [ "$drained" = "true" ] && return 0
     drain_runtime
     if [ $(( $(date +%s) - start )) -ge "$DRAIN_TIMEOUT_SECONDS" ]; then
-      if [ "$force" = "1" ]; then
-        log "drain timed out; --force allows restart with $count active turn(s)"
-        return
-      fi
       undrain_runtime
-      die "runtime drain timed out with $count active turn(s); deployment cancelled"
+      echo "ERROR: runtime drain timed out before drained=true; deployment cancelled" >&2
+      return 1
     fi
     sleep 5
   done
+}
+
+require_runtime_drained() {
+  local state drained
+  if ! state="$(drain_status 2>&1)" || ! drained="$(printf '%s' "$state" | drained_from_json)" || [ "$drained" != "true" ]; then
+    undrain_runtime
+    echo "ERROR: final runtime drain check was not drained=true; deployment cancelled before restart" >&2
+    return 1
+  fi
 }
 
 reject_active_turns() {
@@ -950,7 +967,7 @@ restart_target() {
       ;;
     all)
       drain_runtime
-      if [ "$force" = "1" ]; then log "forcing all restart; active turns may be interrupted"; else wait_drain 0; fi
+      if [ "$force" = "1" ]; then log "forcing all restart; active turns may be interrupted"; else wait_drain 0; require_runtime_drained; fi
       systemctl restart agentdeck-runtime.service
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 30
       systemctl restart agentdeck-web.service
@@ -998,7 +1015,8 @@ worker_deploy() {
     fi
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       drain_runtime || exit $?
-      wait_drain "$force" || exit $?
+      if ! wait_drain "$force"; then rm -f "$pointer_snapshot"; exit 1; fi
+      if ! require_runtime_drained; then rm -f "$pointer_snapshot"; exit 1; fi
       switch_component runtime "$release_id" || exit $?
       systemctl restart agentdeck-runtime.service || exit $?
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || exit $?
@@ -1057,6 +1075,7 @@ worker_rollback() {
     if [ "$target" = "runtime" ] || [ "$target" = "all" ]; then
       drain_runtime
       wait_drain "$force"
+      require_runtime_drained
     fi
     if [ "$target" = runtime ]||[ "$target" = all ];then rollback_component runtime;fi
     if [ "$target" = web ]||[ "$target" = all ];then rollback_component web;fi

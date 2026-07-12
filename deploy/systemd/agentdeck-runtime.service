@@ -23,6 +23,7 @@ EnvironmentFile=@AGENTDECK_ENV_DIR@/runtime.env
 ExecStart=/usr/bin/flock -n /run/agentdeck/runtime-production.lock /usr/bin/node @AGENTDECK_CURRENT_DIR@-runtime/server/dist/agentdeck-runtime.js
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=660
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
