@@ -21,6 +21,9 @@ import { EventSubscriptions } from './event-subscriptions.js';
 import { migrateRuntimeSchema, RUNTIME_SCHEMA_VERSION, verifyRuntimeSchema } from './schema-migrations.js';
 import { deleteSessionRelations } from './session-lifecycle.js';
 import { runtimeIsDrained } from './runtime-drain-state.js';
+import { TurnAdmission } from './turn-admission.js';
+import { codexSessionStateForNotification } from './codex-session-state.js';
+import { KeyedSerialQueue } from './keyed-serial-queue.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -344,6 +347,8 @@ const diagnostics = {
 };
 type RuntimeLifecycle = 'starting' | 'accepting' | 'draining' | 'stopping';
 let runtimeLifecycle:RuntimeLifecycle = 'starting';
+const turnAdmission = new TurnAdmission();
+const codexNotificationQueue = new KeyedSerialQueue();
 let drainStartedAt:number | null = null;
 let drainExpiresAt:number | null = null;
 const DRAIN_TIMEOUT_MS = Number(process.env.RUNTIME_DRAIN_TIMEOUT_MS || 10 * 60 * 1000);
@@ -716,9 +721,10 @@ app.get('/sessions/:id/subscribe', async (req:any, reply) => {
   },RUNTIME_GENERATION);
 });
 
-app.post('/sessions/:id/turns', async (req:any, reply) => {
+app.post('/sessions/:id/turns', (req:any, reply) => {
   if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
-  if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
+  if (!turnAdmission.tryBegin(!isDraining())) return reply.code(503).send(runtimeDrainingBody(req));
+  return (async () => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
@@ -863,6 +869,7 @@ app.post('/sessions/:id/turns', async (req:any, reply) => {
   if (turn?.turn?.id) await db.run('UPDATE sessions SET active_turn_id=?1, status=?2, updated_at=?3 WHERE id=?4', [String(turn.turn.id), 'running', Date.now(), session.id]);
   await appendEvent(session.id, 'turn/start', { result:turn, source:'runtime' });
   return { turn };
+  })().finally(() => turnAdmission.end());
 });
 
 app.post('/sessions/:id/stop', async (req:any, reply) => {
@@ -1023,7 +1030,10 @@ async function runtimeForAccountOnce(accountId:string) {
   let runtime = runtimes.get(account.id);
   if (!runtime) {
     runtime = new CodexAccountRuntime(account, portForAccount(account.id), db);
-    runtime.on('notification', (msg:any) => handleCodexNotification(account, msg).catch(e => app.log.error({ err:e }, 'notification handling failed')));
+    runtime.on('notification', (msg:any) => {
+      const key=String(msg.params?.threadId||msg.params?.thread?.id||account.id);
+      codexNotificationQueue.run(key,()=>handleCodexNotification(account,msg)).catch(e=>app.log.error({err:e},'notification handling failed'));
+    });
     runtime.on('request', (msg:any) => handleCodexRequest(runtime!, msg).catch(error => {
       app.log.warn({ err:error, method:msg?.method }, 'codex request guard failed');
       runtime!.respond(msg.id, approvalResponse(String(msg.method || '')));
@@ -1041,22 +1051,28 @@ async function runtimeForAccountOnce(accountId:string) {
 async function handleCodexNotification(account:Account, msg:any) {
   const upstreamThreadId = String(msg.params?.threadId || msg.params?.thread?.id || '');
   if (!upstreamThreadId) return;
-  const session = await sessionForThread(upstreamThreadId);
+  const session = await sessionForThread(upstreamThreadId, true);
   if (!session) return;
   if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) diagnostics.deltasReceived++;
   appendEvent(session.id, msg.method, msg).catch(e => app.log.error({ err:e }, 'event append failed'));
   if (msg.method === 'turn/started' && msg.params?.turn?.id) {
-    await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,updated_at=?3 WHERE id=?4', [String(msg.params.turn.id), 'running', Date.now(), session.id]);
+    const next=codexSessionStateForNotification(session as any,msg.method,msg.params);
+    await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,interruption_reason=?3,updated_at=?4 WHERE id=?5', [next.active_turn_id,next.status,next.interruption_reason||null,Date.now(),session.id]);
+    invalidateThreadSessionCache(session);
   }
   if (msg.method === 'thread/status/changed') {
-    const rawStatus = rawStatusName(msg.params?.status);
-    const nextStatus = session.active_turn_id ? 'running' : statusName(rawStatus);
-    const nextActiveTurnId = session.active_turn_id || null;
-    await db.run('UPDATE sessions SET status=?1,active_turn_id=?2,updated_at=?3 WHERE id=?4', [nextStatus, nextActiveTurnId, Date.now(), session.id]);
+    const authoritative=await sessionForThread(upstreamThreadId,true);
+    if (!authoritative) return;
+    const next=codexSessionStateForNotification(authoritative as any,msg.method,msg.params);
+    await db.run('UPDATE sessions SET status=?1,active_turn_id=?2,updated_at=?3 WHERE id=?4', [next.status,next.active_turn_id,Date.now(),authoritative.id]);
+    invalidateThreadSessionCache(authoritative);
   }
   if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
-    const nextStatus = msg.method === 'turn/completed' ? turnTerminalStatus(msg.params?.turn) : 'interrupted';
-    await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,interruption_reason=?2,updated_at=?3 WHERE id=?4', [nextStatus, nextStatus === 'interrupted' ? 'turn_failed_or_interrupted' : null, Date.now(), session.id]);
+    const authoritative=await sessionForThread(upstreamThreadId,true);
+    if (!authoritative) return;
+    const next=codexSessionStateForNotification(authoritative as any,msg.method,msg.params);
+    await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,interruption_reason=?2,updated_at=?3 WHERE id=?4', [next.status,next.interruption_reason||null,Date.now(),authoritative.id]);
+    invalidateThreadSessionCache(authoritative);
   }
 }
 
@@ -1155,9 +1171,9 @@ async function reconcileStaleRunningSessions(id?:string) {
   }
 }
 
-async function sessionForThread(upstreamThreadId:string) {
+async function sessionForThread(upstreamThreadId:string, fresh=false) {
   const cached = threadSessionCache.get(upstreamThreadId);
-  if (cached) return cached;
+  if (cached && !fresh) return cached;
   const row = await db.get('SELECT * FROM sessions WHERE id=?1 OR upstream_thread_id=?1 OR codex_thread_id=?1', [upstreamThreadId]) as RuntimeSession | null;
   if (row) {
     threadSessionCache.set(String(row.id), row);
@@ -1165,6 +1181,12 @@ async function sessionForThread(upstreamThreadId:string) {
     if (row.codex_thread_id) threadSessionCache.set(String(row.codex_thread_id), row);
   }
   return row;
+}
+
+function invalidateThreadSessionCache(session:RuntimeSession) {
+  threadSessionCache.delete(String(session.id));
+  if (session.upstream_thread_id) threadSessionCache.delete(String(session.upstream_thread_id));
+  if (session.codex_thread_id) threadSessionCache.delete(String(session.codex_thread_id));
 }
 
 async function getSession(id:string) {
@@ -1871,8 +1893,10 @@ async function drainState() {
   const geminiActivePromptCount=geminiManager.activePromptCount();
   const subscriberPendingBufferCount=subscriptions.pendingBufferCount;
   const pendingEventWriteCount=eventStore.metrics.appendQueueCount+eventStore.metrics.deltaQueueEventCount+eventStore.metrics.pendingSqliteWriteCount+subscriptions.pendingPushCount+subscriberPendingBufferCount;
-  const drained=runtimeIsDrained({activeTurnCount:Number(row?.activeTurnCount||0),submittingTurnCount:Number(row?.submittingTurnCount||0),claudeActiveTurnCount,geminiActivePromptCount,appendQueueCount:eventStore.metrics.appendQueueCount,deltaQueueEventCount:eventStore.metrics.deltaQueueEventCount,pendingSqliteWriteCount:eventStore.metrics.pendingSqliteWriteCount,pendingPushCount:subscriptions.pendingPushCount,subscriberPendingBufferCount});
+  const turnAdmissionInFlight=turnAdmission.inFlight;
+  const drained=runtimeIsDrained({turnAdmissionInFlight,activeTurnCount:Number(row?.activeTurnCount||0),submittingTurnCount:Number(row?.submittingTurnCount||0),claudeActiveTurnCount,geminiActivePromptCount,appendQueueCount:eventStore.metrics.appendQueueCount,deltaQueueEventCount:eventStore.metrics.deltaQueueEventCount,pendingSqliteWriteCount:eventStore.metrics.pendingSqliteWriteCount,pendingPushCount:subscriptions.pendingPushCount,subscriberPendingBufferCount});
   return {
+    turnAdmissionInFlight,
     activeTurnCount:Number(row?.activeTurnCount || 0),
     submittingTurnCount:Number(row?.submittingTurnCount || 0),
     claudeActiveTurnCount,

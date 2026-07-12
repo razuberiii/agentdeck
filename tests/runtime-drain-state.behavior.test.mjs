@@ -1,4 +1,4 @@
 import assert from'node:assert/strict';import test from'node:test';import{runtimeIsDrained}from'../server/dist/runtime-drain-state.js';
-const empty=()=>({activeTurnCount:0,submittingTurnCount:0,claudeActiveTurnCount:0,geminiActivePromptCount:0,appendQueueCount:0,deltaQueueEventCount:0,pendingSqliteWriteCount:0,pendingPushCount:0,subscriberPendingBufferCount:0});
+const empty=()=>({turnAdmissionInFlight:0,activeTurnCount:0,submittingTurnCount:0,claudeActiveTurnCount:0,geminiActivePromptCount:0,appendQueueCount:0,deltaQueueEventCount:0,pendingSqliteWriteCount:0,pendingPushCount:0,subscriberPendingBufferCount:0});
 test('runtime drains only when every provider and delivery queue is idle',()=>{assert.equal(runtimeIsDrained(empty()),true);for(const field of Object.keys(empty()))assert.equal(runtimeIsDrained({...empty(),[field]:1}),false,field);});
 test('output draining and cancelling database turns block drain',()=>{for(const status of['output_draining','cancelling'])assert.equal(runtimeIsDrained({...empty(),activeTurnCount:1}),false,status);});
