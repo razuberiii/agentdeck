@@ -107,12 +107,12 @@ run_as_service_user() {
 }
 
 ensure_service_owned_dirs() {
-  resolve_service_user
-  mkdir -p "$DATA_DIR/cache" "$PLAYWRIGHT_BROWSERS_PATH" "$NPM_CONFIG_CACHE" "$DATA_DIR/provider-tools/bin" "$DATA_DIR/deploy-candidates" "$RELEASES_DIR" "$LOG_DIR"
-  chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools" "$DATA_DIR/deploy-candidates" "$LOG_DIR"
+  resolve_service_user || return $?
+  mkdir -p "$DATA_DIR/cache" "$PLAYWRIGHT_BROWSERS_PATH" "$NPM_CONFIG_CACHE" "$DATA_DIR/provider-tools/bin" "$DATA_DIR/deploy-candidates" "$RELEASES_DIR" "$LOG_DIR" || return $?
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/cache" "$DATA_DIR/provider-tools" "$DATA_DIR/deploy-candidates" "$LOG_DIR" || return $?
   # Releases are immutable build products.  The builder needs to create entries in
   # the parent, but a running Web/Runtime process must never own existing releases.
-  chown "$SERVICE_USER:$SERVICE_USER" "$RELEASES_DIR"
+  chown "$SERVICE_USER:$SERVICE_USER" "$RELEASES_DIR" || return $?
 }
 
 valid_release_id() {
@@ -136,20 +136,22 @@ safe_rm_tree() {
 }
 
 ensure_playwright_browsers() {
-  ensure_service_owned_dirs
+  ensure_service_owned_dirs || return $?
   if find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 2 -type d -name 'chromium-*' 2>/dev/null | grep -q .; then
     log "Playwright Chromium already present in $PLAYWRIGHT_BROWSERS_PATH"
     return
   fi
   log "installing Playwright Chromium into $PLAYWRIGHT_BROWSERS_PATH as $SERVICE_USER"
-  run_as_service_user npx playwright install chromium
+  run_as_service_user npx playwright install chromium || return $?
 }
 
 ensure_dirs() {
-  mkdir -p "$CONTROL_ROOT" "$DATA_DIR" "$STATE_DIR" "$RELEASES_DIR" "$JOBS_DIR" "$LOG_DIR"
+  mkdir -p "$CONTROL_ROOT" "$DATA_DIR" "$STATE_DIR" "$RELEASES_DIR" "$JOBS_DIR" "$LOG_DIR" || return $?
   if [ -L "$CURRENT_LINK" ]; then
-    [ -L "$CURRENT_WEB_LINK" ] || ln -sfn "$(readlink "$CURRENT_LINK")" "$CURRENT_WEB_LINK"
-    [ -L "$CURRENT_RUNTIME_LINK" ] || ln -sfn "$(readlink "$CURRENT_LINK")" "$CURRENT_RUNTIME_LINK"
+    local current_target
+    current_target="$(readlink "$CURRENT_LINK")" || return $?
+    if [ ! -L "$CURRENT_WEB_LINK" ]; then ln -sfn "$current_target" "$CURRENT_WEB_LINK" || return $?; fi
+    if [ ! -L "$CURRENT_RUNTIME_LINK" ]; then ln -sfn "$current_target" "$CURRENT_RUNTIME_LINK" || return $?; fi
   fi
 }
 
@@ -229,9 +231,9 @@ release_target() {
 
 require_git_source_root() {
   local git_root
-  command -v git >/dev/null 2>&1 || die "git is required to create a release"
-  git_root="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
-  [ -n "$git_root" ] || die "source root is not a Git repository: $SOURCE_ROOT"
+  command -v git >/dev/null 2>&1 || return 127
+  git_root="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null)" || return $?
+  [ -n "$git_root" ] || return 1
   SOURCE_ROOT="$git_root"
 }
 
@@ -462,38 +464,38 @@ run_install_units() {
 
 make_release() {
   local stage_state="$1" job_id="$2"
-  ensure_dirs
-  ensure_service_owned_dirs
-  require_git_source_root
+  ensure_dirs || return $?
+  ensure_service_owned_dirs || return $?
+  require_git_source_root || return $?
   local commit short branch ts release_id release_path previous_release built_by node_version npm_version
-  cd "$SOURCE_ROOT"
-  commit="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse HEAD)"
-  short="$(printf '%s' "$commit" | cut -c1-12)"
+  cd "$SOURCE_ROOT" || return $?
+  commit="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" rev-parse HEAD)" || return $?
+  short="$(printf '%s' "$commit" | cut -c1-12)" || return $?
   branch="$(git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" branch --show-current 2>/dev/null || true)"
-  ts="$(date -u +%Y%m%d-%H%M%S)"
+  ts="$(date -u +%Y%m%d-%H%M%S)" || return $?
   release_id="$ts-$short"
-  valid_release_id "$release_id" || die "generated invalid release id: $release_id"
-  release_path="$(release_path_for "$release_id")"
+  valid_release_id "$release_id" || return $?
+  release_path="$(release_path_for "$release_id")" || return $?
   CREATED_RELEASE_ID="$release_id"
   export AGENTDECK_JOB_RELEASE="$release_id"
-  deploy_journal_set_value "$stage_state" release_id "$release_id"
-  write_job "$job_id" running "creating release"
+  deploy_journal_set_value "$stage_state" release_id "$release_id" || return $?
+  write_job "$job_id" running "creating release" || return $?
   previous_release="$(release_target "$CURRENT_LINK")"
   built_by="$(id -un 2>/dev/null || whoami 2>/dev/null || echo unknown)"
   [ ! -e "$release_path" ] || die "release already exists: $release_id"
   log "creating release $release_id"
-  run_as_service_user git worktree add --detach "$release_path" "$commit" >/dev/null
-  cd "$release_path"
-  ensure_playwright_browsers
-  run_as_service_user npm ci
-  run_as_service_user npm run typecheck
-  run_as_service_user npm run lint
-  run_as_service_user npm run build
-  run_as_service_user npm test
-  run_as_service_user npm run test:e2e
-  node_version="$(run_as_service_user node --version)"
-  npm_version="$(run_as_service_user npm --version)"
-  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" "$SOURCE_ROOT" "$branch" "$previous_release" "$built_by" "$node_version" "$npm_version" "$SYSTEMD_UNIT_VERSION" <<'NODE'
+  run_as_service_user git worktree add --detach "$release_path" "$commit" >/dev/null || return $?
+  cd "$release_path" || return $?
+  ensure_playwright_browsers || return $?
+  run_as_service_user npm ci || return $?
+  run_as_service_user npm run typecheck || return $?
+  run_as_service_user npm run lint || return $?
+  run_as_service_user npm run build || return $?
+  run_as_service_user npm test || return $?
+  run_as_service_user npm run test:e2e || return $?
+  node_version="$(run_as_service_user node --version)" || return $?
+  npm_version="$(run_as_service_user npm --version)" || return $?
+  node - "$release_path/deploy-manifest.json" "$release_id" "$commit" "$SOURCE_ROOT" "$branch" "$previous_release" "$built_by" "$node_version" "$npm_version" "$SYSTEMD_UNIT_VERSION" <<'NODE' || return $?
 const fs = require('node:fs');
 fs.writeFileSync(process.argv[2], JSON.stringify({
   releaseId:process.argv[3],
@@ -521,8 +523,8 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
   compatibility:{ web:true, runtime:true },
 }, null, 2) + '\n');
 NODE
-  ln -sfn "releases/$release_id" "$CANDIDATE_LINK.tmp"
-  mv -Tf "$CANDIDATE_LINK.tmp" "$CANDIDATE_LINK"
+  ln -sfn "releases/$release_id" "$CANDIDATE_LINK.tmp" || return $?
+  mv -Tf "$CANDIDATE_LINK.tmp" "$CANDIDATE_LINK" || return $?
 }
 
 assert_release_unit_requirement() {
@@ -861,20 +863,26 @@ switch_component() {
   local component="$1" release_id="$2" current previous
   if [ "$component" = "web" ]; then current="$CURRENT_WEB_LINK"; previous="$PREVIOUS_WEB_LINK"; else current="$CURRENT_RUNTIME_LINK"; previous="$PREVIOUS_RUNTIME_LINK"; fi
   local current_target
-  current_target="$(readlink "$current" 2>/dev/null || true)"
+  if [ -L "$current" ]; then current_target="$(readlink "$current")" || return $?; elif [ -e "$current" ]; then return 1; else current_target=""; fi
   if [ -n "$current_target" ]; then
-    ln -sfn "$current_target" "$previous.tmp"
-    mv -Tf "$previous.tmp" "$previous"
+    ln -sfn "$current_target" "$previous.tmp" || return $?
+    mv -Tf "$previous.tmp" "$previous" || return $?
   fi
-  ln -sfn "releases/$release_id" "$current.tmp"
-  mv -Tf "$current.tmp" "$current"
+  ln -sfn "releases/$release_id" "$current.tmp" || return $?
+  mv -Tf "$current.tmp" "$current" || return $?
 }
 
 snapshot_deploy_pointers() {
   local out="$1" link
-  : > "$out"
+  : > "$out" || return $?
   for link in "$CURRENT_WEB_LINK" "$PREVIOUS_WEB_LINK" "$CURRENT_RUNTIME_LINK" "$PREVIOUS_RUNTIME_LINK"; do
-    if [ -L "$link" ]; then printf '%s\t%s\n' "$link" "$(readlink "$link")" >> "$out"; else printf '%s\t\n' "$link" >> "$out"; fi
+    if [ -L "$link" ]; then
+      local target
+      target="$(readlink "$link")" || return $?
+      printf '%s\t%s\n' "$link" "$target" >> "$out" || return $?
+    else
+      printf '%s\t\n' "$link" >> "$out" || return $?
+    fi
   done
 }
 
@@ -889,24 +897,29 @@ restore_deploy_pointers() {
 
 restore_component_pointer_snapshot() {
   local snapshot="$1" component="$2" link target
-  [ -f "$snapshot" ] || return 0
+  [ -f "$snapshot" ] || return 1
   while IFS=$'\t' read -r link target; do
     case "$component:$link" in
       web:"$CURRENT_WEB_LINK"|web:"$PREVIOUS_WEB_LINK"|runtime:"$CURRENT_RUNTIME_LINK"|runtime:"$PREVIOUS_RUNTIME_LINK") ;;
       *) continue ;;
     esac
-    if [ -n "${target:-}" ]; then ln -sfn "$target" "$link.tmp"; mv -Tf "$link.tmp" "$link"; else rm -f "$link" "$link.tmp"; fi
-  done < "$snapshot"
+    if [ -n "${target:-}" ]; then
+      ln -sfn "$target" "$link.tmp" || return $?
+      mv -Tf "$link.tmp" "$link" || return $?
+    else
+      rm -f "$link" "$link.tmp" || return $?
+    fi
+  done < "$snapshot" || return $?
 }
 
 deploy_stage_set() {
-  printf '%s=1\n' "$2" >> "$1"
-  sync -f "$1" 2>/dev/null || true
+  printf '%s=1\n' "$2" >> "$1" || return $?
+  sync -f "$1" 2>/dev/null || return $?
 }
 deploy_stage_has() { grep -qx "$2=1" "$1" 2>/dev/null; }
 deploy_journal_set_value() {
-  printf '%s=%s\n' "$2" "$3" >> "$1"
-  sync -f "$1" 2>/dev/null || true
+  printf '%s=%s\n' "$2" "$3" >> "$1" || return $?
+  sync -f "$1" 2>/dev/null || return $?
 }
 deploy_journal_value() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1; }
 write_deploy_recovery_job() {
@@ -916,17 +929,18 @@ write_deploy_recovery_job() {
 
 cleanup_release_worktree() {
   local release_id="$1" release_path was_worktree=0
-  [ -n "$release_id" ] && valid_release_id "$release_id" || return 0
-  release_path="$(release_path_for "$release_id")"
-  clear_candidate_release_links "$release_path"
-  release_is_referenced "$release_path" && { log "cannot clean referenced failed release: $release_path"; return 1; }
+  [ -n "$release_id" ] || return 0
+  valid_release_id "$release_id" || return 1
+  release_path="$(release_path_for "$release_id")" || return $?
+  clear_candidate_release_links "$release_path" || return $?
+  if release_is_referenced "$release_path"; then log "cannot clean referenced failed release: $release_path"; return 1; else local reference_code=$?; [ "$reference_code" -eq 1 ] || return "$reference_code"; fi
   cd "$SOURCE_ROOT" || return 1
   if [ -e "$release_path" ]; then
     if [ -f "$release_path/.git" ]; then
       was_worktree=1
       run_as_service_user git -c "safe.directory=$SOURCE_ROOT" -C "$SOURCE_ROOT" worktree remove --force "$release_path" || return 1
     else
-      safe_rm_tree "$release_path" "$RELEASES_DIR"
+      rm -rf "$release_path" || return $?
     fi
   fi
   [ ! -e "$release_path" ] || return 1
@@ -938,15 +952,15 @@ deploy_recover_once() {
   local failed_release_id="" recovery_failed=0 original_code
   [ -f "$stage_state" ] || return 0
   if deploy_stage_has "$stage_state" deploy_succeeded; then
-    write_deploy_recovery_job "$job_id" "$target" succeeded "deploy succeeded (commit journal recovered)"
+    write_deploy_recovery_job "$job_id" "$target" succeeded "deploy succeeded (commit journal recovered)" || return $?
     return 0
   fi
   deploy_stage_has "$stage_state" recovery_completed && return 0
-  original_code="$(deploy_journal_value "$stage_state" original_exit_code)"
-  [ -n "$original_code" ] || deploy_journal_set_value "$stage_state" original_exit_code "$code"
-  deploy_stage_has "$stage_state" recovery_started || deploy_stage_set "$stage_state" recovery_started
-  undrain_runtime
-  failed_release_id="$(deploy_journal_value "$stage_state" release_id)"
+  original_code="$(deploy_journal_value "$stage_state" original_exit_code)" || return $?
+  if [ -z "$original_code" ]; then deploy_journal_set_value "$stage_state" original_exit_code "$code" || return $?; fi
+  if ! deploy_stage_has "$stage_state" recovery_started; then deploy_stage_set "$stage_state" recovery_started || return $?; fi
+  undrain_runtime || return $?
+  failed_release_id="$(deploy_journal_value "$stage_state" release_id)" || return $?
   if [ -z "$failed_release_id" ]; then
     failed_release_id="$(node - "$JOBS_DIR/$job_id.json" <<'NODE' 2>/dev/null || true
 const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));if(j.release)process.stdout.write(String(j.release));}catch{}
@@ -955,45 +969,45 @@ NODE
   fi
   if deploy_stage_has "$stage_state" runtime_pointer_switch_started; then
     if ! deploy_stage_has "$stage_state" runtime_pointer_restore_completed; then
-      deploy_stage_has "$stage_state" runtime_pointer_restore_started || deploy_stage_set "$stage_state" runtime_pointer_restore_started
+      if ! deploy_stage_has "$stage_state" runtime_pointer_restore_started; then deploy_stage_set "$stage_state" runtime_pointer_restore_started || return $?; fi
       log "deploy failed; restoring Runtime release pointers"
-      if restore_component_pointer_snapshot "$pointer_snapshot" runtime; then deploy_stage_set "$stage_state" runtime_pointer_restore_completed; else recovery_failed=1; fi
+      if restore_component_pointer_snapshot "$pointer_snapshot" runtime; then deploy_stage_set "$stage_state" runtime_pointer_restore_completed || return $?; else recovery_failed=1; fi
     fi
     if [ "$recovery_failed" = 0 ] && deploy_stage_has "$stage_state" runtime_restart_started && ! deploy_stage_has "$stage_state" runtime_restart_recovery_completed; then
-      deploy_stage_has "$stage_state" runtime_restart_recovery_started || deploy_stage_set "$stage_state" runtime_restart_recovery_started
-      if systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45; then deploy_stage_set "$stage_state" runtime_restart_recovery_completed; else recovery_failed=1; fi
+      if ! deploy_stage_has "$stage_state" runtime_restart_recovery_started; then deploy_stage_set "$stage_state" runtime_restart_recovery_started || return $?; fi
+      if systemctl restart agentdeck-runtime.service && wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45; then deploy_stage_set "$stage_state" runtime_restart_recovery_completed || return $?; else recovery_failed=1; fi
     fi
   fi
   if [ "$recovery_failed" = 0 ] && deploy_stage_has "$stage_state" web_pointer_switch_started; then
     if ! deploy_stage_has "$stage_state" web_pointer_restore_completed; then
-      deploy_stage_has "$stage_state" web_pointer_restore_started || deploy_stage_set "$stage_state" web_pointer_restore_started
+      if ! deploy_stage_has "$stage_state" web_pointer_restore_started; then deploy_stage_set "$stage_state" web_pointer_restore_started || return $?; fi
       log "deploy failed; restoring Web release pointers"
-      if restore_component_pointer_snapshot "$pointer_snapshot" web; then deploy_stage_set "$stage_state" web_pointer_restore_completed; else recovery_failed=1; fi
+      if restore_component_pointer_snapshot "$pointer_snapshot" web; then deploy_stage_set "$stage_state" web_pointer_restore_completed || return $?; else recovery_failed=1; fi
     fi
     if [ "$recovery_failed" = 0 ] && deploy_stage_has "$stage_state" web_restart_started && ! deploy_stage_has "$stage_state" web_restart_recovery_completed; then
-      deploy_stage_has "$stage_state" web_restart_recovery_started || deploy_stage_set "$stage_state" web_restart_recovery_started
-      if systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45; then deploy_stage_set "$stage_state" web_restart_recovery_completed; else recovery_failed=1; fi
+      if ! deploy_stage_has "$stage_state" web_restart_recovery_started; then deploy_stage_set "$stage_state" web_restart_recovery_started || return $?; fi
+      if systemctl restart agentdeck-web.service && wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45; then deploy_stage_set "$stage_state" web_restart_recovery_completed || return $?; else recovery_failed=1; fi
     fi
   fi
   if [ "$recovery_failed" = "1" ]; then
-    deploy_stage_set "$stage_state" recovery_failed
-    write_deploy_recovery_job "$job_id" "$target" failed "FATAL: deploy failed (exit $code) and old-version recovery failed; diagnostic state preserved"
+    deploy_stage_set "$stage_state" recovery_failed || return $?
+    write_deploy_recovery_job "$job_id" "$target" failed "FATAL: deploy failed (exit $code) and old-version recovery failed; diagnostic state preserved" || return $?
     log "FATAL: old-version recovery failed after original deploy exit $code; preserving $pointer_snapshot, $stage_state and failed release"
     return 70
   fi
-  write_deploy_recovery_job "$job_id" "$target" failed "deploy failed (exit $code); recovery cleanup in progress"
+  write_deploy_recovery_job "$job_id" "$target" failed "deploy failed (exit $code); recovery cleanup in progress" || return $?
   if [ -n "$failed_release_id" ] && ! deploy_stage_has "$stage_state" release_cleanup_completed; then
-    deploy_stage_has "$stage_state" release_cleanup_started || deploy_stage_set "$stage_state" release_cleanup_started
+    if ! deploy_stage_has "$stage_state" release_cleanup_started; then deploy_stage_set "$stage_state" release_cleanup_started || return $?; fi
     if cleanup_release_worktree "$failed_release_id"; then
-      deploy_stage_set "$stage_state" release_cleanup_completed
+      deploy_stage_set "$stage_state" release_cleanup_completed || return $?
     else
-      deploy_stage_set "$stage_state" release_cleanup_failed
-      write_deploy_recovery_job "$job_id" "$target" failed "FATAL: deploy failed (exit $code) and failed release cleanup is incomplete; diagnostic state preserved"
+      deploy_stage_set "$stage_state" release_cleanup_failed || return $?
+      write_deploy_recovery_job "$job_id" "$target" failed "FATAL: deploy failed (exit $code) and failed release cleanup is incomplete; diagnostic state preserved" || return $?
       return 70
     fi
   fi
-  deploy_stage_set "$stage_state" recovery_completed
-  write_deploy_recovery_job "$job_id" "$target" failed "deploy failed (exit $code); started operations recovered"
+  deploy_stage_set "$stage_state" recovery_completed || return $?
+  write_deploy_recovery_job "$job_id" "$target" failed "deploy failed (exit $code); started operations recovered" || return $?
   return 0
 }
 
@@ -1016,33 +1030,36 @@ deploy_worker_exit_trap() {
 }
 
 recover_incomplete_deploy_journals() {
-  local stage_state job_id pointer_snapshot target code status
+  local stage_state job_id pointer_snapshot target code status metadata
   for stage_state in "$STATE_DIR"/*.stages; do
     [ -f "$stage_state" ] || continue
     job_id="$(basename "$stage_state" .stages)"
     pointer_snapshot="$STATE_DIR/$job_id.pointers"
-    read -r target status < <(node - "$JOBS_DIR/$job_id.json" <<'NODE' 2>/dev/null || true
-const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));process.stdout.write(`${j.target||'all'} ${j.status||'running'}`)}catch{}
+    metadata="$(node - "$JOBS_DIR/$job_id.json" <<'NODE' 2>/dev/null
+const fs=require('node:fs');try{const j=JSON.parse(fs.readFileSync(process.argv[2]));process.stdout.write(`${j.target||'all'} ${j.status||'running'}`)}catch{process.exit(1)}
 NODE
-)
+)" || return $?
+    read -r target status <<< "$metadata" || return $?
     target="${target:-all}"
     if deploy_stage_has "$stage_state" deploy_succeeded; then
-      [ "$status" = succeeded ] || write_deploy_recovery_job "$job_id" "$target" succeeded "deploy succeeded (commit journal recovered)"
-      rm -f "$pointer_snapshot" "$stage_state"
+      if [ "$status" != succeeded ]; then write_deploy_recovery_job "$job_id" "$target" succeeded "deploy succeeded (commit journal recovered)" || return $?; fi
+      rm -f "$pointer_snapshot" "$stage_state" || return $?
       continue
     fi
     deploy_stage_has "$stage_state" recovery_completed && continue
-    code="$(deploy_journal_value "$stage_state" original_exit_code)"; code="${code:-1}"
+    code="$(deploy_journal_value "$stage_state" original_exit_code)" || return $?; code="${code:-1}"
     deploy_recover_once "$job_id" "$target" "$pointer_snapshot" "$stage_state" "$code" || return $?
   done
 }
 
 release_is_referenced() {
   local release="$1" link job job_release target
-  release="$(realpath -m "$release")"
+  release="$(realpath -m "$release")" || return 2
   for link in "$CURRENT_LINK" "$PREVIOUS_LINK" "$CANDIDATE_LINK" "$CURRENT_WEB_LINK" "$PREVIOUS_WEB_LINK" "$CANDIDATE_WEB_LINK" "$CURRENT_RUNTIME_LINK" "$PREVIOUS_RUNTIME_LINK" "$CANDIDATE_RUNTIME_LINK"; do
     [ -L "$link" ] || continue
-    target="$(realpath -m "$(dirname "$link")/$(readlink "$link")")"
+    local raw_target
+    raw_target="$(readlink "$link")" || return 2
+    target="$(realpath -m "$(dirname "$link")/$raw_target")" || return 2
     [ "$target" = "$release" ] && return 0
   done
   for job in "$JOBS_DIR"/*.json; do
@@ -1060,11 +1077,13 @@ remove_release_if_unreferenced() {
 }
 
 clear_candidate_release_links() {
-  local release="$1" link
-  release="$(realpath -m "$release")"
+  local release="$1" link link_target resolved
+  release="$(realpath -m "$release")" || return $?
   for link in "$CANDIDATE_LINK" "$CANDIDATE_WEB_LINK" "$CANDIDATE_RUNTIME_LINK"; do
     [ -L "$link" ] || continue
-    [ "$(realpath -m "$(dirname "$link")/$(readlink "$link")")" = "$release" ] && rm -f "$link"
+    link_target="$(readlink "$link")" || return $?
+    resolved="$(realpath -m "$(dirname "$link")/$link_target")" || return $?
+    if [ "$resolved" = "$release" ]; then rm -f "$link" || return $?; fi
   done
 }
 rollback_component(){ local component="$1" current previous current_target previous_target; if [ "$component" = web ];then current="$CURRENT_WEB_LINK";previous="$PREVIOUS_WEB_LINK";else current="$CURRENT_RUNTIME_LINK";previous="$PREVIOUS_RUNTIME_LINK";fi; [ -L "$previous" ]||die "previous $component release is not set";previous_target="$(readlink "$previous")";current_target="$(readlink "$current" 2>/dev/null||true)";ln -sfn "$previous_target" "$current.tmp";mv -Tf "$current.tmp" "$current";[ -z "$current_target" ]||{ ln -sfn "$current_target" "$previous.tmp";mv -Tf "$previous.tmp" "$previous";}; }
@@ -1173,12 +1192,12 @@ worker_deploy() {
   flock -n 9 || return $?
   recover_incomplete_deploy_journals || return $?
   local release_id release_path
-  : > "$stage_state"
-  snapshot_deploy_pointers "$pointer_snapshot"
-  sync -f "$pointer_snapshot" 2>/dev/null || true
+  : > "$stage_state" || return $?
+  snapshot_deploy_pointers "$pointer_snapshot" || return $?
+  sync -f "$pointer_snapshot" 2>/dev/null || return $?
     if [ "$target" = runtime ] || [ "$target" = all ]; then verify_runtime_systemd_contract "$SYSTEMD_UNIT_VERSION" || exit $?; fi
     make_release "$stage_state" "$job_id" || exit $?
-    deploy_stage_set "$stage_state" release_built
+    deploy_stage_set "$stage_state" release_built || return $?
     release_id="$CREATED_RELEASE_ID"
     release_path="$(release_path_for "$release_id")"
     if [ "$target" = web ]||[ "$target" = all ];then ln -sfn "releases/$release_id" "$CANDIDATE_WEB_LINK";fi
@@ -1206,34 +1225,34 @@ worker_deploy() {
       drain_runtime || exit $?
       if ! wait_drain "$force"; then exit 1; fi
       if ! require_runtime_drained; then exit 1; fi
-      deploy_stage_set "$stage_state" runtime_pointer_switch_started
+      deploy_stage_set "$stage_state" runtime_pointer_switch_started || return $?
       switch_component runtime "$release_id" || return $?
-      deploy_stage_set "$stage_state" runtime_pointer_switch_completed
-      deploy_stage_set "$stage_state" runtime_restart_started
+      deploy_stage_set "$stage_state" runtime_pointer_switch_completed || return $?
+      deploy_stage_set "$stage_state" runtime_restart_started || return $?
       systemctl restart agentdeck-runtime.service || return $?
-      deploy_stage_set "$stage_state" runtime_restart_completed
+      deploy_stage_set "$stage_state" runtime_restart_completed || return $?
       wait_http "http://127.0.0.1:$RUNTIME_PORT/healthz" 45 || exit $?
     else
-      deploy_stage_set "$stage_state" web_pointer_switch_started
+      deploy_stage_set "$stage_state" web_pointer_switch_started || return $?
       switch_component web "$release_id" || return $?
-      deploy_stage_set "$stage_state" web_pointer_switch_completed
+      deploy_stage_set "$stage_state" web_pointer_switch_completed || return $?
     fi
     if [ "$target" = "web" ] || [ "$target" = "all" ]; then
       if [ "$target" = "all" ]; then
-        deploy_stage_set "$stage_state" web_pointer_switch_started
+        deploy_stage_set "$stage_state" web_pointer_switch_started || return $?
         switch_component web "$release_id" || return $?
-        deploy_stage_set "$stage_state" web_pointer_switch_completed
+        deploy_stage_set "$stage_state" web_pointer_switch_completed || return $?
       fi
-      deploy_stage_set "$stage_state" web_restart_started
+      deploy_stage_set "$stage_state" web_restart_started || return $?
       systemctl restart agentdeck-web.service || return $?
-      deploy_stage_set "$stage_state" web_restart_completed
+      deploy_stage_set "$stage_state" web_restart_completed || return $?
       wait_http "http://127.0.0.1:$WEB_PORT/api/status" 45 || exit $?
     fi
-  clear_candidate_release_links "$release_path"
-  cleanup_releases
-  deploy_stage_set "$stage_state" deploy_succeeded
-  write_job "$job_id" succeeded "deploy succeeded"
-  rm -f "$pointer_snapshot" "$stage_state"
+  clear_candidate_release_links "$release_path" || return $?
+  cleanup_releases || return $?
+  deploy_stage_set "$stage_state" deploy_succeeded || return $?
+  write_job "$job_id" succeeded "deploy succeeded" || return $?
+  rm -f "$pointer_snapshot" "$stage_state" || return $?
 }
 
 worker_rollback() {

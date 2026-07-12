@@ -76,7 +76,7 @@ test('web-only deploy does not restart runtime or providers', () => {
   const workerBody = ctl.slice(ctl.indexOf('worker_deploy()'), ctl.indexOf('worker_rollback()'));
   assert.match(workerBody, /if \[ "\$target" = "web" \] \|\| \[ "\$target" = "all" \]/);
   assert.match(workerBody, /systemctl restart agentdeck-web\.service/);
-  assert.match(workerBody, /else\s+deploy_stage_set "\$stage_state" web_pointer_switch_started\s+switch_component web "\$release_id"/);
+  assert.match(workerBody, /else\s+deploy_stage_set "\$stage_state" web_pointer_switch_started \|\| return \$\?\s+switch_component web "\$release_id"/);
   assert.doesNotMatch(workerBody, /agentdeck-app-server/);
   assert.doesNotMatch(workerBody, /check_active_turns/);
 });

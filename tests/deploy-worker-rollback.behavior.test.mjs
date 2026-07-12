@@ -72,6 +72,7 @@ deploy_stage_set(){
 }
 mv_failed=0
 mv(){
+  if [ "$MODE" = previous-mv ] && [ "$mv_failed" = 0 ] && [ "${'${!#}'}" = "$PREVIOUS_RUNTIME_LINK" ];then mv_failed=1;return 45;fi
   if [ "$MODE" = partial-pointer ] && [ "$mv_failed" = 0 ] && [ "${'${!#}'}" = "$CURRENT_RUNTIME_LINK" ];then mv_failed=1;return 41;fi
   command mv "$@"
 }
@@ -89,6 +90,7 @@ write_job test accepted accepted;worker_deploy test runtime 0`;
 }
 
 for(const [mode,name] of [
+  ['previous-mv','previous pointer mv failure stops before current cutover and restores snapshot'],
   ['partial-pointer','previous pointer changed before current pointer write fails'],
   ['completed-gap','pointer switched before completed journal write'],
   ['restart-side-effect','restart has a side effect but returns non-zero'],
@@ -97,6 +99,7 @@ for(const [mode,name] of [
 ])test(name,()=>{const result=crashScenario(mode);try{
   assert.notEqual(result.child.status,0,result.child.stderr);assert.equal(result.current,'releases/old-runtime');assert.equal(result.previous,'releases/old-prev-runtime');
   assert.match(result.journal,/runtime_pointer_switch_started=1/);assert.match(result.journal,/recovery_completed=1/);
+  if(mode==='previous-mv')assert.doesNotMatch(result.journal,/runtime_pointer_switch_completed=1/);
   if(mode.startsWith('restart-'))assert.equal((result.systemctl.match(/restart agentdeck-runtime\.service/g)||[]).length,2);
 }finally{rmSync(result.root,{recursive:true,force:true});}});
 

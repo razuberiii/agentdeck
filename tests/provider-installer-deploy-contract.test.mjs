@@ -63,7 +63,7 @@ test('deploy worker uses service user for build checks and candidate processes',
 
 test('deploy release id is not captured from noisy build stdout and cleanup is bounded', () => {
   assert.match(ctlSource, /CREATED_RELEASE_ID=""/);
-  assert.match(ctlSource, /make_release "\$stage_state" "\$job_id" \|\| exit \$\?\n\s+deploy_stage_set "\$stage_state" release_built\n\s+release_id="\$CREATED_RELEASE_ID"/);
+  assert.match(ctlSource, /make_release "\$stage_state" "\$job_id" \|\| exit \$\?\n\s+deploy_stage_set "\$stage_state" release_built \|\| return \$\?\n\s+release_id="\$CREATED_RELEASE_ID"/);
   assert.doesNotMatch(ctlSource, /release_id="\$\(make_release\)"/);
   assert.ok(ctlSource.indexOf('deploy_journal_set_value "$stage_state" release_id "$release_id"') < ctlSource.indexOf('worktree add --detach "$release_path"'), 'release id must be journaled before worktree creation');
   assert.match(ctlSource, /valid_release_id\(\)/);
@@ -71,7 +71,7 @@ test('deploy release id is not captured from noisy build stdout and cleanup is b
   assert.match(ctlSource, /safe_rm_tree\(\)/);
   assert.match(ctlSource, /case "\$real_path" in "\$real_root"\/\*/);
   assert.match(ctlSource, /require_git_source_root\(\)/);
-  assert.match(ctlSource, /die "source root is not a Git repository: \$SOURCE_ROOT"/);
+  assert.match(ctlSource, /\[ -n "\$git_root" \] \|\| return 1/);
   assert.match(ctlSource, /git -c "safe\.directory=\$SOURCE_ROOT" -C "\$SOURCE_ROOT" rev-parse --show-toplevel/);
   assert.match(ctlSource, /commit="\$\(git -c "safe\.directory=\$SOURCE_ROOT" -C "\$SOURCE_ROOT" rev-parse HEAD\)"/);
   assert.doesNotMatch(ctlSource, /git rev-parse HEAD 2>\/dev\/null \|\| echo unknown/);
