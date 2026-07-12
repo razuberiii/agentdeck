@@ -260,13 +260,14 @@ export class GeminiAcpRuntime {
     if (state.activePrompt) throw new Error('Gemini turn already running');
     const controller = new AbortController();
     state.promptController = controller;
-    await this.options.updateSession(localSessionId, { status: 'running', updated_at: Date.now() });
-    await this.options.appendEvent(localSessionId, 'turn/started', { provider:'gemini', providerSessionId:state.providerSessionId });
-    const started = Date.now();
-    const task = this.agent!.request(methods.agent.session.prompt, {
-      sessionId: state.providerSessionId,
-      prompt,
-    }, { cancellationSignal: controller.signal }).then(async response => {
+    const task = Promise.resolve().then(async () => {
+      await this.options.updateSession(localSessionId, { status: 'running', updated_at: Date.now() });
+      await this.options.appendEvent(localSessionId, 'turn/started', { provider:'gemini', providerSessionId:state.providerSessionId });
+      const started = Date.now();
+      const response = await this.agent!.request(methods.agent.session.prompt, {
+        sessionId: state.providerSessionId,
+        prompt,
+      }, { cancellationSignal: controller.signal });
       await this.options.appendEvent(localSessionId, 'turn/completed', { provider:'gemini', providerSessionId:state.providerSessionId, response, elapsedMs:Date.now() - started });
       await this.options.updateSession(localSessionId, { status: 'idle', active_turn_id: null, updated_at: Date.now() });
       return response;

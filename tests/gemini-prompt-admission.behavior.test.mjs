@@ -1,0 +1,47 @@
+import assert from'node:assert/strict';
+import test from'node:test';
+import{GeminiAcpRuntime}from'../server/dist/acp/gemini-runtime.js';
+import{runtimeIsDrained}from'../server/dist/runtime-drain-state.js';
+
+function runtimeWith({updateSession=async()=>{},appendEvent=async()=>{},request=async()=>({ok:true})}={}){
+  const runtime=new GeminiAcpRuntime({db:{},dataDir:'/tmp',defaultCwd:'/tmp',profileId:'test',profileDir:'/tmp',updateSession,appendEvent});
+  runtime.sessions.set('session-1',{localSessionId:'session-1',providerSessionId:'provider-1',cwd:'/tmp',configOptions:[],model:null,activePrompt:null,promptController:null,permissionMode:'read-only'});
+  runtime.agent={request};
+  return runtime;
+}
+function drainWork(runtime){return{turnAdmissionInFlight:0,activeTurnCount:0,submittingTurnCount:0,claudeActiveTurnCount:0,geminiActivePromptCount:runtime.activePromptCount(),appendQueueCount:0,deltaQueueEventCount:0,pendingSqliteWriteCount:0,pendingPushCount:0,subscriberPendingBufferCount:0};}
+
+test('Gemini prompt is drain-visible while its initial session update is paused',async()=>{
+  let resume;const paused=new Promise(resolve=>{resume=resolve;});
+  const runtime=runtimeWith({updateSession:async()=>paused});
+  const prompt=runtime.prompt('session-1',[]);
+  assert.equal(runtime.activePromptCount(),1);
+  assert.equal(runtimeIsDrained(drainWork(runtime)),false);
+  resume();await prompt;
+  assert.equal(runtime.activePromptCount(),0);
+});
+
+test('Gemini admission clears after initial update or event persistence fails',async t=>{
+  await t.test('updateSession failure',async()=>{
+    const runtime=runtimeWith({updateSession:async()=>{throw new Error('update failed');}});
+    await assert.rejects(runtime.prompt('session-1',[]),/update failed/);
+    assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
+  });
+  await t.test('appendEvent failure',async()=>{
+    const runtime=runtimeWith({appendEvent:async()=>{throw new Error('append failed');}});
+    await assert.rejects(runtime.prompt('session-1',[]),/append failed/);
+    assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
+  });
+});
+
+test('Gemini prompt completion and agent failure both clear admission state',async t=>{
+  await t.test('completion',async()=>{
+    const runtime=runtimeWith();await runtime.prompt('session-1',[]);
+    assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
+  });
+  await t.test('failure',async()=>{
+    const runtime=runtimeWith({request:async()=>{throw new Error('agent failed');}});
+    await assert.rejects(runtime.prompt('session-1',[]),/agent failed/);
+    assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
+  });
+});
