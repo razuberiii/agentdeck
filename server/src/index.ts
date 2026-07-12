@@ -34,7 +34,7 @@ import { claudeAuthLogout, claudeAuthState, claudeAuthStatus } from './claude/cl
 import { claudeProfileEnv, claudeSafeEnvSummary } from './claude/claude-profile-env.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
-import { buildArtifactManifest } from './artifact-manifest.js';
+import { artifactContentChanged, buildArtifactManifest, isArtifactTestAssetPath } from './artifact-manifest.js';
 import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, type AgentProviderId } from './provider-registry.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
@@ -5783,7 +5783,7 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
   const saved:any[] = [];
   const changed = Object.values(after).map((f:any) => {
     const old = before[f.relativePath];
-    const operation = !old ? 'created' : (old.size !== f.size || old.modifiedAt !== f.modifiedAt || old.contentHash !== f.contentHash ? 'modified' : '');
+    const operation = !old ? 'created' : (artifactContentChanged(old,f) ? 'modified' : '');
     return operation ? { ...f, operation } : null;
   }).filter(Boolean).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
   for (const f of changed as any[]) {
@@ -5819,7 +5819,7 @@ function artifactPathIsInternal(relativePath:string) {
   if (!parts.length) return true;
   if (parts.includes('deploy-state') || parts.includes('releases') || parts.includes('candidate') || parts.includes('current') || parts.includes('previous')) return true;
   if (parts.includes('node_modules') || parts.includes('.git') || parts.includes('coverage') || parts.includes('dist') || parts.includes('build')) return true;
-  if (parts.join('/') === 'client/public/test-assets/image-test.png' || parts.join('/') === 'client/public/test-assets/image-test.svg' || parts.join('/') === 'client/public/test-assets/agentdeck-test.txt') return true;
+  if (isArtifactTestAssetPath(relativePath)) return true;
   if (/^deploy-.*\.(log|json)$/i.test(base) || base === 'deploy-manifest.json') return true;
   if (/\.(sqlite|sqlite3|db|db-wal|db-shm|sqlite-wal|sqlite-shm)$/i.test(base)) return true;
   return false;

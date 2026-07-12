@@ -6,6 +6,7 @@ const server = readFileSync(new URL('../server/src/index.ts', import.meta.url), 
 const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const client = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 const schema = readFileSync(new URL('../server/src/schema-migrations.ts', import.meta.url), 'utf8');
+const artifactManifest = readFileSync(new URL('../server/src/artifact-manifest.ts', import.meta.url), 'utf8');
 
 test('canonical user messages do not persist provider attachment prompts', () => {
   assert.match(server, /function saveCanonicalUserMessage/);
@@ -31,7 +32,7 @@ test('artifacts are registered from persisted turn baselines', () => {
   assert.match(server, /relative_path/);
   assert.match(server, /turn_id/);
   assert.match(server, /if \(!anchorItemId \|\| !turnId\) return \[\]/);
-  assert.match(server, /const operation = !old \? 'created' : \(old\.size !== f\.size \|\| old\.modifiedAt !== f\.modifiedAt \|\| old\.contentHash !== f\.contentHash \? 'modified' : ''\)/);
+  assert.match(server, /const operation = !old \? 'created' : \(artifactContentChanged\(old,f\) \? 'modified' : ''\)/);
   assert.match(server, /ON CONFLICT\(session_id, turn_id, relative_path, operation\) DO UPDATE/);
   assert.doesNotMatch(server, /artifactScanStarts/);
 });
@@ -61,7 +62,8 @@ test('artifact ownership excludes internal files and does not scan with missing 
   assert.doesNotMatch(server, /scanArtifactsForTurn\(threadId, String\(row\.project_dir\), null, anchorItemId\)/);
   assert.match(server, /function artifactPathIsInternal/);
   assert.match(server, /deploy-manifest\.json/);
-  assert.match(server, /client\/public\/test-assets\/image-test\.png/);
+  assert.match(artifactManifest, /client\/public\/test-assets/);
+  assert.match(artifactManifest, /server\/public\/test-assets/);
 });
 
 test('session restore reconciles canonical user messages with attachments', () => {
