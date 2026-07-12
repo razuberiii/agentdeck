@@ -141,7 +141,7 @@ test('runtime drop-in installation is idempotent and reloads the effective contr
   const rendered=runInstallUnits({}, {args:['--runtime-drop-in'],envFiles:{'runtime.env':'EXISTING=1\n'}});
   try{
     const dropin=readFileSync(join(rendered.systemdDir,'agentdeck-runtime.service.d/90-agentdeck-contract.conf'),'utf8');
-    assert.match(dropin,/AGENTDECK_SYSTEMD_UNIT_VERSION=2/);assert.match(dropin,/TimeoutStopSec=7500/);
+    assert.match(dropin,/AGENTDECK_SYSTEMD_UNIT_VERSION=2/);assert.match(dropin,/TimeoutStopSec=660/);
     execFileSync('bash',[join(repoRoot,'deploy/install-units.sh'),'--runtime-drop-in'],{cwd:repoRoot,env:{...process.env,PATH:`${rendered.fakeBin}:${process.env.PATH}`,ROOT:repoRoot,LOG:join(rendered.dir,'install-2.log'),AGENTDECK_SYSTEMD_DIR:rendered.systemdDir,AGENTDECK_BIN_DIR:rendered.outBin,AGENTDECK_ENV_DIR:rendered.envDir,AGENTDECK_DATA_DIR:rendered.dataDir},stdio:'pipe'});
     assert.equal(readFileSync(join(rendered.systemdDir,'agentdeck-runtime.service.d/90-agentdeck-contract.conf'),'utf8'),dropin);
   }finally{rmSync(rendered.dir,{recursive:true,force:true});}
@@ -164,7 +164,7 @@ test('install-units renders default ubuntu user and paths into final units', () 
     assert.match(runtime, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current-runtime$/m);
     assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
     assert.match(runtime, /^Environment=CODEX_BIN=\/home\/ubuntu\/\.local\/bin\/codex$/m);
-    assert.match(runtime, /^TimeoutStopSec=7500$/m);
+    assert.match(runtime, /^TimeoutStopSec=660$/m);
     assert.match(web, /^Environment=PATH=.*\/home\/ubuntu\/\.local\/bin:\/usr\/local\/bin/m);
     assert.match(appServer, /approval_policy=\\"never\\"/);
     assert.match(appServer, /sandbox_mode=\\"danger-full-access\\"/);

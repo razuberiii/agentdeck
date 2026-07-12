@@ -26,6 +26,7 @@ RUNTIME_PORT="${AGENTDECK_RUNTIME_PORT:-3852}"
 RUNTIME_CANDIDATE_PORT="${AGENTDECK_RUNTIME_CANDIDATE_PORT:-3952}"
 DRAIN_TIMEOUT_SECONDS="${AGENTDECK_DRAIN_TIMEOUT_SECONDS:-7200}"
 DRAIN_LEASE_SECONDS="${AGENTDECK_DRAIN_LEASE_SECONDS:-120}"
+RUNTIME_STOP_TIMEOUT_SECONDS=660
 KEEP_RELEASES="${AGENTDECK_KEEP_RELEASES:-5}"
 SYSTEMD_UNIT_VERSION=2
 SERVICE_USER=""
@@ -551,7 +552,7 @@ NODE
 )"
   fi
   [[ "$timeout_us" =~ ^[0-9]+$ ]] || die "effective Runtime TimeoutStopUSec is invalid: ${timeout_us:-missing}"
-  [ "$timeout_us" -gt $((DRAIN_TIMEOUT_SECONDS * 1000000)) ] || die "effective Runtime TimeoutStopUSec=$timeout_us must exceed drain timeout $((DRAIN_TIMEOUT_SECONDS * 1000000))us"
+  [ "$timeout_us" -ge $((RUNTIME_STOP_TIMEOUT_SECONDS * 1000000)) ] || die "effective Runtime TimeoutStopUSec=$timeout_us is below Runtime stop contract $((RUNTIME_STOP_TIMEOUT_SECONDS * 1000000))us"
   [[ "$actual_version" =~ ^[0-9]+$ ]] || die "effective Runtime unit contract version is missing (fragment=$fragment drop-ins=${dropins:-none}); run daemon-reload after install-units"
   [ "$actual_version" -ge "$required" ] || die "effective Runtime unit contract version $actual_version is older than required $required (fragment=$fragment drop-ins=${dropins:-none})"
   log "effective Runtime contract ok: version=$actual_version timeoutStopUSec=$timeout_us fragment=$fragment drop-ins=${dropins:-none}"

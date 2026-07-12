@@ -50,7 +50,7 @@ test('draining waits for active turns, submitting turns, and pending event pushe
 
 test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
 
-test('runtime systemd stop timeout exceeds the application drain timeout',()=>{const seconds=Number(runtimeUnit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]||0);assert.ok(seconds>7200);});
+test('runtime systemd stop timeout satisfies the independent graceful-stop contract',()=>{const seconds=Number(runtimeUnit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]||0);assert.equal(seconds,660);assert.match(ctl,/RUNTIME_STOP_TIMEOUT_SECONDS=660/);});
 
 test('deploy supports component scoped web runtime provider and changed modes', () => {
   assert.match(deploy, /--components web,runtime\|--changed/);
@@ -76,7 +76,7 @@ test('web-only deploy does not restart runtime or providers', () => {
   const workerBody = ctl.slice(ctl.indexOf('worker_deploy()'), ctl.indexOf('worker_rollback()'));
   assert.match(workerBody, /if \[ "\$target" = "web" \] \|\| \[ "\$target" = "all" \]/);
   assert.match(workerBody, /systemctl restart agentdeck-web\.service/);
-  assert.match(workerBody, /else\s+switch_component web "\$release_id"/);
+  assert.match(workerBody, /else\s+deploy_stage_set "\$stage_state" web_pointer_switch_started\s+switch_component web "\$release_id"/);
   assert.doesNotMatch(workerBody, /agentdeck-app-server/);
   assert.doesNotMatch(workerBody, /check_active_turns/);
 });

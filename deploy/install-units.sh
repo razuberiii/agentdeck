@@ -138,7 +138,7 @@ if [ "$INSTALL_MODE" = runtime-drop-in ]; then
   cat > "$tmpdir/agentdeck-runtime.service.d/90-agentdeck-contract.conf" <<'EOF'
 [Service]
 Environment=AGENTDECK_SYSTEMD_UNIT_VERSION=2
-TimeoutStopSec=7500
+TimeoutStopSec=660
 EOF
   sudo install -d -m 0755 "$SYSTEMD_DIR/agentdeck-runtime.service.d"
   install_if_changed 0644 "$tmpdir/agentdeck-runtime.service.d/90-agentdeck-contract.conf" "$SYSTEMD_DIR/agentdeck-runtime.service.d/90-agentdeck-contract.conf"

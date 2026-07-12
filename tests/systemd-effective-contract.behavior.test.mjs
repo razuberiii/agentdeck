@@ -6,14 +6,16 @@ import {spawnSync} from 'node:child_process';
 import test from 'node:test';
 
 const repo=new URL('..',import.meta.url).pathname;
-function verify({version=2,timeout=7201000000,fragment='/etc/systemd/system/agentdeck-runtime.service',dropins=''}={}){
+function verify({version=2,timeout=660000000,fragment='/etc/systemd/system/agentdeck-runtime.service',dropins='',drainTimeout=7200}={}){
   const root=mkdtempSync(join(tmpdir(),'agentdeck-systemd-contract-'));
-  const run=spawnSync('bash',['-c','source "$REPO/scripts/agentdeckctl"; systemctl(){ printf "%s" "$CONTRACT"; }; verify_runtime_systemd_contract 2'],{encoding:'utf8',env:{...process.env,REPO:repo,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,DATA_DIR:join(root,'data'),CONTRACT:`FragmentPath=${fragment}\nDropInPaths=${dropins}\nTimeoutStopUSec=${timeout}\nEnvironment=HOME=/tmp AGENTDECK_SYSTEMD_UNIT_VERSION=${version}\n`}});
+  const run=spawnSync('bash',['-c','source "$REPO/scripts/agentdeckctl"; systemctl(){ printf "%s" "$CONTRACT"; }; verify_runtime_systemd_contract 2'],{encoding:'utf8',env:{...process.env,REPO:repo,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,DATA_DIR:join(root,'data'),AGENTDECK_DRAIN_TIMEOUT_SECONDS:String(drainTimeout),CONTRACT:`FragmentPath=${fragment}\nDropInPaths=${dropins}\nTimeoutStopUSec=${timeout}\nEnvironment=HOME=/tmp AGENTDECK_SYSTEMD_UNIT_VERSION=${version}\n`}});
   rmSync(root,{recursive:true,force:true});return run;
 }
 
 test('new agentdeckctl rejects an actually loaded old unit contract',()=>assert.notEqual(verify({version:1}).status,0));
-test('/run drop-in effective timeout and contract pass validation',()=>{const result=verify({dropins:'/run/systemd/system/agentdeck-runtime.service.d/90-agentdeck-contract.conf'});assert.equal(result.status,0,result.stderr);});
+test('deploy drain 7200 and Runtime stop timeout 660 are independent and pass',()=>{const result=verify({drainTimeout:7200,timeout:660000000});assert.equal(result.status,0,result.stderr);});
+test('Runtime stop timeout below the 660 second contract is rejected',()=>assert.notEqual(verify({timeout:659999999}).status,0));
+test('/run 660 second drop-in effective timeout and contract pass validation',()=>{const result=verify({timeout:660000000,dropins:'/run/systemd/system/agentdeck-runtime.service.d/90-agentdeck-contract.conf'});assert.equal(result.status,0,result.stderr);});
 test('drop-in on disk but absent from systemctl state is rejected as not daemon-reloaded',()=>assert.notEqual(verify({version:'',dropins:''}).status,0));
 
 test('contract rejection occurs before build and leaves production pointer and PID untouched',()=>{
