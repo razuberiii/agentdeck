@@ -45,3 +45,23 @@ test('Gemini prompt completion and agent failure both clear admission state',asy
     assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
   });
 });
+
+test('Gemini terminal persistence failures are independent and preserve the original error',async t=>{
+  for(const failingEvent of ['turn/started','turn/completed','turn/failed'])await t.test(failingEvent,async()=>{
+    const updates=[];const original=new Error(`${failingEvent} failed`);
+    const runtime=runtimeWith({
+      appendEvent:async(_id,type)=>{if(type===failingEvent)throw original;},
+      updateSession:async(_id,value)=>{updates.push(value);},
+      request:failingEvent==='turn/failed'?async()=>{throw new Error('provider failed');}:async()=>({ok:true}),
+    });
+    await assert.rejects(runtime.prompt('session-1',[]),error=>error===original || (failingEvent==='turn/failed'&&error.message==='provider failed'));
+    assert.ok(updates.some(value=>value.status==='interrupted'));
+    assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
+  });
+  await t.test('terminal session update',async()=>{
+    const providerError=new Error('provider failed');
+    const runtime=runtimeWith({request:async()=>{throw providerError;},updateSession:async(_id,value)=>{if(value.status==='interrupted')throw new Error('session failed');}});
+    await assert.rejects(runtime.prompt('session-1',[]),error=>error===providerError);
+    assert.equal(runtime.activePromptCount(),0);assert.equal(runtime.sessions.get('session-1').promptController,null);
+  });
+});

@@ -29,6 +29,7 @@ export class ClaudeRuntimeManager {
     private options: {
       appendEvent(sessionId: string, eventType: string, payload: any): Promise<any>;
       updateSession(sessionId: string, values: Record<string, string | number | null>): Promise<void>;
+      executeQuery?: typeof query;
       logger?: { info(obj:any, msg?:string):void; warn(obj:any, msg?:string):void; error(obj:any, msg?:string):void };
     },
   ) {}
@@ -39,14 +40,14 @@ export class ClaudeRuntimeManager {
     if (this.active.has(input.localSessionId)) throw new Error('Claude turn already running');
     const controller = new AbortController();
     this.active.set(input.localSessionId, { controller, profileId:input.profile.id, turnId:input.turnId });
-    await this.options.updateSession(input.localSessionId, { status:'running', active_turn_id:input.turnId, executing_profile_id:input.profile.id, current_upstream_account_id:input.profile.id, last_execution_account_id:input.profile.id, updated_at:Date.now() });
-    await this.options.appendEvent(input.localSessionId, 'turn/started', { provider:'claude', turnId:input.turnId, profileId:input.profile.id });
-    const env = await this.profileStore.readEnv(input.profile);
-    const runtimeEnv = claudeProfileEnv(input.profile, env);
-    const prompt = this.prompt(input);
-    const canUseTool = this.canUseTool(input);
     try {
-      for await (const message of query({
+      await this.options.updateSession(input.localSessionId, { status:'running', active_turn_id:input.turnId, executing_profile_id:input.profile.id, current_upstream_account_id:input.profile.id, last_execution_account_id:input.profile.id, updated_at:Date.now() });
+      await this.options.appendEvent(input.localSessionId, 'turn/started', { provider:'claude', turnId:input.turnId, profileId:input.profile.id });
+      const env = await this.profileStore.readEnv(input.profile);
+      const runtimeEnv = claudeProfileEnv(input.profile, env);
+      const prompt = this.prompt(input);
+      const canUseTool = this.canUseTool(input);
+      for await (const message of (this.options.executeQuery || query)({
         prompt,
         options: {
           cwd: input.cwd,
@@ -78,8 +79,10 @@ export class ClaudeRuntimeManager {
     } catch (e:any) {
       const aborted = controller.signal.aborted;
       const message = redactClaudeText(e?.message || String(e));
-      await this.options.updateSession(input.localSessionId, { status:'interrupted', active_turn_id:null, interruption_reason:aborted ? 'manual_stop' : 'claude_turn_failed', updated_at:Date.now() });
-      await this.options.appendEvent(input.localSessionId, aborted ? 'turn/interrupted' : 'turn/failed', { provider:'claude', turnId:input.turnId, error:{ message }, reason:aborted ? 'manual_stop' : 'claude_turn_failed' });
+      await Promise.allSettled([
+        this.options.updateSession(input.localSessionId, { status:'interrupted', active_turn_id:null, interruption_reason:aborted ? 'manual_stop' : 'claude_turn_failed', updated_at:Date.now() }),
+        this.options.appendEvent(input.localSessionId, aborted ? 'turn/interrupted' : 'turn/failed', { provider:'claude', turnId:input.turnId, error:{ message }, reason:aborted ? 'manual_stop' : 'claude_turn_failed' }),
+      ]);
       if (!aborted) throw e;
     } finally {
       this.active.delete(input.localSessionId);

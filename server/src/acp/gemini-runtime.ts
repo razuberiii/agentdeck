@@ -274,8 +274,10 @@ export class GeminiAcpRuntime {
     }).catch(async e => {
       const message = e?.message || String(e);
       this.noteAuthError(e);
-      await this.options.appendEvent(localSessionId, 'turn/failed', { provider:'gemini', providerSessionId:state.providerSessionId, error:{ message } });
-      await this.options.updateSession(localSessionId, { status: 'interrupted', active_turn_id: null, interruption_reason: 'gemini_prompt_failed', updated_at: Date.now() });
+      await Promise.allSettled([
+        this.options.appendEvent(localSessionId, 'turn/failed', { provider:'gemini', providerSessionId:state.providerSessionId, error:{ message } }),
+        this.options.updateSession(localSessionId, { status: 'interrupted', active_turn_id: null, interruption_reason: 'gemini_prompt_failed', updated_at: Date.now() }),
+      ]);
       throw e;
     }).finally(() => {
       state.activePrompt = null;

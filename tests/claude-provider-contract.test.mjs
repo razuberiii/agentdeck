@@ -41,7 +41,7 @@ test('Claude profile store keeps secrets out of SQLite and enforces file permiss
 });
 
 test('Claude runtime uses official SDK query with Claude Code preset and guarded permission mode', () => {
-  assert.match(runtimeManagerSource, /for await \(const message of query\(/);
+  assert.match(runtimeManagerSource, /for await \(const message of \(this\.options\.executeQuery \|\| query\)\(/);
   assert.match(runtimeManagerSource, /systemPrompt:\s*\{ type:'preset', preset:'claude_code' \}/);
   assert.match(runtimeManagerSource, /canUseTool/);
   assert.match(runtimeManagerSource, /AbortController/);
