@@ -18,12 +18,13 @@ Environment=PLAYWRIGHT_BROWSERS_PATH=@AGENTDECK_DATA_DIR@/cache/ms-playwright
 Environment=RUNTIME_HOST=127.0.0.1
 Environment=RUNTIME_PORT=3852
 Environment=RUNTIME_MODE=active
+Environment=AGENTDECK_SYSTEMD_UNIT_VERSION=2
 Environment=CODEX_APP_SERVER_PORT_BASE=4620
 EnvironmentFile=@AGENTDECK_ENV_DIR@/runtime.env
 ExecStart=/usr/bin/flock -n /run/agentdeck/runtime-production.lock /usr/bin/node @AGENTDECK_CURRENT_DIR@-runtime/server/dist/agentdeck-runtime.js
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=660
+TimeoutStopSec=7500
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full

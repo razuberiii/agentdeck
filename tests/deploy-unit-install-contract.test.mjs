@@ -48,7 +48,7 @@ test('agentdeckctl deploy all does not install systemd units during cutover', ()
 });
 
 test('only explicit install-units commands invoke the unit installer', () => {
-  assert.match(ctl, /install-units\|setup-units\) run_install_units/);
+  assert.match(ctl, /install-units\|setup-units\).*run_install_units/);
   const runInstall = block('run_install_units()', 'make_release()');
   assert.match(runInstall, /\$SOURCE_ROOT\/deploy\/install-units\.sh/);
   assert.match(runInstall, /Installing\/updating systemd units:/);
@@ -80,7 +80,7 @@ test('install-units writes only changed files and reloads systemd only for unit 
   assert.match(installUnits, /install_if_changed 0755 "\$ROOT\/scripts\/agentdeckctl" "\$BIN_DIR\/agentdeckctl"/);
 });
 
-function runInstallUnits(env = {}) {
+function runInstallUnits(env = {}, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'agentdeck-units-'));
   const fakeBin = join(dir, 'bin');
   const systemdDir = join(dir, 'systemd');
@@ -92,6 +92,7 @@ function runInstallUnits(env = {}) {
   mkdirSync(envDir, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(outBin, { recursive: true });
+  for(const [name,value] of Object.entries(options.envFiles||{}))writeFileSync(join(envDir,name),value);
   writeFileSync(join(fakeBin, 'sudo'), `#!/usr/bin/env bash
 if [ "$1" = "install" ] && [ "$2" = "-d" ] && [ "$5" = "/run/agentdeck" ]; then
   exit 0
@@ -113,7 +114,7 @@ exit 2
   chmodSync(join(fakeBin, 'sudo'), 0o755);
   chmodSync(join(fakeBin, 'systemctl'), 0o755);
   chmodSync(join(fakeBin, 'getent'), 0o755);
-  execFileSync('bash', [join(repoRoot, 'deploy/install-units.sh')], {
+  execFileSync('bash', [join(repoRoot, 'deploy/install-units.sh'),...(options.args||[])], {
     cwd: repoRoot,
     env: {
       ...process.env,
@@ -128,8 +129,23 @@ exit 2
     },
     stdio: 'pipe',
   });
-  return { dir, systemdDir, envDir, dataDir };
+  return { dir, systemdDir, envDir, dataDir, fakeBin, outBin };
 }
+
+test('existing readable env files do not require a writable /etc-style env directory',()=>{
+  const rendered=runInstallUnits({}, {envFiles:{'web.env':'EXISTING=1\n','runtime.env':'EXISTING=1\n','agentdeck-app-server-default.env':'EXISTING=1\n'}});
+  try{assert.equal(readFileSync(join(rendered.envDir,'runtime.env'),'utf8'),'EXISTING=1\n');}finally{rmSync(rendered.dir,{recursive:true,force:true});}
+});
+
+test('runtime drop-in installation is idempotent and reloads the effective contract',()=>{
+  const rendered=runInstallUnits({}, {args:['--runtime-drop-in'],envFiles:{'runtime.env':'EXISTING=1\n'}});
+  try{
+    const dropin=readFileSync(join(rendered.systemdDir,'agentdeck-runtime.service.d/90-agentdeck-contract.conf'),'utf8');
+    assert.match(dropin,/AGENTDECK_SYSTEMD_UNIT_VERSION=2/);assert.match(dropin,/TimeoutStopSec=7500/);
+    execFileSync('bash',[join(repoRoot,'deploy/install-units.sh'),'--runtime-drop-in'],{cwd:repoRoot,env:{...process.env,PATH:`${rendered.fakeBin}:${process.env.PATH}`,ROOT:repoRoot,LOG:join(rendered.dir,'install-2.log'),AGENTDECK_SYSTEMD_DIR:rendered.systemdDir,AGENTDECK_BIN_DIR:rendered.outBin,AGENTDECK_ENV_DIR:rendered.envDir,AGENTDECK_DATA_DIR:rendered.dataDir},stdio:'pipe'});
+    assert.equal(readFileSync(join(rendered.systemdDir,'agentdeck-runtime.service.d/90-agentdeck-contract.conf'),'utf8'),dropin);
+  }finally{rmSync(rendered.dir,{recursive:true,force:true});}
+});
 
 test('install-units renders default ubuntu user and paths into final units', () => {
   const rendered = runInstallUnits();
@@ -148,7 +164,7 @@ test('install-units renders default ubuntu user and paths into final units', () 
     assert.match(runtime, /^WorkingDirectory=\/opt\/stacks\/agentdeck\/current-runtime$/m);
     assert.match(runtime, /^Environment=DATA_DIR=.*\/data$/m);
     assert.match(runtime, /^Environment=CODEX_BIN=\/home\/ubuntu\/\.local\/bin\/codex$/m);
-    assert.match(runtime, /^TimeoutStopSec=660$/m);
+    assert.match(runtime, /^TimeoutStopSec=7500$/m);
     assert.match(web, /^Environment=PATH=.*\/home\/ubuntu\/\.local\/bin:\/usr\/local\/bin/m);
     assert.match(appServer, /approval_policy=\\"never\\"/);
     assert.match(appServer, /sandbox_mode=\\"danger-full-access\\"/);

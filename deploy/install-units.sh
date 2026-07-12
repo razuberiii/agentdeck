@@ -2,6 +2,13 @@
 # shellcheck disable=SC2269
 set -euo pipefail
 
+INSTALL_MODE=all
+case "${1:-}" in
+  '') ;;
+  --runtime-drop-in) INSTALL_MODE=runtime-drop-in ;;
+  *) echo "usage: deploy/install-units.sh [--runtime-drop-in]" >&2; exit 2 ;;
+esac
+
 ROOT=${ROOT:-/opt/agentdeck}
 DATA_DIR=${AGENTDECK_DATA_DIR:-${DATA_DIR:-/opt/data/agentdeck}}
 ENV_DIR=${AGENTDECK_ENV_DIR:-${ENV_DIR:-/etc/agentdeck}}
@@ -114,19 +121,35 @@ if [ ! -d "$ENV_DIR" ]; then
   echo "ERROR: env dir does not exist: $ENV_DIR" >&2
   exit 1
 fi
-if [ ! -w "$ENV_DIR" ]; then
-  echo "ERROR: env dir is not writable: $ENV_DIR" >&2
-  exit 1
-fi
+
+required_env=(runtime.env)
+[ "$INSTALL_MODE" = runtime-drop-in ] || required_env+=(web.env agentdeck-app-server-default.env)
+for env_file in "${required_env[@]}"; do
+  if [ ! -r "$ENV_DIR/$env_file" ] && [ ! -w "$ENV_DIR" ]; then
+    echo "ERROR: missing env file $ENV_DIR/$env_file and env dir is not writable" >&2
+    exit 1
+  fi
+done
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
-for unit in agentdeck-web.service agentdeck-runtime.service agentdeck-app-server@.service; do
-  render_unit_template "$ROOT/deploy/systemd/$unit" "$tmpdir/$unit"
-  install_if_changed 0644 "$tmpdir/$unit" "$SYSTEMD_DIR/$unit"
-done
+if [ "$INSTALL_MODE" = runtime-drop-in ]; then
+  mkdir -p "$tmpdir/agentdeck-runtime.service.d"
+  cat > "$tmpdir/agentdeck-runtime.service.d/90-agentdeck-contract.conf" <<'EOF'
+[Service]
+Environment=AGENTDECK_SYSTEMD_UNIT_VERSION=2
+TimeoutStopSec=7500
+EOF
+  sudo install -d -m 0755 "$SYSTEMD_DIR/agentdeck-runtime.service.d"
+  install_if_changed 0644 "$tmpdir/agentdeck-runtime.service.d/90-agentdeck-contract.conf" "$SYSTEMD_DIR/agentdeck-runtime.service.d/90-agentdeck-contract.conf"
+else
+  for unit in agentdeck-web.service agentdeck-runtime.service agentdeck-app-server@.service; do
+    render_unit_template "$ROOT/deploy/systemd/$unit" "$tmpdir/$unit"
+    install_if_changed 0644 "$tmpdir/$unit" "$SYSTEMD_DIR/$unit"
+  done
+fi
 
-if [ ! -f "$ENV_DIR/web.env" ]; then
+if [ "$INSTALL_MODE" != runtime-drop-in ] && [ ! -f "$ENV_DIR/web.env" ]; then
   if [ -f "$ENV_DIR/.env" ]; then
     sudo cp "$ENV_DIR/.env" "$ENV_DIR/web.env"
   else
@@ -152,7 +175,7 @@ if [ ! -f "$ENV_DIR/runtime.env" ]; then
   sudo chmod 0600 "$ENV_DIR/runtime.env"
 fi
 
-if [ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
+if [ "$INSTALL_MODE" != runtime-drop-in ] && [ ! -f "$ENV_DIR/agentdeck-app-server-default.env" ]; then
   {
     echo "HOME=${AGENTDECK_HOME}"
     echo "CODEX_HOME=${AGENTDECK_CODEX_HOME:-$DATA_DIR/profiles/default/.codex}"
@@ -166,5 +189,13 @@ if [ "$changed" = "1" ]; then
 else
   echo "systemd units unchanged; skipping daemon-reload"
 fi
+case "$SYSTEMD_DIR" in
+  /run/systemd/system|/run/systemd/system/*)
+    reapply_arg=""
+    [ "$INSTALL_MODE" = runtime-drop-in ] && reapply_arg=" --runtime-drop-in"
+    echo "Runtime systemd configuration is active after daemon-reload; it is stored under /run and will disappear after host reboot."
+    echo "Reapply idempotently from the host startup flow: sudo AGENTDECK_SYSTEMD_DIR=$SYSTEMD_DIR agentdeckctl install-units$reapply_arg"
+    ;;
+esac
 install_if_changed 0755 "$ROOT/scripts/agentdeckctl" "$BIN_DIR/agentdeckctl"
 echo "installed units"

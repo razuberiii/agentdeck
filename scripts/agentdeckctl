@@ -44,7 +44,7 @@ commands:
   status [--json]
   check
   doctor
-  install-units
+  install-units [--runtime-drop-in]
   backup [--include-secrets]
   restore <backup.tar.zst> [--dry-run] [--force]
   restart web|runtime|all [--force]
@@ -436,6 +436,7 @@ check_systemd_units() {
 }
 
 run_install_units() {
+  local install_mode="${1:-}"
   ensure_dirs
   echo "Installing/updating systemd units:"
   echo "  agentdeck-web.service"
@@ -455,7 +456,7 @@ run_install_units() {
     ' "$tmpdir/$unit" | awk '!seen[$0]++'
   done
   rm -rf "$tmpdir"
-  ROOT="$SOURCE_ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/deploy/install-units.sh"
+  ROOT="$SOURCE_ROOT" DATA_DIR="$DATA_DIR" ENV_DIR="$ENV_DIR" "$SOURCE_ROOT/deploy/install-units.sh" $install_mode
 }
 
 make_release() {
@@ -1210,6 +1211,7 @@ FORCE=0
 JSON=0
 INCLUDE_SECRETS=0
 DRY_RUN=0
+RUNTIME_DROP_IN=0
 JOB_ID=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -1218,6 +1220,7 @@ while [ "$#" -gt 0 ]; do
     --json) JSON=1; shift ;;
     --include-secrets) INCLUDE_SECRETS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --runtime-drop-in) RUNTIME_DROP_IN=1; shift ;;
     --job-id=*) JOB_ID="${1#--job-id=}"; shift ;;
     *) usage; exit 2 ;;
   esac
@@ -1228,7 +1231,7 @@ case "$COMMAND" in
   status) [ "$JSON" = "1" ] && status_json || status_text ;;
   check) run_check ;;
   doctor) run_doctor ;;
-  install-units|setup-units) run_install_units ;;
+  install-units|setup-units) [ "$RUNTIME_DROP_IN" = 1 ] && run_install_units --runtime-drop-in || run_install_units ;;
   backup) run_backup "$INCLUDE_SECRETS" ;;
   restore) run_restore "$TARGET" "$DRY_RUN" "$FORCE" ;;
   restart) [ -n "$TARGET" ] || die "restart target required"; restart_target "$TARGET" "$FORCE" ;;

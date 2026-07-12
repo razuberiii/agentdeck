@@ -50,7 +50,7 @@ test('draining waits for active turns, submitting turns, and pending event pushe
 
 test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
 
-test('runtime systemd stop timeout exceeds the application drain timeout',()=>{const seconds=Number(runtimeUnit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]||0);assert.ok(seconds>600);});
+test('runtime systemd stop timeout exceeds the application drain timeout',()=>{const seconds=Number(runtimeUnit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]||0);assert.ok(seconds>7200);});
 
 test('deploy supports component scoped web runtime provider and changed modes', () => {
   assert.match(deploy, /--components web,runtime\|--changed/);
