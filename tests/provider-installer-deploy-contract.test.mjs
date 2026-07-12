@@ -63,8 +63,9 @@ test('deploy worker uses service user for build checks and candidate processes',
 
 test('deploy release id is not captured from noisy build stdout and cleanup is bounded', () => {
   assert.match(ctlSource, /CREATED_RELEASE_ID=""/);
-  assert.match(ctlSource, /make_release \|\| exit \$\?\n\s+deploy_stage_set "\$stage_state" release_built\n\s+release_id="\$CREATED_RELEASE_ID"/);
+  assert.match(ctlSource, /make_release "\$stage_state" "\$job_id" \|\| exit \$\?\n\s+deploy_stage_set "\$stage_state" release_built\n\s+release_id="\$CREATED_RELEASE_ID"/);
   assert.doesNotMatch(ctlSource, /release_id="\$\(make_release\)"/);
+  assert.ok(ctlSource.indexOf('deploy_journal_set_value "$stage_state" release_id "$release_id"') < ctlSource.indexOf('worktree add --detach "$release_path"'), 'release id must be journaled before worktree creation');
   assert.match(ctlSource, /valid_release_id\(\)/);
   assert.match(ctlSource, /release_path_for\(\)/);
   assert.match(ctlSource, /safe_rm_tree\(\)/);

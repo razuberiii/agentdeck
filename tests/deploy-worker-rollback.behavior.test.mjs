@@ -99,3 +99,59 @@ for(const [mode,name] of [
   assert.match(result.journal,/runtime_pointer_switch_started=1/);assert.match(result.journal,/recovery_completed=1/);
   if(mode.startsWith('restart-'))assert.equal((result.systemctl.match(/restart agentdeck-runtime\.service/g)||[]).length,2);
 }finally{rmSync(result.root,{recursive:true,force:true});}});
+
+test('recovery_started is resumable and completes on a later invocation',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-resume-recovery-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;for r in old new prev;do mkdir -p "$RELEASES_DIR/$r";done;ln -s releases/new "$CURRENT_RUNTIME_LINK";ln -s releases/old "$PREVIOUS_RUNTIME_LINK";snapshot="$STATE_DIR/old.pointers";printf '%s\\t%s\\n%s\\t%s\\n' "$CURRENT_RUNTIME_LINK" releases/old "$PREVIOUS_RUNTIME_LINK" releases/prev > "$snapshot";journal="$STATE_DIR/old.stages";printf 'runtime_pointer_switch_started=1\\nrecovery_started=1\\noriginal_exit_code=9\\n' > "$journal";write_job old running old;undrain_runtime(){ :; };wait_http(){ :; };systemctl(){ :; };deploy_recover_once old runtime "$snapshot" "$journal" 9`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.equal(run.status,0,run.stderr);assert.equal(readlinkSync(join(root,'current-runtime')),'releases/old');assert.match(readFileSync(join(root,'state/old.stages'),'utf8'),/recovery_completed=1/);}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('interrupted recovery resumes at Web after Runtime restore completed',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-partial-recovery-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;for r in old-web new-web prev-web old-runtime;do mkdir -p "$RELEASES_DIR/$r";done;ln -s releases/new-web "$CURRENT_WEB_LINK";ln -s releases/prev-web "$PREVIOUS_WEB_LINK";ln -s releases/old-runtime "$CURRENT_RUNTIME_LINK";snapshot="$STATE_DIR/old.pointers";printf '%s\\t%s\\n%s\\t%s\\n' "$CURRENT_WEB_LINK" releases/old-web "$PREVIOUS_WEB_LINK" releases/prev-web > "$snapshot";journal="$STATE_DIR/old.stages";printf 'runtime_pointer_switch_started=1\\nruntime_pointer_restore_completed=1\\nweb_pointer_switch_started=1\\nrecovery_started=1\\noriginal_exit_code=9\\n' > "$journal";write_job old running old;undrain_runtime(){ :; };calls=0;real_restore='';eval "$(declare -f restore_component_pointer_snapshot|sed '1s/restore_component_pointer_snapshot/real_restore/')";restore_component_pointer_snapshot(){ calls=$((calls+1));if [ "$calls" = 1 ];then return 44;fi;real_restore "$@";};deploy_recover_once old all "$snapshot" "$journal" 9 || :;deploy_recover_once old all "$snapshot" "$journal" 9`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.equal(run.status,0,run.stderr);assert.equal(readlinkSync(join(root,'current-web')),'releases/old-web');const journal=readFileSync(join(root,'state/old.stages'),'utf8');assert.match(journal,/web_pointer_restore_completed=1/);assert.match(journal,/recovery_completed=1/);}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('deploy_succeeded is authoritative when TERM arrives before job succeeded write',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-commit-point-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;for r in old prev;do mkdir -p "$RELEASES_DIR/$r";done;ln -s releases/old "$CURRENT_RUNTIME_LINK";ln -s releases/prev "$PREVIOUS_RUNTIME_LINK";make_release(){ mkdir -p "$RELEASES_DIR/${releaseId}";CREATED_RELEASE_ID=${releaseId};deploy_journal_set_value "$1" release_id "$CREATED_RELEASE_ID";AGENTDECK_JOB_RELEASE="$CREATED_RELEASE_ID";export AGENTDECK_JOB_RELEASE; };verify_runtime_systemd_contract(){ :; };assert_release_unit_requirement(){ :; };check_systemd_units(){ :; };start_candidate_runtime(){ :; };validate_candidate_runtime_compatibility(){ :; };drain_runtime(){ :; };undrain_runtime(){ :; };wait_drain(){ :; };require_runtime_drained(){ :; };wait_http(){ :; };cleanup_releases(){ :; };systemctl(){ echo restart >> "$ROOT/restarts"; };eval "$(declare -f write_job|sed '1s/write_job/real_write_job/')";killed=0;write_job(){ if [ "$2" = succeeded ]&&[ "$killed" = 0 ];then killed=1;kill -TERM $$;fi;real_write_job "$@";};real_write_job test accepted accepted;worker_deploy test runtime 0`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,ROOT:root,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.equal(run.status,0,run.stderr);assert.equal(readlinkSync(join(root,'current-runtime')),`releases/${releaseId}`);assert.equal(JSON.parse(readFileSync(join(root,'state/jobs/test.json'),'utf8')).status,'succeeded');assert.equal((readFileSync(join(root,'restarts'),'utf8').match(/restart/g)||[]).length,1);}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('flock failure marks the second deploy failed without restart',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-lock-failure-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;systemctl(){ echo restart >> "$ROOT/restarts"; };write_job second accepted accepted;exec 8>"$LOCK_FILE";flock -n 8;worker_deploy second runtime 0`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,ROOT:root,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.notEqual(run.status,0);assert.equal(JSON.parse(readFileSync(join(root,'state/jobs/second.json'),'utf8')).status,'failed');assert.equal(existsSync(join(root,'restarts')),false);}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('new worker recovers an unfinished journal under the deploy lock before building',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-stale-journal-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;for r in old new prev;do mkdir -p "$RELEASES_DIR/$r";done;ln -s releases/new "$CURRENT_RUNTIME_LINK";ln -s releases/prev "$PREVIOUS_RUNTIME_LINK";printf '%s\\t%s\\n%s\\t%s\\n' "$CURRENT_RUNTIME_LINK" releases/old "$PREVIOUS_RUNTIME_LINK" releases/prev > "$STATE_DIR/stale.pointers";printf 'runtime_pointer_switch_started=1\\noriginal_exit_code=9\\n' > "$STATE_DIR/stale.stages";AGENTDECK_JOB_COMMAND=deploy AGENTDECK_JOB_TARGET=runtime write_job stale running stale;make_release(){ deploy_stage_has "$STATE_DIR/stale.stages" recovery_completed || return 66;return 67;};verify_runtime_systemd_contract(){ :; };undrain_runtime(){ :; };write_job next accepted accepted;worker_deploy next runtime 0`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.notEqual(run.status,0);assert.equal(readlinkSync(join(root,'current-runtime')),'releases/old');assert.match(readFileSync(join(root,'state/stale.stages'),'utf8'),/recovery_completed=1/);assert.equal(JSON.parse(readFileSync(join(root,'state/jobs/stale.json'),'utf8')).status,'failed');}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+for(const failure of ['npm ci','unit','E2E'])test(`${failure} failure removes the persisted partial release without restart`,()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-partial-release-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;make_release(){ CREATED_RELEASE_ID=${releaseId};deploy_journal_set_value "$1" release_id "$CREATED_RELEASE_ID";AGENTDECK_JOB_RELEASE="$CREATED_RELEASE_ID";export AGENTDECK_JOB_RELEASE;mkdir -p "$RELEASES_DIR/$CREATED_RELEASE_ID";write_job "$2" running '${failure}';return 33;};verify_runtime_systemd_contract(){ :; };undrain_runtime(){ :; };systemctl(){ echo restart >> "$ROOT/restarts"; };write_job test accepted accepted;worker_deploy test runtime 0`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,ROOT:root,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.notEqual(run.status,0);assert.equal(existsSync(join(root,'releases',releaseId)),false);assert.equal(existsSync(join(root,'restarts')),false);assert.match(readFileSync(join(root,'state/test.stages'),'utf8'),/release_cleanup_completed=1/);}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('partial release cleanup failure preserves journal and release diagnostics',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-cleanup-failure-')),data=join(root,'data');mkdirSync(data,{recursive:true});
+  const script=`source "$REPO/scripts/agentdeckctl";ensure_dirs;make_release(){ CREATED_RELEASE_ID=${releaseId};deploy_journal_set_value "$1" release_id "$CREATED_RELEASE_ID";AGENTDECK_JOB_RELEASE="$CREATED_RELEASE_ID";export AGENTDECK_JOB_RELEASE;mkdir -p "$RELEASES_DIR/$CREATED_RELEASE_ID";write_job "$2" running build;return 33;};verify_runtime_systemd_contract(){ :; };undrain_runtime(){ :; };cleanup_release_worktree(){ return 55; };write_job test accepted accepted;worker_deploy test runtime 0`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data}});
+  try{assert.equal(run.status,70);assert.equal(existsSync(join(root,'releases',releaseId)),true);assert.match(readFileSync(join(root,'state/test.stages'),'utf8'),/release_cleanup_failed=1/);assert.match(JSON.parse(readFileSync(join(root,'state/jobs/test.json'),'utf8')).message,/cleanup is incomplete/);}finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('failed release cleanup removes the registered Git worktree safely',()=>{
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-real-worktree-')),source=join(root,'source'),control=join(root,'control'),data=join(root,'data');mkdirSync(source,{recursive:true});mkdirSync(data,{recursive:true});
+  const script=`git -C "$SOURCE" init -q;git -C "$SOURCE" config user.email test@example.com;git -C "$SOURCE" config user.name test;echo base > "$SOURCE/file";git -C "$SOURCE" add file;git -C "$SOURCE" commit -qm base;source "$REPO/scripts/agentdeckctl";SOURCE_ROOT="$SOURCE";ensure_dirs;SERVICE_USER=$(id -un);SERVICE_HOME=$HOME;git -C "$SOURCE" worktree add --detach "$RELEASES_DIR/${releaseId}" HEAD >/dev/null;cleanup_release_worktree ${releaseId};test ! -e "$RELEASES_DIR/${releaseId}";! git -C "$SOURCE" worktree list --porcelain|grep -F "$RELEASES_DIR/${releaseId}"`;
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,SOURCE:source,AGENTDECK_ROOT:control,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(control,'state'),DATA_DIR:data}});
+  try{assert.equal(run.status,0,run.stderr);}finally{rmSync(root,{recursive:true,force:true});}
+});
