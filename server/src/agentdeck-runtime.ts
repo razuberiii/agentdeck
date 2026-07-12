@@ -18,7 +18,7 @@ import { ClaudeProfileStore } from './claude/claude-profile-store.js';
 import type { ClaudeProfile } from './claude/claude-types.js';
 import { DurableEventStore } from './event-store.js';
 import { EventSubscriptions } from './event-subscriptions.js';
-import { migrateRuntimeSchema, RUNTIME_SCHEMA_VERSION } from './schema-migrations.js';
+import { migrateRuntimeSchema, RUNTIME_SCHEMA_VERSION, verifyRuntimeSchema } from './schema-migrations.js';
 import { deleteSessionRelations } from './session-lifecycle.js';
 
 const execFileAsync = promisify(execFile);
@@ -383,7 +383,7 @@ app.addHook('preHandler', async (req, reply) => {
 });
 
 app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle, mode:RUNTIME_MODE, releaseId:RELEASE_ID, commit:RELEASE_COMMIT }));
-app.get('/internal/deep-health',async()=>{const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='runtime'");const integrity=await db.get('PRAGMA integrity_check');const schemaMigrationVersion=Number(migration?.version||0),schemaCompatible=schemaMigrationVersion===RUNTIME_SCHEMA_VERSION;return{ok:integrity?.integrity_check==='ok'&&schemaCompatible,component:'runtime',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,schemaCompatible,sqlite:integrity?.integrity_check==='ok',mode:RUNTIME_MODE,candidateRejectsTurns:RUNTIME_MODE==='candidate'};});
+app.get('/internal/deep-health',async()=>{const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='runtime'");const integrity=await db.get('PRAGMA integrity_check');const schemaMigrationVersion=Number(migration?.version||0),schemaShapeCompatible=await verifyRuntimeSchema(db).then(()=>true).catch(()=>false),schemaCompatible=schemaMigrationVersion===RUNTIME_SCHEMA_VERSION&&schemaShapeCompatible;return{ok:integrity?.integrity_check==='ok'&&schemaCompatible,component:'runtime',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,schemaCompatible,schemaShapeCompatible,sqlite:integrity?.integrity_check==='ok',mode:RUNTIME_MODE,candidateRejectsTurns:RUNTIME_MODE==='candidate'};});
 app.get('/admin/runtime/state', async () => runtimeAdminState());
 app.post('/admin/runtime/drain', async (req:any) => startRuntimeDrain(req));
 app.post('/admin/runtime/undrain', async () => cancelRuntimeDrain());
