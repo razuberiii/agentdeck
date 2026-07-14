@@ -4,6 +4,12 @@ export type DurableRuntimeEvent={session_id:string;threadId:string;generation:st
 type Pending={eventType:string;payload:unknown;eventKey:string|null;resolve:(event:DurableRuntimeEvent)=>void;reject:(error:unknown)=>void};
 type Lane={chain:Promise<void>;batch:Pending[];bytes:number;timer?:NodeJS.Timeout;operations:number};
 type EventStoreMetrics={appendQueueCount:number;deltaQueueEventCount:number;deltaQueueBytes:number;pendingSqliteWriteCount:number;sqliteBatches:number;sqliteRows:number;sqliteMs:number};
+export type AtomicTerminalCommit={
+  sessionId:string;turnId:string;status:string;interruptionReason:string|null;
+  assistant?:{eventType:string;payload:unknown;eventKey:string};
+  terminal:{eventType:string;payload:unknown;eventKey:string};
+  testFailureStage?:'session_update'|'terminal_event';
+};
 
 /** A session's append calls enter one FIFO lane before they touch a delta batch. */
 export class DurableEventStore {
@@ -24,6 +30,11 @@ export class DurableEventStore {
   }
   async flush(sessionId:string){ await this.queue(sessionId,lane=>this.flushLane(sessionId,lane)); }
   async drain(){ await Promise.all([...this.lanes.keys()].map(id=>this.flush(id))); await Promise.all([...this.lanes.values()].map(l=>l.chain)); }
+  async commitAtomicTerminal(input:AtomicTerminalCommit):Promise<{terminal:DurableRuntimeEvent;assistant?:DurableRuntimeEvent}> {
+    let result!:{terminal:DurableRuntimeEvent;assistant?:DurableRuntimeEvent};
+    await this.queue(input.sessionId,async lane=>{await this.flushLane(input.sessionId,lane);result=await this.commitAtomicTerminalInLane(input);});
+    return result;
+  }
 
   private queue(sessionId:string,fn:(lane:Lane)=>Promise<void>|void):Promise<void>{
     const lane=this.lanes.get(sessionId)||{chain:Promise.resolve(),batch:[],bytes:0,operations:0}; this.lanes.set(sessionId,lane); lane.operations++;
@@ -47,6 +58,32 @@ export class DurableEventStore {
   private async commitOne(sessionId:string,pending:Pending){this.metrics.pendingSqliteWriteCount++;const started=Date.now();try{await this.ensureNoGap(sessionId);if(pending.eventKey){const existing=await this.db.get('SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND event_key=?2',[sessionId,pending.eventKey]);if(existing){pending.resolve({...existing,threadId:sessionId,generation:this.generation,sequence:Number(existing.sequence)} as DurableRuntimeEvent);return;}}
     const row=await this.db.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1',[sessionId]);const event:DurableRuntimeEvent={session_id:sessionId,threadId:sessionId,generation:this.generation,sequence:Number(row?.sequence||0)+1,event_type:pending.eventType,payload_json:JSON.stringify(pending.payload),created_at:Date.now()};this.db.transactionRun([{sql:'INSERT INTO events (session_id,ts,kind,payload,sequence,event_type,payload_json,created_at,event_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)',params:[event.session_id,event.created_at,event.event_type,event.payload_json,event.sequence,event.event_type,event.payload_json,event.created_at,pending.eventKey]},{sql:'UPDATE sessions SET last_sequence=?1,updated_at=?2 WHERE (id=?3 OR codex_thread_id=?3) AND COALESCE(last_sequence,0)<?1',params:[event.sequence,event.created_at,event.session_id]}]);this.metrics.sqliteBatches++;this.metrics.sqliteRows++;this.metrics.sqliteMs+=Date.now()-started;pending.resolve(event);try{await this.options.onCommitted?.(event);}catch{/* durable commit succeeded; subscriber replay remains the recovery path */}
   }catch(error){pending.reject(error);}finally{this.metrics.pendingSqliteWriteCount--;}}
+  private async commitAtomicTerminalInLane(input:AtomicTerminalCommit){
+    this.metrics.pendingSqliteWriteCount++;const started=Date.now();
+    try{
+      await this.ensureNoGap(input.sessionId);
+      const keys=[input.terminal.eventKey,...(input.assistant?[input.assistant.eventKey]:[])];
+      const existingRows=await this.db.all(`SELECT session_id,sequence,event_type,payload_json,created_at,event_key FROM events WHERE session_id=?1 AND event_key IN (${keys.map((_,i)=>`?${i+2}`).join(',')})`,[input.sessionId,...keys]);
+      const existing=new Map(existingRows.map(row=>[String(row.event_key),row]));
+      const max=await this.db.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1',[input.sessionId]);
+      let sequence=Number(max?.sequence||0);const now=Date.now(),created:DurableRuntimeEvent[]=[];const statements:Array<{sql:string;params?:unknown[];requireChanges?:number}>=[];
+      const add=(event:{eventType:string;payload:unknown;eventKey:string})=>{
+        const row=existing.get(event.eventKey);if(row)return{...row,threadId:input.sessionId,generation:this.generation,sequence:Number(row.sequence)} as DurableRuntimeEvent;
+        const durable:DurableRuntimeEvent={session_id:input.sessionId,threadId:input.sessionId,generation:this.generation,sequence:++sequence,event_type:event.eventType,payload_json:JSON.stringify(event.payload),created_at:now};
+        statements.push({sql:'INSERT INTO events (session_id,ts,kind,payload,sequence,event_type,payload_json,created_at,event_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)',params:[durable.session_id,now,durable.event_type,durable.payload_json,durable.sequence,durable.event_type,durable.payload_json,now,event.eventKey]});created.push(durable);return durable;
+      };
+      const assistant=input.assistant?add(input.assistant):undefined;
+      statements.push({sql:'UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=?2,last_sequence=?3,updated_at=?4 WHERE id=?5 AND (active_turn_id=?6 OR active_turn_id IS NULL)',params:[input.status,input.interruptionReason,sequence+(existing.has(input.terminal.eventKey)?0:1),now,input.sessionId,input.turnId],requireChanges:1});
+      if(input.testFailureStage==='session_update')statements.push({sql:'SELECT antigravity_test_session_update_failure()'});
+      const terminal=add(input.terminal);
+      if(input.testFailureStage==='terminal_event')statements.push({sql:'SELECT antigravity_test_terminal_event_failure()'});
+      statements.push({sql:'UPDATE sessions SET last_sequence=?1,updated_at=?2 WHERE id=?3 AND COALESCE(last_sequence,0)<?1',params:[sequence,now,input.sessionId]});
+      statements.push({sql:'DELETE FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',params:[input.sessionId,input.turnId]});
+      this.db.transactionRun(statements);this.metrics.sqliteBatches++;this.metrics.sqliteRows+=created.length;this.metrics.sqliteMs+=Date.now()-started;
+      for(const event of created)try{await this.options.onCommitted?.(event);}catch{/* durable replay is authoritative */}
+      return{terminal,assistant};
+    }finally{this.metrics.pendingSqliteWriteCount--;}
+  }
   private async assertNoGap(sessionId:string){const row=await this.db.get('SELECT COUNT(*) AS count,COALESCE(MIN(sequence),0) AS first,COALESCE(MAX(sequence),0) AS last FROM events WHERE session_id=?1',[sessionId]);const count=Number(row?.count||0),first=Number(row?.first||0),last=Number(row?.last||0);if(count&&(first!==1||count!==last))throw new Error(`durable event sequence gap for ${sessionId}`);}
   private async ensureNoGap(sessionId:string){if(this.verifiedSessions.has(sessionId))return;await this.assertNoGap(sessionId);this.verifiedSessions.add(sessionId);}
 }
