@@ -34,7 +34,7 @@ import { claudeAuthLogout, claudeAuthState, claudeAuthStatus } from './claude/cl
 import { claudeProfileEnv, claudeSafeEnvSummary } from './claude/claude-profile-env.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
-import { artifactContentChanged, artifactEligibleForDownload, buildArtifactManifest, isArtifactTestAssetPath, workspaceCodeChanges } from './artifact-manifest.js';
+import { artifactContentChanged, artifactEligibleForDownload, buildArtifactManifest, isArtifactTestAssetPath, workspaceCodeChangesForDisplay } from './artifact-manifest.js';
 import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, VISIBLE_PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, visibleProvider, type AgentProviderId } from './provider-registry.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
@@ -4316,6 +4316,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
   const items:any[] = [];
   const completedItemIds = new Set<string>();
   const deltaText = new Map<string, string>();
+  const deltaTurn = new Map<string, string>();
   const deltaOrder:string[] = [];
   for (const event of events as any[]) {
     const eventType = String(event.event_type || '');
@@ -4333,7 +4334,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
         .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
         .map((item:any) => ({ type:'text', text:stripProviderOnlyText(stripInternalAttachmentPrompt(String(item.text || '').replace(MOBILE_CONTEXT_MARKER, ''))).trim() }))
         .filter((item:any) => item.text);
-      if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', content });
+      if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', turnId:payload?.turnId||null,segmentId:payload?.segmentId||payload?.turnId||null,content });
       continue;
     }
     if (eventType === 'item/completed') {
@@ -4349,12 +4350,14 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       if (itemId && delta) {
         if (!deltaText.has(itemId)) deltaOrder.push(itemId);
         deltaText.set(itemId, (deltaText.get(itemId) || '') + delta);
+        deltaTurn.set(itemId,String(payload?.turnId||payload?.params?.turnId||payload?.segmentId||''));
       }
       continue;
     }
     if (eventType === 'turn/failed' || eventType === 'turn/interrupted') {
       const reason = payload?.reason || payload?.params?.reason || payload?.error?.message || payload?.params?.error?.message || '';
-      items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage', text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
+      const terminalTurnId=String(payload?.turnId||payload?.params?.turn?.id||'');
+      items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage',turnId:terminalTurnId||null,segmentId:terminalTurnId||null,text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
     }
   }
   while (canonicalUserIndex < canonicalUsers.length) {
@@ -4362,8 +4365,10 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
   }
   for (const itemId of deltaOrder) {
     const text = String(deltaText.get(itemId) || '').trim();
-    if (text && !completedItemIds.has(itemId)) items.push({ id:itemId, type:'agentMessage', text, phase:'commentary' });
+    if (text && !completedItemIds.has(itemId)){const turnId=deltaTurn.get(itemId)||'';items.push({id:itemId,type:'agentMessage',turnId:turnId||null,segmentId:turnId||null,text,phase:'commentary'});}
   }
+  const turns:any[]=[];const turnsById=new Map<string,any>();
+  for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
   return {
     id:threadId,
     name:String(row.title || projectNameFromPath(String(row.project_dir || 'Session'))),
@@ -4372,7 +4377,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     status:{ type:String(row.status || 'idle') },
     createdAt:Math.floor(Number(row.created_at || Date.now()) / 1000),
     updatedAt:Math.floor(Number(row.updated_at || Date.now()) / 1000),
-    turns:items.length ? [{ id:`turn-${threadId}`, items }] : [],
+    turns,
     path:null,
   };
 }
@@ -4397,6 +4402,10 @@ function canonicalUserMessageItem(m:any) {
     id:String(m.id),
     type:'userMessage',
     clientMessageId:m.client_message_id || null,
+    turnId:m.turn_id || null,
+    segmentId:m.segment_id || m.turn_id || null,
+    retryOf:m.retry_of || null,
+    createdAt:Number(m.created_at||0),
     status:m.status || 'persisted',
     attachments:userMessageAttachmentsFromRow(m),
     content:userMessageContentFromRow(m),
@@ -4763,7 +4772,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     await runtime.createAntigravitySession({sessionId:threadId,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),title:String(row.title||''),mode:sessionMode(row),model:cleanAgentModel(row.model)||undefined,providerSessionId,legacyHistory,createdAt:Number(row.created_at||Date.now())});
     const attachmentPaths=await antigravityAttachmentPaths(threadId,attachments),providerInput=antigravityProviderInput(providerText,attachmentPaths),input=[{type:'text',text:providerInput}];
     const subscription=ensureSessionSubscription(id,threadId);broadcast(threadId,{type:'runtimeConnection',status:runtimeConnectionStatus(subscription),error:subscription.lastError});
-    await saveCanonicalUserMessage(threadId,originalText,attachments,clientMessageId,turnId);broadcast(threadId,{type:'user',clientMessageId,status:'persisted',planMode:effectivePlanMode,text:originalText,attachments:attachments.map((a:any)=>({id:String(a.id),name:String(a.name||'attachment'),type:String(a.type||''),url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}`}))});await ack('persisted');
+    await saveCanonicalUserMessage(threadId,originalText,attachments,clientMessageId,turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId));broadcast(threadId,canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode));await ack('persisted');
     await recordArtifactBaseline(threadId,String(row.project_dir),turnId).catch(()=>{});activeRuntimeProviderSessions.add(threadId);
     await runtime.startTurn(threadId,{input,text:providerInput,attachments:attachmentPaths,originalText,clientMessageId,turnId,planMode:effectivePlanMode,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),permissionMode:sessionMode(row),model:cleanAgentModel(row.model)||undefined});
     await ack('accepted');
@@ -4773,12 +4782,12 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     const dto:any = await getActiveGeminiProfile();
     if (!dto?.id || dto.status !== 'authenticated' || !dto.login?.ok) throw new Error('请先登录 Gemini');
     const input = await buildTurnInput(threadId, providerText, attachments);
-    const userMessage = { type:'user', clientMessageId, status:'persisted', planMode:effectivePlanMode, text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+    const userMessage=canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode);
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
-    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
-    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
+    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
+    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     await ack('persisted');
@@ -4791,9 +4800,8 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
       activeRuntimeProviderSessions.delete(threadId);
       const message = e?.message || String(e);
       if (isGeminiAuthenticationErrorMessage(message)) await markGeminiProfileNeedsLogin(String(dto.id), message);
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[submissionFailureStatus(row),Date.now(),threadId]).catch(()=>{});
       await ack('failed', message);
-      broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
       throw e;
     }
     return;
@@ -4804,12 +4812,12 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     const input = effectivePlanMode === 'plan'
       ? await buildClaudeTurnInput(threadId, providerText, attachments)
       : await buildClaudeTurnInput(threadId, text, attachments);
-    const userMessage = { type:'user', clientMessageId, status:'persisted', planMode:effectivePlanMode, text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+    const userMessage=canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode);
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
-    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
-    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId).catch(()=>{});
+    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
+    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     await ack('persisted');
@@ -4821,9 +4829,8 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     } catch (e:any) {
       activeRuntimeProviderSessions.delete(threadId);
       const message = e?.message || String(e);
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[submissionFailureStatus(row),Date.now(),threadId]).catch(()=>{});
       await ack('failed', message);
-      broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
       throw e;
     }
     return;
@@ -4838,7 +4845,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   const activeProfile:any = continuePreflight.profile;
   const execution = codexExecutionContext(activeProfile);
   const executionSnapshotJson = JSON.stringify(execution.accountSnapshot || null);
-  const userMessage = { type:'user', clientMessageId, status:'persisted', planMode:effectivePlanMode, text:originalText, attachments: attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'image'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` })) };
+  const userMessage=canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode);
   if (USE_AGENT_RUNTIME) {
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
@@ -4850,7 +4857,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
       [execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
     ).catch(()=>{});
     activeCodexSessions.add(threadId);
-    await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
+    await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
     broadcast(threadId, userMessage);
     await ack('persisted');
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
@@ -4873,9 +4880,8 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     } catch(e:any) {
       const message = e?.message || String(e);
       activeCodexSessions.delete(threadId);
-      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]).catch(()=>{});
+      await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[submissionFailureStatus(row),Date.now(),threadId]).catch(()=>{});
       await ack('failed', message);
-      broadcast(threadId,{type:'codex',method:'turn/failed',params:{error:{message}}});
       maybeExitAfterDrain();
       throw e;
     }
@@ -4887,7 +4893,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     [effectivePlanMode === 'plan' ? 'planning' : 'running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
   );
   activeCodexSessions.add(threadId);
-  await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId).catch(()=>{});
+  await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
   await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
   broadcast(threadId, userMessage);
   await ack('persisted');
@@ -4902,6 +4908,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     throw e;
   }
 }
+function submissionFailureStatus(row:any){const status=String(row?.status||'idle');return['running','planning','submitting','output_draining','waiting_approval','waiting_input','waiting_plan_approval','executing_approved_plan'].includes(status)?status:'failed';}
 async function claimMessageReceipt(sessionId:string,clientMessageId:string,retryOf=''){
   if(retryOf)return claimRetryReceipt(db,sessionId,clientMessageId,retryOf);
   const now=Date.now();
@@ -4912,20 +4919,25 @@ async function claimMessageReceipt(sessionId:string,clientMessageId:string,retry
 }
 async function updateMessageReceipt(sessionId:string,clientMessageId:string,status:string,error?:string){
   await db.run(`UPDATE message_receipts SET status=?1,error=?2,updated_at=?3 WHERE session_id=?4 AND client_message_id=?5${status==='accepted'?" AND status NOT IN ('failed','cancelled')":''}`,[status,error||null,Date.now(),sessionId,clientMessageId]);
+  await db.run(`UPDATE agent_messages SET status=?1 WHERE session_id=?2 AND client_message_id=?3${status==='accepted'?" AND status NOT IN ('failed','cancelled')":''}`,[status,sessionId,clientMessageId]).catch(()=>{});
 }
+function canonicalUserMessageId(sessionId:string,clientMessageId:string){return`user-${crypto.createHash('sha256').update(`${sessionId}:${clientMessageId}`).digest('base64url').slice(0,24)}`;}
+function canonicalUserBroadcast(threadId:string,text:string,attachments:any[],clientMessageId:string,turnId:string,retryOf:string,planMode:string){return{type:'user',messageId:canonicalUserMessageId(threadId,clientMessageId),clientMessageId,turnId,segmentId:turnId,retryOf:retryOf||undefined,createdAt:Date.now(),status:'persisted',planMode,text,attachments:attachments.map((a:any)=>({id:String(a.id),name:String(a.name||'attachment'),type:String(a.type||''),size:Number(a.size||0),url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}`}))};}
 async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if(USE_AGENT_RUNTIME&&normalizeProvider(row?.provider_id)==='antigravity'){await runtime.stopTurn(threadId);return;} if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeRuntimeProviderSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
-async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', id = crypto.randomUUID(), createdAt = Date.now()) {
+async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', retryOf='', id:string = crypto.randomUUID(), createdAt = Date.now()) {
   const safeAttachments = attachments.map((a:any)=>({ id:String(a.id), name:String(a.name || 'attachment'), type:String(a.type || ''), size:Number(a.size || 0), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }));
   await db.run(
-    `INSERT INTO agent_messages (id,session_id,role,text,created_at,client_message_id,turn_id,original_text,attachments_json,status)
-     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+    `INSERT INTO agent_messages (id,session_id,role,text,created_at,client_message_id,turn_id,segment_id,retry_of,original_text,attachments_json,status)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,?9,?10,?11)
      ON CONFLICT(session_id,client_message_id) WHERE client_message_id IS NOT NULL DO UPDATE SET
        text=excluded.text,
        original_text=excluded.original_text,
        attachments_json=excluded.attachments_json,
        turn_id=COALESCE(agent_messages.turn_id, excluded.turn_id),
+       segment_id=COALESCE(agent_messages.segment_id, excluded.segment_id),
+       retry_of=COALESCE(agent_messages.retry_of, excluded.retry_of),
        status=excluded.status`,
-    [id, threadId, 'user', String(text || ''), createdAt, clientMessageId || null, turnId || null, String(text || ''), JSON.stringify(safeAttachments), 'persisted']
+    [id, threadId, 'user', String(text || ''), createdAt, clientMessageId || null, turnId || null, retryOf||null, String(text || ''), JSON.stringify(safeAttachments), 'persisted']
   );
 }
 async function findCanonicalUserForRuntimeEvent(threadId:string, payload:any, text:string) {
@@ -5033,9 +5045,10 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
   const eventType = String(event.event_type || '');
   const runtimeSequence = Number(event.sequence || 0);
   const runtimeGeneration = String(event.generation || '');
-  const base = { runtimeSequence, runtimeGeneration, threadId };
+  const base:any = { runtimeSequence, runtimeGeneration, threadId };
   let payload:any = {};
   try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
+  const eventTurnId=String(payload?.params?.turn?.id||payload?.params?.turnId||payload?.turnId||payload?.segmentId||'');if(eventTurnId){base.turnId=eventTurnId;base.segmentId=String(payload?.segmentId||payload?.params?.segmentId||eventTurnId);}
   const out:any[] = [];
   if (eventType === 'runtime/recovering') {
     out.push({ type:'runtimeConnection', status:'recovering', ...base });
@@ -5114,8 +5127,8 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
       .join('\n');
     const canonical = await findCanonicalUserForRuntimeEvent(threadId, payload, text).catch(()=>null);
     if (canonical) {
-      out.push({ type:'user', messageId:String(canonical.id), clientMessageId:canonical.client_message_id || '', status:canonical.status || 'persisted', text:stripInternalAttachmentPrompt(String(canonical.original_text || canonical.text || '')), attachments:userMessageAttachmentsFromRow(canonical), ...base });
-    } else if (text) out.push({ type:'user', text, attachments:[], ...base });
+      out.push({ type:'user', messageId:String(canonical.id), clientMessageId:canonical.client_message_id || '', turnId:canonical.turn_id||payload?.turnId||'',segmentId:canonical.segment_id||canonical.turn_id||payload?.segmentId||payload?.turnId||'',retryOf:canonical.retry_of||undefined,createdAt:Number(canonical.created_at||0),status:canonical.status || 'persisted', text:stripInternalAttachmentPrompt(String(canonical.original_text || canonical.text || '')), attachments:userMessageAttachmentsFromRow(canonical), ...base });
+    } else if (text) out.push({ type:'user',turnId:payload?.turnId||'',segmentId:payload?.segmentId||payload?.turnId||'',clientMessageId:payload?.clientMessageId||'', text, attachments:[], ...base });
     return out;
   }
   if (eventType === 'thread/read') return out;
@@ -5133,7 +5146,7 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
     if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(threadId, String(msg.params.turn.id));
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
       if(msg.method!=='turn/completed'&&payload?.clientMessageId){const deliveryError=String(msg.params?.error?.message||msg.method);await updateMessageReceipt(threadId,String(payload.clientMessageId),'failed',deliveryError).catch(()=>{});out.push({type:'messageStatus',clientMessageId:String(payload.clientMessageId),status:'failed',error:deliveryError,...base});}
-      const artifactTurnId = activeArtifactTurns.get(threadId) || activeTurns.get(threadId) || '';
+      const artifactTurnId=String(msg.params?.turn?.id||payload?.params?.turn?.id||payload?.turnId||'')||activeArtifactTurns.get(threadId)||activeTurns.get(threadId)||'';
       activeCodexSessions.delete(threadId);
       activeRuntimeProviderSessions.delete(threadId);
       activeTurns.delete(threadId);
@@ -5604,6 +5617,8 @@ function sanitizeThreadForMobile(thread:any){
       if (item.type === 'userMessage') return (item.content || []).some((c:any) => (c.type === 'text' && String(c.text || '').trim()) || c.type === 'image' || c.type === 'localImage');
       if (item.type === 'agentMessage') return !!String(item.text || '').trim();
       if (item.type === 'imageView' || item.type === 'imageGeneration') return true;
+      if (item.type === 'artifactCollection') return Array.isArray(item.artifacts) && item.artifacts.length > 0;
+      if (item.type === 'codeChanges') return Array.isArray(item.changes) && item.changes.length > 0;
       return false;
     });
   }
@@ -5633,15 +5648,12 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
     const id = String(row.id || '');
     const client = String(row.client_message_id || '');
     const text = normalizeUserSnapshotText(String(row.original_text || row.text || ''));
-    return !(id && existing.has(`id:${id}`)) && !(client && existing.has(`client:${client}`)) && !(text && existing.has(`text:${text}`));
+    const stable=!!(id||client);
+    return !(id && existing.has(`id:${id}`)) && !(client && existing.has(`client:${client}`)) && !(!stable&&text&&existing.has(`text:${text}`));
   });
   if (!missing.length) return;
   if (!Array.isArray(thread.turns)) thread.turns = [];
-  if (!thread.turns.length) thread.turns.push({ id:`turn-${threadId}`, items:[] });
-  let insertTurn = thread.turns.find((turn:any) => (turn.items || []).some((item:any) => item?.type === 'agentMessage'));
-  if (!insertTurn) insertTurn = thread.turns[0];
-  if (!Array.isArray(insertTurn.items)) insertTurn.items = [];
-  insertTurn.items.unshift(...missing.map(canonicalUserMessageItem));
+  for(const row of missing){const turnId=String(row.turn_id||row.segment_id||'');let target=turnId?thread.turns.find((turn:any)=>String(turn?.id||turn?.turnId||'')===turnId):null;if(!target){target={id:turnId||`canonical-${row.id}`,turnId:turnId||null,userMessageIds:[String(row.id)],items:[],startedAt:Math.floor(Number(row.created_at||Date.now())/1000)};thread.turns.push(target);}else target.userMessageIds=Array.from(new Set([...(target.userMessageIds||[]),String(row.id)]));if(!Array.isArray(target.items))target.items=[];target.items.unshift(canonicalUserMessageItem(row));}
 }
 function userMessageItemText(item:any) {
   const content = Array.isArray(item?.content) ? item.content : [];
@@ -5707,14 +5719,15 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
   const before = baseline.manifest || {};
   const after = await artifactManifest(root,before);
   const saved:any[] = [];
-  const changed = Object.values(after).map((f:any) => {
+  const eligibleChanged = Object.values(after).map((f:any) => {
     const old = before[f.relativePath];
     const operation = !old ? 'created' : (artifactContentChanged(old,f) ? 'modified' : '');
     return operation ? { ...f, operation } : null;
-  }).filter(Boolean).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
+  }).filter((f:any)=>f&&artifactEligibleForDownload(f.relativePath,f.operation));
+  const downloadableCreatedPaths=new Set(eligibleChanged.filter((f:any)=>f.operation==='created').map((f:any)=>String(f.relativePath)));
+  const changed=eligibleChanged.sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
   for (const f of changed as any[]) {
     if (artifactPathIsInternal(f.relativePath)) continue;
-    if(!artifactEligibleForDownload(f.relativePath,f.operation))continue;
     const id = crypto.createHash('sha256').update(`${threadId}\0${baseline.turnId}\0${f.relativePath}\0${f.operation}`).digest('base64url').slice(0, 32);
     const existed = await db.get('SELECT id FROM artifacts WHERE id=?1 AND session_id=?2', [id, threadId]);
     await db.run(
@@ -5737,7 +5750,7 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
     const row = await artifactForSession(threadId, id);
     if (row) saved.push(artifactDto(row));
   }
-  const codeChanges=baseline.workspace?workspaceCodeChanges(baseline.workspace,await workspaceChangeManifest(root,baseline.workspace)):[];
+  const codeChanges=baseline.workspace?workspaceCodeChangesForDisplay(baseline.workspace,await workspaceChangeManifest(root,baseline.workspace),downloadableCreatedPaths):[];
   if(codeChanges.length)await db.run(`INSERT INTO turn_code_changes(session_id,turn_id,anchor_item_id,changes_json,created_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(session_id,turn_id) DO UPDATE SET anchor_item_id=excluded.anchor_item_id,changes_json=excluded.changes_json,created_at=excluded.created_at`,[threadId,baseline.turnId,anchorItemId||null,JSON.stringify(codeChanges),Date.now()]);else await db.run('DELETE FROM turn_code_changes WHERE session_id=?1 AND turn_id=?2',[threadId,baseline.turnId]);
   return {artifacts:saved,codeChanges};
 }

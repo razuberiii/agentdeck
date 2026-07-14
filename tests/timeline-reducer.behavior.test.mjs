@@ -228,3 +228,14 @@ test('active turn status beats active session status and waiting states have pri
     assert.equal(resolveTurnUiStatus({status:'idle'}, [], false), 'idle');
   `);
 });
+
+test('only structured durable turn terminals decide the current turn status',()=>{
+  runReducerScenario(`
+    const interruptedActivity={type:'activity',activityId:'cmd-1',phase:'interrupted',turnId:'t1'};
+    assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t1',status:'running'}},[],false,'interrupted',[interruptedActivity]),'running');
+    assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t1',status:'running'}},[],false,'unknown',[]),'running');
+    assert.equal(resolveTurnUiStatus({status:'idle'},[],false,'interrupted',[interruptedActivity,{type:'codex',method:'turn/completed',turnId:'t1',params:{turn:{id:'t1',status:'completed'}}}]),'completed');
+    assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t2',status:'running'}},[],false,'interrupted',[{type:'codex',method:'turn/interrupted',turnId:'t1',params:{turn:{id:'t1',status:'interrupted'}}},{type:'codex',method:'turn/started',turnId:'t2',params:{turn:{id:'t2',status:'running'}}}]),'running');
+    assert.equal(resolveTurnUiStatus({status:'interrupted'},[],false,'unknown',[{type:'codex',method:'turn/interrupted',turnId:'t1',params:{turn:{id:'t1',status:'interrupted'}}}]),'interrupted');
+  `);
+});
