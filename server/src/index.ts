@@ -40,6 +40,7 @@ import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
 import { resolveCodexProfileMetadataFromAuth } from './codex-profile-metadata.js';
 import { safeAntigravitySummary } from './antigravity-turn.js';
+import { loadAntigravityLegacyHistory } from './antigravity-history.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
@@ -1393,7 +1394,10 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
   const startedAt = Date.now();
   let row = await findSession(req.params.id);
   if (!row && USE_AGENT_RUNTIME) row = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [String(req.params.id)]).catch(()=>null);
-  if (row && normalizeProvider(row.provider_id) === 'antigravity') {
+  const runtimeBackedRow:any = USE_AGENT_RUNTIME && row && normalizeProvider(row.provider_id) === 'antigravity'
+    ? await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1', [String(row.codex_thread_id || row.id)]).catch(()=>null)
+    : null;
+  if (row && normalizeProvider(row.provider_id) === 'antigravity' && !runtimeBackedRow) {
     if (!pathAllowed(String(row.project_dir))) return reply.code(403).send({error:'workspace not allowed'});
     const thread = await antigravityThread(row);
     const localSessionId = String(row.codex_thread_id || row.id || req.params.id);
@@ -1404,9 +1408,10 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     if (!row) return reply.code(404).send({error:'not found'});
     if (!pathAllowed(String(row.project_dir))) return reply.code(403).send({error:'workspace not allowed'});
     const sqliteStartedAt = Date.now();
-    const runtimeRowRaw:any = await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [threadId]).catch(()=>null) || row;
-    const webPlanStatus = ['planning','waiting_plan_approval','executing_approved_plan','plan_cancelled'].includes(String(row.status || '')) ? String(row.status) : '';
-    const inferredStatus = webPlanStatus || await inferredRuntimeStatus(threadId, String(runtimeRowRaw?.status || row.status || 'idle')).catch(()=>String(runtimeRowRaw?.status || row.status || 'idle'));
+    const runtimeRowRaw:any = runtimeBackedRow || await runtimeDb.get('SELECT * FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR upstream_thread_id=?1', [threadId]).catch(()=>null) || row;
+    const runtimeAntigravity=normalizeProvider(runtimeRowRaw?.provider_id||runtimeRowRaw?.provider)==='antigravity';
+    const webPlanStatus = !runtimeAntigravity&&['planning','waiting_plan_approval','executing_approved_plan','plan_cancelled'].includes(String(row.status || '')) ? String(row.status) : '';
+    const inferredStatus = runtimeAntigravity?String(runtimeRowRaw?.status||'idle'):webPlanStatus || await inferredRuntimeStatus(threadId, String(runtimeRowRaw?.status || row.status || 'idle')).catch(()=>String(runtimeRowRaw?.status || row.status || 'idle'));
     const runtimeRow:any = { ...runtimeRowRaw, status:inferredStatus };
     if (runtimeRow?.status && runtimeRow.status !== row.status) {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [String(runtimeRow.status), Date.now(), threadId]).catch(()=>{});
@@ -4542,11 +4547,12 @@ type JoinOptions={clientConnectionId?:string;recoverRuntimeGeneration?:boolean;r
 async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions={}){
   const row = await findSession(id);
   const threadId = String(row?.codex_thread_id || id);
+  const runtimeBackedAntigravity=USE_AGENT_RUNTIME&&normalizeProvider(row?.provider_id)==='antigravity'&&!!await runtimeDb.get('SELECT 1 AS ok FROM sessions WHERE id=?1 OR codex_thread_id=?1',[threadId]).catch(()=>null);
   if(USE_AGENT_RUNTIME&&['running','submitting','planning','recovering','executing_approved_plan','waiting_approval','waiting_input','waiting_plan_approval'].includes(String(row?.active_turn_status||row?.status||'')))activeRuntimeProviderSessions.add(threadId);
   const pendingRelease=runtimeSubscriptionReleases.get(threadId);if(pendingRelease){clearTimeout(pendingRelease);runtimeSubscriptionReleases.delete(threadId);}
   if(!clients.has(threadId)) clients.set(threadId,new Set());
   app.log.info({sessionId:id,threadId,connectionGeneration:ws.agentdeckGeneration||null,subscriberCount:clients.get(threadId)?.size||0,replayFrom:Number(lastSequence||0),browserAppliedSequence:options.browserAppliedSequence||0,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeGeneration:options.requestedRuntimeGeneration||null,recoveryEpoch:options.recoveryEpoch||0,joinRequestId:options.joinRequestId||null},'websocket joined session');
-  if (row && normalizeProvider(row.provider_id) === 'antigravity') {
+  if (row && normalizeProvider(row.provider_id) === 'antigravity' && !runtimeBackedAntigravity) {
     clients.get(threadId)!.add(ws);
     ws.send(JSON.stringify({type:'joined',sessionId:threadId,runtimeConnection:'connected',clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
     return;
@@ -4952,7 +4958,7 @@ async function providerInputText(threadId:string, text:string, attachments:any[]
   return lines.join('\n\n');
 }
 function validAntigravityConversationId(value:any,localId:string){const id=String(value||'');return id!==localId&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)?id:null;}
-async function antigravityLegacyHistory(threadId:string){const rows=await db.all("SELECT id,role,COALESCE(original_text,text) AS text,created_at FROM agent_messages WHERE session_id=?1 AND role IN ('user','assistant') ORDER BY created_at ASC LIMIT 80",[threadId]);return rows.map((row:any)=>({id:String(row.id),role:String(row.role),text:String(row.text||''),createdAt:Number(row.created_at||0)}));}
+async function antigravityLegacyHistory(threadId:string){return loadAntigravityLegacyHistory(db,threadId);}
 async function antigravityAttachmentPaths(threadId:string,attachments:any[]){const out:any[]=[];for(const attachment of attachments){const meta=await readAttachmentMeta(threadId,String(attachment.id));out.push({id:String(meta.id||attachment.id),name:String(meta.name||attachment.name||'attachment'),mime:String(meta.mime||meta.type||''),size:Number(meta.size||0),path:String(meta.path)});}return out;}
 function antigravityProviderInput(text:string,attachments:any[]){const lines=[String(text||'')];if(attachments.length){lines.push('Attachments are available at these verified local paths:');for(const item of attachments)lines.push(`- ${item.name} (${item.mime||'application/octet-stream'}): ${item.path}`);}return lines.filter(Boolean).join('\n\n');}
 async function runtimeLatestSequence(threadId:string) {

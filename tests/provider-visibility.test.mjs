@@ -6,3 +6,11 @@ test('Gemini is hidden from selectable providers while legacy identity remains r
 test('Antigravity quota advertises only best-effort unstructured official usage',()=>{const quota=PROVIDER_DEFINITIONS.antigravity.capabilities.quota;assert.equal(quota.supported,false);assert.equal(quota.reasonCode,'best_effort_unstructured_usage');assert.deepEqual(quota.details,{source:'interactive_usage',structured:false,cached:true,mayFail:true});assert.equal(PROVIDER_DEFINITIONS.antigravity.quotaSupport,false);});
 test('Antigravity attachment capability reflects verified path transport',()=>{assert.deepEqual(PROVIDER_DEFINITIONS.antigravity.capabilities.attachments.details,{imageInput:true,fileInput:true,fileTransport:'verified_path_with_add_dir'});});
 test('client consumes server provider definitions instead of a second full provider list',()=>{const source=readFileSync(new URL('../client/src/main.tsx',import.meta.url),'utf8');assert.match(source,/function visibleProviderIds/);assert.doesNotMatch(source,/const PROVIDER_ORDER/);assert.match(source,/providerIds\.map/);});
+
+test('all public session creation is gated by provider visibility before legacy Gemini compatibility',()=>{
+  const source=readFileSync(new URL('../server/src/index.ts',import.meta.url),'utf8');
+  const create=source.slice(source.indexOf("app.post('/api/sessions'"),source.indexOf("app.get('/api/sessions/:id'"));
+  assert.ok(create.indexOf('if(!visibleProvider(provider))')<create.indexOf("if (provider === 'gemini')"));
+  assert.equal((source.match(/app\.post\('\/api\/gemini\/sessions/g)||[]).length,0);
+  assert.match(source,/if \(provider&&visibleProvider\(provider\)\) await setSetting\('activeProvider', provider\)/);
+});

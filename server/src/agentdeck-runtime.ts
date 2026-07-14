@@ -51,8 +51,16 @@ const SHARED_CODEX_DIR = RUNTIME_MODE === 'candidate' ? path.join(DATA_DIR, 'can
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
-type ActiveAntigravityTurn={child:ChildProcess;turnId:string;interrupted:boolean;done:Promise<void>};
-const antigravityTurns=new Map<string,ActiveAntigravityTurn>();
+type AntigravityExecutionPhase='claimed'|'preparing'|'spawning'|'running'|'cancelling'|'completed'|'failed'|'interrupted';
+type AntigravityTerminal='completed'|'failed'|'interrupted';
+type AntigravityExecution={
+  sessionId:string;turnId:string;itemId:string;body:any;phase:AntigravityExecutionPhase;
+  child:ChildProcess|null;childClosed:Promise<void>|null;cancelRequested:boolean;
+  requestedTerminal:Exclude<AntigravityTerminal,'completed'>|null;cancelReason:string|null;
+  terminal:AntigravityTerminal|null;finalizePromise:Promise<void>|null;terminatePromise:Promise<void>|null;
+  timeout:NodeJS.Timeout|null;logFile:string;done:Promise<void>;resolveDone:()=>void;
+};
+const antigravityTurns=new Map<string,AntigravityExecution>();
 const antigravitySessionQueue=new KeyedSerialQueue();
 function isLoopbackHost(host:string) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
@@ -751,7 +759,9 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
     const turnId=String(body.turnId||body.clientMessageId||crypto.randomUUID());
     const claim=await db.run("UPDATE sessions SET status=?1,active_turn_id=?2,selected_profile_id=?3,executing_profile_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5 AND active_turn_id IS NULL AND status NOT IN ('running','planning','output_draining')",[body.planMode==='plan'?'planning':'running',turnId,profile.id,Date.now(),session.id]);
     if(!claim.changes)return reply.code(409).send({error:'antigravity_turn_already_running'});
-    void runAntigravityRuntimeTurn(session,{...body,input,text,turnId,profile}).catch(e=>app.log.warn({provider:'antigravity',sessionId:session.id,error:safeAntigravitySummary(e?.message||String(e))},'antigravity runtime turn failed'));
+    const execution=createAntigravityExecution(session.id,turnId,{...body,input,text,turnId,profile});
+    antigravityTurns.set(session.id,execution);
+    void runAntigravityRuntimeTurn(session,execution).catch(e=>app.log.warn({provider:'antigravity',sessionId:session.id,error:safeAntigravitySummary(e?.message||String(e))},'antigravity runtime turn failed'));
     return{ok:true,provider:'antigravity',turn:{id:turnId}};
   }
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
@@ -904,7 +914,7 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
   if (!session) return reply.code(404).send({ error:'not found' });
   if(session.provider_id==='antigravity'||session.provider==='antigravity'){
     const active=antigravityTurns.get(session.id);if(!active)return{ok:true,alreadyStopped:true};
-    active.interrupted=true;await terminateAntigravityProcess(active.child,Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000));await active.done;
+    await requestAntigravityCancellation(active,'interrupted','manual_stop');await active.done;
     return{ok:true,interrupted:true,processExited:true};
   }
   if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || 'default'))).cancel(session.id);
@@ -994,43 +1004,123 @@ async function antigravityRecoveryText(session:RuntimeSession){
   return `${RECOVERY_CONTEXT_MARKER}\nThe upstream Antigravity conversation could not be resumed. Continue using this visible AgentDeck history; do not repeat it verbatim.\n${visible.slice(-20).join('\n\n')}\n[[/AGENT_RUNTIME_RECOVERY_CONTEXT]]`;
 }
 
-async function runAntigravityRuntimeTurn(session:RuntimeSession,body:any){
-  const profile=body.profile as AntigravityRuntimeProfile,turnId=String(body.turnId),itemId=stableAntigravityAssistantId(session.id,turnId);let logFile='',child:ChildProcess|null=null,active:ActiveAntigravityTurn|null=null,observed:string|null=null,rebuild=false,terminal=false;let resolveDone!:()=>void;const done=new Promise<void>(resolve=>{resolveDone=resolve;});
-  const persistObserved=async()=>{if(observed||!logFile)return;const log=await readFile(logFile,'utf8').catch(()=>'');observed=parseAntigravityConversation(log);if(observed)await db.run('UPDATE sessions SET provider_session_id=?1,upstream_thread_id=?1,provider_metadata=?2,upstream_binding_profile_id=?3,current_upstream_account_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5',[observed,JSON.stringify(antigravityMetadata(session.provider_metadata,{profileId:profile.id,cliVersion:'1.1.2',conversationId:observed,recoveryGeneration:Number((antigravityMetadata(session.provider_metadata) as any).recoveryGeneration||0)+(rebuild?1:0)})),profile.id,Date.now(),session.id]);};
-  const fail=async(error:any,interrupted=false)=>{if(terminal)return;terminal=true;const message=safeAntigravitySummary(error?.message||String(error));await db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=?2,updated_at=?3 WHERE id=?4',[interrupted?'interrupted':'failed',interrupted?'manual_stop':'antigravity_turn_failed',Date.now(),session.id]);await appendEvent(session.id,interrupted?'turn/interrupted':'turn/failed',{method:interrupted?'turn/interrupted':'turn/failed',clientMessageId:String(body.clientMessageId||''),params:{turn:{id:turnId,status:interrupted?'interrupted':'failed'},error:{message}}});};
+function createAntigravityExecution(sessionId:string,turnId:string,body:any):AntigravityExecution{
+  let resolveDone!:()=>void;
+  const done=new Promise<void>(resolve=>{resolveDone=resolve;});
+  return{sessionId,turnId,itemId:stableAntigravityAssistantId(sessionId,turnId),body,phase:'claimed',child:null,childClosed:null,cancelRequested:false,requestedTerminal:null,cancelReason:null,terminal:null,finalizePromise:null,terminatePromise:null,timeout:null,logFile:'',done,resolveDone};
+}
+
+class AntigravityCancellation extends Error{}
+function assertAntigravityNotCancelled(execution:AntigravityExecution){if(execution.cancelRequested)throw new AntigravityCancellation(execution.cancelReason||'Antigravity cancelled');}
+async function antigravityLifecycleTestDelay(name:'before_spawn'|'after_spawn'){
+  if(process.env.NODE_ENV!=='test')return;
+  const value=Number(process.env[name==='before_spawn'?'ANTIGRAVITY_TEST_BEFORE_SPAWN_DELAY_MS':'ANTIGRAVITY_TEST_AFTER_SPAWN_DELAY_MS']||0);
+  if(value>0)await sleep(value);
+}
+function antigravityChildClosed(child:ChildProcess){
+  return new Promise<void>(resolve=>{let settled=false;const done=()=>{if(settled)return;settled=true;resolve();};child.once('close',done);child.once('error',done);});
+}
+async function requestAntigravityCancellation(execution:AntigravityExecution,terminal:Exclude<AntigravityTerminal,'completed'>,reason:string){
+  if(execution.terminal)return execution.done;
+  execution.cancelRequested=true;
+  if(execution.requestedTerminal!=='failed')execution.requestedTerminal=terminal;
+  execution.cancelReason=execution.requestedTerminal==='failed'&&execution.cancelReason?execution.cancelReason:reason;
+  execution.phase='cancelling';
+  if(execution.child)await terminateAntigravityExecution(execution);
+  return execution.done;
+}
+async function terminateAntigravityExecution(execution:AntigravityExecution){
+  if(execution.terminatePromise)return execution.terminatePromise;
+  execution.terminatePromise=(async()=>{
+    const child=execution.child;if(!child)return;
+    const closed=execution.childClosed||antigravityChildClosed(child);
+    execution.childClosed=closed;
+    if(child.exitCode!==null||child.signalCode!==null){await closed;return;}
+    try{process.kill(-child.pid!,'SIGTERM');}catch{try{child.kill('SIGTERM');}catch{}}
+    const grace=Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000);
+    if(await Promise.race([closed.then(()=>true),new Promise<false>(resolve=>setTimeout(()=>resolve(false),grace))]))return;
+    try{process.kill(-child.pid!,'SIGKILL');}catch{try{child.kill('SIGKILL');}catch{}}
+    await closed;
+  })();
+  return execution.terminatePromise;
+}
+async function finalizeAntigravityExecution(execution:AntigravityExecution,terminal:AntigravityTerminal,error?:any,assistantText?:string){
+  if(execution.finalizePromise)return execution.finalizePromise;
+  execution.terminal=terminal;
+  execution.phase=terminal;
+  execution.finalizePromise=(async()=>{
+    if(execution.timeout){clearTimeout(execution.timeout);execution.timeout=null;}
+    if(terminal!=='completed')await terminateAntigravityExecution(execution).catch(()=>{});
+    if(terminal==='completed'&&assistantText!==undefined){
+      try{
+        await flushDeltaEvents(execution.sessionId);
+        await appendEvent(execution.sessionId,'item/completed',{method:'item/completed',params:{item:{id:execution.itemId,type:'agentMessage',text:assistantText,phase:'final_answer'}}});
+      }catch(persistError){terminal='failed';error=persistError;execution.terminal=terminal;execution.phase=terminal;execution.cancelReason='antigravity_final_output_persist_failed';}
+    }
+    const status=terminal==='completed'?'idle':terminal;
+    const reason=terminal==='completed'?null:(execution.cancelReason||(terminal==='interrupted'?'manual_stop':'antigravity_turn_failed'));
+    await retryAntigravityTerminalWrite(()=>db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=?2,updated_at=?3 WHERE id=?4',[status,reason,Date.now(),execution.sessionId]));
+    const eventType=terminal==='completed'?'turn/completed':terminal==='interrupted'?'turn/interrupted':'turn/failed';
+    const message=terminal==='completed'?undefined:safeAntigravitySummary(error?.message||String(error||reason));
+    await retryAntigravityTerminalWrite(()=>appendEvent(execution.sessionId,eventType,{method:eventType,clientMessageId:String(execution.body.clientMessageId||''),reason,params:{turn:{id:execution.turnId,status:terminal},...(message?{error:{message}}:{})}}));
+  })().finally(async()=>{
+    if(antigravityTurns.get(execution.sessionId)===execution)antigravityTurns.delete(execution.sessionId);
+    if(execution.logFile)await rm(execution.logFile,{force:true}).catch(()=>{});
+    execution.resolveDone();
+  });
+  return execution.finalizePromise;
+}
+async function retryAntigravityTerminalWrite<T>(write:()=>Promise<T>){let last:any;for(let attempt=0;attempt<3;attempt++){try{return await write();}catch(error){last=error;if(attempt<2)await sleep(10*(attempt+1));}}throw last;}
+
+async function runAntigravityRuntimeTurn(session:RuntimeSession,execution:AntigravityExecution){
+  const body=execution.body,profile=body.profile as AntigravityRuntimeProfile,turnId=execution.turnId;let observed:string|null=null,rebuild=false;
+  const persistObserved=async()=>{if(observed||!execution.logFile)return;const log=await readFile(execution.logFile,'utf8').catch(()=>'');observed=parseAntigravityConversation(log);if(observed)await db.run('UPDATE sessions SET provider_session_id=?1,upstream_thread_id=?1,provider_metadata=?2,upstream_binding_profile_id=?3,current_upstream_account_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5',[observed,JSON.stringify(antigravityMetadata(session.provider_metadata,{profileId:profile.id,cliVersion:'1.1.2',conversationId:observed,recoveryGeneration:Number((antigravityMetadata(session.provider_metadata) as any).recoveryGeneration||0)+(rebuild?1:0)})),profile.id,Date.now(),session.id]);};
   try{
+    execution.phase='preparing';assertAntigravityNotCancelled(execution);
     await appendEvent(session.id,'user',{input:body.input,clientMessageId:String(body.clientMessageId||''),provider:'antigravity',profileId:profile.id});
+    assertAntigravityNotCancelled(execution);
     const boundProfile=String(session.upstream_binding_profile_id||session.current_upstream_account_id||session.account_id||''),requested=String(session.provider_session_id||session.upstream_thread_id||'')||null;
     const prior=await db.get("SELECT COUNT(*) AS count FROM events WHERE session_id=?1 AND event_type='item/completed'",[session.id]);
+    assertAntigravityNotCancelled(execution);
     const profileSwitched=!!boundProfile&&boundProfile!==profile.id,missing=!!requested&&!antigravityConversationExists(profile.homeDir,requested),bindingLost=!requested&&Number(prior?.count||0)>0;
     rebuild=profileSwitched||missing||bindingLost;const prompt=rebuild?`${await antigravityRecoveryText(session)}\n\nCurrent user message:\n${body.text}`:String(body.text);
+    assertAntigravityNotCancelled(execution);
     if(rebuild)await appendEvent(session.id,'system',{provider:'antigravity',text:'上游会话已重建，部分 Provider 隐藏状态可能丢失。',reason:profileSwitched?'profile_changed':bindingLost?'binding_missing':'conversation_missing'});
-    const attachments=validateAntigravityRuntimeAttachments(session.id,body.attachments);const logDir=path.join(DATA_DIR,'runtime','antigravity-logs',profile.id);await mkdir(logDir,{recursive:true});logFile=path.join(logDir,`${crypto.createHash('sha256').update(`${session.id}:${turnId}`).digest('hex')}.log`);
-    const plan=body.planMode==='plan',args=buildAntigravityArgs({prompt,model:body.model||session.model,mode:plan?'plan':'accept-edits',yolo:!plan&&String(body.permissionMode||session.permission_mode)==='yolo',conversationId:rebuild?null:requested,logFile,printTimeout:String(process.env.ANTIGRAVITY_PRINT_TIMEOUT||'2h'),addDirs:attachments.map(item=>path.dirname(item.path))});
-    const binary=await resolveAntigravityBinary({configured:process.env.ANTIGRAVITY_BIN,dataDir:DATA_DIR,homeDir:DEFAULT_HOME,pathEnv:process.env.PATH}),env={...process.env,HOME:profile.homeDir,XDG_CONFIG_HOME:path.join(profile.homeDir,'.config'),XDG_CACHE_HOME:path.join(profile.homeDir,'.cache')};
-    child=spawn(binary,args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});active={child,turnId,interrupted:false,done};antigravityTurns.set(session.id,active);
+    assertAntigravityNotCancelled(execution);
+    const attachments=validateAntigravityRuntimeAttachments(session.id,body.attachments);assertAntigravityNotCancelled(execution);
+    const logDir=path.join(DATA_DIR,'runtime','antigravity-logs',profile.id);await mkdir(logDir,{recursive:true});assertAntigravityNotCancelled(execution);
+    execution.logFile=path.join(logDir,`${crypto.createHash('sha256').update(`${session.id}:${turnId}`).digest('hex')}.log`);
+    const plan=body.planMode==='plan',args=buildAntigravityArgs({prompt,model:body.model||session.model,mode:plan?'plan':'accept-edits',yolo:!plan&&String(body.permissionMode||session.permission_mode)==='yolo',conversationId:rebuild?null:requested,logFile:execution.logFile,printTimeout:String(process.env.ANTIGRAVITY_PRINT_TIMEOUT||'2h'),addDirs:attachments.map(item=>path.dirname(item.path))});
+    assertAntigravityNotCancelled(execution);
+    await antigravityLifecycleTestDelay('before_spawn');assertAntigravityNotCancelled(execution);
+    const binary=await resolveAntigravityBinary({configured:process.env.ANTIGRAVITY_BIN,dataDir:DATA_DIR,homeDir:DEFAULT_HOME,pathEnv:process.env.PATH});assertAntigravityNotCancelled(execution);
+    const env={...process.env,HOME:profile.homeDir,XDG_CONFIG_HOME:path.join(profile.homeDir,'.config'),XDG_CACHE_HOME:path.join(profile.homeDir,'.cache')};
+    execution.phase='spawning';assertAntigravityNotCancelled(execution);
+    const child=spawn(binary,args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});execution.child=child;execution.childClosed=antigravityChildClosed(child);
+    const childResult=runAntigravityChild(child,{timeoutMs:0,cleanOutput:cleanRuntimeAgentOutput,onDelta:delta=>{if(delta)void appendEvent(session.id,'item/agentMessage/delta',{method:'item/agentMessage/delta',params:{itemId:execution.itemId,delta}});void persistObserved().catch(()=>{});},onState:state=>{if(state==='output_draining'&&!execution.cancelRequested)void db.run('UPDATE sessions SET status=?1,updated_at=?2 WHERE id=?3',['output_draining',Date.now(),session.id]);}});
+    void childResult.catch(()=>{});
+    await antigravityLifecycleTestDelay('after_spawn');
+    if(execution.cancelRequested){await terminateAntigravityExecution(execution);throw new AntigravityCancellation(execution.cancelReason||'Antigravity cancelled');}
+    execution.phase='running';
     await appendEvent(session.id,'turn/start',{result:{turn:{id:turnId,status:'inProgress'}},provider:'antigravity'});
-    const result=await runAntigravityChild(child,{timeoutMs:Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS||DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS),cleanOutput:cleanRuntimeAgentOutput,onDelta:delta=>{if(delta)void appendEvent(session.id,'item/agentMessage/delta',{method:'item/agentMessage/delta',params:{itemId,delta}});void persistObserved().catch(()=>{});},onState:state=>{if(state==='output_draining')void db.run('UPDATE sessions SET status=?1,updated_at=?2 WHERE id=?3',['output_draining',Date.now(),session.id]);}});
+    assertAntigravityNotCancelled(execution);
+    const timeoutMs=Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS||DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS);
+    execution.timeout=setTimeout(()=>{void requestAntigravityCancellation(execution,'failed','antigravity_timeout');},timeoutMs);execution.timeout.unref?.();
+    const result=await childResult;
+    assertAntigravityNotCancelled(execution);
     await persistObserved();
     if(!observed)throw new Error('Antigravity conversation ID was not recorded');
     if(requested&&!rebuild&&observed!==requested){await db.run('UPDATE sessions SET provider_session_id=NULL,upstream_thread_id=NULL,interruption_reason=?1 WHERE id=?2',['antigravity_resume_mismatch',session.id]);throw new Error('Antigravity did not resume the requested conversation; refusing silent fallback');}
-    await flushDeltaEvents(session.id);await appendEvent(session.id,'item/completed',{method:'item/completed',params:{item:{id:itemId,type:'agentMessage',text:result.output,phase:'final_answer'}}});
-    await db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=NULL,updated_at=?2 WHERE id=?3',['idle',Date.now(),session.id]);await appendEvent(session.id,'turn/completed',{method:'turn/completed',params:{turn:{id:turnId,status:'completed'}}});terminal=true;
-  }catch(e:any){await persistObserved().catch(()=>{});if(child&&child.exitCode===null&&child.signalCode===null)await terminateAntigravityProcess(child,1000).catch(()=>{});await fail(e,!!active?.interrupted);throw e;
-  }finally{if(active&&antigravityTurns.get(session.id)===active)antigravityTurns.delete(session.id);if(logFile)await rm(logFile,{force:true}).catch(()=>{});resolveDone();}
+    await finalizeAntigravityExecution(execution,'completed',undefined,result.output);
+  }catch(e:any){
+    await persistObserved().catch(()=>{});
+    const terminal=execution.requestedTerminal||'failed';
+    await finalizeAntigravityExecution(execution,terminal,e);
+    if(!(e instanceof AntigravityCancellation))throw e;
+  }
 }
 
 function validateAntigravityRuntimeAttachments(sessionId:string,raw:any){const items=Array.isArray(raw)?raw:[];if(!items.length)return[];const root=realpathSync(path.join(DATA_DIR,'attachments',sessionId));return items.map((item:any)=>{const rp=realpathSync(String(item?.path||''));if(!rp.startsWith(root+path.sep)||!existsSync(rp))throw new Error('invalid Antigravity attachment path');return{...item,path:rp};});}
-async function terminateAntigravityProcess(child:ChildProcess,graceMs=5000){
-  if(child.exitCode!==null||child.signalCode!==null)return;
-  let resolveClosed!:()=>void;const closed=new Promise<void>(resolve=>{resolveClosed=resolve;});const onExit=()=>resolveClosed();child.once('close',onExit);child.once('exit',onExit);
-  if(child.exitCode!==null||child.signalCode!==null){resolveClosed();await closed;return;}
-  try{process.kill(-child.pid!,'SIGTERM');}catch{try{child.kill('SIGTERM');}catch{}}
-  if(await Promise.race([closed.then(()=>true),new Promise<false>(resolve=>setTimeout(()=>resolve(false),graceMs))]))return;
-  try{process.kill(-child.pid!,'SIGKILL');}catch{try{child.kill('SIGKILL');}catch{}}
-  await closed;
-}
-
 function cleanRuntimeAgentOutput(text:string){return String(text||'').replace(/\x1B\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,'').trim();}
 
 function claudePermissionMode(mode:any) {
@@ -2049,6 +2139,9 @@ async function shutdownGracefully(signal:string) {
     app.log.warn({ signal, error:e?.message || String(e), drainState:await drainState().catch(()=>null) }, 'runtime drain timed out before shutdown');
   }
   runtimeLifecycle = 'stopping';
+  const activeAntigravity=[...antigravityTurns.values()];
+  await Promise.all(activeAntigravity.map(execution=>requestAntigravityCancellation(execution,'interrupted','runtime_shutdown')));
+  await Promise.all(activeAntigravity.map(execution=>execution.done));
   await eventStore.drain();
   await subscriptions.drain();
   subscriptions.closeAll();
