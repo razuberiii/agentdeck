@@ -10,8 +10,8 @@ test('Agent selection page renders provider name with account-aware status', () 
     source.indexOf("{page==='agent'&&"),
     source.indexOf("{page==='mode'&&")
   );
-  assert.match(source, /const PROVIDER_ORDER:ProviderId\[\]\s*=\s*\['codex','claude','antigravity'\]/);
-  assert.match(agentBlock, /PROVIDER_ORDER\.map/);
+  assert.match(source, /function visibleProviderIds/);
+  assert.match(agentBlock, /providerIds\.map/);
   assert.match(agentBlock, /providerStatusById\[provider\]/);
   assert.match(agentBlock, /providerChoiceDetail\(providerStatusById\[provider\]\)/);
   assert.match(agentBlock, /providerChoiceNote\(providerStatusById\[provider\]\)/);

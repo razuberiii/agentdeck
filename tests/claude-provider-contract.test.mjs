@@ -15,7 +15,8 @@ const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.
 test('Claude Code is registered as the second provider and Gemini remains last', () => {
   assert.match(registrySource, /PROVIDER_ORDER:\s*AgentProviderId\[\]\s*=\s*\['codex', 'claude', 'antigravity', 'gemini'\]/);
   assert.match(registrySource, /claude:\s*\{\s*id:'claude', displayName:'Claude Code', order:1/);
-  assert.match(clientSource, /const PROVIDER_ORDER:ProviderId\[\]\s*=\s*\['codex','claude','antigravity'\]/);
+  assert.match(clientSource, /function visibleProviderIds/);
+  assert.doesNotMatch(clientSource, /const PROVIDER_ORDER/);
 });
 
 test('Claude capabilities are explicit and do not invent quota or model discovery', () => {

@@ -39,7 +39,7 @@ import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, VISIBLE_PROVIDER_ORDER, providerD
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
 import { resolveCodexProfileMetadataFromAuth } from './codex-profile-metadata.js';
-import { AntigravityProcessError, DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS, finalizeAntigravityTurn, runAntigravityChild, safeAntigravitySummary, stableAntigravityAssistantId, type AntigravityTurnState } from './antigravity-turn.js';
+import { safeAntigravitySummary } from './antigravity-turn.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
 const DATA_DIR = process.env.DATA_DIR || '/var/lib/agentdeck';
@@ -109,7 +109,6 @@ const RUNTIME_SUBSCRIPTION_IDLE_MS=Math.max(1000,Number(process.env.RUNTIME_SUBS
 const persistedIngestionCursors = new Map<string,number>();
 const persistedIngestionGenerations = new Map<string,string>();
 const sessionCommandQueue=new SessionCommandQueue(Number(process.env.WS_SESSION_COMMAND_QUEUE_MAX||64));
-const activeAntigravityTurns = new Map<string, { child:any; state:AntigravityTurnState; assistantId:string; turnId:string }>();
 const chunkedMessages = new Map<string, { sessionId:string; clientMessageId:string; chunks:string[]; size:number; createdAt:number }>();
 const threadTokenUsage = new Map<string, any>();
 const runtimeDiagnostics = { subscribeStarts:0, subscribeReconnects:0, subscribeEvents:0, broadcasts:0, replayCalls:0 };
@@ -371,7 +370,7 @@ app.get('/api/status', async (req) => {
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
   app.log.info({ ms:Date.now() - startedAt }, 'api status computed');
-  return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
+  return { authed, authenticated:true, serverTime: Date.now(), release:{ releaseId:RELEASE_ID, commit:RELEASE_COMMIT, pid:process.pid, port:Number(process.env.PORT || 3842) }, runtimeState, codex: codexStatus, claude: claudeStatus, gemini: { ...geminiStatus, runtime:geminiRuntime }, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerDefinitions: VISIBLE_PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]), providerStatus: providerStatuses, activeProvider: settings.activeProvider, roots, defaultWorkspace: DEFAULT_WORKSPACE_DIR, mode:modeLabel(settings.defaultMode), defaultMode:settings.defaultMode, defaultModel:settings.defaultModel, codexHome: codex.getCodexHome(), activeProfile, activeClaudeProfile, activeGeminiProfile, activeAntigravityProfile, claudeProfiles: await listClaudeProfiles(), geminiProfiles: await listGeminiProfiles(), geminiPendingProfiles: await listGeminiPendingProfiles(), capabilities: attachmentCapabilities(geminiRuntime) };
 });
 app.get('/internal/deep-health',async(req:any,reply)=>{if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(String(req.ip||'')))return reply.code(403).send({error:'loopback_only'});const runtimeHealth=USE_AGENT_RUNTIME?await runtime.deepHealth():null;const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='web'");const integrity=await db.get('PRAGMA integrity_check');const sqlite=integrity?.integrity_check==='ok',schemaMigrationVersion=Number(migration?.version||0),webSchemaShapeCompatible=await verifyWebSchema(db).then(()=>true).catch(()=>false),webSchemaCompatible=schemaMigrationVersion===WEB_SCHEMA_VERSION&&webSchemaShapeCompatible,runtimeSchemaCompatible=!!runtimeHealth&&Number(runtimeHealth.schemaMigrationVersion)===RUNTIME_SCHEMA_VERSION&&runtimeHealth.schemaShapeCompatible===true;const compatible=!!runtimeHealth&&Number(runtimeHealth.contractVersion)===API_DTO_CONTRACT_VERSION&&runtimeSchemaCompatible;return{ok:sqlite&&webSchemaCompatible&&compatible&&!!runtimeHealth?.ok,component:'web',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,expectedSchemaMigrationVersion:WEB_SCHEMA_VERSION,webSchemaCompatible,webSchemaShapeCompatible,runtimeSchemaCompatible,sqlite,runtimeConnected:!!runtimeHealth?.ok,runtimeReleaseId:runtimeHealth?.releaseId||null,runtimeMode:runtimeHealth?.mode||null,runtimeContractVersion:runtimeHealth?.contractVersion||null,runtimeSchemaMigrationVersion:runtimeHealth?.schemaMigrationVersion||null,compatible};});
 app.get('/api/app-state', { preHandler: ensureAuth }, async () => lightAppState());
@@ -1240,6 +1239,7 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
   try { projectDir = await validateProject(req.body?.projectDir || DEFAULT_WORKSPACE_DIR, roots); }
   catch { return reply.code(400).send({error:'project path is outside allowed workspace roots'}); }
   const provider = normalizeProvider(req.body?.providerId) || (await appSettings()).activeProvider;
+  if(!visibleProvider(provider))return reply.code(409).send({error:`${provider}_not_selectable`,code:`${provider}_not_selectable`,message:`${providerDisplayName(provider)} 不能用于新建会话`});
   const requestedTitle = String(req.body?.title || '').trim();
   const title = sessionTitleFromTask(req.body?.initialTask, requestedTitle || path.basename(projectDir));
   const settings = await appSettings();
@@ -1650,9 +1650,12 @@ app.get('/api/sessions/:id/messages/:clientMessageId/status',{preHandler:ensureA
   const session=await findSession(String(req.params.id));
   if(!session)return reply.code(404).send({code:'session_not_found'});
   const sessionId=String(session.codex_thread_id||session.id);
-  const row=await db.get('SELECT status,error,retry_of,created_at,updated_at FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[sessionId,String(req.params.clientMessageId)]);
+  const row=await db.get(`SELECT r.status,r.error,r.retry_of,r.created_at,r.updated_at,m.original_text,m.text,m.attachments_json
+    FROM message_receipts r LEFT JOIN agent_messages m ON m.session_id=r.session_id AND m.client_message_id=r.client_message_id AND m.role='user'
+    WHERE r.session_id=?1 AND r.client_message_id=?2 ORDER BY m.created_at DESC LIMIT 1`,[sessionId,String(req.params.clientMessageId)]);
   if(!row)return reply.code(404).send({code:'message_not_found',clientMessageId:String(req.params.clientMessageId)});
-  return{clientMessageId:String(req.params.clientMessageId),sessionId,status:String(row.status),error:row.error||null,retryOf:row.retry_of||null,createdAt:Number(row.created_at),updatedAt:Number(row.updated_at)};
+  let attachments:any[]=[];try{const parsed=JSON.parse(String(row.attachments_json||'[]'));if(Array.isArray(parsed))attachments=parsed.map((item:any)=>({id:String(item.id||''),name:String(item.name||'attachment'),type:String(item.type||''),size:Number(item.size||0)})).filter((item:any)=>item.id);}catch{}
+  return{clientMessageId:String(req.params.clientMessageId),sessionId,status:String(row.status),error:row.error||null,retryOf:row.retry_of||null,text:String(row.original_text||row.text||''),attachments,createdAt:Number(row.created_at),updatedAt:Number(row.updated_at)};
 });
 app.get('/api/wireguard/config/:name', { preHandler: ensureAuth }, async (req:any, reply) => {
   const name = String(req.params.name || '');
@@ -1851,7 +1854,7 @@ setTimeout(() => cleanupArchivedSessions('startup').catch(e => app.log.error({ e
 setInterval(() => cleanupArchivedSessions('scheduled').catch(e => app.log.error({ err:e }, 'archived session cleanup failed')), Math.max(60_000, ARCHIVED_SESSION_CLEANUP_INTERVAL_MS)).unref();
 process.on('SIGTERM', () => requestGracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => requestGracefulShutdown('SIGINT'));
-function activeAgentTurnCount() { return activeCodexSessions.size + activeAntigravityTurns.size; }
+function activeAgentTurnCount() { return activeCodexSessions.size; }
 function requestGracefulShutdown(signal:string) {
   if (shutdownRequested) return;
   shutdownRequested = true;
@@ -1864,8 +1867,8 @@ function requestGracefulShutdown(signal:string) {
     app.log.info({ signal }, 'shutting down immediately');
     process.exit(0);
   }
-  app.log.warn({ signal, activeCodex: activeCodexSessions.size, activeAntigravity: activeAntigravityTurns.size }, 'shutdown requested; waiting for active agent turns');
-  for (const sessionId of new Set([...activeCodexSessions, ...activeAntigravityTurns.keys()])) {
+  app.log.warn({ signal, activeCodex: activeCodexSessions.size }, 'shutdown requested; waiting for active agent turns');
+  for (const sessionId of activeCodexSessions) {
     broadcast(sessionId, { type:'system', text:'服务将在当前回复完成后重启' });
   }
 }
@@ -4749,11 +4752,13 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   if (normalizeProvider(row.provider_id) === 'antigravity') {
     if(!USE_AGENT_RUNTIME)throw new Error('Antigravity 需要 persistent runtime');
     const dto:any=await getActiveAntigravityProfile();if(!dto?.id||!dto?.home_dir)throw new Error('请先登录 Antigravity');
-    const providerInput=await providerInputText(threadId,providerText,attachments),input=[{type:'text',text:providerInput}];
+    const legacyHistory=await antigravityLegacyHistory(threadId),providerSessionId=validAntigravityConversationId(row.provider_session_id,threadId);
+    await runtime.createAntigravitySession({sessionId:threadId,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),title:String(row.title||''),mode:sessionMode(row),model:cleanAgentModel(row.model)||undefined,providerSessionId,legacyHistory,createdAt:Number(row.created_at||Date.now())});
+    const attachmentPaths=await antigravityAttachmentPaths(threadId,attachments),providerInput=antigravityProviderInput(providerText,attachmentPaths),input=[{type:'text',text:providerInput}];
     const subscription=ensureSessionSubscription(id,threadId);broadcast(threadId,{type:'runtimeConnection',status:runtimeConnectionStatus(subscription),error:subscription.lastError});
     await saveCanonicalUserMessage(threadId,originalText,attachments,clientMessageId,turnId);broadcast(threadId,{type:'user',clientMessageId,status:'persisted',planMode:effectivePlanMode,text:originalText,attachments:attachments.map((a:any)=>({id:String(a.id),name:String(a.name||'attachment'),type:String(a.type||''),url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}`}))});await ack('persisted');
     await recordArtifactBaseline(threadId,String(row.project_dir),turnId).catch(()=>{});activeRuntimeProviderSessions.add(threadId);
-    await runtime.startTurn(threadId,{input,text:providerInput,originalText,clientMessageId,turnId,planMode:effectivePlanMode,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),permissionMode:sessionMode(row),model:cleanAgentModel(row.model)||undefined});
+    await runtime.startTurn(threadId,{input,text:providerInput,attachments:attachmentPaths,originalText,clientMessageId,turnId,planMode:effectivePlanMode,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),permissionMode:sessionMode(row),model:cleanAgentModel(row.model)||undefined});
     await ack('accepted');
     return;
   }
@@ -4901,84 +4906,7 @@ async function claimMessageReceipt(sessionId:string,clientMessageId:string,retry
 async function updateMessageReceipt(sessionId:string,clientMessageId:string,status:string,error?:string){
   await db.run(`UPDATE message_receipts SET status=?1,error=?2,updated_at=?3 WHERE session_id=?4 AND client_message_id=?5${status==='accepted'?" AND status NOT IN ('failed','cancelled')":''}`,[status,error||null,Date.now(),sessionId,clientMessageId]);
 }
-async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeRuntimeProviderSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
-async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [], turnId:string = crypto.randomUUID(), clientMessageId = '', planMode:'direct'|'plan' = 'direct', originalText = text) {
-  const threadId = String(row.codex_thread_id || row.id);
-  const message = String(text || '').trim();
-  if (!message && !attachments.length) throw new Error('empty message');
-  const providerInput = await providerInputText(threadId, message, attachments);
-  const profile:any = await getActiveAntigravityProfile();
-  if (!profile?.home_dir) throw new Error('请先登录 Antigravity');
-  const login = await antigravityLoginStatus(String(profile.home_dir));
-  if (!login.ok) throw new Error('请先登录 Antigravity');
-  const now = Date.now();
-  const userId = crypto.randomUUID();
-  const title = autoTitle(String(originalText || message), String(row.project_dir), String(row.title || ''));
-  await saveCanonicalUserMessage(threadId, String(originalText || message), attachments, clientMessageId, turnId, userId, now);
-  if (title) { await db.run('UPDATE sessions SET title=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[title, now, threadId]); broadcast(threadId,{type:'sessionTitle', title}); }
-  await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[planMode === 'plan' ? 'planning' : 'running', now, threadId]);
-  await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
-  broadcast(threadId,{type:'user', planMode, text:String(originalText || message), attachments:attachments.map((a:any)=>({ id:String(a.id), name:String(a.name||'attachment'), type:String(a.type||''), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }))});
-  broadcast(threadId,{type:'codex', method:'turn/started', params:{}});
-  const assistantId = stableAntigravityAssistantId(threadId, turnId);
-  const model = cleanAgentModel(row.model);
-  broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:{ id:`${assistantId}-progress`, type:'plan', text:`Antigravity 已接收请求，正在用 ${model || '默认模型'} 分析。` } }});
-  try {
-    const output = await runAntigravityPrint(profile, row, providerInput, threadId, assistantId);
-    await finalizeAntigravityTurn({
-      assistantId,
-      text:output,
-      status:'completed',
-      persistAssistant:(id, value)=>persistAntigravityAssistant(id, threadId, value),
-      updateSession:async status=>{
-        if (planMode === 'plan' && status === 'idle') {
-          await completePlanTask(threadId, output, assistantId, []);
-          return;
-        }
-        await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[status, Date.now(), threadId]);
-      },
-      notify:message=>broadcast(threadId, message),
-      beforeTerminal:async () => {
-        const found = await scanArtifactsForTurn(threadId, String(row.project_dir), turnId, assistantId)
-          .catch((error:any) => {
-            app.log.warn({ sessionId:threadId, error:safeAntigravitySummary(String(error?.message || error)) }, 'antigravity artifact scan failed');
-            return [];
-          });
-        if (found.length) broadcast(threadId,{type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }});
-      },
-    });
-  } catch (e:any) {
-    const active = activeAntigravityTurns.get(threadId);
-    const interrupted = active?.state === 'interrupted';
-    const result = e instanceof AntigravityProcessError ? e.result : null;
-    const safeError = safeAntigravitySummary(String(e?.message || e || 'Antigravity failed'));
-    const failureText = result?.output
-      ? `${result.output}\n\nAntigravity 执行${interrupted ? '已中断' : '失败'}：${safeError}`
-      : `Antigravity 执行${interrupted ? '已中断' : '失败'}：${safeError}`;
-    await finalizeAntigravityTurn({
-      assistantId,
-      text:failureText,
-      status:interrupted ? 'interrupted' : 'failed',
-      error:safeError,
-      persistAssistant:(id, value)=>persistAntigravityAssistant(id, threadId, value),
-      updateSession:status=>db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',[status, Date.now(), threadId]).then(()=>{}),
-      notify:message=>broadcast(threadId, message),
-    });
-    throw e;
-  } finally {
-    activeAntigravityTurns.delete(threadId);
-    activeArtifactTurns.delete(threadId);
-    maybeExitAfterDrain();
-  }
-}
-async function persistAntigravityAssistant(id:string, threadId:string, text:string) {
-  await db.run(
-    `INSERT INTO agent_messages (id,session_id,role,text,created_at)
-     VALUES (?1,?2,'assistant',?3,?4)
-     ON CONFLICT(id) DO UPDATE SET text=excluded.text`,
-    [id, threadId, text, Date.now()]
-  );
-}
+async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if(USE_AGENT_RUNTIME&&normalizeProvider(row?.provider_id)==='antigravity'){await runtime.stopTurn(threadId);return;} if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeRuntimeProviderSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', id = crypto.randomUUID(), createdAt = Date.now()) {
   const safeAttachments = attachments.map((a:any)=>({ id:String(a.id), name:String(a.name || 'attachment'), type:String(a.type || ''), size:Number(a.size || 0), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }));
   await db.run(
@@ -5023,36 +4951,10 @@ async function providerInputText(threadId:string, text:string, attachments:any[]
   lines.push(attachmentLines.join('\n'));
   return lines.join('\n\n');
 }
-async function runAntigravityPrint(profile:any, row:any, prompt:string, threadId:string, itemId:string) {
-  const antigravityBin = await resolveAntigravityBinary();
-  const args:string[] = [];
-  const model = cleanAgentModel(row.model);
-  if (model) args.push('--model', model);
-  if (sessionMode(row) === 'yolo') args.push('--dangerously-skip-permissions');
-  args.push('--print', prompt);
-  const homeDir = String(profile.home_dir);
-  const child = spawn(antigravityBin, args, {
-    cwd:String(row.project_dir),
-    env:{ ...process.env, HOME:homeDir, XDG_CONFIG_HOME:path.join(homeDir,'.config'), XDG_CACHE_HOME:path.join(homeDir,'.cache') },
-    stdio:['ignore','pipe','pipe'],
-  });
-  const active = { child, state:'running' as AntigravityTurnState, assistantId:itemId, turnId:String(row.active_turn_id || '') };
-  activeAntigravityTurns.set(threadId, active);
-  const result = await runAntigravityChild(child, {
-    timeoutMs:Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS || DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS),
-    cleanOutput:cleanAgentOutput,
-    onDelta:delta => {
-      if (delta.trim()) broadcast(threadId,{type:'codex', method:'item/agentMessage/delta', params:{ itemId, delta }});
-    },
-    onState:state => {
-      if (active.state !== 'interrupted') active.state = state;
-      if (state === 'output_draining') {
-        db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE id=?3 OR codex_thread_id=?3',['output_draining', Date.now(), threadId]).catch(()=>{});
-      }
-    },
-  });
-  return result.output;
-}
+function validAntigravityConversationId(value:any,localId:string){const id=String(value||'');return id!==localId&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)?id:null;}
+async function antigravityLegacyHistory(threadId:string){const rows=await db.all("SELECT id,role,COALESCE(original_text,text) AS text,created_at FROM agent_messages WHERE session_id=?1 AND role IN ('user','assistant') ORDER BY created_at ASC LIMIT 80",[threadId]);return rows.map((row:any)=>({id:String(row.id),role:String(row.role),text:String(row.text||''),createdAt:Number(row.created_at||0)}));}
+async function antigravityAttachmentPaths(threadId:string,attachments:any[]){const out:any[]=[];for(const attachment of attachments){const meta=await readAttachmentMeta(threadId,String(attachment.id));out.push({id:String(meta.id||attachment.id),name:String(meta.name||attachment.name||'attachment'),mime:String(meta.mime||meta.type||''),size:Number(meta.size||0),path:String(meta.path)});}return out;}
+function antigravityProviderInput(text:string,attachments:any[]){const lines=[String(text||'')];if(attachments.length){lines.push('Attachments are available at these verified local paths:');for(const item of attachments)lines.push(`- ${item.name} (${item.mime||'application/octet-stream'}): ${item.path}`);}return lines.filter(Boolean).join('\n\n');}
 async function runtimeLatestSequence(threadId:string) {
   const row = await runtimeDb.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1', [threadId]);
   return Number(row?.sequence || 0);

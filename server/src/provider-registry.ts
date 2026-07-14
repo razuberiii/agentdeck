@@ -99,11 +99,11 @@ const antigravityCapabilities: ProviderCapabilities = {
   approvals:unsupported('approval_protocol_not_available', 'Antigravity CLI 当前未提供稳定审批协议'),
   askUserQuestion:unsupported('ask_user_question_not_supported', 'Antigravity CLI 当前未提供稳定 AskUserQuestion 协议'),
   cancellation:supported(),
-  attachments:supported({ imageInput:true, fileInput:false, fileTransport:'path' }),
+  attachments:supported({ imageInput:true, fileInput:true, fileTransport:'verified_path_with_add_dir' }),
   imageInput:supported(),
   modelSelection:supported({source:'cli_model'}),
   modelDiscovery:supported({ source:'cli_models_or_fallback' }),
-  quota:supported({source:'interactive_usage',structured:false}),
+  quota:unsupported('best_effort_unstructured_usage', '仅可缓存并尝试读取官方 CLI /usage 文本；该入口非结构化、可能失败', {source:'interactive_usage',structured:false,cached:true,mayFail:true}),
   sessionResume:supported({source:'cli_conversation'}),
   sessionFork:unsupported('capability_unknown', 'Antigravity fork 能力无法稳定探测'),
   crossProfileResume:supported({rebind:'local_history_context'}),
@@ -139,7 +139,7 @@ export const VISIBLE_PROVIDER_ORDER: AgentProviderId[] = PROVIDER_ORDER.filter(i
 export const PROVIDER_DEFINITIONS: Record<AgentProviderId, ProviderDefinition> = {
   codex: { id:'codex', displayName:'Codex', order:0, capabilities:codexCapabilities, accountManagement:true, modelSelection:true, quotaSupport:true, visible:true },
   claude: { id:'claude', displayName:'Claude Code', order:1, capabilities:claudeCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false, visible:true },
-  antigravity: { id:'antigravity', displayName:'Antigravity', order:2, capabilities:antigravityCapabilities, accountManagement:true, modelSelection:true, quotaSupport:true, visible:true },
+  antigravity: { id:'antigravity', displayName:'Antigravity', order:2, capabilities:antigravityCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false, visible:true },
   gemini: { id:'gemini', displayName:'Gemini', order:3, capabilities:geminiCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false, visible:false },
 };
 

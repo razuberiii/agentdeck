@@ -1,3 +1,8 @@
 import test from 'node:test';import assert from 'node:assert/strict';
-import { normalizeProvider, providerStatusArray, VISIBLE_PROVIDER_ORDER } from '../server/dist/provider-registry.js';
+import { readFileSync } from 'node:fs';
+import { importTypeScript } from './helpers/import-typescript.mjs';
+const { normalizeProvider, providerStatusArray, VISIBLE_PROVIDER_ORDER, PROVIDER_DEFINITIONS } = await importTypeScript(new URL('../server/src/provider-registry.ts',import.meta.url));
 test('Gemini is hidden from selectable providers while legacy identity remains readable',()=>{assert.equal(normalizeProvider('gemini'),'gemini');assert.equal(VISIBLE_PROVIDER_ORDER.includes('gemini'),false);const statuses={codex:{id:'codex'},claude:{id:'claude'},antigravity:{id:'antigravity'},gemini:{id:'gemini'}};assert.deepEqual(providerStatusArray(statuses).map(x=>x.id),['codex','claude','antigravity']);});
+test('Antigravity quota advertises only best-effort unstructured official usage',()=>{const quota=PROVIDER_DEFINITIONS.antigravity.capabilities.quota;assert.equal(quota.supported,false);assert.equal(quota.reasonCode,'best_effort_unstructured_usage');assert.deepEqual(quota.details,{source:'interactive_usage',structured:false,cached:true,mayFail:true});assert.equal(PROVIDER_DEFINITIONS.antigravity.quotaSupport,false);});
+test('Antigravity attachment capability reflects verified path transport',()=>{assert.deepEqual(PROVIDER_DEFINITIONS.antigravity.capabilities.attachments.details,{imageInput:true,fileInput:true,fileTransport:'verified_path_with_add_dir'});});
+test('client consumes server provider definitions instead of a second full provider list',()=>{const source=readFileSync(new URL('../client/src/main.tsx',import.meta.url),'utf8');assert.match(source,/function visibleProviderIds/);assert.doesNotMatch(source,/const PROVIDER_ORDER/);assert.match(source,/providerIds\.map/);});

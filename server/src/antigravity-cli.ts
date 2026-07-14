@@ -1,22 +1,33 @@
 import path from 'node:path';
-import { existsSync } from 'node:fs';
+import { constants, existsSync } from 'node:fs';
+import { access } from 'node:fs/promises';
 
 export const ANTIGRAVITY_CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT = '2h';
 
-export type AntigravityCliOptions={prompt:string;model?:string|null;mode?:string|null;yolo?:boolean;conversationId?:string|null;logFile:string;printTimeout?:string};
+export type AntigravityCliOptions={prompt:string;model?:string|null;mode?:string|null;yolo?:boolean;conversationId?:string|null;logFile:string;printTimeout?:string;addDirs?:string[]};
 
 export function buildAntigravityArgs(options:AntigravityCliOptions) {
   const args:string[]=[];
   if(options.model)args.push('--model',String(options.model));
   args.push('--mode',options.mode==='plan'?'plan':'accept-edits');
-  if(options.yolo)args.push('--dangerously-skip-permissions');
+  if(options.yolo&&options.mode!=='plan')args.push('--dangerously-skip-permissions');
   if(options.conversationId){
     if(!ANTIGRAVITY_CONVERSATION_ID.test(options.conversationId))throw new Error('invalid Antigravity conversation id');
     args.push('--conversation',options.conversationId);
   }
+  for(const dir of [...new Set(options.addDirs||[])])args.push('--add-dir',dir);
   args.push('--log-file',options.logFile,'--print-timeout',options.printTimeout||DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT,'--print',options.prompt);
   return args;
+}
+
+export async function resolveAntigravityBinary(options:{configured?:string;dataDir:string;homeDir?:string;pathEnv?:string}){
+  const names=[options.configured,path.join(options.dataDir,'provider-tools','bin','agy'),options.homeDir?path.join(options.homeDir,'.local','bin','agy'):'','agy'].filter(Boolean) as string[];
+  for(const name of names){
+    const candidates=name.includes(path.sep)?[name]:String(options.pathEnv||process.env.PATH||'').split(path.delimiter).filter(Boolean).map(dir=>path.join(dir,name));
+    for(const candidate of candidates)try{await access(candidate,constants.X_OK);return candidate;}catch{}
+  }
+  throw new Error('provider_binary_not_found: Antigravity binary was not found');
 }
 
 export function parseAntigravityConversation(log:string) {

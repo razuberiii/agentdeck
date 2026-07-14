@@ -24,7 +24,7 @@ import { runtimeIsDrained } from './runtime-drain-state.js';
 import { TurnAdmission } from './turn-admission.js';
 import { codexSessionStateForNotification } from './codex-session-state.js';
 import { KeyedSerialQueue } from './keyed-serial-queue.js';
-import { buildAntigravityArgs, parseAntigravityConversation, antigravityConversationExists, antigravityMetadata } from './antigravity-cli.js';
+import { buildAntigravityArgs, parseAntigravityConversation, antigravityConversationExists, antigravityMetadata, resolveAntigravityBinary } from './antigravity-cli.js';
 import { DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS, runAntigravityChild, safeAntigravitySummary, stableAntigravityAssistantId } from './antigravity-turn.js';
 
 const execFileAsync = promisify(execFile);
@@ -51,7 +51,9 @@ const SHARED_CODEX_DIR = RUNTIME_MODE === 'candidate' ? path.join(DATA_DIR, 'can
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
-const antigravityTurns=new Map<string,{child:ChildProcess;turnId:string;interrupted:boolean}>();
+type ActiveAntigravityTurn={child:ChildProcess;turnId:string;interrupted:boolean;done:Promise<void>};
+const antigravityTurns=new Map<string,ActiveAntigravityTurn>();
+const antigravitySessionQueue=new KeyedSerialQueue();
 function isLoopbackHost(host:string) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
@@ -578,12 +580,8 @@ app.post('/gemini/sessions', async (req:any, reply) => {
 app.post('/antigravity/sessions', async (req:any, reply) => {
   if(isCandidateMode())return reply.code(503).send(runtimeUnavailableBody(req,'runtime_candidate'));
   if(isDraining())return reply.code(503).send(runtimeDrainingBody(req));
-  const body=req.body||{},id=String(body.sessionId||crypto.randomUUID()),cwd=String(body.cwd||DEFAULT_WORKDIR),profile=validateAntigravityProfile(body.profile,body.accountId),opts=turnOptions(body),now=Date.now();
-  await db.run(`INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_metadata,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json)
-    VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'antigravity',?9,?7,?2,NULL,'antigravity',NULL,NULL,0,NULL,?10,?9,?9,?9,?9,?9,?9,?11)
-    ON CONFLICT(id) DO UPDATE SET provider_id='antigravity',provider='antigravity',project_dir=excluded.project_dir,updated_at=excluded.updated_at`,[id,cwd,cleanTitle(body.title||path.basename(cwd),cwd),opts.permissionMode,opts.approvalPolicy,opts.sandboxMode,opts.model||null,now,profile.id,JSON.stringify(antigravityMetadata(null,{profileId:profile.id})),JSON.stringify(body.accountSnapshot||null)]);
-  await appendEvent(id,'antigravity/session_created',{provider:'antigravity',profileId:profile.id,cwd});
-  return{session:await getSession(id),providerSessionId:null};
+  const body=req.body||{},id=String(body.sessionId||crypto.randomUUID());
+  return antigravitySessionQueue.run(id,async()=>({session:await ensureAntigravityRuntimeSession(id,body),providerSessionId:(await getSession(id))?.provider_session_id||null}));
 });
 
 app.post('/claude/sessions', async (req:any, reply) => {
@@ -750,8 +748,7 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
     const turnId=String(body.turnId||body.clientMessageId||crypto.randomUUID());
     const claim=await db.run("UPDATE sessions SET status=?1,active_turn_id=?2,selected_profile_id=?3,executing_profile_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5 AND active_turn_id IS NULL AND status NOT IN ('running','planning','output_draining')",[body.planMode==='plan'?'planning':'running',turnId,profile.id,Date.now(),session.id]);
     if(!claim.changes)return reply.code(409).send({error:'antigravity_turn_already_running'});
-    await appendEvent(session.id,'user',{input,clientMessageId:String(body.clientMessageId||''),provider:'antigravity',profileId:profile.id});
-    void runAntigravityRuntimeTurn(session,{...body,text,turnId,profile}).catch(e=>app.log.warn({provider:'antigravity',sessionId:session.id,error:safeAntigravitySummary(e?.message||String(e))},'antigravity runtime turn failed'));
+    void runAntigravityRuntimeTurn(session,{...body,input,text,turnId,profile}).catch(e=>app.log.warn({provider:'antigravity',sessionId:session.id,error:safeAntigravitySummary(e?.message||String(e))},'antigravity runtime turn failed'));
     return{ok:true,provider:'antigravity',turn:{id:turnId}};
   }
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
@@ -904,8 +901,8 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
   if (!session) return reply.code(404).send({ error:'not found' });
   if(session.provider_id==='antigravity'||session.provider==='antigravity'){
     const active=antigravityTurns.get(session.id);if(!active)return{ok:true,alreadyStopped:true};
-    active.interrupted=true;try{process.kill(-active.child.pid!,'SIGTERM');}catch{try{active.child.kill('SIGTERM');}catch{}}
-    return{ok:true,interrupted:true};
+    active.interrupted=true;await terminateAntigravityProcess(active.child,Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000));await active.done;
+    return{ok:true,interrupted:true,processExited:true};
   }
   if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || 'default'))).cancel(session.id);
   if (session.provider_id === 'claude' || session.provider === 'claude') return claudeManager.cancel(session.id);
@@ -962,6 +959,21 @@ function validateClaudeProfileForRuntime(raw:any, fallbackId?:any): ClaudeProfil
 }
 
 type AntigravityRuntimeProfile={id:string;homeDir:string};
+async function ensureAntigravityRuntimeSession(id:string,body:any){
+  const existing=await getSession(id),cwd=String(body.cwd||existing?.project_dir||DEFAULT_WORKDIR),profile=validateAntigravityProfile(body.profile,body.accountId||existing?.account_id),opts=turnOptions({...existing,...body}),now=Date.now();
+  const supplied=String(body.providerSessionId||'');
+  const upstream=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(supplied)&&supplied!==id?supplied:null;
+  await db.run(`INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_metadata,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json)
+    VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'antigravity',?9,?7,?2,?10,'antigravity',?10,NULL,0,NULL,?11,?9,?9,?9,?9,?9,?9,?12)
+    ON CONFLICT(id) DO UPDATE SET provider_id='antigravity',provider='antigravity',project_dir=excluded.project_dir,account_id=excluded.account_id,model=COALESCE(sessions.model,excluded.model),model_id=COALESCE(sessions.model_id,excluded.model_id),provider_session_id=CASE WHEN sessions.provider_session_id=sessions.id THEN excluded.provider_session_id ELSE COALESCE(sessions.provider_session_id,excluded.provider_session_id) END,upstream_thread_id=CASE WHEN sessions.upstream_thread_id=sessions.id THEN excluded.upstream_thread_id ELSE COALESCE(sessions.upstream_thread_id,excluded.upstream_thread_id) END,updated_at=excluded.updated_at`,[id,cwd,cleanTitle(body.title||existing?.title||path.basename(cwd),cwd),opts.permissionMode,opts.approvalPolicy,opts.sandboxMode,opts.model||null,Number(body.createdAt||existing?.created_at||now),profile.id,upstream,JSON.stringify(antigravityMetadata(existing?.provider_metadata,{profileId:profile.id,legacyImported:!!body.legacyHistory})),JSON.stringify(body.accountSnapshot||null)]);
+  const imported=await db.get("SELECT 1 AS ok FROM events WHERE session_id=?1 AND event_type='antigravity/history_imported' LIMIT 1",[id]);
+  if(!imported?.ok&&Array.isArray(body.legacyHistory)){
+    for(const entry of body.legacyHistory){const role=entry?.role==='assistant'?'assistant':'user',text=String(entry?.text||'').trim();if(!text)continue;const item={id:`legacy-${String(entry.id||crypto.randomUUID())}`,type:role==='assistant'?'agentMessage':'userMessage',text,content:role==='user'?[{type:'text',text}]:undefined,phase:role==='assistant'?'final_answer':undefined};await appendEvent(id,'item/completed',{method:'item/completed',params:{item}});}
+    await appendEvent(id,'antigravity/history_imported',{provider:'antigravity',count:body.legacyHistory.length});
+  }
+  if(!existing)await appendEvent(id,'antigravity/session_created',{provider:'antigravity',profileId:profile.id,cwd,legacyImported:!!body.legacyHistory});
+  return getSession(id);
+}
 function validateAntigravityProfile(raw:any,fallbackId?:any):AntigravityRuntimeProfile{
   const id=String(raw?.id||fallbackId||'').trim(),homeDir=String(raw?.homeDir||raw?.home_dir||'').trim();
   if(!/^[a-f0-9]{16}$/i.test(id)&&id!=='default')throw new Error('bad Antigravity profile id');
@@ -975,35 +987,45 @@ function validateAntigravityProfile(raw:any,fallbackId?:any):AntigravityRuntimeP
 async function antigravityRecoveryText(session:RuntimeSession){
   const rows=await db.all("SELECT event_type,payload_json FROM events WHERE session_id=?1 AND event_type IN ('user','item/completed') AND sequence < (SELECT COALESCE(MAX(sequence),0) FROM events WHERE session_id=?1) ORDER BY sequence DESC LIMIT 30",[session.id]);
   const visible:string[]=[];
-  for(const row of rows.reverse())try{const p=JSON.parse(String(row.payload_json||'{}'));if(row.event_type==='user'){const t=visibleInputText(p.input);if(t)visible.push(`User: ${t}`);}else{const item=p?.params?.item||p?.item;if(item?.type==='agentMessage'&&item?.text)visible.push(`Assistant: ${String(item.text)}`);}}catch{}
+  for(const row of rows.reverse())try{const p=JSON.parse(String(row.payload_json||'{}'));if(row.event_type==='user'){const t=visibleInputText(p.input);if(t)visible.push(`User: ${t}`);}else{const item=p?.params?.item||p?.item;if(item?.type==='agentMessage'&&item?.text)visible.push(`Assistant: ${String(item.text)}`);if(item?.type==='userMessage'){const t=String(item.text||item.content?.map((x:any)=>x?.text||'').join('\n')||'').trim();if(t)visible.push(`User: ${t}`);}}}catch{}
   return `${RECOVERY_CONTEXT_MARKER}\nThe upstream Antigravity conversation could not be resumed. Continue using this visible AgentDeck history; do not repeat it verbatim.\n${visible.slice(-20).join('\n\n')}\n[[/AGENT_RUNTIME_RECOVERY_CONTEXT]]`;
 }
 
 async function runAntigravityRuntimeTurn(session:RuntimeSession,body:any){
-  const profile=body.profile as AntigravityRuntimeProfile,turnId=String(body.turnId),itemId=stableAntigravityAssistantId(session.id,turnId);
-  const boundProfile=String(session.upstream_binding_profile_id||session.current_upstream_account_id||session.account_id||''),requested=String(session.provider_session_id||session.upstream_thread_id||'')||null;
-  const prior=await db.get("SELECT COUNT(*) AS count FROM events WHERE session_id=?1 AND event_type='item/completed'",[session.id]);
-  const profileSwitched=!!boundProfile&&boundProfile!==profile.id,missing=!!requested&&!antigravityConversationExists(profile.homeDir,requested),bindingLost=!requested&&Number(prior?.count||0)>0;
-  const rebuild=profileSwitched||missing||bindingLost;
-  const prompt=rebuild?`${await antigravityRecoveryText(session)}\n\nCurrent user message:\n${body.text}`:String(body.text);
-  if(rebuild)await appendEvent(session.id,'system',{provider:'antigravity',text:'上游会话已重建，部分 Provider 隐藏状态可能丢失。',reason:profileSwitched?'profile_changed':bindingLost?'binding_missing':'conversation_missing'});
-  const logDir=path.join(DATA_DIR,'runtime','antigravity-logs',profile.id);await mkdir(logDir,{recursive:true});const logFile=path.join(logDir,`${session.id}-${turnId}.log`);
-  const args=buildAntigravityArgs({prompt,model:body.model||session.model,mode:body.planMode==='plan'?'plan':'accept-edits',yolo:String(body.permissionMode||session.permission_mode)==='yolo',conversationId:rebuild?null:requested,logFile,printTimeout:String(process.env.ANTIGRAVITY_PRINT_TIMEOUT||'2h')});
-  const env={...process.env,HOME:profile.homeDir,XDG_CONFIG_HOME:path.join(profile.homeDir,'.config'),XDG_CACHE_HOME:path.join(profile.homeDir,'.cache')};
-  const child=spawn(process.env.ANTIGRAVITY_BIN||'agy',args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});
-  const active={child,turnId,interrupted:false};antigravityTurns.set(session.id,active);
-  await appendEvent(session.id,'turn/start',{result:{turn:{id:turnId,status:'inProgress'}},provider:'antigravity'});
-  let observed:string|null=null;
-  const persistObserved=async()=>{if(observed)return;const log=await readFile(logFile,'utf8').catch(()=>'');observed=parseAntigravityConversation(log);if(observed)await db.run('UPDATE sessions SET provider_session_id=?1,upstream_thread_id=?1,provider_metadata=?2,upstream_binding_profile_id=?3,current_upstream_account_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5',[observed,JSON.stringify(antigravityMetadata(session.provider_metadata,{profileId:profile.id,cliVersion:'1.1.2',conversationId:observed,recoveryGeneration:Number((antigravityMetadata(session.provider_metadata) as any).recoveryGeneration||0)+(rebuild?1:0)})),profile.id,Date.now(),session.id]);};
+  const profile=body.profile as AntigravityRuntimeProfile,turnId=String(body.turnId),itemId=stableAntigravityAssistantId(session.id,turnId);let logFile='',child:ChildProcess|null=null,active:ActiveAntigravityTurn|null=null,observed:string|null=null,rebuild=false,terminal=false;let resolveDone!:()=>void;const done=new Promise<void>(resolve=>{resolveDone=resolve;});
+  const persistObserved=async()=>{if(observed||!logFile)return;const log=await readFile(logFile,'utf8').catch(()=>'');observed=parseAntigravityConversation(log);if(observed)await db.run('UPDATE sessions SET provider_session_id=?1,upstream_thread_id=?1,provider_metadata=?2,upstream_binding_profile_id=?3,current_upstream_account_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5',[observed,JSON.stringify(antigravityMetadata(session.provider_metadata,{profileId:profile.id,cliVersion:'1.1.2',conversationId:observed,recoveryGeneration:Number((antigravityMetadata(session.provider_metadata) as any).recoveryGeneration||0)+(rebuild?1:0)})),profile.id,Date.now(),session.id]);};
+  const fail=async(error:any,interrupted=false)=>{if(terminal)return;terminal=true;const message=safeAntigravitySummary(error?.message||String(error));await db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=?2,updated_at=?3 WHERE id=?4',[interrupted?'interrupted':'failed',interrupted?'manual_stop':'antigravity_turn_failed',Date.now(),session.id]);await appendEvent(session.id,interrupted?'turn/interrupted':'turn/failed',{method:interrupted?'turn/interrupted':'turn/failed',clientMessageId:String(body.clientMessageId||''),params:{turn:{id:turnId,status:interrupted?'interrupted':'failed'},error:{message}}});};
   try{
+    await appendEvent(session.id,'user',{input:body.input,clientMessageId:String(body.clientMessageId||''),provider:'antigravity',profileId:profile.id});
+    const boundProfile=String(session.upstream_binding_profile_id||session.current_upstream_account_id||session.account_id||''),requested=String(session.provider_session_id||session.upstream_thread_id||'')||null;
+    const prior=await db.get("SELECT COUNT(*) AS count FROM events WHERE session_id=?1 AND event_type='item/completed'",[session.id]);
+    const profileSwitched=!!boundProfile&&boundProfile!==profile.id,missing=!!requested&&!antigravityConversationExists(profile.homeDir,requested),bindingLost=!requested&&Number(prior?.count||0)>0;
+    rebuild=profileSwitched||missing||bindingLost;const prompt=rebuild?`${await antigravityRecoveryText(session)}\n\nCurrent user message:\n${body.text}`:String(body.text);
+    if(rebuild)await appendEvent(session.id,'system',{provider:'antigravity',text:'上游会话已重建，部分 Provider 隐藏状态可能丢失。',reason:profileSwitched?'profile_changed':bindingLost?'binding_missing':'conversation_missing'});
+    const attachments=validateAntigravityRuntimeAttachments(session.id,body.attachments);const logDir=path.join(DATA_DIR,'runtime','antigravity-logs',profile.id);await mkdir(logDir,{recursive:true});logFile=path.join(logDir,`${crypto.createHash('sha256').update(`${session.id}:${turnId}`).digest('hex')}.log`);
+    const plan=body.planMode==='plan',args=buildAntigravityArgs({prompt,model:body.model||session.model,mode:plan?'plan':'accept-edits',yolo:!plan&&String(body.permissionMode||session.permission_mode)==='yolo',conversationId:rebuild?null:requested,logFile,printTimeout:String(process.env.ANTIGRAVITY_PRINT_TIMEOUT||'2h'),addDirs:attachments.map(item=>path.dirname(item.path))});
+    const binary=await resolveAntigravityBinary({configured:process.env.ANTIGRAVITY_BIN,dataDir:DATA_DIR,homeDir:DEFAULT_HOME,pathEnv:process.env.PATH}),env={...process.env,HOME:profile.homeDir,XDG_CONFIG_HOME:path.join(profile.homeDir,'.config'),XDG_CACHE_HOME:path.join(profile.homeDir,'.cache')};
+    child=spawn(binary,args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});active={child,turnId,interrupted:false,done};antigravityTurns.set(session.id,active);
+    await appendEvent(session.id,'turn/start',{result:{turn:{id:turnId,status:'inProgress'}},provider:'antigravity'});
     const result=await runAntigravityChild(child,{timeoutMs:Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS||DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS),cleanOutput:cleanRuntimeAgentOutput,onDelta:delta=>{if(delta)void appendEvent(session.id,'item/agentMessage/delta',{method:'item/agentMessage/delta',params:{itemId,delta}});void persistObserved().catch(()=>{});},onState:state=>{if(state==='output_draining')void db.run('UPDATE sessions SET status=?1,updated_at=?2 WHERE id=?3',['output_draining',Date.now(),session.id]);}});
     await persistObserved();
     if(!observed)throw new Error('Antigravity conversation ID was not recorded');
     if(requested&&!rebuild&&observed!==requested){await db.run('UPDATE sessions SET provider_session_id=NULL,upstream_thread_id=NULL,interruption_reason=?1 WHERE id=?2',['antigravity_resume_mismatch',session.id]);throw new Error('Antigravity did not resume the requested conversation; refusing silent fallback');}
     await flushDeltaEvents(session.id);await appendEvent(session.id,'item/completed',{method:'item/completed',params:{item:{id:itemId,type:'agentMessage',text:result.output,phase:'final_answer'}}});
-    await db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=NULL,updated_at=?2 WHERE id=?3',['idle',Date.now(),session.id]);await appendEvent(session.id,'turn/completed',{method:'turn/completed',params:{turn:{id:turnId,status:'completed'}}});
-  }catch(e:any){const interrupted=active.interrupted;await persistObserved().catch(()=>{});await db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=?2,updated_at=?3 WHERE id=?4',[interrupted?'interrupted':'failed',interrupted?'manual_stop':'antigravity_turn_failed',Date.now(),session.id]);await appendEvent(session.id,interrupted?'turn/interrupted':'turn/failed',{method:interrupted?'turn/interrupted':'turn/failed',clientMessageId:String(body.clientMessageId||''),params:{turn:{id:turnId,status:interrupted?'interrupted':'failed'},error:{message:safeAntigravitySummary(e?.message||String(e))}}});throw e;
-  }finally{antigravityTurns.delete(session.id);await rm(logFile,{force:true}).catch(()=>{});}
+    await db.run('UPDATE sessions SET status=?1,active_turn_id=NULL,interruption_reason=NULL,updated_at=?2 WHERE id=?3',['idle',Date.now(),session.id]);await appendEvent(session.id,'turn/completed',{method:'turn/completed',params:{turn:{id:turnId,status:'completed'}}});terminal=true;
+  }catch(e:any){await persistObserved().catch(()=>{});if(child&&child.exitCode===null&&child.signalCode===null)await terminateAntigravityProcess(child,1000).catch(()=>{});await fail(e,!!active?.interrupted);throw e;
+  }finally{if(active&&antigravityTurns.get(session.id)===active)antigravityTurns.delete(session.id);if(logFile)await rm(logFile,{force:true}).catch(()=>{});resolveDone();}
+}
+
+function validateAntigravityRuntimeAttachments(sessionId:string,raw:any){const items=Array.isArray(raw)?raw:[];if(!items.length)return[];const root=realpathSync(path.join(DATA_DIR,'attachments',sessionId));return items.map((item:any)=>{const rp=realpathSync(String(item?.path||''));if(!rp.startsWith(root+path.sep)||!existsSync(rp))throw new Error('invalid Antigravity attachment path');return{...item,path:rp};});}
+async function terminateAntigravityProcess(child:ChildProcess,graceMs=5000){
+  if(child.exitCode!==null||child.signalCode!==null)return;
+  let resolveClosed!:()=>void;const closed=new Promise<void>(resolve=>{resolveClosed=resolve;});const onExit=()=>resolveClosed();child.once('close',onExit);child.once('exit',onExit);
+  if(child.exitCode!==null||child.signalCode!==null){resolveClosed();await closed;return;}
+  try{process.kill(-child.pid!,'SIGTERM');}catch{try{child.kill('SIGTERM');}catch{}}
+  if(await Promise.race([closed.then(()=>true),new Promise<false>(resolve=>setTimeout(()=>resolve(false),graceMs))]))return;
+  try{process.kill(-child.pid!,'SIGKILL');}catch{try{child.kill('SIGKILL');}catch{}}
+  await closed;
 }
 
 function cleanRuntimeAgentOutput(text:string){return String(text||'').replace(/\x1B\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,'').trim();}
