@@ -27,7 +27,7 @@ const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
 const browserOutbox=new BrowserOutbox();
 const sessionSendModeKey=(sessionId:string)=>`agentdeck:sendMode:${sessionId}`;
 const pendingTaskModeKey=(sessionId:string)=>`agentdeck:pendingTaskMode:${sessionId}`;
-const PROVIDER_ORDER:ProviderId[] = ['codex','claude','antigravity','gemini'];
+const PROVIDER_ORDER:ProviderId[] = ['codex','claude','antigravity'];
 const ToastContext = createContext<(kind:Toast['kind'], text:string)=>void>(()=>{});
 function haptic(){ navigator.vibrate?.(10); }
 function isMobileInput(){ return matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent); }

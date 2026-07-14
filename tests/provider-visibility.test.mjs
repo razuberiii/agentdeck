@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import { normalizeProvider, providerStatusArray, VISIBLE_PROVIDER_ORDER } from '../server/dist/provider-registry.js';
+test('Gemini is hidden from selectable providers while legacy identity remains readable',()=>{assert.equal(normalizeProvider('gemini'),'gemini');assert.equal(VISIBLE_PROVIDER_ORDER.includes('gemini'),false);const statuses={codex:{id:'codex'},claude:{id:'claude'},antigravity:{id:'antigravity'},gemini:{id:'gemini'}};assert.deepEqual(providerStatusArray(statuses).map(x=>x.id),['codex','claude','antigravity']);});

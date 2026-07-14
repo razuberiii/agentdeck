@@ -35,7 +35,7 @@ import { claudeProfileEnv, claudeSafeEnvSummary } from './claude/claude-profile-
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
 import { artifactContentChanged, buildArtifactManifest, isArtifactTestAssetPath } from './artifact-manifest.js';
-import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, type AgentProviderId } from './provider-registry.js';
+import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, VISIBLE_PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, visibleProvider, type AgentProviderId } from './provider-registry.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
 import { resolveCodexProfileMetadataFromAuth } from './codex-profile-metadata.js';
@@ -218,6 +218,7 @@ let geminiStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } =
 let claudeStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } = { expiresAt: 0 };
 let unifiedProviderStatusCache: { expiresAt:number; promise?:Promise<Record<AgentProviderId, ProviderStatus>>; value?:Record<AgentProviderId, ProviderStatus>; generation:number } = { expiresAt: 0, generation: 0 };
 let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any>; value?:any } = { key:'', expiresAt: 0 };
+const antigravityUsageCache=new Map<string,{expiresAt:number;value:string|null;promise?:Promise<string|null>}>();
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
 await db.init();
@@ -639,14 +640,14 @@ app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
     light ? Promise.resolve(cachedUnifiedProviderStatusesSnapshot()) : unifiedProviderStatuses(force),
     syncAntigravityProfilesFromDisk().catch(()=>{}),
   ]);
-  return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]), providerInstallers:providerInstallerSummaries(), providerInstallJobs:providerInstallJobSummaries() };
+  return { settings, profiles, pendingProfiles, activeProfile, claudeProfiles, activeClaudeProfile, geminiProfiles, geminiPendingProfiles, activeGeminiProfile, antigravityProfiles, activeAntigravityProfile, codex: codexStatus, claude: claudeStatus, gemini:{...geminiStatus,runtime:geminiRuntime}, antigravity: antigravityStatus, providers: providerStatusArray(providerStatuses), providerStatus: providerStatuses, providerDefinitions: VISIBLE_PROVIDER_ORDER.map(id => PROVIDER_DEFINITIONS[id]), providerInstallers:providerInstallerSummaries(), providerInstallJobs:providerInstallJobSummaries() };
 });
 app.patch('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const provider = normalizeProvider(req.body?.activeProvider);
   // Selecting an agent does not change CLI or account health. Keep the warm
   // provider snapshot so this interaction stays instant instead of probing all
   // four CLIs again (Gemini alone can take several seconds to answer).
-  if (provider) await setSetting('activeProvider', provider);
+  if (provider&&visibleProvider(provider)) await setSetting('activeProvider', provider);
   const mode = normalizeMode(req.body?.defaultMode);
   if (mode) await setSetting('defaultMode', mode);
   if (Object.prototype.hasOwnProperty.call(req.body || {}, 'defaultModel')) {
@@ -1256,6 +1257,7 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     });
   }
   if (provider === 'antigravity') {
+    if(!USE_AGENT_RUNTIME)return reply.code(409).send({error:'Antigravity 需要 persistent runtime'});
     const status = await cachedAntigravityStatus();
     if (!status.ok) return reply.code(409).send({error:'Antigravity CLI 不可用，不能创建 Antigravity 会话'});
     const activeProfile:any = await getActiveAntigravityProfile();
@@ -1265,12 +1267,13 @@ app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => 
     const id = crypto.randomUUID();
     const now = Date.now();
     const model = cleanAgentModel(req.body?.model) || cleanAgentModel(settings.defaultModels?.antigravity) || null;
-    const fields = modeFields(mode);
+    const fields = modeFields(mode),snapshot={id:String(activeProfile.id),name:String(activeProfile.name||'Antigravity Account')};
+    const created=await runtime.createAntigravitySession({sessionId:id,accountId:activeProfile.id,profile:{id:activeProfile.id,homeDir:activeProfile.home_dir},accountSnapshot:snapshot,cwd:projectDir,title,mode,model,approvalPolicy:fields.approval_policy,sandboxMode:fields.sandbox_mode});
     await db.run(
-      'INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?9,?10,?11,?8,?2,?1)',
-      [id, projectDir, title, 'idle', fields.permission_mode, fields.approval_policy, fields.sandbox_mode, model, now, 'antigravity', activeProfile.id]
+      'INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,0,?9,?9,?10,?11,?8,?2,NULL,?11,?11,?11,?11,?11,?11,?12)',
+      [id, projectDir, title, 'idle', fields.permission_mode, fields.approval_policy, fields.sandbox_mode, model, now, 'antigravity', activeProfile.id,JSON.stringify(snapshot)]
     );
-    return rowSessionDto(await findSession(id));
+    return rowSessionDto(created.session||await findSession(id));
   }
   if (provider === 'gemini') {
     if (!USE_AGENT_RUNTIME) return reply.code(409).send({error:'Gemini ACP 需要 persistent runtime'});
@@ -2078,7 +2081,7 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
   const geminiMessage = !geminiCli?.ok ? (geminiCli?.error || 'Gemini CLI 不可用') : !USE_AGENT_RUNTIME ? 'Gemini ACP 需要 persistent runtime' : geminiPersonalUnsupported ? geminiPersonalUnsupportedMessage() : geminiAuth === 'authenticated' ? null : geminiAuth === 'authenticating' ? 'Gemini 正在登录' : '请先登录 Gemini';
   const antigravityEmail = findEmailInText(String(antigravityProfile?.login?.email || antigravityProfile?.name || '')) || undefined;
   const antigravityAuth = antigravityProfile?.id ? 'unknown' : 'unauthenticated';
-  const antigravityCanCreate = !!antigravityCli?.ok && !!antigravityProfile?.id && !!antigravityProfile?.login?.ok;
+  const antigravityCanCreate = USE_AGENT_RUNTIME && !!antigravityCli?.ok && !!antigravityProfile?.id && !!antigravityProfile?.login?.ok;
   const claudeState = claudeAuthState(claudeProfile ? {
     id:String(claudeProfile.id),
     name:String(claudeProfile.name || 'Claude Code Account'),
@@ -2170,9 +2173,9 @@ async function buildUnifiedProviderStatuses(force = false):Promise<Record<AgentP
       canContinueSession: antigravityCanCreate,
       canManageAccounts: true,
       canLogout: false,
-      canQueryQuota: false,
+      canQueryQuota: true,
       canListModels: !!antigravityCli?.ok && !!antigravityProfile?.id,
-      canSelectModel: false,
+      canSelectModel: !!antigravityCli?.ok,
       capabilities: adapterCapabilities.antigravity,
       reasonCode: !antigravityCli?.ok ? 'antigravity_unavailable' : antigravityProfile?.id ? 'antigravity_auth_unknown' : 'antigravity_not_logged_in',
       message: !antigravityCli?.ok ? (antigravityCli?.error || 'Antigravity CLI 不可用') : antigravityProfile?.id ? 'Antigravity 登录状态无法可靠探测' : '请先添加 Antigravity 账户',
@@ -2198,7 +2201,7 @@ function providerInstallerSummary(provider:AgentProviderId) {
   };
 }
 function providerInstallerSummaries() {
-  return Object.fromEntries(PROVIDER_ORDER.map(provider => [provider, providerInstallerSummary(provider)]));
+  return Object.fromEntries(VISIBLE_PROVIDER_ORDER.map(provider => [provider, providerInstallerSummary(provider)]));
 }
 function providerInstallJobSummary(job:ProviderInstallJob) {
   return {
@@ -2687,7 +2690,7 @@ async function copyDirContents(from:string, to:string) {
 async function appSettings() {
   const rows = await db.all('SELECT key,value FROM settings');
   const map = Object.fromEntries(rows.map((r:any)=>[r.key, r.value]));
-  const activeProvider = normalizeProvider(map.activeProvider) || 'codex';
+  const storedProvider=normalizeProvider(map.activeProvider);const activeProvider=storedProvider&&visibleProvider(storedProvider)?storedProvider:'codex';
   const legacyCodexModel = cleanModel(map.defaultModel) || '';
   const legacyAntigravityModel = legacyCodexModel ? '' : (cleanAgentModel(map.defaultModel) || '');
   const geminiDefault = await activeGeminiDefaultModel();
@@ -3834,6 +3837,11 @@ async function antigravityProfileName(homeDir:string) {
   return await scanEmail(path.join(homeDir, '.gemini')).catch(()=>null) || 'Antigravity Account';
 }
 function antigravityUsage(homeDir:string): Promise<string|null> {
+  const cached=antigravityUsageCache.get(homeDir);if(cached&&cached.expiresAt>Date.now()){if(cached.promise)return cached.promise;return Promise.resolve(cached.value);}
+  const promise=readAntigravityUsage(homeDir).then(value=>{antigravityUsageCache.set(homeDir,{value,expiresAt:Date.now()+(value?5*60_000:60_000)});return value;}).catch(error=>{antigravityUsageCache.delete(homeDir);throw error;});
+  antigravityUsageCache.set(homeDir,{value:null,promise,expiresAt:Date.now()+15_000});return promise;
+}
+function readAntigravityUsage(homeDir:string): Promise<string|null> {
   return new Promise((resolve) => {
     let output = '';
     let sent = false;
@@ -4723,7 +4731,8 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   const planId = effectivePlanMode === 'plan' ? await createPlanTask(threadId, originalText, row) : '';
   const ack = async (status:string, error?:string) => {
     await updateMessageReceipt(threadId,clientMessageId,status,error);
-    broadcast(threadId, { type:'messageStatus', clientMessageId, status, error });
+    const current=await db.get('SELECT status,error FROM message_receipts WHERE session_id=?1 AND client_message_id=?2',[threadId,clientMessageId]);
+    broadcast(threadId, { type:'messageStatus', clientMessageId, status:String(current?.status||status), error:current?.error||error });
   };
   await ack('received');
   const turnId = clientMessageId || crypto.randomUUID();
@@ -4738,7 +4747,13 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     broadcast(threadId,{type:'sessionTitle',title:generatedTitle});
   }
   if (normalizeProvider(row.provider_id) === 'antigravity') {
-    await sendAntigravityTurn(row, providerText, attachments, turnId, clientMessageId, effectivePlanMode, originalText);
+    if(!USE_AGENT_RUNTIME)throw new Error('Antigravity 需要 persistent runtime');
+    const dto:any=await getActiveAntigravityProfile();if(!dto?.id||!dto?.home_dir)throw new Error('请先登录 Antigravity');
+    const providerInput=await providerInputText(threadId,providerText,attachments),input=[{type:'text',text:providerInput}];
+    const subscription=ensureSessionSubscription(id,threadId);broadcast(threadId,{type:'runtimeConnection',status:runtimeConnectionStatus(subscription),error:subscription.lastError});
+    await saveCanonicalUserMessage(threadId,originalText,attachments,clientMessageId,turnId);broadcast(threadId,{type:'user',clientMessageId,status:'persisted',planMode:effectivePlanMode,text:originalText,attachments:attachments.map((a:any)=>({id:String(a.id),name:String(a.name||'attachment'),type:String(a.type||''),url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}`}))});await ack('persisted');
+    await recordArtifactBaseline(threadId,String(row.project_dir),turnId).catch(()=>{});activeRuntimeProviderSessions.add(threadId);
+    await runtime.startTurn(threadId,{input,text:providerInput,originalText,clientMessageId,turnId,planMode:effectivePlanMode,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),permissionMode:sessionMode(row),model:cleanAgentModel(row.model)||undefined});
     await ack('accepted');
     return;
   }
@@ -4884,9 +4899,9 @@ async function claimMessageReceipt(sessionId:string,clientMessageId:string,retry
   return{created:false,status:String(row?.status||'received'),error:row?.error||null,canonicalClientMessageId:clientMessageId};
 }
 async function updateMessageReceipt(sessionId:string,clientMessageId:string,status:string,error?:string){
-  await db.run('UPDATE message_receipts SET status=?1,error=?2,updated_at=?3 WHERE session_id=?4 AND client_message_id=?5',[status,error||null,Date.now(),sessionId,clientMessageId]);
+  await db.run(`UPDATE message_receipts SET status=?1,error=?2,updated_at=?3 WHERE session_id=?4 AND client_message_id=?5${status==='accepted'?" AND status NOT IN ('failed','cancelled')":''}`,[status,error||null,Date.now(),sessionId,clientMessageId]);
 }
-async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (row && normalizeProvider(row.provider_id) === 'antigravity') { const active = activeAntigravityTurns.get(threadId); if (active) { active.state='interrupted'; try { active.child.kill('SIGTERM'); } catch {} } activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); return; } if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
+async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeRuntimeProviderSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function sendAntigravityTurn(row:any, text:string, attachments:any[] = [], turnId:string = crypto.randomUUID(), clientMessageId = '', planMode:'direct'|'plan' = 'direct', originalText = text) {
   const threadId = String(row.codex_thread_id || row.id);
   const message = String(text || '').trim();
@@ -5208,6 +5223,7 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
     if (shouldBroadcastCodexNotification(msg)) out.push({ type:'codex', method:msg.method, params:msg.params, ...base });
     if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(threadId, String(msg.params.turn.id));
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
+      if(msg.method!=='turn/completed'&&payload?.clientMessageId){const deliveryError=String(msg.params?.error?.message||msg.method);await updateMessageReceipt(threadId,String(payload.clientMessageId),'failed',deliveryError).catch(()=>{});out.push({type:'messageStatus',clientMessageId:String(payload.clientMessageId),status:'failed',error:deliveryError,...base});}
       const artifactTurnId = activeArtifactTurns.get(threadId) || activeTurns.get(threadId) || '';
       activeCodexSessions.delete(threadId);
       activeRuntimeProviderSessions.delete(threadId);

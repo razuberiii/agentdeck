@@ -39,6 +39,7 @@ export type ProviderDefinition = {
   accountManagement: boolean;
   modelSelection: boolean;
   quotaSupport: boolean;
+  visible: boolean;
 };
 
 const supported = (details?: Record<string, any>): ProviderCapability => ({ supported:true, details });
@@ -91,7 +92,7 @@ const claudeCapabilities: ProviderCapabilities = {
 const antigravityCapabilities: ProviderCapabilities = {
   authentication:supported({ methods:['google_oauth'] }),
   accountManagement:supported(),
-  persistentSessions:unsupported('capability_unknown', 'Antigravity 会话持久化能力无法稳定探测'),
+  persistentSessions:supported({source:'cli_conversation_id'}),
   streaming:supported(),
   partialStreaming:supported(),
   toolCalls:supported(),
@@ -100,12 +101,12 @@ const antigravityCapabilities: ProviderCapabilities = {
   cancellation:supported(),
   attachments:supported({ imageInput:true, fileInput:false, fileTransport:'path' }),
   imageInput:supported(),
-  modelSelection:unsupported('model_selection_not_supported', 'Antigravity 当前未接入可选模型设置'),
+  modelSelection:supported({source:'cli_model'}),
   modelDiscovery:supported({ source:'cli_models_or_fallback' }),
-  quota:unsupported('quota_not_supported', 'Antigravity CLI 当前没有稳定的实时额度接口'),
-  sessionResume:unsupported('capability_unknown', 'Antigravity 会话恢复能力无法稳定探测'),
+  quota:supported({source:'interactive_usage',structured:false}),
+  sessionResume:supported({source:'cli_conversation'}),
   sessionFork:unsupported('capability_unknown', 'Antigravity fork 能力无法稳定探测'),
-  crossProfileResume:unsupported('capability_unknown', 'Antigravity 跨账户恢复能力无法稳定探测'),
+  crossProfileResume:supported({rebind:'local_history_context'}),
   workspaceSelection:supported(),
   diffArtifacts:supported(),
 };
@@ -133,12 +134,13 @@ const geminiCapabilities: ProviderCapabilities = {
 };
 
 export const PROVIDER_ORDER: AgentProviderId[] = ['codex', 'claude', 'antigravity', 'gemini'];
+export const VISIBLE_PROVIDER_ORDER: AgentProviderId[] = PROVIDER_ORDER.filter(id => id !== 'gemini');
 
 export const PROVIDER_DEFINITIONS: Record<AgentProviderId, ProviderDefinition> = {
-  codex: { id:'codex', displayName:'Codex', order:0, capabilities:codexCapabilities, accountManagement:true, modelSelection:true, quotaSupport:true },
-  claude: { id:'claude', displayName:'Claude Code', order:1, capabilities:claudeCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false },
-  antigravity: { id:'antigravity', displayName:'Antigravity', order:2, capabilities:antigravityCapabilities, accountManagement:true, modelSelection:false, quotaSupport:false },
-  gemini: { id:'gemini', displayName:'Gemini', order:3, capabilities:geminiCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false },
+  codex: { id:'codex', displayName:'Codex', order:0, capabilities:codexCapabilities, accountManagement:true, modelSelection:true, quotaSupport:true, visible:true },
+  claude: { id:'claude', displayName:'Claude Code', order:1, capabilities:claudeCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false, visible:true },
+  antigravity: { id:'antigravity', displayName:'Antigravity', order:2, capabilities:antigravityCapabilities, accountManagement:true, modelSelection:true, quotaSupport:true, visible:true },
+  gemini: { id:'gemini', displayName:'Gemini', order:3, capabilities:geminiCapabilities, accountManagement:true, modelSelection:true, quotaSupport:false, visible:false },
 };
 
 export function providerDefinition(id: AgentProviderId) {
@@ -150,7 +152,7 @@ export function providerCapabilitiesFor(id: AgentProviderId) {
 }
 export function providerExecutionCapabilitiesFor(id:AgentProviderId):ProviderExecutionCapabilities{
   const capabilities=providerCapabilitiesFor(id);
-  return {canCreateSession:true,canContinueSession:capabilities.sessionResume.supported,supportsResume:capabilities.sessionResume.supported,supportsApprovals:capabilities.approvals.supported,supportsPlanMode:id!=='antigravity',enforcedReadOnly:id==='codex'||id==='gemini',supportsAttachments:capabilities.attachments.supported,supportsModelSwitch:capabilities.modelSelection.supported,supportsAccountSwitch:capabilities.accountManagement.supported,supportsCancellation:capabilities.cancellation.supported};
+  return {canCreateSession:true,canContinueSession:capabilities.sessionResume.supported,supportsResume:capabilities.sessionResume.supported,supportsApprovals:capabilities.approvals.supported,supportsPlanMode:true,enforcedReadOnly:id==='codex'||id==='gemini',supportsAttachments:capabilities.attachments.supported,supportsModelSwitch:capabilities.modelSelection.supported,supportsAccountSwitch:capabilities.accountManagement.supported,supportsCancellation:capabilities.cancellation.supported};
 }
 
 export function providerDisplayName(id: AgentProviderId) {
@@ -158,8 +160,10 @@ export function providerDisplayName(id: AgentProviderId) {
 }
 
 export function providerStatusArray<T extends { id: AgentProviderId }>(statuses: Record<AgentProviderId, T>) {
-  return PROVIDER_ORDER.map(id => statuses[id]).filter(Boolean);
+  return VISIBLE_PROVIDER_ORDER.map(id => statuses[id]).filter(Boolean);
 }
+
+export function visibleProvider(id:AgentProviderId) { return providerDefinition(id).visible; }
 
 export function normalizeProvider(value: any): AgentProviderId | null {
   const v = String(value || '');
