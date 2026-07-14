@@ -32,6 +32,10 @@ export type ClaudeTurnInput = {
   resume?: string | null;
   profile: ClaudeProfile;
   turnId: string;
+  segmentId: string;
+  clientMessageId: string;
+  messageId: string;
+  retryOf: string;
 };
 
 export type ClaudeCanonicalEvent =

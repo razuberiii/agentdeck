@@ -20,7 +20,7 @@ type PendingApproval = {
 };
 
 export class ClaudeRuntimeManager {
-  private active = new Map<string, { controller: AbortController; profileId: string; turnId: string }>();
+  private active = new Map<string,{controller:AbortController;profileId:string;turnId:string;segmentId:string;clientMessageId:string;messageId:string;retryOf:string}>();
   private approvals = new Map<string, PendingApproval>();
 
   constructor(
@@ -39,10 +39,10 @@ export class ClaudeRuntimeManager {
   async startTurn(input: ClaudeTurnInput) {
     if (this.active.has(input.localSessionId)) throw new Error('Claude turn already running');
     const controller = new AbortController();
-    this.active.set(input.localSessionId, { controller, profileId:input.profile.id, turnId:input.turnId });
+    this.active.set(input.localSessionId,{controller,profileId:input.profile.id,turnId:input.turnId,segmentId:input.segmentId,clientMessageId:input.clientMessageId,messageId:input.messageId,retryOf:input.retryOf});
     try {
       await this.options.updateSession(input.localSessionId, { status:'running', active_turn_id:input.turnId, executing_profile_id:input.profile.id, current_upstream_account_id:input.profile.id, last_execution_account_id:input.profile.id, updated_at:Date.now() });
-      await this.options.appendEvent(input.localSessionId, 'turn/started', { provider:'claude', turnId:input.turnId, profileId:input.profile.id });
+      await this.options.appendEvent(input.localSessionId,'turn/started',{provider:'claude',turnId:input.turnId,segmentId:input.segmentId,clientMessageId:input.clientMessageId,messageId:input.messageId,retryOf:input.retryOf,profileId:input.profile.id});
       const env = await this.profileStore.readEnv(input.profile);
       const runtimeEnv = claudeProfileEnv(input.profile, env);
       const prompt = this.prompt(input);
@@ -72,7 +72,7 @@ export class ClaudeRuntimeManager {
           });
         }
         for (const event of mapClaudeSdkMessage(message as any)) {
-          if (event) await this.options.appendEvent(input.localSessionId, event.eventType, event.payload);
+          if(event)await this.options.appendEvent(input.localSessionId,event.eventType,{...event.payload,turnId:input.turnId,segmentId:input.segmentId,clientMessageId:input.clientMessageId,messageId:input.messageId,retryOf:input.retryOf});
         }
       }
       await this.options.updateSession(input.localSessionId, { status:'idle', active_turn_id:null, interruption_reason:null, updated_at:Date.now() });
@@ -81,7 +81,7 @@ export class ClaudeRuntimeManager {
       const message = redactClaudeText(e?.message || String(e));
       await Promise.allSettled([
         this.options.updateSession(input.localSessionId, { status:'interrupted', active_turn_id:null, interruption_reason:aborted ? 'manual_stop' : 'claude_turn_failed', updated_at:Date.now() }),
-        this.options.appendEvent(input.localSessionId, aborted ? 'turn/interrupted' : 'turn/failed', { provider:'claude', turnId:input.turnId, error:{ message }, reason:aborted ? 'manual_stop' : 'claude_turn_failed' }),
+        this.options.appendEvent(input.localSessionId,aborted?'turn/interrupted':'turn/failed',{provider:'claude',turnId:input.turnId,segmentId:input.segmentId,clientMessageId:input.clientMessageId,messageId:input.messageId,retryOf:input.retryOf,error:{message},reason:aborted?'manual_stop':'claude_turn_failed'}),
       ]);
       if (!aborted) throw e;
     } finally {
@@ -105,7 +105,7 @@ export class ClaudeRuntimeManager {
         this.approvals.delete(id);
       }
     }
-    await this.options.appendEvent(sessionId, 'turn/interrupted', { provider:'claude', turnId:running.turnId, reason:'manual_stop' });
+    await this.options.appendEvent(sessionId,'turn/interrupted',{provider:'claude',turnId:running.turnId,segmentId:running.segmentId,clientMessageId:running.clientMessageId,messageId:running.messageId,retryOf:running.retryOf,reason:'manual_stop'});
     return { ok:true, running:true };
   }
 

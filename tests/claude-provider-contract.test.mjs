@@ -85,7 +85,9 @@ test('Claude SDK mapper emits canonical events and redacts before persistence', 
 test('Claude web integration keeps canonical user messages separate from provider attachment paths', () => {
   assert.match(serverSource, /buildClaudeTurnInput\(threadId, text, attachments\)/);
   assert.match(serverSource, /attachment_path/);
-  assert.match(serverSource, /saveCanonicalUserMessage\(threadId, text, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId\(threadId,clientMessageId\)\)/);
+  assert.match(serverSource, /await saveCanonicalUserMessage\(threadId, text, attachments, clientMessageId, turnId,retryOf,messageId\)/);
+  assert.doesNotMatch(serverSource, /saveCanonicalUserMessage\([^;]+\.catch\(\(\)=>\{\}\)/);
+  assert.match(runtimeManagerSource, /turnId:input\.turnId,segmentId:input\.segmentId,clientMessageId:input\.clientMessageId,messageId:input\.messageId,retryOf:input\.retryOf/);
   assert.match(serverSource, /answerClaudeApproval/);
   assert.match(clientSource, /accept_session/);
   assert.match(clientSource, /ClaudeProfileForm/);

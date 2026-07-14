@@ -55,21 +55,24 @@ const ANTIGRAVITY_TERMINAL_JOURNAL_DIR=path.join(DATA_DIR,'runtime','antigravity
 type AntigravityExecutionPhase='claimed'|'preparing'|'spawning'|'running'|'cancelling'|'completed'|'failed'|'interrupted';
 type AntigravityTerminal='completed'|'failed'|'interrupted';
 type AntigravitySpawnState='not_started'|'pending'|'succeeded'|'failed';
+type AntigravityCleanupState='not_required'|'pending'|'running'|'retryable_failed'|'exited';
 type AntigravityTerminalDecision={terminal:AntigravityTerminal;reason:string|null;message:string|null;assistantText:string|null};
 type AntigravityExecution={
   sessionId:string;turnId:string;itemId:string;body:any;phase:AntigravityExecutionPhase;
   child:ChildProcess|null;childClosed:Promise<void>|null;cancelRequested:boolean;
   spawnState:AntigravitySpawnState;spawnOutcome:Promise<AntigravitySpawnState>|null;
-  processGroupId:number|null;processGroupExited:boolean;
+  processGroupId:number|null;processGroupLeaderPid:number|null;processGroupStartTicks:string|null;processGroupExited:boolean;cleanupState:AntigravityCleanupState;cleanupAttempts:number;cleanupError:string|null;
   cancelReason:string|null;terminalDecision:AntigravityTerminalDecision|null;finalizationCommitted:boolean;
   finalizationError:string|null;finalizePromise:Promise<void>|null;terminatePromise:Promise<void>|null;
   timeout:NodeJS.Timeout|null;logFile:string;done:Promise<void>;resolveDone:()=>void;
 };
 const antigravityTurns=new Map<string,AntigravityExecution>();
+const runtimeTurnLineage=new Map<string,{segmentId:string;clientMessageId:string;messageId:string;retryOf:string}>();
 const antigravitySessionQueue=new KeyedSerialQueue();
 let antigravitySessionFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_TERMINAL_SESSION_FAILURES||0:0);
 let antigravityEventFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_TERMINAL_EVENT_FAILURES||0:0);
 let antigravityIntentFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_TERMINAL_INTENT_FAILURES||0:0);
+let antigravityCleanupFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_CLEANUP_FAILURES||0:0);
 function isLoopbackHost(host:string) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
@@ -793,7 +796,7 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
         await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir),String(body.permissionMode || session.permission_mode));
         await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [accountId, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
       }
-      await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || '') });
+      await appendEvent(session.id, 'user', { input,clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),turnId:String(body.turnId||body.localTurnId||''),segmentId:String(body.segmentId||body.clientMessageId||''),retryOf:String(body.retryOf||'') });
       const running = gemini.prompt(session.id, prompt as any[]);
       running.catch(e => app.log.warn({ err:e, sessionId:session.id }, 'gemini prompt failed'));
       return { ok:true, provider:'gemini' };
@@ -814,7 +817,7 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
     if (!text.trim() && !input.length) return reply.code(400).send({ error:'empty message' });
     const turnId = String(body.turnId || crypto.randomUUID());
     await db.run('UPDATE sessions SET selected_profile_id=?1,executing_profile_id=?1,current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [profile.id, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
-    await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || ''), provider:'claude', profileId:profile.id, profileSwitched });
+    await appendEvent(session.id, 'user', { input,clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),turnId,segmentId:String(body.segmentId||body.clientMessageId||turnId),retryOf:String(body.retryOf||''),provider:'claude',profileId:profile.id,profileSwitched });
     if (profileSwitched) await appendEvent(session.id, 'system', { provider:'claude', text:'已切换 Claude Code profile；下一轮使用本地历史在新 profile 下继续。', previousProfileId, profileId:profile.id });
     const permissionMode = claudePermissionMode(body.permissionMode || session.permission_mode);
     const task = claudeManager.startTurn({
@@ -827,6 +830,10 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
       resume:profileSwitched ? null : session.provider_session_id || session.upstream_thread_id || null,
       profile,
       turnId,
+      segmentId:String(body.segmentId||body.clientMessageId||turnId),
+      clientMessageId:String(body.clientMessageId||''),
+      messageId:String(body.messageId||''),
+      retryOf:String(body.retryOf||''),
     });
     task.catch(e => app.log.warn({ provider:'claude', sessionId:session.id, error:e?.message || String(e) }, 'claude turn failed'));
     return { ok:true, provider:'claude' };
@@ -867,6 +874,10 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
   await appendEvent(session.id, 'user', {
     input,
     clientMessageId:String(body.clientMessageId || ''),
+    messageId:String(body.messageId||''),
+    turnId:String(body.turnId||body.localTurnId||''),
+    segmentId:String(body.segmentId||body.clientMessageId||''),
+    retryOf:String(body.retryOf||''),
     selectedProfileId:body.executionContext?.selectedProfileId || accountId,
     executingProfileId:accountId,
     upstreamBindingProfileId:accountId,
@@ -912,8 +923,8 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
     return reply.code(message.includes('thread not found') ? 409 : 500).send({ error:message });
     }
   }
-  if (turn?.turn?.id) await db.run('UPDATE sessions SET active_turn_id=?1, status=?2, updated_at=?3 WHERE id=?4', [String(turn.turn.id), 'running', Date.now(), session.id]);
-  await appendEvent(session.id, 'turn/start', { result:turn, source:'runtime' });
+  if(turn?.turn?.id){const realTurnId=String(turn.turn.id),lineage={segmentId:String(body.segmentId||body.clientMessageId||''),clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),retryOf:String(body.retryOf||'')};runtimeTurnLineage.set(`${session.id}:${realTurnId}`,lineage);await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,updated_at=?3 WHERE id=?4',[realTurnId,'running',Date.now(),session.id]);}
+  await appendEvent(session.id,'turn/start',{result:turn,source:'runtime',clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),segmentId:String(body.segmentId||body.clientMessageId||''),retryOf:String(body.retryOf||'')});
   return { turn };
   })().finally(() => turnAdmission.end());
 });
@@ -925,7 +936,7 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
     const active=antigravityTurns.get(session.id);
     if(!active){
       const intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1',[session.id]);
-      if(intent)try{await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());await rm(antigravityTerminalJournalPath(String(intent.session_id),String(intent.turn_id)),{force:true}).catch(()=>{});const terminal=String(intent.terminal);if(terminal==='completed')return{ok:true,interrupted:false,alreadyCompleted:true,processExited:true,finalizationCommitted:true};if(terminal==='failed')return{ok:true,interrupted:false,alreadyFailed:true,processExited:true,finalizationCommitted:true};return{ok:true,interrupted:true,alreadyStopped:true,processExited:true,finalizationCommitted:true};}catch(error:any){return reply.code(503).send({ok:false,error:'antigravity_terminal_recovery_failed',safeDetail:safeAntigravitySummary(error?.message||String(error)),processExited:false,finalizationCommitted:false});}
+      if(intent)try{await cleanupAntigravityTerminalIntent(intent);const ready=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1',[session.id]);await commitAntigravityTerminalIntent(ready,takeAntigravityTerminalFault());await rm(antigravityTerminalJournalPath(String(intent.session_id),String(intent.turn_id)),{force:true}).catch(()=>{});const terminal=String(intent.terminal);if(terminal==='completed')return{ok:true,interrupted:false,alreadyCompleted:true,processExited:true,finalizationCommitted:true};if(terminal==='failed')return{ok:true,interrupted:false,alreadyFailed:true,processExited:true,finalizationCommitted:true};return{ok:true,interrupted:true,alreadyStopped:true,processExited:true,finalizationCommitted:true};}catch(error:any){return reply.code(503).send({ok:false,error:'antigravity_terminal_recovery_failed',safeDetail:safeAntigravitySummary(error?.message||String(error)),processExited:false,finalizationCommitted:false});}
       if(session.active_turn_id||['running','planning','output_draining'].includes(session.status))return reply.code(409).send({ok:false,error:'antigravity_state_recovery_required',activeTurnId:session.active_turn_id||null});
       if(session.status==='idle')return{ok:true,interrupted:false,alreadyCompleted:true,processExited:true};if(session.status==='failed')return{ok:true,interrupted:false,alreadyFailed:true,processExited:true};if(session.status==='interrupted')return{ok:true,interrupted:true,alreadyStopped:true,processExited:true};return{ok:true,alreadyStopped:true};
     }
@@ -1023,7 +1034,7 @@ async function antigravityRecoveryText(session:RuntimeSession){
 function createAntigravityExecution(sessionId:string,turnId:string,body:any):AntigravityExecution{
   let resolveDone!:()=>void;
   const done=new Promise<void>(resolve=>{resolveDone=resolve;});
-  return{sessionId,turnId,itemId:stableAntigravityAssistantId(sessionId,turnId),body,phase:'claimed',child:null,childClosed:null,cancelRequested:false,spawnState:'not_started',spawnOutcome:null,processGroupId:null,processGroupExited:false,cancelReason:null,terminalDecision:null,finalizationCommitted:false,finalizationError:null,finalizePromise:null,terminatePromise:null,timeout:null,logFile:'',done,resolveDone};
+  return{sessionId,turnId,itemId:stableAntigravityAssistantId(sessionId,turnId),body,phase:'claimed',child:null,childClosed:null,cancelRequested:false,spawnState:'not_started',spawnOutcome:null,processGroupId:null,processGroupLeaderPid:null,processGroupStartTicks:null,processGroupExited:false,cleanupState:'not_required',cleanupAttempts:0,cleanupError:null,cancelReason:null,terminalDecision:null,finalizationCommitted:false,finalizationError:null,finalizePromise:null,terminatePromise:null,timeout:null,logFile:'',done,resolveDone};
 }
 
 class AntigravityCancellation extends Error{}
@@ -1039,6 +1050,7 @@ function antigravityChildClosed(child:ChildProcess){
   return new Promise<void>(resolve=>{let settled=false;const done=()=>{if(settled)return;settled=true;resolve();};child.once('close',done);child.once('error',done);});
 }
 function isAntigravityProcessGroupAlive(pgid:number){try{process.kill(-pgid,0);return true;}catch(error:any){if(error?.code==='ESRCH')return false;if(error?.code==='EPERM')return true;throw error;}}
+function antigravityProcessStartTicks(pid:number){try{const stat=readFileSync(`/proc/${pid}/stat`,'utf8'),close=stat.lastIndexOf(')');if(close<0)return null;return String(stat.slice(close+2).trim().split(/\s+/)[19]||'')||null;}catch{return null;}}
 function signalAntigravityProcessGroup(pgid:number,signal:NodeJS.Signals){try{process.kill(-pgid,signal);return true;}catch(error:any){if(error?.code==='ESRCH')return false;if(error?.code==='EPERM')throw new Error(`Antigravity process group ${pgid} cannot be signalled`);throw error;}}
 async function waitForAntigravityProcessGroupExit(pgid:number,timeoutMs:number){const end=Date.now()+Math.max(0,timeoutMs);do{if(!isAntigravityProcessGroupAlive(pgid))return true;await sleep(20);}while(Date.now()<end);return !isAntigravityProcessGroupAlive(pgid);}
 async function requestAntigravityCancellation(execution:AntigravityExecution,terminal:Exclude<AntigravityTerminal,'completed'>,reason:string){
@@ -1046,17 +1058,18 @@ async function requestAntigravityCancellation(execution:AntigravityExecution,ter
   execution.cancelReason=reason;
   const won=tryClaimAntigravityTerminal(execution,{terminal,reason,message:terminal==='failed'?safeAntigravitySummary(reason):null,assistantText:null});
   if(won)execution.phase='cancelling';
-  if(won&&execution.child)await terminateAntigravityExecution(execution);
   if(won||!execution.finalizationCommitted)await ensureAntigravityFinalization(execution);
   return execution.done;
 }
 async function terminateAntigravityExecution(execution:AntigravityExecution){
+  if(execution.processGroupExited){execution.cleanupState='exited';return;}
   if(execution.terminatePromise)return execution.terminatePromise;
-  execution.terminatePromise=(async()=>{
+  execution.cleanupState='running';execution.cleanupAttempts++;
+  const attempt=(async()=>{
     const child=execution.child;if(!child){execution.processGroupExited=true;return;}
     if(execution.spawnState==='pending'&&execution.spawnOutcome)await execution.spawnOutcome;
     if(execution.spawnState==='failed'&&!execution.processGroupId){await(execution.childClosed||Promise.resolve());execution.processGroupExited=true;return;}
-    const pgid=execution.processGroupId;if(!pgid||pgid<=1)throw new Error('Antigravity process group state is unknown');
+    const pgid=Number(execution.processGroupId);if(!Number.isSafeInteger(pgid)||pgid<=1)throw new Error('Antigravity process group state is unknown');
     const closed=execution.childClosed||antigravityChildClosed(child);
     execution.childClosed=closed;
     const grace=Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000);
@@ -1065,10 +1078,12 @@ async function terminateAntigravityExecution(execution:AntigravityExecution){
     if(!groupExited&&isAntigravityProcessGroupAlive(pgid))signalAntigravityProcessGroup(pgid,'SIGKILL');
     const killed=groupExited||await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_KILL_CONFIRM_MS||5000));
     await Promise.race([closed,sleep(1000)]);
+    if(antigravityCleanupFaults>0){antigravityCleanupFaults--;throw new Error('injected Antigravity process group cleanup failure');}
     if(!killed)throw new Error(`Antigravity process group ${pgid} did not exit`);
     execution.processGroupExited=true;
   })();
-  return execution.terminatePromise;
+  execution.terminatePromise=attempt;
+  try{await attempt;execution.cleanupState='exited';execution.cleanupError=null;}catch(error:any){execution.cleanupState='retryable_failed';execution.cleanupError=safeAntigravitySummary(error?.message||String(error));throw error;}finally{if(execution.cleanupState!=='exited')execution.terminatePromise=null;}
 }
 async function completeAntigravityProcessGroup(execution:AntigravityExecution){
   if(execution.spawnState==='failed'&&!execution.processGroupId){execution.processGroupExited=true;return;}
@@ -1084,26 +1099,27 @@ function tryClaimAntigravityTerminal(execution:AntigravityExecution,decision:Ant
 }
 function antigravityTerminalPayload(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
   const eventType=decision.terminal==='completed'?'turn/completed':decision.terminal==='interrupted'?'turn/interrupted':'turn/failed';
-  return{eventType,payload:{method:eventType,clientMessageId:String(execution.body.clientMessageId||''),reason:decision.reason,params:{turn:{id:execution.turnId,status:decision.terminal},...(decision.message?{error:{message:decision.message}}:{})}}};
+  return{eventType,payload:{method:eventType,clientMessageId:String(execution.body.clientMessageId||''),messageId:String(execution.body.messageId||''),turnId:execution.turnId,segmentId:String(execution.body.segmentId||execution.turnId),retryOf:String(execution.body.retryOf||''),reason:decision.reason,params:{turn:{id:execution.turnId,status:decision.terminal},...(decision.message?{error:{message:decision.message}}:{})}}};
 }
 function takeAntigravityTerminalFault(){if(antigravitySessionFaults>0){antigravitySessionFaults--;return'session_update' as const;}if(antigravityEventFaults>0){antigravityEventFaults--;return'terminal_event' as const;}return undefined;}
-type AntigravityTerminalJournal={schemaVersion:1;sessionId:string;turnId:string;terminal:AntigravityTerminal;reason:string|null;clientMessageId:string;assistantItem:any|null;terminalPayload:any;createdAt:number;checksum:string};
+type AntigravityTerminalJournal={schemaVersion:1|2;sessionId:string;turnId:string;terminal:AntigravityTerminal;reason:string|null;clientMessageId:string;assistantItem:any|null;terminalPayload:any;createdAt:number;cleanupRequired?:boolean;processGroupId?:number|null;processGroupLeaderPid?:number|null;processGroupStartTicks?:string|null;processGroupExited?:boolean;cleanupAttempts?:number;cleanupError?:string|null;checksum:string};
 function antigravityTerminalJournalPath(sessionId:string,turnId:string){return path.join(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,`${crypto.createHash('sha256').update(`${sessionId}:${turnId}`).digest('hex')}.json`);}
 function antigravityJournalChecksum(value:Omit<AntigravityTerminalJournal,'checksum'>){return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');}
 async function writeAntigravityTerminalJournal(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
-  const terminal=antigravityTerminalPayload(execution,decision),assistantItem=decision.terminal==='completed'&&decision.assistantText!==null?{method:'item/completed',turnId:execution.turnId,segmentId:execution.turnId,params:{item:{id:execution.itemId,type:'agentMessage',turnId:execution.turnId,segmentId:execution.turnId,text:decision.assistantText,phase:'final_answer'}}}:null;
-  const value:Omit<AntigravityTerminalJournal,'checksum'>={schemaVersion:1,sessionId:execution.sessionId,turnId:execution.turnId,terminal:decision.terminal,reason:decision.reason,clientMessageId:String(execution.body.clientMessageId||''),assistantItem,terminalPayload:terminal.payload,createdAt:Date.now()};
+  const segmentId=String(execution.body.segmentId||execution.turnId),terminal=antigravityTerminalPayload(execution,decision),assistantItem=decision.terminal==='completed'&&decision.assistantText!==null?{method:'item/completed',turnId:execution.turnId,segmentId,params:{item:{id:execution.itemId,type:'agentMessage',turnId:execution.turnId,segmentId,text:decision.assistantText,phase:'final_answer'}}}:null;
+  const cleanupRequired=!!execution.processGroupId&&!execution.processGroupExited;
+  const value:Omit<AntigravityTerminalJournal,'checksum'>={schemaVersion:2,sessionId:execution.sessionId,turnId:execution.turnId,terminal:decision.terminal,reason:decision.reason,clientMessageId:String(execution.body.clientMessageId||''),assistantItem,terminalPayload:terminal.payload,createdAt:Date.now(),cleanupRequired,processGroupId:execution.processGroupId,processGroupLeaderPid:execution.processGroupLeaderPid,processGroupStartTicks:execution.processGroupStartTicks,processGroupExited:execution.processGroupExited,cleanupAttempts:execution.cleanupAttempts,cleanupError:execution.cleanupError};
   await mkdir(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,{recursive:true,mode:0o700});await chmod(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,0o700);
   const target=antigravityTerminalJournalPath(execution.sessionId,execution.turnId),temp=`${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`,handle=await open(temp,'wx',0o600);
   try{await handle.writeFile(JSON.stringify({...value,checksum:antigravityJournalChecksum(value)}));await handle.sync();}finally{await handle.close();}
   await rename(temp,target);await chmod(target,0o600);const directory=await open(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,'r');try{await directory.sync();}finally{await directory.close();}return target;
 }
-async function readAntigravityTerminalJournal(filePath:string){const parsed=JSON.parse(await readFile(filePath,'utf8')) as AntigravityTerminalJournal;const{checksum,...value}=parsed;if(parsed.schemaVersion!==1||!parsed.sessionId||!parsed.turnId||!['completed','failed','interrupted'].includes(parsed.terminal)||checksum!==antigravityJournalChecksum(value))throw new Error(`invalid Antigravity terminal sidecar ${path.basename(filePath)}`);return parsed;}
+async function readAntigravityTerminalJournal(filePath:string){const parsed=JSON.parse(await readFile(filePath,'utf8')) as AntigravityTerminalJournal;const{checksum,...value}=parsed;if(![1,2].includes(parsed.schemaVersion)||!parsed.sessionId||!parsed.turnId||!['completed','failed','interrupted'].includes(parsed.terminal)||checksum!==antigravityJournalChecksum(value))throw new Error(`invalid Antigravity terminal sidecar ${path.basename(filePath)}`);if(parsed.schemaVersion===2&&parsed.cleanupRequired&&(!Number.isSafeInteger(parsed.processGroupId)||Number(parsed.processGroupId)<=1))throw new Error(`invalid Antigravity cleanup identity ${path.basename(filePath)}`);return parsed;}
 async function upsertAntigravityIntentFromJournal(journal:AntigravityTerminalJournal){
   if(antigravityIntentFaults>0){antigravityIntentFaults--;throw new Error('injected Antigravity terminal intent failure');}
-  await db.run(`INSERT INTO antigravity_terminal_intents(session_id,turn_id,terminal,reason,client_message_id,assistant_item_json,terminal_payload_json,created_at,updated_at,last_error)
-    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,NULL)
-    ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,terminal=excluded.terminal,reason=excluded.reason,client_message_id=excluded.client_message_id,assistant_item_json=excluded.assistant_item_json,terminal_payload_json=excluded.terminal_payload_json,updated_at=excluded.updated_at,last_error=NULL`,[journal.sessionId,journal.turnId,journal.terminal,journal.reason,journal.clientMessageId,journal.assistantItem?JSON.stringify(journal.assistantItem):null,JSON.stringify(journal.terminalPayload),journal.createdAt]);
+  await db.run(`INSERT INTO antigravity_terminal_intents(session_id,turn_id,terminal,reason,client_message_id,assistant_item_json,terminal_payload_json,created_at,updated_at,last_error,cleanup_required,process_group_id,process_group_leader_pid,process_group_start_ticks,cleanup_attempts,cleanup_error)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,NULL,?9,?10,?11,?12,?13,?14)
+    ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,terminal=excluded.terminal,reason=excluded.reason,client_message_id=excluded.client_message_id,assistant_item_json=excluded.assistant_item_json,terminal_payload_json=excluded.terminal_payload_json,updated_at=excluded.updated_at,last_error=NULL,cleanup_required=excluded.cleanup_required,process_group_id=excluded.process_group_id,process_group_leader_pid=excluded.process_group_leader_pid,process_group_start_ticks=excluded.process_group_start_ticks,cleanup_attempts=excluded.cleanup_attempts,cleanup_error=excluded.cleanup_error`,[journal.sessionId,journal.turnId,journal.terminal,journal.reason,journal.clientMessageId,journal.assistantItem?JSON.stringify(journal.assistantItem):null,JSON.stringify(journal.terminalPayload),journal.createdAt,journal.cleanupRequired?1:0,journal.processGroupId||null,journal.processGroupLeaderPid||null,journal.processGroupStartTicks||null,Number(journal.cleanupAttempts||0),journal.cleanupError||null]);
 }
 async function persistAntigravityTerminalIntent(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
   const sidecar=await writeAntigravityTerminalJournal(execution,decision),journal=await readAntigravityTerminalJournal(sidecar);await upsertAntigravityIntentFromJournal(journal);return sidecar;
@@ -1112,14 +1128,28 @@ async function commitAntigravityTerminalIntent(intent:any,testFailureStage?:'ses
   const terminal=String(intent.terminal) as AntigravityTerminal,eventType=terminal==='completed'?'turn/completed':terminal==='interrupted'?'turn/interrupted':'turn/failed',assistantPayload=intent.assistant_item_json?JSON.parse(String(intent.assistant_item_json)):null;
   return eventStore.commitAtomicTerminal({sessionId:String(intent.session_id),turnId:String(intent.turn_id),status:terminal==='completed'?'idle':terminal,interruptionReason:terminal==='completed'?null:String(intent.reason||''),assistant:assistantPayload?{eventType:'item/completed',payload:assistantPayload,eventKey:`antigravity:${intent.turn_id}:assistant`}:undefined,terminal:{eventType,payload:JSON.parse(String(intent.terminal_payload_json)),eventKey:`antigravity:${intent.turn_id}:terminal`},testFailureStage});
 }
+async function cleanupAntigravityTerminalIntent(intent:any){
+  if(!Number(intent.cleanup_required||0))return;
+  const pgid=Number(intent.process_group_id),leader=Number(intent.process_group_leader_pid||pgid),expected=String(intent.process_group_start_ticks||'');
+  if(!Number.isSafeInteger(pgid)||pgid<=1||!Number.isSafeInteger(leader)||leader<=1)throw new Error('Antigravity cleanup identity is invalid');
+  const attempt=Number(intent.cleanup_attempts||0)+1;
+  try{
+    if(!isAntigravityProcessGroupAlive(pgid)){await db.run('UPDATE antigravity_terminal_intents SET cleanup_required=0,cleanup_error=NULL,cleanup_attempts=?1,updated_at=?2 WHERE session_id=?3 AND turn_id=?4',[attempt,Date.now(),intent.session_id,intent.turn_id]);return;}
+    const actual=antigravityProcessStartTicks(leader);if(!expected||!actual||actual!==expected)throw new Error('Antigravity process group identity cannot be safely verified');
+    signalAntigravityProcessGroup(pgid,'SIGTERM');let exited=await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000));if(!exited){signalAntigravityProcessGroup(pgid,'SIGKILL');exited=await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_KILL_CONFIRM_MS||5000));}
+    if(antigravityCleanupFaults>0){antigravityCleanupFaults--;throw new Error('injected Antigravity process group cleanup failure');}
+    if(!exited)throw new Error(`Antigravity process group ${pgid} did not exit`);
+    await db.run('UPDATE antigravity_terminal_intents SET cleanup_required=0,cleanup_error=NULL,cleanup_attempts=?1,updated_at=?2 WHERE session_id=?3 AND turn_id=?4',[attempt,Date.now(),intent.session_id,intent.turn_id]);
+  }catch(error:any){const safe=safeAntigravitySummary(error?.message||String(error));await db.run('UPDATE antigravity_terminal_intents SET cleanup_attempts=?1,cleanup_error=?2,last_error=?2,updated_at=?3 WHERE session_id=?4 AND turn_id=?5',[attempt,safe,Date.now(),intent.session_id,intent.turn_id]).catch(()=>{});throw error;}
+}
 async function ensureAntigravityFinalization(execution:AntigravityExecution){
   if(execution.finalizationCommitted)return;
   if(execution.finalizePromise)return execution.finalizePromise;
   const decision=execution.terminalDecision;if(!decision)throw new Error('Antigravity terminal is undecided');
   execution.finalizePromise=(async()=>{
-    if(decision.terminal!=='completed')await terminateAntigravityExecution(execution);
     await antigravityLifecycleTestDelay('after_terminal_decision');
-    const sidecar=await persistAntigravityTerminalIntent(execution,decision);
+    let sidecar=await persistAntigravityTerminalIntent(execution,decision);
+    if(decision.terminal!=='completed'&&!execution.processGroupExited)try{await terminateAntigravityExecution(execution);}catch(error){sidecar=await persistAntigravityTerminalIntent(execution,decision);throw error;}
     await antigravityLifecycleTestDelay('before_terminal_commit');
     const intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[execution.sessionId,execution.turnId]);if(!intent)throw new Error('Antigravity terminal intent was not persisted');
     await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());
@@ -1141,7 +1171,7 @@ async function runAntigravityRuntimeTurn(session:RuntimeSession,execution:Antigr
   const persistObserved=async()=>{if(observed||!execution.logFile)return;const log=await readFile(execution.logFile,'utf8').catch(()=>'');observed=parseAntigravityConversation(log);if(observed)await db.run('UPDATE sessions SET provider_session_id=?1,upstream_thread_id=?1,provider_metadata=?2,upstream_binding_profile_id=?3,current_upstream_account_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5',[observed,JSON.stringify(antigravityMetadata(session.provider_metadata,{profileId:profile.id,cliVersion:'1.1.2',conversationId:observed,recoveryGeneration:Number((antigravityMetadata(session.provider_metadata) as any).recoveryGeneration||0)+(rebuild?1:0)})),profile.id,Date.now(),session.id]);};
   try{
     execution.phase='preparing';assertAntigravityNotCancelled(execution);
-    await appendEvent(session.id,'user',{input:body.input,clientMessageId:String(body.clientMessageId||''),turnId,segmentId:turnId,provider:'antigravity',profileId:profile.id});
+    await appendEvent(session.id,'user',{input:body.input,clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),turnId,segmentId:String(body.segmentId||turnId),retryOf:String(body.retryOf||''),provider:'antigravity',profileId:profile.id});
     assertAntigravityNotCancelled(execution);
     const boundProfile=String(session.upstream_binding_profile_id||session.current_upstream_account_id||session.account_id||''),requested=String(session.provider_session_id||session.upstream_thread_id||'')||null;
     const prior=await db.get("SELECT COUNT(*) AS count FROM events WHERE session_id=?1 AND event_type='item/completed'",[session.id]);
@@ -1160,20 +1190,20 @@ async function runAntigravityRuntimeTurn(session:RuntimeSession,execution:Antigr
     const binary=await resolveAntigravityBinary({configured:process.env.ANTIGRAVITY_BIN,dataDir:DATA_DIR,homeDir:DEFAULT_HOME,pathEnv:process.env.PATH});assertAntigravityNotCancelled(execution);
     const env={...process.env,HOME:profile.homeDir,XDG_CONFIG_HOME:path.join(profile.homeDir,'.config'),XDG_CACHE_HOME:path.join(profile.homeDir,'.cache')};
     execution.phase='spawning';assertAntigravityNotCancelled(execution);
-    const child=spawn(binary,args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});execution.child=child;execution.spawnState='pending';execution.childClosed=antigravityChildClosed(child);execution.spawnOutcome=new Promise(resolve=>{let settled=false;const finish=(state:AntigravitySpawnState)=>{if(settled)return;settled=true;execution.spawnState=state;if(state==='succeeded'&&child.pid&&child.pid>1)execution.processGroupId=child.pid;if(state==='failed'&&!execution.processGroupId)execution.processGroupExited=true;resolve(state);};child.once('spawn',()=>finish('succeeded'));child.once('error',()=>finish(child.pid&&child.pid>1?'succeeded':'failed'));if(child.pid&&child.pid>1)queueMicrotask(()=>finish('succeeded'));});
-    const childResult=runAntigravityChild(child,{timeoutMs:0,cleanOutput:cleanRuntimeAgentOutput,onDelta:delta=>{if(delta)void appendEvent(session.id,'item/agentMessage/delta',{method:'item/agentMessage/delta',turnId,segmentId:turnId,params:{itemId:execution.itemId,turnId,segmentId:turnId,delta}});void persistObserved().catch(()=>{});},onState:state=>{if(state==='output_draining'&&!execution.cancelRequested)void db.run('UPDATE sessions SET status=?1,updated_at=?2 WHERE id=?3',['output_draining',Date.now(),session.id]);}});
+    const child=spawn(binary,args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});execution.child=child;execution.spawnState='pending';execution.childClosed=antigravityChildClosed(child);execution.spawnOutcome=new Promise(resolve=>{let settled=false;const finish=(state:AntigravitySpawnState)=>{if(settled)return;settled=true;execution.spawnState=state;if(state==='succeeded'&&child.pid&&child.pid>1){execution.processGroupId=child.pid;execution.processGroupLeaderPid=child.pid;execution.processGroupStartTicks=antigravityProcessStartTicks(child.pid);execution.cleanupState='pending';}if(state==='failed'&&!execution.processGroupId){execution.processGroupExited=true;execution.cleanupState='not_required';}resolve(state);};child.once('spawn',()=>finish('succeeded'));child.once('error',()=>finish(child.pid&&child.pid>1?'succeeded':'failed'));if(child.pid&&child.pid>1)queueMicrotask(()=>finish('succeeded'));});
+    const segmentId=String(body.segmentId||turnId),childResult=runAntigravityChild(child,{timeoutMs:0,cleanOutput:cleanRuntimeAgentOutput,onDelta:delta=>{if(delta)void appendEvent(session.id,'item/agentMessage/delta',{method:'item/agentMessage/delta',turnId,segmentId,params:{itemId:execution.itemId,turnId,segmentId,delta}});void persistObserved().catch(()=>{});},onState:state=>{if(state==='output_draining'&&!execution.cancelRequested)void db.run('UPDATE sessions SET status=?1,updated_at=?2 WHERE id=?3',['output_draining',Date.now(),session.id]);}});
     void childResult.catch(()=>{});
     await antigravityLifecycleTestDelay('after_spawn');
     if(execution.cancelRequested){await terminateAntigravityExecution(execution);throw new AntigravityCancellation(execution.cancelReason||'Antigravity cancelled');}
     execution.phase='running';
-    await appendEvent(session.id,'turn/start',{result:{turn:{id:turnId,status:'inProgress'}},provider:'antigravity'});
+    await appendEvent(session.id,'turn/start',{result:{turn:{id:turnId,status:'inProgress'}},turnId,segmentId:String(body.segmentId||turnId),clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),retryOf:String(body.retryOf||''),provider:'antigravity'});
     assertAntigravityNotCancelled(execution);
     const timeoutMs=Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS||DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS);
     execution.timeout=setTimeout(()=>{void requestAntigravityCancellation(execution,'failed','antigravity_timeout').catch(error=>app.log.error({sessionId:execution.sessionId,error:safeAntigravitySummary(error?.message||String(error))},'Antigravity timeout finalization failed'));},timeoutMs);execution.timeout.unref?.();
     const result=await childResult;
     await antigravityLifecycleTestDelay('after_child_close');
     assertAntigravityNotCancelled(execution);
-    try{await completeAntigravityProcessGroup(execution);}catch(cleanupError:any){await decideAndFinalizeAntigravityExecution(execution,{terminal:'failed',reason:'antigravity_process_group_cleanup_failed',message:safeAntigravitySummary(cleanupError?.message||String(cleanupError)),assistantText:null});throw cleanupError;}
+    try{await completeAntigravityProcessGroup(execution);}catch(cleanupError:any){tryClaimAntigravityTerminal(execution,{terminal:'failed',reason:'antigravity_process_group_cleanup_failed',message:safeAntigravitySummary(cleanupError?.message||String(cleanupError)),assistantText:null});await persistAntigravityTerminalIntent(execution,execution.terminalDecision!);execution.finalizationError=safeAntigravitySummary(cleanupError?.message||String(cleanupError));throw cleanupError;}
     await persistObserved();
     if(!observed)throw new Error('Antigravity conversation ID was not recorded');
     if(requested&&!rebuild&&observed!==requested){await db.run('UPDATE sessions SET provider_session_id=NULL,upstream_thread_id=NULL,interruption_reason=?1 WHERE id=?2',['antigravity_resume_mismatch',session.id]);throw new Error('Antigravity did not resume the requested conversation; refusing silent fallback');}
@@ -1260,9 +1290,9 @@ async function bootstrapRuntimeRecovery() {
   if(process.env.NODE_ENV==='test'&&Number(process.env.ANTIGRAVITY_TEST_BOOTSTRAP_DELAY_MS||0)>0)await sleep(Number(process.env.ANTIGRAVITY_TEST_BOOTSTRAP_DELAY_MS));
   await mkdir(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,{recursive:true,mode:0o700});await chmod(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,0o700);
   const sidecars=(await readdir(ANTIGRAVITY_TERMINAL_JOURNAL_DIR)).filter(name=>name.endsWith('.json')).sort();
-  for(const name of sidecars){const filePath=path.join(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,name);let journal:AntigravityTerminalJournal|null=null;try{journal=await readAntigravityTerminalJournal(filePath);await upsertAntigravityIntentFromJournal(journal);const intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[journal.sessionId,journal.turnId]);if(!intent)throw new Error('sidecar intent upsert did not persist');await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());await rm(filePath,{force:true});}catch(error:any){app.log.error({sessionId:journal?.sessionId||null,turnId:journal?.turnId||null,recoveryStage:'sidecar',file:name,error:safeAntigravitySummary(error?.message||String(error))},'Antigravity sidecar recovery failed');throw error;}}
+  for(const name of sidecars){const filePath=path.join(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,name);let journal:AntigravityTerminalJournal|null=null;try{journal=await readAntigravityTerminalJournal(filePath);await upsertAntigravityIntentFromJournal(journal);let intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[journal.sessionId,journal.turnId]);if(!intent)throw new Error('sidecar intent upsert did not persist');await cleanupAntigravityTerminalIntent(intent);intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[journal.sessionId,journal.turnId]);await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());await rm(filePath,{force:true});}catch(error:any){app.log.error({sessionId:journal?.sessionId||null,turnId:journal?.turnId||null,pgid:journal?.processGroupId||null,attempt:journal?.cleanupAttempts||0,recoveryStage:'sidecar',file:name,error:safeAntigravitySummary(error?.message||String(error))},'Antigravity sidecar recovery failed');throw error;}}
   const pendingIntents=await db.all('SELECT * FROM antigravity_terminal_intents ORDER BY created_at,session_id');
-  for(const intent of pendingIntents)try{await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());}catch(error:any){app.log.error({sessionId:intent.session_id,turnId:intent.turn_id,recoveryStage:'sqlite_intent',error:safeAntigravitySummary(error?.message||String(error))},'Antigravity pending terminal recovery failed');throw error;}
+  for(const intent of pendingIntents)try{await cleanupAntigravityTerminalIntent(intent);const ready=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[intent.session_id,intent.turn_id]);if(!ready)throw new Error('pending intent disappeared before commit');await commitAntigravityTerminalIntent(ready,takeAntigravityTerminalFault());}catch(error:any){app.log.error({sessionId:intent.session_id,turnId:intent.turn_id,pgid:intent.process_group_id||null,attempt:intent.cleanup_attempts||0,recoveryStage:'sqlite_intent',error:safeAntigravitySummary(error?.message||String(error))},'Antigravity pending terminal recovery failed');throw error;}
   const abandoned=await db.all("SELECT id,active_turn_id FROM sessions WHERE (provider='antigravity' OR provider_id='antigravity') AND (active_turn_id IS NOT NULL OR status IN ('running','planning','output_draining'))");
   for(const row of abandoned){
     const turnId=String(row.active_turn_id||`recovery-${row.id}`),payload={method:'turn/interrupted',clientMessageId:'',reason:'runtime_restarted',params:{turn:{id:turnId,status:'interrupted'}}},now=Date.now();
@@ -1325,8 +1355,10 @@ async function handleCodexNotification(account:Account, msg:any) {
   if (!upstreamThreadId) return;
   const session = await sessionForThread(upstreamThreadId, true);
   if (!session) return;
+  const notificationTurnId=String(msg.params?.turn?.id||msg.params?.turnId||session.active_turn_id||''),lineage=notificationTurnId?runtimeTurnLineage.get(`${session.id}:${notificationTurnId}`):null;
+  const durableMsg=lineage?{...msg,turnId:notificationTurnId,segmentId:lineage.segmentId,clientMessageId:lineage.clientMessageId,messageId:lineage.messageId,retryOf:lineage.retryOf}:msg;
   if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) diagnostics.deltasReceived++;
-  appendEvent(session.id, msg.method, msg).catch(e => app.log.error({ err:e }, 'event append failed'));
+  appendEvent(session.id,msg.method,durableMsg).catch(e=>app.log.error({err:e},'event append failed'));
   if (msg.method === 'turn/started' && msg.params?.turn?.id) {
     const next=codexSessionStateForNotification(session as any,msg.method,msg.params);
     await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,interruption_reason=?3,updated_at=?4 WHERE id=?5', [next.active_turn_id,next.status,next.interruption_reason||null,Date.now(),session.id]);
@@ -1345,6 +1377,7 @@ async function handleCodexNotification(account:Account, msg:any) {
     const next=codexSessionStateForNotification(authoritative as any,msg.method,msg.params);
     await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,interruption_reason=?2,updated_at=?3 WHERE id=?4', [next.status,next.interruption_reason||null,Date.now(),authoritative.id]);
     invalidateThreadSessionCache(authoritative);
+    if(notificationTurnId)runtimeTurnLineage.delete(`${session.id}:${notificationTurnId}`);
   }
 }
 

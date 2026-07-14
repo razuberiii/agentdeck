@@ -101,6 +101,7 @@ const pendingApprovals = new Map<string, { id:string|number; method:string; crea
 const activeTurns = new Map<string, string>();
 const activeCodexSessions = new Set<string>();
 const activeRuntimeProviderSessions = new Set<string>();
+let canonicalMessageFaults=Number(process.env.NODE_ENV==='test'?process.env.AGENTDECK_TEST_CANONICAL_INSERT_FAILURES||0:0);
 type RuntimeSubscriptionState = { close:()=>void; connected:boolean; connecting:boolean; generation?:string; receivedSequence:number; processingSequence:number; committedSequence:number; lastSequence:number; lastError?:string; lastStatus:'unknown'|'checking'|'recovering'|'connected'|'unavailable'|'disconnected' };
 const runtimeSubscriptions = new Map<string, RuntimeSubscriptionState>();
 const runtimeSubscriptionReleases=new Map<string,NodeJS.Timeout>();
@@ -4755,6 +4756,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   };
   await ack('received');
   const turnId = clientMessageId || crypto.randomUUID();
+  const messageId=canonicalUserMessageId(threadId,clientMessageId),segmentId=clientMessageId;
   if (planId) await db.run('UPDATE plan_tasks SET execution_turn_id=?1 WHERE plan_id=?2', [turnId, planId]).catch(()=>{});
   activeArtifactTurns.set(threadId, turnId);
   const generatedTitle=autoTitle(originalText,String(row.project_dir),String(row.title||''));
@@ -4772,9 +4774,9 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     await runtime.createAntigravitySession({sessionId:threadId,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),title:String(row.title||''),mode:sessionMode(row),model:cleanAgentModel(row.model)||undefined,providerSessionId,legacyHistory,createdAt:Number(row.created_at||Date.now())});
     const attachmentPaths=await antigravityAttachmentPaths(threadId,attachments),providerInput=antigravityProviderInput(providerText,attachmentPaths),input=[{type:'text',text:providerInput}];
     const subscription=ensureSessionSubscription(id,threadId);broadcast(threadId,{type:'runtimeConnection',status:runtimeConnectionStatus(subscription),error:subscription.lastError});
-    await saveCanonicalUserMessage(threadId,originalText,attachments,clientMessageId,turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId));broadcast(threadId,canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode));await ack('persisted');
+    await saveCanonicalUserMessage(threadId,originalText,attachments,clientMessageId,turnId,retryOf,messageId);await ack('persisted');broadcast(threadId,canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode));
     await recordArtifactBaseline(threadId,String(row.project_dir),turnId).catch(()=>{});activeRuntimeProviderSessions.add(threadId);
-    await runtime.startTurn(threadId,{input,text:providerInput,attachments:attachmentPaths,originalText,clientMessageId,turnId,planMode:effectivePlanMode,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),permissionMode:sessionMode(row),model:cleanAgentModel(row.model)||undefined});
+    await runtime.startTurn(threadId,{input,text:providerInput,attachments:attachmentPaths,originalText,clientMessageId,messageId,segmentId,localTurnId:turnId,provisionalTurnId:turnId,retryOf,turnId,planMode:effectivePlanMode,accountId:dto.id,profile:{id:dto.id,homeDir:dto.home_dir},accountSnapshot:{id:dto.id,name:dto.name||'Antigravity Account'},cwd:String(row.project_dir),permissionMode:sessionMode(row),model:cleanAgentModel(row.model)||undefined});
     await ack('accepted');
     return;
   }
@@ -4785,15 +4787,15 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     const userMessage=canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode);
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
-    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
-    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
+    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,messageId);
+    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId,retryOf,messageId);
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     await ack('persisted');
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]);
     activeRuntimeProviderSessions.add(threadId);
     try {
-      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId,messageId,segmentId,localTurnId:turnId,provisionalTurnId:turnId,retryOf,turnId,accountId:dto.id, accountSnapshot:geminiAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, model:cleanAgentModel(row.model) || undefined });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       await ack('accepted');
     } catch (e:any) {
@@ -4815,15 +4817,15 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     const userMessage=canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode);
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
-    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(()=>{});
-    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
-    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
+    if (effectivePlanMode === 'plan') await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,messageId);
+    else await saveCanonicalUserMessage(threadId, text, attachments, clientMessageId, turnId,retryOf,messageId);
     await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     broadcast(threadId, userMessage);
     await ack('persisted');
+    await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]);
     activeRuntimeProviderSessions.add(threadId);
     try {
-      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, permissionMode:effectivePlanMode === 'plan' ? 'plan' : sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId,messageId,segmentId,localTurnId:turnId,provisionalTurnId:turnId,retryOf,accountId:dto.id, profile:dto, accountSnapshot:claudeAccountSnapshot(dto), cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || row.approval_policy, sandboxMode:planTurnOptions?.sandboxMode || row.sandbox_mode, permissionMode:effectivePlanMode === 'plan' ? 'plan' : sessionMode(row), model:cleanAgentModel(row.model) || undefined, turnId });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       await ack('accepted');
     } catch (e:any) {
@@ -4847,6 +4849,10 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
   const executionSnapshotJson = JSON.stringify(execution.accountSnapshot || null);
   const userMessage=canonicalUserBroadcast(threadId,originalText,attachments,clientMessageId,turnId,retryOf,effectivePlanMode);
   if (USE_AGENT_RUNTIME) {
+    await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,messageId);
+    await ack('persisted');
+    broadcast(threadId, userMessage);
+    await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     const subscription = ensureSessionSubscription(id, threadId);
     broadcast(threadId, { type:'runtimeConnection', status:runtimeConnectionStatus(subscription), error:subscription.lastError });
     await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'submitting',Date.now(),threadId]).catch(async () => {
@@ -4857,10 +4863,6 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
       [execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
     ).catch(()=>{});
     activeCodexSessions.add(threadId);
-    await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
-    broadcast(threadId, userMessage);
-    await ack('persisted');
-    await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
     try {
       app.log.info({
         localSessionId:threadId,
@@ -4874,7 +4876,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
         codexHome:execution.runtime.codexHome,
         account:execution.accountSnapshot,
       }, 'codex sendTurn execution profile selected');
-      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId, accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || opts.approvalPolicy, sandboxMode:planTurnOptions?.sandboxMode || opts.sandboxMode, model:opts.model });
+      await runtime.startTurn(threadId, { input, text:providerText, planMode:effectivePlanMode, originalText, clientMessageId,messageId,segmentId,localTurnId:turnId,provisionalTurnId:turnId,retryOf,turnId,accountId:execution.executingProfileId, codexHome:execution.runtime.codexHome, accountSnapshot:execution.accountSnapshot, executionContext:execution, cwd:String(row.project_dir), approvalPolicy:planTurnOptions?.approvalPolicy || opts.approvalPolicy, sandboxMode:planTurnOptions?.sandboxMode || opts.sandboxMode, model:opts.model });
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[effectivePlanMode === 'plan' ? 'planning' : 'running',Date.now(),threadId]).catch(()=>{});
       await ack('accepted');
     } catch(e:any) {
@@ -4887,16 +4889,16 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     }
     return;
   }
+  await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,messageId);
+  await ack('persisted');
+  broadcast(threadId, userMessage);
+  await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
   await codex.resumeThread(threadId, String(row.project_dir), opts).catch(()=>null);
   await db.run(
     'UPDATE sessions SET status=?1,selected_profile_id=?2,executing_profile_id=?2,last_execution_account_id=?2,account_snapshot_json=?3,updated_at=?4 WHERE codex_thread_id=?5 OR id=?5',
     [effectivePlanMode === 'plan' ? 'planning' : 'running', execution.executingProfileId, executionSnapshotJson, Date.now(), threadId]
   );
   activeCodexSessions.add(threadId);
-  await saveCanonicalUserMessage(threadId, originalText, attachments, clientMessageId, turnId,retryOf,canonicalUserMessageId(threadId,clientMessageId)).catch(()=>{});
-  await recordArtifactBaseline(threadId, String(row.project_dir), turnId).catch((e:any)=>app.log.warn({ sessionId:threadId, error:e?.message || String(e) }, 'artifact baseline failed'));
-  broadcast(threadId, userMessage);
-  await ack('persisted');
   try {
     await codex.startTurn(threadId, input, String(row.project_dir), planTurnOptions ? { ...opts, ...planTurnOptions } : opts);
     await ack('accepted');
@@ -4925,6 +4927,7 @@ function canonicalUserMessageId(sessionId:string,clientMessageId:string){return`
 function canonicalUserBroadcast(threadId:string,text:string,attachments:any[],clientMessageId:string,turnId:string,retryOf:string,planMode:string){return{type:'user',messageId:canonicalUserMessageId(threadId,clientMessageId),clientMessageId,turnId,segmentId:turnId,retryOf:retryOf||undefined,createdAt:Date.now(),status:'persisted',planMode,text,attachments:attachments.map((a:any)=>({id:String(a.id),name:String(a.name||'attachment'),type:String(a.type||''),size:Number(a.size||0),url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}`}))};}
 async function stopTurn(id:string){ const row = await findSession(id); const threadId = String(row?.codex_thread_id || id); if(USE_AGENT_RUNTIME&&normalizeProvider(row?.provider_id)==='antigravity'){await runtime.stopTurn(threadId);return;} if (USE_AGENT_RUNTIME) await runtime.stopTurn(threadId); else await interruptTurn(threadId, row?.project_dir ? String(row.project_dir) : undefined); activeCodexSessions.delete(threadId); activeRuntimeProviderSessions.delete(threadId); activeArtifactTurns.delete(threadId); await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['interrupted',Date.now(),threadId]); broadcast(threadId,{type:'system',text:'已停止生成'}); maybeExitAfterDrain(); }
 async function saveCanonicalUserMessage(threadId:string, text:string, attachments:any[], clientMessageId = '', turnId = '', retryOf='', id:string = crypto.randomUUID(), createdAt = Date.now()) {
+  if(canonicalMessageFaults>0){canonicalMessageFaults--;throw new Error('canonical user message persistence failed');}
   const safeAttachments = attachments.map((a:any)=>({ id:String(a.id), name:String(a.name || 'attachment'), type:String(a.type || ''), size:Number(a.size || 0), url:`/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(String(a.id))}` }));
   await db.run(
     `INSERT INTO agent_messages (id,session_id,role,text,created_at,client_message_id,turn_id,segment_id,retry_of,original_text,attachments_json,status)
@@ -5048,7 +5051,7 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
   const base:any = { runtimeSequence, runtimeGeneration, threadId };
   let payload:any = {};
   try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
-  const eventTurnId=String(payload?.params?.turn?.id||payload?.params?.turnId||payload?.turnId||payload?.segmentId||'');if(eventTurnId){base.turnId=eventTurnId;base.segmentId=String(payload?.segmentId||payload?.params?.segmentId||eventTurnId);}
+  const eventTurnId=String(payload?.params?.turn?.id||payload?.result?.turn?.id||payload?.params?.turnId||payload?.turnId||payload?.segmentId||'');if(eventTurnId){base.turnId=eventTurnId;base.segmentId=String(payload?.segmentId||payload?.params?.segmentId||eventTurnId);}
   const out:any[] = [];
   if (eventType === 'runtime/recovering') {
     out.push({ type:'runtimeConnection', status:'recovering', ...base });
@@ -5077,11 +5080,11 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
     return out;
   }
   if (eventType === 'assistant/message') {
-    out.push({ type:'codex', method:'item/completed', params:{ item:{ id:payload?.itemId || `claude-message-${runtimeSequence}`, type:'agentMessage', text:String(payload?.text || '') } }, ...base });
+    out.push({type:'codex',method:'item/completed',params:{item:{id:payload?.itemId||`claude-message-${runtimeSequence}`,type:'agentMessage',turnId:payload?.turnId||base.turnId,segmentId:payload?.segmentId||base.segmentId,text:String(payload?.text||'')}},...base});
     return out;
   }
   if (eventType === 'assistant/final') {
-    out.push({ type:'codex', method:'item/completed', params:{ item:{ id:payload?.itemId || `claude-final-${runtimeSequence}`, type:'agentMessage', phase:'final_answer', text:String(payload?.text || '') } }, ...base });
+    out.push({type:'codex',method:'item/completed',params:{item:{id:payload?.itemId||`claude-final-${runtimeSequence}`,type:'agentMessage',turnId:payload?.turnId||base.turnId,segmentId:payload?.segmentId||base.segmentId,phase:'final_answer',text:String(payload?.text||'')}},...base});
     return out;
   }
   if (eventType === 'tool/use') {
@@ -5134,6 +5137,7 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
   if (eventType === 'thread/read') return out;
   if (eventType === 'turn/start') {
     const turn = payload?.result?.turn || payload?.turn || null;
+    if(turn?.id&&payload?.clientMessageId)await db.run('UPDATE agent_messages SET turn_id=?1 WHERE session_id=?2 AND client_message_id=?3',[String(turn.id),threadId,String(payload.clientMessageId)]).catch(()=>{});
     if (turn?.id) activeTurns.set(threadId, String(turn.id));
     out.push({ type:'codex', method:'turn/started', params:{ turn }, ...base });
     return out;
@@ -5862,21 +5866,23 @@ function compactCodexActivity(msg:any, base:Record<string,any> = {}) {
   const type = String(item?.type || '');
   const activityId = String(item?.id || msg?.params?.itemId || '');
   if (!activityId) return null;
+  const turnId=String(item?.turnId||msg?.params?.turnId||msg?.turnId||base.turnId||''),segmentId=String(item?.segmentId||msg?.params?.segmentId||msg?.segmentId||base.segmentId||turnId),phase=structuredActivityPhase(item?.status||msg?.params?.status,method);
   if (type === 'commandExecution' || method.includes('commandExecution')) {
     const command = String(item?.command || msg?.params?.command || '').replace(/\s+/g,' ').trim();
-    return { type:'activity', activityId, role:'command', title:method.includes('completed')?'命令已完成':'正在运行命令', detail:command.slice(0,180) || '执行工作区命令', phase:method.includes('completed')?'completed':'running', ...base };
+    return {...base,type:'activity',activityId,turnId,segmentId,role:'command',title:phase==='completed'?'命令已完成':phase==='interrupted'?'命令已中断':phase==='failed'?'命令失败':'正在运行命令',detail:command.slice(0,180)||'执行工作区命令',phase};
   }
   if (type === 'fileChange' || method.includes('fileChange')) {
     const paths = (item?.changes || msg?.params?.changes || []).map((change:any)=>String(change?.path || change || '')).filter(Boolean);
-    return { type:'activity', activityId, role:'file', title:method.includes('completed')?'文件已更新':'正在修改文件', detail:paths.slice(0,3).join(' · ').slice(0,180) || '更新工作区内容', phase:method.includes('completed')?'completed':'running', ...base };
+    return {...base,type:'activity',activityId,turnId,segmentId,role:'file',title:phase==='completed'?'文件已更新':phase==='interrupted'?'文件操作已中断':phase==='failed'?'文件操作失败':'正在修改文件',detail:paths.slice(0,3).join(' · ').slice(0,180)||'更新工作区内容',phase};
   }
   if (type === 'reasoning' || method.includes('reasoning')) {
     const detail = [...(item?.summary || []), ...(item?.content || [])].join(' ').replace(/\s+/g,' ').trim();
     if (!detail || detail === '[object Object]') return null;
-    return { type:'activity', activityId, role:'reasoning', title:'正在梳理思路', detail:detail.slice(0,180), phase:method.includes('completed')?'completed':'running', ...base };
+    return {...base,type:'activity',activityId,turnId,segmentId,role:'reasoning',title:'正在梳理思路',detail:detail.slice(0,180),phase};
   }
   return null;
 }
+function structuredActivityPhase(status:any,method:string){const value=String(status||'').toLowerCase();if(['interrupted','cancelled','canceled'].includes(value)||/interrupted|cancelled|canceled/i.test(method))return'interrupted';if(['failed','error'].includes(value)||/failed|error/i.test(method))return'failed';if(['completed','complete','success','succeeded'].includes(value)||/completed|succeeded/i.test(method))return'completed';return'running';}
 function itemHasProviderOnlyRecovery(item:any) {
   if (String(item?.text || '').includes(RECOVERY_CONTEXT_MARKER)) return true;
   return Array.isArray(item?.content) && item.content.some((part:any) => part?.type === 'text' && String(part.text || '').includes(RECOVERY_CONTEXT_MARKER));

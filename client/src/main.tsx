@@ -499,7 +499,7 @@ function itemToEvent(item:any):DisplayEvent|null{
     const artifactFiles = artifacts.filter((a:any)=>!String(a.type||'').startsWith('image/'));
     const parsedImages = artifacts.length ? [] : extractMarkdownImages(text);
     const parsedFiles = artifacts.length ? [] : extractFileLinks(text);
-    return {key:item.id,role:'assistant',text,meta:item.phase==='final_answer'?'最终回答':'回复',images:[...parsedImages,...artifactImages],files:[...parsedFiles,...artifactFiles]};
+    return {key:item.id,turnId:item.turnId?String(item.turnId):undefined,segmentId:item.segmentId?String(item.segmentId):undefined,role:'assistant',text,meta:item.phase==='final_answer'?'最终回答':'回复',images:[...parsedImages,...artifactImages],files:[...parsedFiles,...artifactFiles]};
   }
   if(item.type==='reasoning') return {key:item.id,role:'reasoning',title:'思考摘要',text:[...(item.summary||[]),...(item.content||[])].join('\n')||'正在思考',open:false};
   if(item.type==='plan') return {key:item.id,role:'reasoning',title:'计划',text:item.text||'',open:true};
@@ -564,7 +564,8 @@ function liveEvents(items:any[]):DisplayEvent[]{
           else { const text=String(out[index].text||'')+delta; out[index]={...out[index],text,images:extractMarkdownImages(text),files:extractFileLinks(text)}; }
         }
       } else if(m.method==='item/completed'){
-        const ev=itemToEvent(item);
+        const lineageItem=item ? {...item,turnId:item.turnId||m.turnId||m.params?.turnId,segmentId:item.segmentId||m.segmentId||m.params?.segmentId||m.turnId||m.params?.turnId} : item;
+        const ev=itemToEvent(lineageItem);
         if(ev&&item?.type!=='userMessage'){
           const index=item?.type==='agentMessage'?streamingIndex.get(String(item.id)):undefined;
           if(index==null) out.push(ev); else out[index]=ev;
