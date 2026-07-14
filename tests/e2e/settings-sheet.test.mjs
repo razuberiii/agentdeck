@@ -11,18 +11,22 @@ const ADMIN_PASSWORD = 'agentdeck-test-password';
 
 test('settings sheet opens, navigates providers, and does not black screen', async () => {
   const port = await freePort();
+  const runtimePort = await freePort();
   const dir = await mkdtemp(path.join(tmpdir(), 'agentdeck-settings-e2e-'));
+  const dataDir=path.join(dir,'data');
+  const runtime=spawn(process.execPath,['server/dist/agentdeck-runtime.js'],{cwd:process.cwd(),env:{...process.env,DATA_DIR:dataDir,RUNTIME_DB:path.join(dir,'runtime.sqlite3'),RUNTIME_PORT:String(runtimePort),RUNTIME_HOST:'127.0.0.1',RUNTIME_RUN_DIR:path.join(dir,'run'),SKIP_RUNTIME_BOOTSTRAP:'1',NODE_ENV:'production'},stdio:['ignore','pipe','pipe']});
   const child = spawn(process.execPath, ['server/dist/index.js'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
-      DATA_DIR: path.join(dir, 'data'),
+      DATA_DIR: dataDir,
       RUNTIME_DB: path.join(dir, 'runtime.sqlite3'),
       ADMIN_PASSWORD,
       COOKIE_SECRET: 'agentdeck-test-cookie-secret-1234567890',
       PORT: String(port),
       ALLOWED_ORIGINS: `http://127.0.0.1:${port},http://localhost:${port}`,
-      USE_AGENT_RUNTIME: '0',
+      USE_AGENT_RUNTIME: '1',
+      AGENT_RUNTIME_URL: `http://127.0.0.1:${runtimePort}`,
       NODE_ENV: 'production',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -30,9 +34,12 @@ test('settings sheet opens, navigates providers, and does not black screen', asy
   const output = [];
   child.stdout.on('data', chunk => output.push(String(chunk)));
   child.stderr.on('data', chunk => output.push(String(chunk)));
+  runtime.stdout.on('data', chunk => output.push(String(chunk)));
+  runtime.stderr.on('data', chunk => output.push(String(chunk)));
 
   let browser;
   try {
+    await waitForServer(runtimePort, runtime, output, '/healthz');
     await waitForServer(port, child, output);
     browser = await chromium.launch({ headless:true });
     const page = await browser.newPage();
@@ -85,7 +92,9 @@ test('settings sheet opens, navigates providers, and does not black screen', asy
   } finally {
     if (browser) await browser.close();
     if(child.exitCode===null)child.kill('SIGTERM');
+    if(runtime.exitCode===null)runtime.kill('SIGTERM');
     await new Promise(resolve => child.exitCode===null ? child.once('exit', resolve) : resolve());
+    await new Promise(resolve => runtime.exitCode===null ? runtime.once('exit', resolve) : resolve());
     await rm(dir, { recursive:true, force:true });
   }
 });
@@ -107,12 +116,12 @@ function freePort() {
   });
 }
 
-async function waitForServer(port, child, output) {
+async function waitForServer(port, child, output, route='/api/auth/status') {
   const start = Date.now();
   while (Date.now() - start < 15000) {
     if (child.exitCode !== null) throw new Error(`server exited early\n${output.join('')}`);
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/auth/status`);
+      const res = await fetch(`http://127.0.0.1:${port}${route}`);
       if (res.ok) return;
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 150));
