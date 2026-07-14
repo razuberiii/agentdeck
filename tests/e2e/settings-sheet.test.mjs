@@ -84,8 +84,8 @@ test('settings sheet opens, navigates providers, and does not black screen', asy
     assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();
-    child.kill('SIGTERM');
-    await new Promise(resolve => child.once('exit', resolve));
+    if(child.exitCode===null)child.kill('SIGTERM');
+    await new Promise(resolve => child.exitCode===null ? child.once('exit', resolve) : resolve());
     await rm(dir, { recursive:true, force:true });
   }
 });
