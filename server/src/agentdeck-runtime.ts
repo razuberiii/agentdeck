@@ -60,7 +60,10 @@ function isLoopbackHost(host:string) {
 if (!isLoopbackHost(HOST) && !RUNTIME_TOKEN) {
   throw new Error('RUNTIME_TOKEN is required when RUNTIME_HOST is not loopback');
 }
-if (RUNTIME_MODE === 'active') mkdirSync(process.env.RUNTIME_RUN_DIR || (process.env.SKIP_RUNTIME_BOOTSTRAP === '1' ? path.join(DATA_DIR,'runtime-run') : '/run/agentdeck'), { recursive:true });
+if (RUNTIME_MODE === 'active') {
+  const configuredRunDir=process.env.RUNTIME_RUN_DIR || '/run/agentdeck';
+  try{mkdirSync(configuredRunDir,{recursive:true});}catch(error:any){if(error?.code!=='EACCES')throw error;mkdirSync(path.join(DATA_DIR,'runtime-run'),{recursive:true});}
+}
 
 type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
 type StructuredRuntimeErrorBody = {
