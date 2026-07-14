@@ -34,7 +34,7 @@ import { claudeAuthLogout, claudeAuthState, claudeAuthStatus } from './claude/cl
 import { claudeProfileEnv, claudeSafeEnvSummary } from './claude/claude-profile-env.js';
 import { extractGeminiModelOptions, providerStatus, type ProviderStatus } from './provider-status.js';
 import { providerCapabilitiesFor } from './provider-adapter.js';
-import { artifactContentChanged, buildArtifactManifest, isArtifactTestAssetPath } from './artifact-manifest.js';
+import { artifactContentChanged, artifactEligibleForDownload, buildArtifactManifest, isArtifactTestAssetPath, workspaceCodeChanges } from './artifact-manifest.js';
 import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, VISIBLE_PROVIDER_ORDER, providerDisplayName as registryProviderDisplayName, providerStatusArray as orderedProviderStatusArray, normalizeProvider as registryNormalizeProvider, visibleProvider, type AgentProviderId } from './provider-registry.js';
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
@@ -1226,14 +1226,14 @@ app.get('/api/dashboard', { preHandler: ensureAuth }, async (req:any) => {
   };
 });
 async function dashboardArtifacts(){
-  const sql='SELECT id,session_id,name,mime,size,created_at,modified_at FROM artifacts ORDER BY COALESCE(modified_at,created_at) DESC LIMIT 12';
-  const [webRows,runtimeRows,webIds,runtimeIds]=await Promise.all([db.all(sql).catch(()=>[]),runtimeDb.all(sql).catch(()=>[]),db.all('SELECT id FROM artifacts').catch(()=>[]),runtimeDb.all('SELECT id FROM artifacts').catch(()=>[])]);
+  const sql='SELECT id,session_id,name,mime,size,created_at,modified_at,relative_path,operation FROM artifacts ORDER BY COALESCE(modified_at,created_at) DESC LIMIT 50';
+  const [webRows,runtimeRows]=await Promise.all([db.all(sql).catch(()=>[]),runtimeDb.all(sql).catch(()=>[])]);
   const byId=new Map<string,any>();
-  for(const row of [...runtimeRows,...webRows]) if(!byId.has(String(row.id))) byId.set(String(row.id),row);
+  for(const row of [...runtimeRows,...webRows]) if(artifactEligibleForDownload(String(row.relative_path||row.name),String(row.operation||'created'))&&!byId.has(String(row.id))) byId.set(String(row.id),row);
   const items=[...byId.values()].sort((a,b)=>Number(b.modified_at||b.created_at||0)-Number(a.modified_at||a.created_at||0)).slice(0,8).map(row=>({
     id:String(row.id),sessionId:String(row.session_id),name:String(row.name),type:String(row.mime||'application/octet-stream'),size:Number(row.size||0),updatedAt:Number(row.modified_at||row.created_at||0),url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}`,
   }));
-  return { total:new Set([...webIds,...runtimeIds].map(row=>String(row.id))).size, items };
+  return { total:byId.size, items };
 }
 app.post('/api/sessions', { preHandler: ensureAuth }, async (req:any, reply) => {
   let projectDir:string;
@@ -1812,18 +1812,19 @@ codex.on('notification', async (msg:any) => {
       activeArtifactTurns.delete(sid);
       const row = await findSession(sid);
       const anchorItemId = row ? await latestAgentItemId(sid, String(row.project_dir)).catch(()=>null) : null;
-      const found = row ? await scanArtifactsForTurn(sid, String(row.project_dir), artifactTurnId, anchorItemId) : [];
+      const found = row ? await scanArtifactsForTurn(sid, String(row.project_dir), artifactTurnId, anchorItemId) : {artifacts:[],codeChanges:[]};
       if (String(row?.status || '') === 'planning') {
         const read = row ? await codex.readThread(sid, true).catch(()=>null) : null;
         const turns = read?.thread?.turns || [];
         const lastTurn = turns[turns.length - 1] || {};
         const finalItem = [...(lastTurn.items || [])].reverse().find((item:any) => isFinalAnswerItem(item));
-        await completePlanTask(sid, String(finalItem?.text || ''), String(finalItem?.id || ''), found);
+        await completePlanTask(sid, String(finalItem?.text || ''), String(finalItem?.id || ''), found.artifacts);
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       } else {
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       }
-      if (found.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) } });
+      if (found.artifacts.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found.artifacts, Date.now()) } });
+      if(found.codeChanges.length)broadcast(sid,{type:'codex',method:'item/completed',params:{item:codeChangesItem(artifactTurnId,found.codeChanges)}});
       maybeExitAfterDrain();
     }
     if (msg.method === 'thread/status/changed') {
@@ -5140,12 +5141,13 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
       const row = await findSession(threadId);
       const read = msg.method === 'turn/completed' && row ? await runtime.readSession(threadId).catch(()=>null) : null;
       const anchorItemId = read?.thread ? latestAgentItemIdFromThread(read.thread) : null;
-      const found = msg.method === 'turn/completed' && row ? await scanArtifactsForTurn(threadId, String(row.project_dir), artifactTurnId, anchorItemId) : [];
+      const found = msg.method === 'turn/completed' && row ? await scanArtifactsForTurn(threadId, String(row.project_dir), artifactTurnId, anchorItemId) : {artifacts:[],codeChanges:[]};
       const wasPlanning = String(row?.status || '') === 'planning';
       const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? 'idle' : 'interrupted';
-      if (wasPlanning && msg.method === 'turn/completed' && !turnFailed(msg.params?.turn)) await completePlanTask(threadId, '', '', found);
+      if (wasPlanning && msg.method === 'turn/completed' && !turnFailed(msg.params?.turn)) await completePlanTask(threadId, '', '', found.artifacts);
       if (!wasPlanning) await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
-      if (found.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found, Date.now()) }, ...base });
+      if (found.artifacts.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found.artifacts, Date.now()) }, ...base });
+      if(found.codeChanges.length)out.push({type:'codex',method:'item/completed',params:{item:codeChangesItem(artifactTurnId,found.codeChanges)},...base});
       maybeExitAfterDrain();
     }
     if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
@@ -5375,7 +5377,7 @@ function sessionIdentitySet(...rows:any[]) {
 async function hardDeleteSessionData(ids:string[]) {
   const unique = [...new Set(ids.filter(Boolean))];
   const result = { ids:unique, webRows:0, runtimeRows:0, attachmentDirs:0, rolloutFiles:0 };
-  for(const id of unique) deleteSessionRelations(db,id,'DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1');
+  for(const id of unique) deleteSessionRelations(db,id,'DELETE FROM sessions WHERE id=?1 OR codex_thread_id=?1 OR provider_session_id=?1',['turn_code_changes']);
   for (const id of unique) {
     result.webRows++;
     if(USE_AGENT_RUNTIME)await runtime.deleteSession(id).catch((error:any)=>{if(error?.statusCode!==404)throw error;});
@@ -5679,10 +5681,10 @@ async function injectGeneratedImages(thread:any, threadId:string){
 async function recordArtifactBaseline(threadId:string, projectDir:string, turnId:string) {
   if (!turnId || !pathAllowed(projectDir)) return;
   const root = realpathSync(projectDir);
-  const manifest = await artifactManifest(root);
+  const artifacts = await artifactManifest(root),workspace=await workspaceChangeManifest(root);
   await db.run(
     'INSERT OR REPLACE INTO artifact_baselines (session_id,turn_id,project_dir,manifest_json,created_at) VALUES (?1,?2,?3,?4,?5)',
-    [threadId, turnId, root, JSON.stringify(manifest), Date.now()]
+    [threadId, turnId, root, JSON.stringify({version:2,artifacts,workspace}), Date.now()]
   );
 }
 async function latestArtifactBaseline(threadId:string) {
@@ -5690,17 +5692,17 @@ async function latestArtifactBaseline(threadId:string) {
   if (!row) return null;
   let manifest:any = {};
   try { manifest = JSON.parse(String(row.manifest_json || '{}')); } catch {}
-  return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest };
+  return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest:manifest?.version===2?manifest.artifacts||{}:manifest, workspace:manifest?.version===2?manifest.workspace||null:null };
 }
 async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:string|null, anchorItemId?:string|null){
-  if (!anchorItemId || !turnId) return [];
+  if (!anchorItemId || !turnId) return {artifacts:[],codeChanges:[]};
   const baseline = turnId ? await db.get('SELECT * FROM artifact_baselines WHERE session_id=?1 AND turn_id=?2', [threadId, turnId]).then((row:any)=>{
     if (!row) return null;
     let manifest:any = {};
     try { manifest = JSON.parse(String(row.manifest_json || '{}')); } catch {}
-    return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest };
+    return { turnId:String(row.turn_id), projectDir:String(row.project_dir), manifest:manifest?.version===2?manifest.artifacts||{}:manifest, workspace:manifest?.version===2?manifest.workspace||null:null };
   }) : null;
-  if (!baseline) return [];
+  if (!baseline) return {artifacts:[],codeChanges:[]};
   const root = realpathSync(projectDir);
   const before = baseline.manifest || {};
   const after = await artifactManifest(root,before);
@@ -5712,6 +5714,7 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
   }).filter(Boolean).sort((a:any,b:any)=>Number(a.modifiedAt)-Number(b.modifiedAt)).slice(-12);
   for (const f of changed as any[]) {
     if (artifactPathIsInternal(f.relativePath)) continue;
+    if(!artifactEligibleForDownload(f.relativePath,f.operation))continue;
     const id = crypto.createHash('sha256').update(`${threadId}\0${baseline.turnId}\0${f.relativePath}\0${f.operation}`).digest('base64url').slice(0, 32);
     const existed = await db.get('SELECT id FROM artifacts WHERE id=?1 AND session_id=?2', [id, threadId]);
     await db.run(
@@ -5734,9 +5737,12 @@ async function scanArtifactsForTurn(threadId:string, projectDir:string, turnId?:
     const row = await artifactForSession(threadId, id);
     if (row) saved.push(artifactDto(row));
   }
-  return saved;
+  const codeChanges=baseline.workspace?workspaceCodeChanges(baseline.workspace,await workspaceChangeManifest(root,baseline.workspace)):[];
+  if(codeChanges.length)await db.run(`INSERT INTO turn_code_changes(session_id,turn_id,anchor_item_id,changes_json,created_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(session_id,turn_id) DO UPDATE SET anchor_item_id=excluded.anchor_item_id,changes_json=excluded.changes_json,created_at=excluded.created_at`,[threadId,baseline.turnId,anchorItemId||null,JSON.stringify(codeChanges),Date.now()]);else await db.run('DELETE FROM turn_code_changes WHERE session_id=?1 AND turn_id=?2',[threadId,baseline.turnId]);
+  return {artifacts:saved,codeChanges};
 }
 async function artifactManifest(root:string,previous?:Record<string,any>){return buildArtifactManifest(root,{types:ARTIFACT_TYPES,skipDirs:ARTIFACT_SKIP_DIRS,isInternal:artifactPathIsInternal,previous});}
+async function workspaceChangeManifest(root:string,previous?:Record<string,any>){return buildArtifactManifest(root,{types:ARTIFACT_TYPES,skipDirs:ARTIFACT_SKIP_DIRS,isInternal:artifactPathIsInternal,previous,includeAll:true,maxFiles:5000,maxDepth:12,maxBytes:5*1024*1024});}
 function artifactPathIsInternal(relativePath:string) {
   const parts = String(relativePath || '').split(path.sep).filter(Boolean);
   const base = parts[parts.length - 1] || '';
@@ -5749,8 +5755,9 @@ function artifactPathIsInternal(relativePath:string) {
   return false;
 }
 async function injectArtifacts(thread:any, threadId:string){
-  const rows = await db.all('SELECT * FROM artifacts WHERE session_id=?1 AND anchor_item_id IS NOT NULL ORDER BY created_at ASC LIMIT 100', [threadId]);
-  if (!rows.length) return;
+  const rows = (await db.all('SELECT * FROM artifacts WHERE session_id=?1 AND anchor_item_id IS NOT NULL ORDER BY created_at ASC LIMIT 100', [threadId])).filter((row:any)=>artifactEligibleForDownload(String(row.relative_path||row.name),String(row.operation||'created')));
+  const codeRows=await db.all('SELECT * FROM turn_code_changes WHERE session_id=?1 AND anchor_item_id IS NOT NULL ORDER BY created_at ASC LIMIT 100',[threadId]);
+  if (!rows.length&&!codeRows.length) return;
   if (!thread.turns) thread.turns = [];
   const groups = groupArtifacts(rows);
   for (const group of groups) {
@@ -5760,6 +5767,7 @@ async function injectArtifacts(thread:any, threadId:string){
     if (insertAfter !== null && insertAfter >= 0) thread.turns.splice(insertAfter + 1, 0, turn);
     else thread.turns.push(turn);
   }
+  for(const row of codeRows){let changes:any[]=[];try{changes=JSON.parse(String(row.changes_json||'[]'));}catch{}if(!changes.length)continue;const stamp=Number(row.created_at||Date.now()),turn={items:[codeChangesItem(String(row.turn_id),changes)],startedAt:Math.floor(stamp/1000),completedAt:Math.floor(stamp/1000),durationMs:null},insertAfter=turnIndexForAnchor(thread.turns,row.anchor_item_id);if(insertAfter!==null&&insertAfter>=0)thread.turns.splice(insertAfter+1,0,turn);else thread.turns.push(turn);}
 }
 async function artifactForSession(threadId:string, artifactId:string): Promise<any | null>{
   if (!/^[A-Za-z0-9_-]{8,80}$/.test(artifactId)) return null;
@@ -5777,11 +5785,9 @@ async function artifactForSession(threadId:string, artifactId:string): Promise<a
 }
 function artifactDto(row:any){ return { id:String(row.id), name:String(row.name), type:String(row.mime), size:Number(row.size || 0), operation:String(row.operation || 'created'), relativePath:row.relative_path || null, turnId:row.turn_id || null, anchorItemId:row.anchor_item_id || null, contentHash:row.content_hash || null, url:`/api/sessions/${encodeURIComponent(String(row.session_id))}/files/${encodeURIComponent(String(row.id))}` }; }
 function artifactMessageItem(artifacts:any[], stamp:number){
-  const created = artifacts.filter((a:any)=>String(a.operation || 'created') === 'created').length;
-  const modified = artifacts.filter((a:any)=>String(a.operation || '') === 'modified').length;
-  const text = created && modified ? '文件变更' : modified ? '已修改文件' : '已生成文件';
-  return { type:'agentMessage', id:`artifacts-${stamp}`, phase:'final_answer', text, artifacts };
+  return { type:'artifactCollection', id:`artifacts-${stamp}`, title:'可下载文件', artifacts };
 }
+function codeChangesItem(turnId:string,changes:any[]){return{type:'codeChanges',id:`code-changes-${turnId}`,title:'本轮代码变更',changes};}
 function groupArtifacts(rows:any[]){
   const groups:any[][] = [];
   for (const row of rows) {

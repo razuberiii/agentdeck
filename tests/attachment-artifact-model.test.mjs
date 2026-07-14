@@ -31,7 +31,7 @@ test('artifacts are registered from persisted turn baselines', () => {
   assert.match(server, /content_hash/);
   assert.match(server, /relative_path/);
   assert.match(server, /turn_id/);
-  assert.match(server, /if \(!anchorItemId \|\| !turnId\) return \[\]/);
+  assert.match(server, /if \(!anchorItemId \|\| !turnId\) return \{artifacts:\[\],codeChanges:\[\]\}/);
   assert.match(server, /const operation = !old \? 'created' : \(artifactContentChanged\(old,f\) \? 'modified' : ''\)/);
   assert.match(server, /ON CONFLICT\(session_id, turn_id, relative_path, operation\) DO UPDATE/);
   assert.doesNotMatch(server, /artifactScanStarts/);
@@ -48,11 +48,25 @@ test('session snapshots only inject persisted artifacts and keep anchors stable'
 });
 
 test('artifact cards are not duplicated by markdown link parsing', () => {
-  assert.match(server, /modified \? '已修改文件' : '已生成文件'/);
-  assert.match(client, /ArtifactGroup title="已生成文件"/);
-  assert.match(client, /ArtifactGroup title="已修改文件"/);
+  assert.match(server, /type:'artifactCollection'/);
+  assert.match(server, /type:'codeChanges'/);
+  assert.match(server, /title:'可下载文件'/);
+  assert.match(server, /title:'本轮代码变更'/);
+  assert.match(client, /item\.type==='artifactCollection'/);
+  assert.match(client, /item\.type==='codeChanges'/);
+  assert.doesNotMatch(server, /modified \? '已修改文件' : '已生成文件'/);
   assert.match(client, /const parsedImages = artifacts\.length \? \[\] : extractMarkdownImages\(text\)/);
   assert.match(client, /const parsedFiles = artifacts\.length \? \[\] : extractFileLinks\(text\)/);
+});
+
+test('project files are filtered from downloadable artifacts but retained as code changes', () => {
+  assert.match(artifactManifest, /artifactPathIsProjectFile/);
+  assert.match(artifactManifest, /artifactEligibleForDownload/);
+  assert.match(artifactManifest, /operation!==['"]created['"]/);
+  assert.match(artifactManifest, /package\.json/);
+  assert.match(server, /workspaceCodeChanges/);
+  assert.match(server, /artifactEligibleForDownload\(String\(row\.relative_path/);
+  assert.match(schema, /CREATE TABLE IF NOT EXISTS turn_code_changes/);
 });
 
 test('artifact ownership excludes internal files and does not scan with missing turn id', () => {

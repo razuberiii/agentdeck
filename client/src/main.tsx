@@ -525,6 +525,8 @@ function itemToEvent(item:any):DisplayEvent|null{
     const target = String(a.type || '').startsWith('image/') ? 'images' : 'files';
     return {key:item.id,role:'image',title:'文件',text:'', [target]:[a]} as DisplayEvent;
   }
+  if(item.type==='artifactCollection'&&Array.isArray(item.artifacts)){const artifacts=item.artifacts,targeted=artifacts.reduce((out:any,a:any)=>{out[String(a.type||'').startsWith('image/')?'images':'files'].push(a);return out;},{images:[],files:[]});return{key:item.id,role:'image',title:item.title||'可下载文件',text:'',images:targeted.images,files:targeted.files};}
+  if(item.type==='codeChanges'&&Array.isArray(item.changes)){const text=item.changes.map((change:any)=>`${change.status} ${change.path}${change.toPath?` → ${change.toPath}`:''}`).join('\n');return text?{key:item.id,role:'reasoning',title:item.title||'本轮代码变更',text,open:false}:null;}
   if(item.type==='dynamicToolCall'&&item.contentItems?.length) {
     const images = item.contentItems.filter((x:any)=>x.type==='inputImage').map((x:any,i:number)=>({id:item.id+i,name:'image',type:'image',size:0,url:x.imageUrl}));
     return images.length ? {key:item.id,role:'image',title:item.tool||'工具结果',text:'',images} : null;
@@ -731,14 +733,9 @@ function extractFileLinks(text:string):Attachment[]{
 function ImageGrid({images,onOpen,onLoad}:{images:Attachment[];onOpen:(a:Attachment)=>void;onLoad?:()=>void}){ if(!images.length)return null; return <div className="imageGrid">{images.map(img=><button className="thumb" key={img.id} onClick={()=>onOpen(img)}><img src={img.previewUrl||img.url} alt={img.name} onLoad={onLoad}/></button>)}</div>; }
 function FileGrid({files}:{files:Attachment[]}){
   if(!files.length)return null;
-  const hasArtifactOps=files.some(f=>f.operation==='created'||f.operation==='modified');
+  const hasArtifactOps=files.some(f=>f.operation==='created');
   if(!hasArtifactOps) return <div className="fileGrid">{files.map(f=><FileCard key={f.id} file={f}/>)}</div>;
-  const created=files.filter(f=>String(f.operation||'created')==='created');
-  const modified=files.filter(f=>String(f.operation||'')==='modified');
-  return <div className="artifactGroups">
-    {!!created.length&&<ArtifactGroup title="已生成文件" files={created}/>}
-    {!!modified.length&&<ArtifactGroup title="已修改文件" files={modified}/>}
-  </div>;
+  return <div className="artifactGroups"><ArtifactGroup title="已生成文件" files={files}/></div>;
 }
 function ArtifactGroup({title,files}:{title:string;files:Attachment[]}){ return <div className="artifactGroup"><b>{title}</b><div className="fileGrid">{files.map(f=><FileCard key={f.id} file={f}/>)}</div></div>; }
 function FileCard({file:f}:{file:Attachment}){ return <a className="fileCard" href={f.url} download={f.name} target="_blank" rel="noreferrer"><span className="fileIcon">↓</span><span><b>{f.relativePath || f.name}</b><small>{f.operation==='modified'?'已修改':(f.type || 'download')}</small></span></a>; }

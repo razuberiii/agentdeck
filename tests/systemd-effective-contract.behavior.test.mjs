@@ -19,7 +19,7 @@ test('/run 660 second drop-in effective timeout and contract pass validation',()
 test('drop-in on disk but absent from systemctl state is rejected as not daemon-reloaded',()=>assert.notEqual(verify({version:'',dropins:''}).status,0));
 
 test('contract rejection occurs before build and leaves production pointer and PID untouched',()=>{
-  const root=mkdtempSync(join(tmpdir(),'agentdeck-contract-block-')),data=join(root,'data'),bin=join(root,'bin');mkdirSync(data,{recursive:true});mkdirSync(bin);mkdirSync(join(root,'releases/old'),{recursive:true});
+  const root=mkdtempSync(join(tmpdir(),'agentdeck-contract-block-')),data=join(root,'data'),bin=join(data,'provider-tools/bin');mkdirSync(bin,{recursive:true});mkdirSync(join(root,'releases/old'),{recursive:true});
   writeFileSync(join(bin,'systemctl'),'#!/usr/bin/env bash\nif [ "$1" = show ];then printf "FragmentPath=/old/unit\\nDropInPaths=\\nTimeoutStopUSec=1\\nEnvironment=AGENTDECK_SYSTEMD_UNIT_VERSION=1\\n";else echo restart >> "$ROOT/restarts";fi\n');chmodSync(join(bin,'systemctl'),0o755);
   const script='source "$REPO/scripts/agentdeckctl";ensure_dirs;ln -s releases/old "$CURRENT_RUNTIME_LINK";make_release(){ echo built > "$ROOT/built"; };undrain_runtime(){ :; };write_job test accepted accepted;worker_deploy test runtime 0';
   const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,ROOT:root,AGENTDECK_ROOT:root,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(root,'state'),DATA_DIR:data,PATH:`${bin}:${process.env.PATH}`}});
