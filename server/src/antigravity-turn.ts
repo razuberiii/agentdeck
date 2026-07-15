@@ -53,8 +53,8 @@ export async function finalizeAntigravityTurn(options:FinalizeOptions) {
 
 type RunOptions = {
   timeoutMs:number;
-  killGraceMs?:number;
   cleanOutput:(text:string)=>string;
+  onTimeout?:()=>void | Promise<void>;
   onDelta?:(delta:string)=>void;
   onState?:(state:AntigravityTurnState)=>void | Promise<void>;
 };
@@ -80,18 +80,16 @@ export function runAntigravityChild(child:ChildProcess, options:RunOptions):Prom
     let spawnError:Error | null = null;
     let timedOut = false;
     let settled = false;
-    let forceKillTimer:NodeJS.Timeout | null = null;
 
     const setState = (state:AntigravityTurnState) => { void options.onState?.(state); };
-    const timeout = setTimeout(() => {
+    const timeout = options.timeoutMs > 0 ? setTimeout(() => {
+      // Antigravity is a detached process-group. Its Runtime execution owner
+      // supplies timeout cancellation and group termination; this helper only
+      // classifies a timeout when explicitly used by a non-detached caller.
       timedOut = true;
-      try { child.kill('SIGTERM'); } catch {}
-      forceKillTimer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch {}
-      }, options.killGraceMs ?? 5000);
-      forceKillTimer.unref?.();
-    }, options.timeoutMs);
-    timeout.unref?.();
+      void options.onTimeout?.();
+    }, options.timeoutMs) : null;
+    timeout?.unref?.();
 
     child.stdout?.on('data', chunk => {
       stdout += chunk.toString();
@@ -115,8 +113,7 @@ export function runAntigravityChild(child:ChildProcess, options:RunOptions):Prom
     child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (timeout) clearTimeout(timeout);
       exitCode = code ?? exitCode;
       exitSignal = signal ?? exitSignal;
       const output = options.cleanOutput(stdout);

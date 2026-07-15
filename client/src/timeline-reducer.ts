@@ -4,6 +4,9 @@ export type TimelineDisplayEvent = {
   text?: string;
   clientMessageId?: string;
   messageId?: string;
+  turnId?:string;
+  segmentId?:string;
+  retryOf?:string;
   attachments?: { id?: string; url?: string; name?: string; type?: string; size?: number }[];
   meta?: string;
   deliveryStatus?: string;
@@ -85,6 +88,8 @@ function liveUserKeys(msg: any): string[] {
     text: String(msg.text || ''),
     clientMessageId: msg.clientMessageId ? String(msg.clientMessageId) : undefined,
     messageId: msg.messageId ? String(msg.messageId) : undefined,
+    turnId:msg.turnId?String(msg.turnId):undefined,
+    segmentId:msg.segmentId?String(msg.segmentId):undefined,
     attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
   });
 }
@@ -325,9 +330,16 @@ export function resolveTurnUiStatus(session: any, approvals: any[] = [], cancell
   const activeStatus = normalizeTurnStatus(active?.status);
   if (active?.turnId && activeStatus !== 'unknown' && activeStatus !== 'idle' && activeStatus !== 'completed') return activeStatus;
   if (active?.turnId) return 'running';
-  if (live.some(m => m?.type === 'codex' && (m.method === 'turn/started' || m.method === 'item/agentMessage/delta'))) return 'running';
-  if (current !== 'unknown' && current !== 'completed') return current;
+  const structured=latestStructuredTurnEvent(live);
+  if(structured?.method==='turn/started')return'running';
+  if(structured?.method==='turn/completed')return turnStatusFromTerminal(structured,'completed');
+  if(structured?.method==='turn/failed')return'failed';
+  if(structured?.method==='turn/interrupted')return'interrupted';
+  if(live.some(m=>m?.type==='codex'&&m.method==='item/agentMessage/delta'))return'running';
   const sessionStatus = normalizeTurnStatus(session?.status);
   if (['running','waiting_approval','waiting_input','cancelling','failed','interrupted'].includes(sessionStatus)) return sessionStatus;
+  if(['running','waiting_approval','waiting_input','cancelling'].includes(current))return current;
   return 'idle';
 }
+function turnStatusFromTerminal(message:any,fallback:TurnUiStatus):TurnUiStatus{const status=normalizeTurnStatus(message?.params?.turn?.status);return status==='failed'||status==='interrupted'?status:fallback;}
+function latestStructuredTurnEvent(live:any[]){let latest:any=null,latestSequence=Number.NEGATIVE_INFINITY,latestIndex=-1;for(let index=0;index<live.length;index++){const event=live[index];if(event?.type!=='codex'||!['turn/started','turn/completed','turn/failed','turn/interrupted'].includes(String(event.method)))continue;const value=Number(event.runtimeSequence),sequence=Number.isFinite(value)&&value>0?value:Number.NEGATIVE_INFINITY;if(!latest||sequence>latestSequence||(sequence===latestSequence&&index>latestIndex)){latest=event;latestSequence=sequence;latestIndex=index;}}return latest;}

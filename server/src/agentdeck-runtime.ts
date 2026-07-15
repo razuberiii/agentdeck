@@ -4,11 +4,11 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { chmod, cp, lstat, mkdir, readFile, readlink, rm, symlink } from 'node:fs/promises';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { chmod, cp, lstat, mkdir, open, readFile, readdir, readlink, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Db } from './db.js';
 import { WsJsonRpcClient } from './ws-json-rpc.js';
@@ -24,6 +24,8 @@ import { runtimeIsDrained } from './runtime-drain-state.js';
 import { TurnAdmission } from './turn-admission.js';
 import { codexSessionStateForNotification } from './codex-session-state.js';
 import { KeyedSerialQueue } from './keyed-serial-queue.js';
+import { buildAntigravityArgs, parseAntigravityConversation, antigravityConversationExists, antigravityMetadata, resolveAntigravityBinary } from './antigravity-cli.js';
+import { DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS, runAntigravityChild, safeAntigravitySummary, stableAntigravityAssistantId } from './antigravity-turn.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_HOME = process.env.HOME || os.homedir();
@@ -49,13 +51,43 @@ const SHARED_CODEX_DIR = RUNTIME_MODE === 'candidate' ? path.join(DATA_DIR, 'can
 const SHARED_SESSIONS_DIR = path.join(SHARED_CODEX_DIR, 'sessions');
 const SHARED_GENERATED_IMAGES_DIR = path.join(SHARED_CODEX_DIR, 'generated_images');
 const RECOVERY_CONTEXT_MARKER = '[[AGENT_RUNTIME_RECOVERY_CONTEXT]]';
+const ANTIGRAVITY_TERMINAL_JOURNAL_DIR=path.join(DATA_DIR,'runtime','antigravity-terminal-intents');
+type AntigravityExecutionPhase='claimed'|'preparing'|'spawning'|'running'|'cancelling'|'completed'|'failed'|'interrupted';
+type AntigravityTerminal='completed'|'failed'|'interrupted';
+type AntigravitySpawnState='not_started'|'pending'|'succeeded'|'failed';
+type AntigravityCleanupState='not_required'|'pending'|'running'|'retryable_failed'|'exited';
+type AntigravityProcessIdentity={pid:number;startTicks:string;pgrp:number;sessionId:number};
+type AntigravityTerminalDecision={terminal:AntigravityTerminal;reason:string|null;message:string|null;assistantText:string|null};
+type AntigravityExecution={
+  sessionId:string;turnId:string;itemId:string;body:any;phase:AntigravityExecutionPhase;
+  child:ChildProcess|null;childClosed:Promise<void>|null;cancelRequested:boolean;
+  spawnState:AntigravitySpawnState;spawnOutcome:Promise<AntigravitySpawnState>|null;
+  processGroupId:number|null;processGroupLeaderPid:number|null;processGroupStartTicks:string|null;processGroupMembers:AntigravityProcessIdentity[];processGroupExited:boolean;cleanupState:AntigravityCleanupState;cleanupAttempts:number;cleanupError:string|null;
+  cancelReason:string|null;terminalDecision:AntigravityTerminalDecision|null;finalizationCommitted:boolean;
+  finalizationError:string|null;finalizePromise:Promise<void>|null;terminatePromise:Promise<void>|null;
+  timeout:NodeJS.Timeout|null;logFile:string;done:Promise<void>;resolveDone:()=>void;
+};
+const antigravityTurns=new Map<string,AntigravityExecution>();
+const runtimeTurnLineage=new Map<string,{segmentId:string;clientMessageId:string;messageId:string;retryOf:string}>();
+async function persistRuntimeTurnLineage(sessionId:string,turnId:string,lineage:{segmentId:string;clientMessageId:string;messageId:string;retryOf:string}){const now=Date.now();await db.run(`INSERT INTO runtime_turn_lineage(session_id,turn_id,segment_id,client_message_id,message_id,retry_of,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7) ON CONFLICT(session_id,turn_id) DO UPDATE SET segment_id=excluded.segment_id,client_message_id=excluded.client_message_id,message_id=excluded.message_id,retry_of=excluded.retry_of,updated_at=excluded.updated_at`,[sessionId,turnId,lineage.segmentId,lineage.clientMessageId||null,lineage.messageId||null,lineage.retryOf||null,now]);runtimeTurnLineage.set(`${sessionId}:${turnId}`,lineage);}
+async function runtimeLineage(sessionId:string,turnId:string){const cached=runtimeTurnLineage.get(`${sessionId}:${turnId}`);if(cached)return cached;const row=await db.get('SELECT segment_id,client_message_id,message_id,retry_of FROM runtime_turn_lineage WHERE session_id=?1 AND turn_id=?2',[sessionId,turnId]);if(!row)return null;const lineage={segmentId:String(row.segment_id||''),clientMessageId:String(row.client_message_id||''),messageId:String(row.message_id||''),retryOf:String(row.retry_of||'')};runtimeTurnLineage.set(`${sessionId}:${turnId}`,lineage);return lineage;}
+async function deleteRuntimeTurnLineage(sessionId:string,turnId:string){runtimeTurnLineage.delete(`${sessionId}:${turnId}`);await db.run('DELETE FROM runtime_turn_lineage WHERE session_id=?1 AND turn_id=?2',[sessionId,turnId]);}
+const antigravitySessionQueue=new KeyedSerialQueue();
+let antigravitySessionFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_TERMINAL_SESSION_FAILURES||0:0);
+let antigravityEventFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_TERMINAL_EVENT_FAILURES||0:0);
+let antigravityIntentFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_TERMINAL_INTENT_FAILURES||0:0);
+let antigravityCleanupFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_CLEANUP_FAILURES||0:0);
+let antigravityCleanupPreSignalFaults=Number(process.env.NODE_ENV==='test'?process.env.ANTIGRAVITY_TEST_CLEANUP_PRE_SIGNAL_FAILURES||0:0);
 function isLoopbackHost(host:string) {
   return host === '127.0.0.1' || host === '::1' || host === 'localhost';
 }
 if (!isLoopbackHost(HOST) && !RUNTIME_TOKEN) {
   throw new Error('RUNTIME_TOKEN is required when RUNTIME_HOST is not loopback');
 }
-if (RUNTIME_MODE === 'active') mkdirSync('/run/agentdeck', { recursive:true });
+if (RUNTIME_MODE === 'active') {
+  const configuredRunDir=process.env.RUNTIME_RUN_DIR || '/run/agentdeck';
+  try{mkdirSync(configuredRunDir,{recursive:true});}catch(error:any){if(error?.code!=='EACCES')throw error;mkdirSync(path.join(DATA_DIR,'runtime-run'),{recursive:true});}
+}
 
 type Account = { id:string; provider:string; codex_home:string; runtime_instance_id:string | null };
 type StructuredRuntimeErrorBody = {
@@ -85,6 +117,7 @@ type RuntimeSession = {
   model_revision?:number;
   provider_id?: string | null;
   provider_session_id?: string | null;
+  provider_metadata?: string | null;
   creator_profile_id?: string | null;
   selected_profile_id?: string | null;
   executing_profile_id?: string | null;
@@ -391,6 +424,7 @@ app.addHook('preHandler', async (req, reply) => {
 });
 
 app.get('/healthz', async () => ({ ok:true, instanceId:INSTANCE_ID, pid:process.pid, now:Date.now(), lifecycle:runtimeLifecycle, mode:RUNTIME_MODE, releaseId:RELEASE_ID, commit:RELEASE_COMMIT }));
+app.get('/readyz', async (_req,reply) => runtimeLifecycle==='accepting'?{ok:true,lifecycle:runtimeLifecycle}:reply.code(503).send({ok:false,lifecycle:runtimeLifecycle}));
 app.get('/internal/deep-health',async()=>{const migration=await db.get("SELECT COALESCE(MAX(version),0) version FROM schema_migrations WHERE owner='runtime'");const integrity=await db.get('PRAGMA integrity_check');const schemaMigrationVersion=Number(migration?.version||0),schemaShapeCompatible=await verifyRuntimeSchema(db).then(()=>true).catch(()=>false),schemaCompatible=schemaMigrationVersion===RUNTIME_SCHEMA_VERSION&&schemaShapeCompatible;return{ok:integrity?.integrity_check==='ok'&&schemaCompatible,component:'runtime',releaseId:RELEASE_ID,contractVersion:API_DTO_CONTRACT_VERSION,schemaMigrationVersion,schemaCompatible,schemaShapeCompatible,sqlite:integrity?.integrity_check==='ok',mode:RUNTIME_MODE,candidateRejectsTurns:RUNTIME_MODE==='candidate'};});
 app.get('/admin/runtime/state', async () => runtimeAdminState());
 app.post('/admin/runtime/drain', async (req:any) => startRuntimeDrain(req));
@@ -571,6 +605,13 @@ app.post('/gemini/sessions', async (req:any, reply) => {
   }
 });
 
+app.post('/antigravity/sessions', async (req:any, reply) => {
+  if(isCandidateMode())return reply.code(503).send(runtimeUnavailableBody(req,'runtime_candidate'));
+  if(isDraining())return reply.code(503).send(runtimeDrainingBody(req));
+  const body=req.body||{},id=String(body.sessionId||crypto.randomUUID());
+  return antigravitySessionQueue.run(id,async()=>({session:await ensureAntigravityRuntimeSession(id,body),providerSessionId:(await getSession(id))?.provider_session_id||null}));
+});
+
 app.post('/claude/sessions', async (req:any, reply) => {
   if (isCandidateMode()) return reply.code(503).header('Retry-After', '5').send(runtimeUnavailableBody(req, 'runtime_candidate'));
   if (isDraining()) return reply.code(503).send(runtimeDrainingBody(req));
@@ -687,7 +728,7 @@ app.patch('/sessions/:id', async (req:any, reply) => {
   await runtime.request('thread/name/set', { threadId, name:title }).catch(()=>{});
   return { ok:true, session: await getSession(session.id) };
 });
-app.delete('/sessions/:id',async(req:any,reply)=>{const session=await getSession(String(req.params.id));if(!session)return reply.code(404).send({error:'not found'});if(session.active_turn_id||['running','submitting','planning'].includes(session.status))return reply.code(409).send({error:'turn_running'});deleteSessionRelations(db,session.id);return{ok:true};});
+app.delete('/sessions/:id',async(req:any,reply)=>{const session=await getSession(String(req.params.id));if(!session)return reply.code(404).send({error:'not found'});if(session.active_turn_id||['running','submitting','planning'].includes(session.status))return reply.code(409).send({error:'turn_running'});deleteSessionRelations(db,session.id,'DELETE FROM sessions WHERE id=?1',['antigravity_terminal_intents','runtime_turn_lineage']);return{ok:true};});
 
 app.get('/sessions/:id/events', async (req:any) => {
   const after = Number(req.query?.after || 0);
@@ -727,8 +768,22 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
   return (async () => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
+  if(session.provider_id==='antigravity'||session.provider==='antigravity'){
+    const body=req.body||{},profile=validateAntigravityProfile(body.profile,body.accountId||session.current_upstream_account_id||session.account_id);
+    if(antigravityTurns.has(session.id)||session.active_turn_id)return reply.code(409).send({error:'antigravity_turn_already_running'});
+    const input=Array.isArray(body.input)?body.input:[{type:'text',text:String(body.text||'')}],text=String(body.text||visibleInputText(input));
+    if(!text.trim())return reply.code(400).send({error:'empty message'});
+    const turnId=String(body.turnId||body.clientMessageId||crypto.randomUUID());
+    const claim=await db.run("UPDATE sessions SET status=?1,active_turn_id=?2,selected_profile_id=?3,executing_profile_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5 AND active_turn_id IS NULL AND status NOT IN ('running','planning','output_draining')",[body.planMode==='plan'?'planning':'running',turnId,profile.id,Date.now(),session.id]);
+    if(!claim.changes)return reply.code(409).send({error:'antigravity_turn_already_running'});
+    const execution=createAntigravityExecution(session.id,turnId,{...body,input,text,turnId,profile});
+    antigravityTurns.set(session.id,execution);
+    void runAntigravityRuntimeTurn(session,execution).catch(e=>app.log.warn({provider:'antigravity',sessionId:session.id,error:safeAntigravitySummary(e?.message||String(e))},'antigravity runtime turn failed'));
+    return{ok:true,provider:'antigravity',turn:{id:turnId}};
+  }
   if (session.provider_id === 'gemini' || session.provider === 'gemini') {
     const body = req.body || {};
+    const turnId=String(body.turnId||body.localTurnId||body.clientMessageId||crypto.randomUUID());
     const accountId = String(body.accountId || session.current_upstream_account_id || session.account_id || 'default');
     const previousAccountId = String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || '');
     const accountSwitched = !!previousAccountId && previousAccountId !== accountId;
@@ -747,14 +802,14 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
         await gemini.recoverSession(session.id, session.provider_session_id || null, String(body.cwd || session.project_dir),String(body.permissionMode || session.permission_mode));
         await db.run('UPDATE sessions SET current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [accountId, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
       }
-      await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || '') });
-      const running = gemini.prompt(session.id, prompt as any[]);
+      await appendEvent(session.id, 'user', { input,clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),turnId,segmentId:String(body.segmentId||body.clientMessageId||turnId),retryOf:String(body.retryOf||'') });
+      const running = gemini.prompt(session.id, prompt as any[],{turnId,segmentId:String(body.segmentId||body.clientMessageId||turnId),clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),retryOf:String(body.retryOf||'')});
       running.catch(e => app.log.warn({ err:e, sessionId:session.id }, 'gemini prompt failed'));
       return { ok:true, provider:'gemini' };
     } catch (e:any) {
       const message = e?.message || String(e);
       await db.run('UPDATE sessions SET status=?1, active_turn_id=NULL, interruption_reason=?2, updated_at=?3 WHERE id=?4', ['interrupted', 'gemini_turn_start_failed', Date.now(), session.id]);
-      await appendEvent(session.id, 'turn/failed', { provider:'gemini', error:{ message } });
+      await appendEvent(session.id, 'turn/failed', { provider:'gemini',turnId,segmentId:String(body.segmentId||body.clientMessageId||turnId),clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),retryOf:String(body.retryOf||''), error:{ message } });
       return reply.code(isGeminiAuthenticationErrorMessage(message) ? 409 : 500).send({ error:message, gemini:await geminiManager.status(accountId) });
     }
   }
@@ -768,7 +823,7 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
     if (!text.trim() && !input.length) return reply.code(400).send({ error:'empty message' });
     const turnId = String(body.turnId || crypto.randomUUID());
     await db.run('UPDATE sessions SET selected_profile_id=?1,executing_profile_id=?1,current_upstream_account_id=?1,last_execution_account_id=?1,account_snapshot_json=COALESCE(?2,account_snapshot_json),updated_at=?3 WHERE id=?4', [profile.id, body.accountSnapshot ? JSON.stringify(body.accountSnapshot) : null, Date.now(), session.id]);
-    await appendEvent(session.id, 'user', { input, clientMessageId:String(body.clientMessageId || ''), provider:'claude', profileId:profile.id, profileSwitched });
+    await appendEvent(session.id, 'user', { input,clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),turnId,segmentId:String(body.segmentId||body.clientMessageId||turnId),retryOf:String(body.retryOf||''),provider:'claude',profileId:profile.id,profileSwitched });
     if (profileSwitched) await appendEvent(session.id, 'system', { provider:'claude', text:'已切换 Claude Code profile；下一轮使用本地历史在新 profile 下继续。', previousProfileId, profileId:profile.id });
     const permissionMode = claudePermissionMode(body.permissionMode || session.permission_mode);
     const task = claudeManager.startTurn({
@@ -781,6 +836,10 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
       resume:profileSwitched ? null : session.provider_session_id || session.upstream_thread_id || null,
       profile,
       turnId,
+      segmentId:String(body.segmentId||body.clientMessageId||turnId),
+      clientMessageId:String(body.clientMessageId||''),
+      messageId:String(body.messageId||''),
+      retryOf:String(body.retryOf||''),
     });
     task.catch(e => app.log.warn({ provider:'claude', sessionId:session.id, error:e?.message || String(e) }, 'claude turn failed'));
     return { ok:true, provider:'claude' };
@@ -821,6 +880,10 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
   await appendEvent(session.id, 'user', {
     input,
     clientMessageId:String(body.clientMessageId || ''),
+    messageId:String(body.messageId||''),
+    turnId:String(body.turnId||body.localTurnId||''),
+    segmentId:String(body.segmentId||body.clientMessageId||''),
+    retryOf:String(body.retryOf||''),
     selectedProfileId:body.executionContext?.selectedProfileId || accountId,
     executingProfileId:accountId,
     upstreamBindingProfileId:accountId,
@@ -866,8 +929,8 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
     return reply.code(message.includes('thread not found') ? 409 : 500).send({ error:message });
     }
   }
-  if (turn?.turn?.id) await db.run('UPDATE sessions SET active_turn_id=?1, status=?2, updated_at=?3 WHERE id=?4', [String(turn.turn.id), 'running', Date.now(), session.id]);
-  await appendEvent(session.id, 'turn/start', { result:turn, source:'runtime' });
+  if(turn?.turn?.id){const realTurnId=String(turn.turn.id),lineage={segmentId:String(body.segmentId||body.clientMessageId||''),clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),retryOf:String(body.retryOf||'')};await persistRuntimeTurnLineage(session.id,realTurnId,lineage);await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,updated_at=?3 WHERE id=?4',[realTurnId,'running',Date.now(),session.id]);}
+  await appendEvent(session.id,'turn/start',{result:turn,source:'runtime',clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),segmentId:String(body.segmentId||body.clientMessageId||''),retryOf:String(body.retryOf||'')});
   return { turn };
   })().finally(() => turnAdmission.end());
 });
@@ -875,6 +938,20 @@ app.post('/sessions/:id/turns', (req:any, reply) => {
 app.post('/sessions/:id/stop', async (req:any, reply) => {
   const session = await getSession(String(req.params.id));
   if (!session) return reply.code(404).send({ error:'not found' });
+  if(session.provider_id==='antigravity'||session.provider==='antigravity'){
+    const active=antigravityTurns.get(session.id);
+    if(!active){
+      const intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1',[session.id]);
+      if(intent)try{await cleanupAntigravityTerminalIntent(intent);const ready=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1',[session.id]);await commitAntigravityTerminalIntent(ready,takeAntigravityTerminalFault());await rm(antigravityTerminalJournalPath(String(intent.session_id),String(intent.turn_id)),{force:true}).catch(()=>{});const terminal=String(intent.terminal);if(terminal==='completed')return{ok:true,interrupted:false,alreadyCompleted:true,processExited:true,finalizationCommitted:true};if(terminal==='failed')return{ok:true,interrupted:false,alreadyFailed:true,processExited:true,finalizationCommitted:true};return{ok:true,interrupted:true,alreadyStopped:true,processExited:true,finalizationCommitted:true};}catch(error:any){return reply.code(503).send({ok:false,error:'antigravity_terminal_recovery_failed',safeDetail:safeAntigravitySummary(error?.message||String(error)),processExited:false,finalizationCommitted:false});}
+      if(session.active_turn_id||['running','planning','output_draining'].includes(session.status))return reply.code(409).send({ok:false,error:'antigravity_state_recovery_required',activeTurnId:session.active_turn_id||null});
+      if(session.status==='idle')return{ok:true,interrupted:false,alreadyCompleted:true,processExited:true};if(session.status==='failed')return{ok:true,interrupted:false,alreadyFailed:true,processExited:true};if(session.status==='interrupted')return{ok:true,interrupted:true,alreadyStopped:true,processExited:true};return{ok:true,alreadyStopped:true};
+    }
+    try{await requestAntigravityCancellation(active,'interrupted','manual_stop');await active.done;}catch(error:any){return reply.code(503).send({ok:false,error:'antigravity_terminal_persistence_failed',safeDetail:safeAntigravitySummary(error?.message||String(error)),processExited:active.child?active.processGroupExited:false,finalizationCommitted:false});}
+    const terminal=active.terminalDecision?.terminal;
+    if(terminal==='completed')return{ok:true,interrupted:false,alreadyCompleted:true,processExited:true,finalizationCommitted:true};
+    if(terminal==='failed')return{ok:true,interrupted:false,alreadyFailed:true,processExited:true,finalizationCommitted:true};
+    return{ok:true,interrupted:true,processExited:active.child?active.processGroupExited:true,finalizationCommitted:true};
+  }
   if (session.provider_id === 'gemini' || session.provider === 'gemini') return (await geminiManager.get(String(session.current_upstream_account_id || session.last_execution_account_id || session.account_id || 'default'))).cancel(session.id);
   if (session.provider_id === 'claude' || session.provider === 'claude') return claudeManager.cancel(session.id);
   if (!session.active_turn_id) return { ok:true, alreadyStopped:true };
@@ -893,14 +970,12 @@ app.post('/sessions/:id/stop', async (req:any, reply) => {
   return { ok:true, interrupted:!warning, warning };
 });
 
+process.once('SIGTERM', () => { shutdownGracefully('SIGTERM').catch(e => { app.log.error({ err:e }, 'runtime graceful shutdown failed'); process.exit(1); }); });
+process.once('SIGINT', () => { shutdownGracefully('SIGINT').catch(e => { app.log.error({ err:e }, 'runtime graceful shutdown failed'); process.exit(1); }); });
+if(process.env.SKIP_RUNTIME_BOOTSTRAP!=='1')try{await bootstrapRuntimeRecovery();}catch(error:any){app.log.fatal({recoveryStage:'bootstrap',error:safeAntigravitySummary(error?.message||String(error))},'Runtime bootstrap recovery failed; refusing traffic');db.close();process.exit(1);}
 await app.listen({ host:HOST, port:PORT });
 runtimeLifecycle = 'accepting';
 app.log.info({ host:HOST, port:PORT, db:DB_FILE, instanceId:INSTANCE_ID, lifecycle:runtimeLifecycle }, 'agentdeck-runtime listening');
-process.once('SIGTERM', () => { shutdownGracefully('SIGTERM').catch(e => { app.log.error({ err:e }, 'runtime graceful shutdown failed'); process.exit(1); }); });
-process.once('SIGINT', () => { shutdownGracefully('SIGINT').catch(e => { app.log.error({ err:e }, 'runtime graceful shutdown failed'); process.exit(1); }); });
-if (process.env.SKIP_RUNTIME_BOOTSTRAP !== '1') {
-  setTimeout(() => bootstrapRuntimeRecovery().catch(e => app.log.error({ err:e }, 'runtime bootstrap recovery failed')), 50);
-}
 setInterval(() => {
   db.run('UPDATE runtime_instances SET heartbeat_at=?1 WHERE instance_id=?2', [Date.now(), INSTANCE_ID]).catch(()=>{});
 }, 5000).unref();
@@ -928,6 +1003,239 @@ function validateClaudeProfileForRuntime(raw:any, fallbackId?:any): ClaudeProfil
     updatedAt:Number(raw?.updatedAt || raw?.updated_at || 0),
   };
 }
+
+type AntigravityRuntimeProfile={id:string;homeDir:string};
+async function ensureAntigravityRuntimeSession(id:string,body:any){
+  const existing=await getSession(id),cwd=String(body.cwd||existing?.project_dir||DEFAULT_WORKDIR),profile=validateAntigravityProfile(body.profile,body.accountId||existing?.account_id),opts=turnOptions({...existing,...body}),now=Date.now();
+  const supplied=String(body.providerSessionId||'');
+  const upstream=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(supplied)&&supplied!==id?supplied:null;
+  await db.run(`INSERT INTO sessions (id,codex_thread_id,project_dir,title,status,permission_mode,approval_policy,sandbox_mode,model,archived,created_at,updated_at,provider_id,account_id,model_id,workspace_path,provider_session_id,provider,upstream_thread_id,active_turn_id,last_sequence,interruption_reason,provider_metadata,creator_profile_id,selected_profile_id,executing_profile_id,upstream_binding_profile_id,last_execution_account_id,current_upstream_account_id,account_snapshot_json)
+    VALUES (?1,?1,?2,?3,'idle',?4,?5,?6,?7,0,?8,?8,'antigravity',?9,?7,?2,?10,'antigravity',?10,NULL,0,NULL,?11,?9,?9,?9,?9,?9,?9,?12)
+    ON CONFLICT(id) DO UPDATE SET provider_id='antigravity',provider='antigravity',project_dir=excluded.project_dir,account_id=excluded.account_id,model=COALESCE(sessions.model,excluded.model),model_id=COALESCE(sessions.model_id,excluded.model_id),provider_session_id=CASE WHEN sessions.provider_session_id=sessions.id THEN excluded.provider_session_id ELSE COALESCE(sessions.provider_session_id,excluded.provider_session_id) END,upstream_thread_id=CASE WHEN sessions.upstream_thread_id=sessions.id THEN excluded.upstream_thread_id ELSE COALESCE(sessions.upstream_thread_id,excluded.upstream_thread_id) END,updated_at=excluded.updated_at`,[id,cwd,cleanTitle(body.title||existing?.title||path.basename(cwd),cwd),opts.permissionMode,opts.approvalPolicy,opts.sandboxMode,opts.model||null,Number(body.createdAt||existing?.created_at||now),profile.id,upstream,JSON.stringify(antigravityMetadata(existing?.provider_metadata,{profileId:profile.id,legacyImported:!!body.legacyHistory})),JSON.stringify(body.accountSnapshot||null)]);
+  const imported=await db.get("SELECT 1 AS ok FROM events WHERE session_id=?1 AND event_type='antigravity/history_imported' LIMIT 1",[id]);
+  if(!imported?.ok&&Array.isArray(body.legacyHistory)){
+    for(const entry of body.legacyHistory){const role=entry?.role==='assistant'?'assistant':'user',text=String(entry?.text||'').trim();if(!text)continue;const item={id:`legacy-${String(entry.id||crypto.randomUUID())}`,type:role==='assistant'?'agentMessage':'userMessage',text,content:role==='user'?[{type:'text',text}]:undefined,phase:role==='assistant'?'final_answer':undefined};await appendEvent(id,'item/completed',{method:'item/completed',params:{item}});}
+    await appendEvent(id,'antigravity/history_imported',{provider:'antigravity',count:body.legacyHistory.length});
+  }
+  if(!existing)await appendEvent(id,'antigravity/session_created',{provider:'antigravity',profileId:profile.id,cwd,legacyImported:!!body.legacyHistory});
+  return getSession(id);
+}
+function validateAntigravityProfile(raw:any,fallbackId?:any):AntigravityRuntimeProfile{
+  const id=String(raw?.id||fallbackId||'').trim(),homeDir=String(raw?.homeDir||raw?.home_dir||'').trim();
+  if(!/^[a-f0-9]{16}$/i.test(id)&&id!=='default')throw new Error('bad Antigravity profile id');
+  if(!homeDir)throw new Error('Antigravity profile details required');
+  const root=realpathSync(path.join(DATA_DIR,'antigravity-profiles'));
+  const resolved=realpathSync(homeDir);
+  if(!(resolved===root||resolved.startsWith(root+path.sep)))throw new Error('Antigravity profile outside managed root');
+  return{id,homeDir:resolved};
+}
+
+async function antigravityRecoveryText(session:RuntimeSession){
+  const rows=await db.all("SELECT event_type,payload_json FROM events WHERE session_id=?1 AND event_type IN ('user','item/completed') AND sequence < (SELECT COALESCE(MAX(sequence),0) FROM events WHERE session_id=?1) ORDER BY sequence DESC LIMIT 30",[session.id]);
+  const visible:string[]=[];
+  for(const row of rows.reverse())try{const p=JSON.parse(String(row.payload_json||'{}'));if(row.event_type==='user'){const t=visibleInputText(p.input);if(t)visible.push(`User: ${t}`);}else{const item=p?.params?.item||p?.item;if(item?.type==='agentMessage'&&item?.text)visible.push(`Assistant: ${String(item.text)}`);if(item?.type==='userMessage'){const t=String(item.text||item.content?.map((x:any)=>x?.text||'').join('\n')||'').trim();if(t)visible.push(`User: ${t}`);}}}catch{}
+  return `${RECOVERY_CONTEXT_MARKER}\nThe upstream Antigravity conversation could not be resumed. Continue using this visible AgentDeck history; do not repeat it verbatim.\n${visible.slice(-20).join('\n\n')}\n[[/AGENT_RUNTIME_RECOVERY_CONTEXT]]`;
+}
+
+function createAntigravityExecution(sessionId:string,turnId:string,body:any):AntigravityExecution{
+  let resolveDone!:()=>void;
+  const done=new Promise<void>(resolve=>{resolveDone=resolve;});
+  return{sessionId,turnId,itemId:stableAntigravityAssistantId(sessionId,turnId),body,phase:'claimed',child:null,childClosed:null,cancelRequested:false,spawnState:'not_started',spawnOutcome:null,processGroupId:null,processGroupLeaderPid:null,processGroupStartTicks:null,processGroupMembers:[],processGroupExited:false,cleanupState:'not_required',cleanupAttempts:0,cleanupError:null,cancelReason:null,terminalDecision:null,finalizationCommitted:false,finalizationError:null,finalizePromise:null,terminatePromise:null,timeout:null,logFile:'',done,resolveDone};
+}
+
+class AntigravityCancellation extends Error{}
+function assertAntigravityNotCancelled(execution:AntigravityExecution){if(execution.cancelRequested)throw new AntigravityCancellation(execution.cancelReason||'Antigravity cancelled');}
+async function antigravityLifecycleTestDelay(name:'before_spawn'|'after_spawn'|'after_child_close'|'after_terminal_decision'|'before_terminal_commit'){
+  if(process.env.NODE_ENV!=='test')return;
+  const key={before_spawn:'ANTIGRAVITY_TEST_BEFORE_SPAWN_DELAY_MS',after_spawn:'ANTIGRAVITY_TEST_AFTER_SPAWN_DELAY_MS',after_child_close:'ANTIGRAVITY_TEST_AFTER_CHILD_CLOSE_DELAY_MS',after_terminal_decision:'ANTIGRAVITY_TEST_AFTER_TERMINAL_DECISION_DELAY_MS',before_terminal_commit:'ANTIGRAVITY_TEST_BEFORE_TERMINAL_COMMIT_DELAY_MS'}[name];
+  const marker=process.env[`${key}_MARKER`];if(marker)await writeFile(marker,name);
+  const value=Number(process.env[key]||0);
+  if(value>0)await sleep(value);
+}
+function antigravityChildClosed(child:ChildProcess){
+  return new Promise<void>(resolve=>{let settled=false;const done=()=>{if(settled)return;settled=true;resolve();};child.once('close',done);child.once('error',done);});
+}
+function isAntigravityProcessGroupAlive(pgid:number){try{process.kill(-pgid,0);return true;}catch(error:any){if(error?.code==='ESRCH')return false;if(error?.code==='EPERM')return true;throw error;}}
+function antigravityProcessIdentity(pid:number):AntigravityProcessIdentity|null{try{if(!Number.isSafeInteger(pid)||pid<=1)return null;const stat=readFileSync(`/proc/${pid}/stat`,'utf8'),close=stat.lastIndexOf(')');if(close<0)return null;const fields=stat.slice(close+2).trim().split(/\s+/),pgrp=Number(fields[2]),sessionId=Number(fields[3]),startTicks=String(fields[19]||'');if(!Number.isSafeInteger(pgrp)||pgrp<=1||!Number.isSafeInteger(sessionId)||sessionId<=0||!startTicks)return null;return{pid,startTicks,pgrp,sessionId};}catch{return null;}}
+function antigravityProcessStartTicks(pid:number){return antigravityProcessIdentity(pid)?.startTicks||null;}
+function antigravityProcessGroupMembers(pgid:number){if(!Number.isSafeInteger(pgid)||pgid<=1)return[];const members:AntigravityProcessIdentity[]=[];let entries:string[];try{entries=readdirSync('/proc');}catch{return members;}for(const name of entries){if(!/^\d+$/.test(name))continue;const identity=antigravityProcessIdentity(Number(name));if(identity?.pgrp===pgid)members.push(identity);}return members.sort((a,b)=>a.pid-b.pid);}
+function mergeAntigravityProcessGroupMembers(existing:AntigravityProcessIdentity[],current:AntigravityProcessIdentity[]){const byIdentity=new Map(existing.map(member=>[`${member.pid}:${member.startTicks}`,member]));for(const member of current)byIdentity.set(`${member.pid}:${member.startTicks}`,member);return[...byIdentity.values()].sort((a,b)=>a.pid-b.pid);}
+function validAntigravityProcessGroupMembers(value:any,pgid:number):value is AntigravityProcessIdentity[]{return Array.isArray(value)&&value.every(member=>Number.isSafeInteger(member?.pid)&&member.pid>1&&Number.isSafeInteger(member?.pgrp)&&member.pgrp===pgid&&Number.isSafeInteger(member?.sessionId)&&member.sessionId>0&&typeof member?.startTicks==='string'&&member.startTicks.length>0);}
+function parseAntigravityProcessGroupMembers(value:any,pgid:number){try{const parsed=typeof value==='string'?JSON.parse(value):value;return validAntigravityProcessGroupMembers(parsed,pgid)?parsed:[];}catch{return[];}}
+function captureAntigravityProcessGroupMembers(execution:AntigravityExecution){const pgid=Number(execution.processGroupId);if(!Number.isSafeInteger(pgid)||pgid<=1)return;execution.processGroupMembers=mergeAntigravityProcessGroupMembers(execution.processGroupMembers,antigravityProcessGroupMembers(pgid));}
+function signalAntigravityProcessGroup(pgid:number,signal:NodeJS.Signals){try{process.kill(-pgid,signal);return true;}catch(error:any){if(error?.code==='ESRCH')return false;if(error?.code==='EPERM')throw new Error(`Antigravity process group ${pgid} cannot be signalled`);throw error;}}
+async function waitForAntigravityProcessGroupExit(pgid:number,timeoutMs:number){const end=Date.now()+Math.max(0,timeoutMs);do{if(!isAntigravityProcessGroupAlive(pgid))return true;await sleep(20);}while(Date.now()<end);return !isAntigravityProcessGroupAlive(pgid);}
+async function requestAntigravityCancellation(execution:AntigravityExecution,terminal:Exclude<AntigravityTerminal,'completed'>,reason:string){
+  execution.cancelRequested=true;
+  execution.cancelReason=reason;
+  const won=tryClaimAntigravityTerminal(execution,{terminal,reason,message:terminal==='failed'?safeAntigravitySummary(reason):null,assistantText:null});
+  if(won)execution.phase='cancelling';
+  if(won||!execution.finalizationCommitted)await ensureAntigravityFinalization(execution);
+  return execution.done;
+}
+async function terminateAntigravityExecution(execution:AntigravityExecution){
+  if(execution.processGroupExited){execution.cleanupState='exited';return;}
+  if(execution.terminatePromise)return execution.terminatePromise;
+  execution.cleanupState='running';execution.cleanupAttempts++;
+  const attempt=(async()=>{
+    const child=execution.child;if(!child){execution.processGroupExited=true;return;}
+    if(execution.spawnState==='pending'&&execution.spawnOutcome)await execution.spawnOutcome;
+    if(execution.spawnState==='failed'&&!execution.processGroupId){await(execution.childClosed||Promise.resolve());execution.processGroupExited=true;return;}
+    const pgid=Number(execution.processGroupId);if(!Number.isSafeInteger(pgid)||pgid<=1)throw new Error('Antigravity process group state is unknown');
+    captureAntigravityProcessGroupMembers(execution);
+    if(antigravityCleanupPreSignalFaults>0){antigravityCleanupPreSignalFaults--;throw new Error('injected Antigravity process group cleanup failure before signal');}
+    const closed=execution.childClosed||antigravityChildClosed(child);
+    execution.childClosed=closed;
+    const grace=Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000);
+    if(isAntigravityProcessGroupAlive(pgid)){try{signalAntigravityProcessGroup(pgid,'SIGTERM');}catch(error){try{child.kill('SIGTERM');}catch{}throw error;}}
+    const groupExited=await waitForAntigravityProcessGroupExit(pgid,grace);
+    if(!groupExited&&isAntigravityProcessGroupAlive(pgid))signalAntigravityProcessGroup(pgid,'SIGKILL');
+    const killed=groupExited||await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_KILL_CONFIRM_MS||5000));
+    await Promise.race([closed,sleep(1000)]);
+    if(antigravityCleanupFaults>0){antigravityCleanupFaults--;throw new Error('injected Antigravity process group cleanup failure');}
+    if(!killed)throw new Error(`Antigravity process group ${pgid} did not exit`);
+    execution.processGroupExited=true;
+  })();
+  execution.terminatePromise=attempt;
+  try{await attempt;execution.cleanupState='exited';execution.cleanupError=null;}catch(error:any){execution.cleanupState='retryable_failed';execution.cleanupError=safeAntigravitySummary(error?.message||String(error));throw error;}finally{if(execution.cleanupState!=='exited')execution.terminatePromise=null;}
+}
+async function completeAntigravityProcessGroup(execution:AntigravityExecution){
+  if(execution.spawnState==='failed'&&!execution.processGroupId){execution.processGroupExited=true;return;}
+  const pgid=execution.processGroupId;if(!pgid||pgid<=1)throw new Error('Antigravity completed without a confirmed process group');
+  if(await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_NATURAL_EXIT_MS||100))){execution.processGroupExited=true;return;}
+  captureAntigravityProcessGroupMembers(execution);
+  await persistAntigravityTerminalIntent(execution,{terminal:'failed',reason:'antigravity_process_group_cleanup_failed',message:'Antigravity process group cleanup was interrupted before completion',assistantText:null});
+  await terminateAntigravityExecution(execution);
+}
+function tryClaimAntigravityTerminal(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
+  if(execution.terminalDecision)return false;
+  execution.terminalDecision=decision;execution.phase=decision.terminal;
+  if(execution.timeout){clearTimeout(execution.timeout);execution.timeout=null;}
+  return true;
+}
+function antigravityTerminalPayload(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
+  const eventType=decision.terminal==='completed'?'turn/completed':decision.terminal==='interrupted'?'turn/interrupted':'turn/failed';
+  return{eventType,payload:{method:eventType,clientMessageId:String(execution.body.clientMessageId||''),messageId:String(execution.body.messageId||''),turnId:execution.turnId,segmentId:String(execution.body.segmentId||execution.turnId),retryOf:String(execution.body.retryOf||''),reason:decision.reason,params:{turn:{id:execution.turnId,status:decision.terminal},...(decision.message?{error:{message:decision.message}}:{})}}};
+}
+function takeAntigravityTerminalFault(){if(antigravitySessionFaults>0){antigravitySessionFaults--;return'session_update' as const;}if(antigravityEventFaults>0){antigravityEventFaults--;return'terminal_event' as const;}return undefined;}
+type AntigravityTerminalJournal={schemaVersion:1|2|3;sessionId:string;turnId:string;terminal:AntigravityTerminal;reason:string|null;clientMessageId:string;assistantItem:any|null;terminalPayload:any;createdAt:number;cleanupRequired?:boolean;processGroupId?:number|null;processGroupLeaderPid?:number|null;processGroupStartTicks?:string|null;processGroupMembers?:AntigravityProcessIdentity[];processGroupExited?:boolean;cleanupAttempts?:number;cleanupError?:string|null;checksum:string};
+function antigravityTerminalJournalPath(sessionId:string,turnId:string){return path.join(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,`${crypto.createHash('sha256').update(`${sessionId}:${turnId}`).digest('hex')}.json`);}
+function antigravityJournalChecksum(value:Omit<AntigravityTerminalJournal,'checksum'>){return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');}
+async function writeAntigravityTerminalJournal(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
+  if(execution.processGroupId&&!execution.processGroupExited)captureAntigravityProcessGroupMembers(execution);
+  const segmentId=String(execution.body.segmentId||execution.turnId),terminal=antigravityTerminalPayload(execution,decision),assistantItem=decision.terminal==='completed'&&decision.assistantText!==null?{method:'item/completed',turnId:execution.turnId,segmentId,params:{item:{id:execution.itemId,type:'agentMessage',turnId:execution.turnId,segmentId,text:decision.assistantText,phase:'final_answer'}}}:null;
+  const cleanupRequired=!!execution.processGroupId&&!execution.processGroupExited;
+  const value:Omit<AntigravityTerminalJournal,'checksum'>={schemaVersion:3,sessionId:execution.sessionId,turnId:execution.turnId,terminal:decision.terminal,reason:decision.reason,clientMessageId:String(execution.body.clientMessageId||''),assistantItem,terminalPayload:terminal.payload,createdAt:Date.now(),cleanupRequired,processGroupId:execution.processGroupId,processGroupLeaderPid:execution.processGroupLeaderPid,processGroupStartTicks:execution.processGroupStartTicks,processGroupMembers:execution.processGroupMembers,processGroupExited:execution.processGroupExited,cleanupAttempts:execution.cleanupAttempts,cleanupError:execution.cleanupError};
+  await mkdir(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,{recursive:true,mode:0o700});await chmod(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,0o700);
+  const target=antigravityTerminalJournalPath(execution.sessionId,execution.turnId),temp=`${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`,handle=await open(temp,'wx',0o600);
+  try{await handle.writeFile(JSON.stringify({...value,checksum:antigravityJournalChecksum(value)}));await handle.sync();}finally{await handle.close();}
+  await rename(temp,target);await chmod(target,0o600);const directory=await open(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,'r');try{await directory.sync();}finally{await directory.close();}return target;
+}
+async function readAntigravityTerminalJournal(filePath:string){const parsed=JSON.parse(await readFile(filePath,'utf8')) as AntigravityTerminalJournal;const{checksum,...value}=parsed;if(![1,2,3].includes(parsed.schemaVersion)||!parsed.sessionId||!parsed.turnId||!['completed','failed','interrupted'].includes(parsed.terminal)||checksum!==antigravityJournalChecksum(value))throw new Error(`invalid Antigravity terminal sidecar ${path.basename(filePath)}`);if(parsed.schemaVersion>=2&&parsed.cleanupRequired&&(!Number.isSafeInteger(parsed.processGroupId)||Number(parsed.processGroupId)<=1))throw new Error(`invalid Antigravity cleanup identity ${path.basename(filePath)}`);if(parsed.schemaVersion===3&&parsed.processGroupMembers&&!validAntigravityProcessGroupMembers(parsed.processGroupMembers,Number(parsed.processGroupId)))throw new Error(`invalid Antigravity process group members ${path.basename(filePath)}`);return parsed;}
+async function upsertAntigravityIntentFromJournal(journal:AntigravityTerminalJournal){
+  if(antigravityIntentFaults>0){antigravityIntentFaults--;throw new Error('injected Antigravity terminal intent failure');}
+  await db.run(`INSERT INTO antigravity_terminal_intents(session_id,turn_id,terminal,reason,client_message_id,assistant_item_json,terminal_payload_json,created_at,updated_at,last_error,cleanup_required,process_group_id,process_group_leader_pid,process_group_start_ticks,process_group_members_json,cleanup_attempts,cleanup_error)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,NULL,?9,?10,?11,?12,?13,?14,?15)
+    ON CONFLICT(session_id) DO UPDATE SET turn_id=excluded.turn_id,terminal=excluded.terminal,reason=excluded.reason,client_message_id=excluded.client_message_id,assistant_item_json=excluded.assistant_item_json,terminal_payload_json=excluded.terminal_payload_json,updated_at=excluded.updated_at,last_error=NULL,cleanup_required=excluded.cleanup_required,process_group_id=excluded.process_group_id,process_group_leader_pid=excluded.process_group_leader_pid,process_group_start_ticks=excluded.process_group_start_ticks,process_group_members_json=excluded.process_group_members_json,cleanup_attempts=excluded.cleanup_attempts,cleanup_error=excluded.cleanup_error`,[journal.sessionId,journal.turnId,journal.terminal,journal.reason,journal.clientMessageId,journal.assistantItem?JSON.stringify(journal.assistantItem):null,JSON.stringify(journal.terminalPayload),journal.createdAt,journal.cleanupRequired?1:0,journal.processGroupId||null,journal.processGroupLeaderPid||null,journal.processGroupStartTicks||null,journal.processGroupMembers?.length?JSON.stringify(journal.processGroupMembers):null,Number(journal.cleanupAttempts||0),journal.cleanupError||null]);
+}
+async function persistAntigravityTerminalIntent(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
+  const sidecar=await writeAntigravityTerminalJournal(execution,decision),journal=await readAntigravityTerminalJournal(sidecar);await upsertAntigravityIntentFromJournal(journal);return sidecar;
+}
+async function commitAntigravityTerminalIntent(intent:any,testFailureStage?:'session_update'|'terminal_event'){
+  const terminal=String(intent.terminal) as AntigravityTerminal,eventType=terminal==='completed'?'turn/completed':terminal==='interrupted'?'turn/interrupted':'turn/failed',assistantPayload=intent.assistant_item_json?JSON.parse(String(intent.assistant_item_json)):null;
+  return eventStore.commitAtomicTerminal({sessionId:String(intent.session_id),turnId:String(intent.turn_id),status:terminal==='completed'?'idle':terminal,interruptionReason:terminal==='completed'?null:String(intent.reason||''),assistant:assistantPayload?{eventType:'item/completed',payload:assistantPayload,eventKey:`antigravity:${intent.turn_id}:assistant`}:undefined,terminal:{eventType,payload:JSON.parse(String(intent.terminal_payload_json)),eventKey:`antigravity:${intent.turn_id}:terminal`},testFailureStage});
+}
+async function cleanupAntigravityTerminalIntent(intent:any){
+  if(!Number(intent.cleanup_required||0))return;
+  const pgid=Number(intent.process_group_id),leader=Number(intent.process_group_leader_pid||pgid),expected=String(intent.process_group_start_ticks||'');
+  if(!Number.isSafeInteger(pgid)||pgid<=1||!Number.isSafeInteger(leader)||leader<=1)throw new Error('Antigravity cleanup identity is invalid');
+  const attempt=Number(intent.cleanup_attempts||0)+1;
+  try{
+    if(!isAntigravityProcessGroupAlive(pgid)){await db.run('UPDATE antigravity_terminal_intents SET cleanup_required=0,cleanup_error=NULL,cleanup_attempts=?1,updated_at=?2 WHERE session_id=?3 AND turn_id=?4',[attempt,Date.now(),intent.session_id,intent.turn_id]);return;}
+    const leaderIdentity=antigravityProcessIdentity(leader);let verified=!!expected&&leaderIdentity?.pgrp===pgid&&leaderIdentity.startTicks===expected;
+    if(!verified){const persisted=parseAntigravityProcessGroupMembers(intent.process_group_members_json,pgid),current=antigravityProcessGroupMembers(pgid),keys=new Set(persisted.map(member=>`${member.pid}:${member.startTicks}`));verified=current.some(member=>keys.has(`${member.pid}:${member.startTicks}`));if(!verified)throw new Error('Antigravity process group identity cannot be safely verified; possible PGID reuse');}
+    signalAntigravityProcessGroup(pgid,'SIGTERM');let exited=await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_STOP_GRACE_MS||5000));if(!exited){signalAntigravityProcessGroup(pgid,'SIGKILL');exited=await waitForAntigravityProcessGroupExit(pgid,Number(process.env.ANTIGRAVITY_KILL_CONFIRM_MS||5000));}
+    if(antigravityCleanupFaults>0){antigravityCleanupFaults--;throw new Error('injected Antigravity process group cleanup failure');}
+    if(!exited)throw new Error(`Antigravity process group ${pgid} did not exit`);
+    await db.run('UPDATE antigravity_terminal_intents SET cleanup_required=0,cleanup_error=NULL,cleanup_attempts=?1,updated_at=?2 WHERE session_id=?3 AND turn_id=?4',[attempt,Date.now(),intent.session_id,intent.turn_id]);
+  }catch(error:any){const safe=safeAntigravitySummary(error?.message||String(error));await db.run('UPDATE antigravity_terminal_intents SET cleanup_attempts=?1,cleanup_error=?2,last_error=?2,updated_at=?3 WHERE session_id=?4 AND turn_id=?5',[attempt,safe,Date.now(),intent.session_id,intent.turn_id]).catch(()=>{});throw error;}
+}
+async function ensureAntigravityFinalization(execution:AntigravityExecution){
+  if(execution.finalizationCommitted)return;
+  if(execution.finalizePromise)return execution.finalizePromise;
+  const decision=execution.terminalDecision;if(!decision)throw new Error('Antigravity terminal is undecided');
+  execution.finalizePromise=(async()=>{
+    await antigravityLifecycleTestDelay('after_terminal_decision');
+    let sidecar=await persistAntigravityTerminalIntent(execution,decision);
+    if(decision.terminal!=='completed'&&!execution.processGroupExited)try{await terminateAntigravityExecution(execution);}catch(error){sidecar=await persistAntigravityTerminalIntent(execution,decision);throw error;}
+    await antigravityLifecycleTestDelay('before_terminal_commit');
+    const intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[execution.sessionId,execution.turnId]);if(!intent)throw new Error('Antigravity terminal intent was not persisted');
+    await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());
+    await rm(sidecar,{force:true}).catch(error=>app.log.warn({sessionId:execution.sessionId,turnId:execution.turnId,error:safeAntigravitySummary(error?.message||String(error))},'Antigravity committed terminal sidecar cleanup deferred'));
+    execution.finalizationCommitted=true;execution.finalizationError=null;
+    if(antigravityTurns.get(execution.sessionId)===execution)antigravityTurns.delete(execution.sessionId);
+    if(execution.logFile)await rm(execution.logFile,{force:true}).catch(()=>{});
+    execution.resolveDone();
+  })().catch(async error=>{execution.finalizationError=safeAntigravitySummary(error?.message||String(error));await db.run('UPDATE antigravity_terminal_intents SET last_error=?1,updated_at=?2 WHERE session_id=?3',[execution.finalizationError,Date.now(),execution.sessionId]).catch(()=>{});throw error;}).finally(()=>{if(!execution.finalizationCommitted)execution.finalizePromise=null;});
+  return execution.finalizePromise;
+}
+async function decideAndFinalizeAntigravityExecution(execution:AntigravityExecution,decision:AntigravityTerminalDecision){
+  tryClaimAntigravityTerminal(execution,decision);
+  return ensureAntigravityFinalization(execution);
+}
+
+async function runAntigravityRuntimeTurn(session:RuntimeSession,execution:AntigravityExecution){
+  const body=execution.body,profile=body.profile as AntigravityRuntimeProfile,turnId=execution.turnId;let observed:string|null=null,rebuild=false;
+  const persistObserved=async()=>{if(observed||!execution.logFile)return;const log=await readFile(execution.logFile,'utf8').catch(()=>'');observed=parseAntigravityConversation(log);if(observed)await db.run('UPDATE sessions SET provider_session_id=?1,upstream_thread_id=?1,provider_metadata=?2,upstream_binding_profile_id=?3,current_upstream_account_id=?3,last_execution_account_id=?3,updated_at=?4 WHERE id=?5',[observed,JSON.stringify(antigravityMetadata(session.provider_metadata,{profileId:profile.id,cliVersion:'1.1.2',conversationId:observed,recoveryGeneration:Number((antigravityMetadata(session.provider_metadata) as any).recoveryGeneration||0)+(rebuild?1:0)})),profile.id,Date.now(),session.id]);};
+  try{
+    execution.phase='preparing';assertAntigravityNotCancelled(execution);
+    await appendEvent(session.id,'user',{input:body.input,clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),turnId,segmentId:String(body.segmentId||turnId),retryOf:String(body.retryOf||''),provider:'antigravity',profileId:profile.id});
+    assertAntigravityNotCancelled(execution);
+    const boundProfile=String(session.upstream_binding_profile_id||session.current_upstream_account_id||session.account_id||''),requested=String(session.provider_session_id||session.upstream_thread_id||'')||null;
+    const prior=await db.get("SELECT COUNT(*) AS count FROM events WHERE session_id=?1 AND event_type='item/completed'",[session.id]);
+    assertAntigravityNotCancelled(execution);
+    const profileSwitched=!!boundProfile&&boundProfile!==profile.id,missing=!!requested&&!antigravityConversationExists(profile.homeDir,requested),bindingLost=!requested&&Number(prior?.count||0)>0;
+    rebuild=profileSwitched||missing||bindingLost;const prompt=rebuild?`${await antigravityRecoveryText(session)}\n\nCurrent user message:\n${body.text}`:String(body.text);
+    assertAntigravityNotCancelled(execution);
+    if(rebuild)await appendEvent(session.id,'system',{provider:'antigravity',text:'上游会话已重建，部分 Provider 隐藏状态可能丢失。',reason:profileSwitched?'profile_changed':bindingLost?'binding_missing':'conversation_missing'});
+    assertAntigravityNotCancelled(execution);
+    const attachments=validateAntigravityRuntimeAttachments(session.id,body.attachments);assertAntigravityNotCancelled(execution);
+    const logDir=path.join(DATA_DIR,'runtime','antigravity-logs',profile.id);await mkdir(logDir,{recursive:true});assertAntigravityNotCancelled(execution);
+    execution.logFile=path.join(logDir,`${crypto.createHash('sha256').update(`${session.id}:${turnId}`).digest('hex')}.log`);
+    const plan=body.planMode==='plan',args=buildAntigravityArgs({prompt,model:body.model||session.model,mode:plan?'plan':'accept-edits',yolo:!plan&&String(body.permissionMode||session.permission_mode)==='yolo',conversationId:rebuild?null:requested,logFile:execution.logFile,printTimeout:String(process.env.ANTIGRAVITY_PRINT_TIMEOUT||'2h'),addDirs:attachments.map(item=>path.dirname(item.path))});
+    assertAntigravityNotCancelled(execution);
+    await antigravityLifecycleTestDelay('before_spawn');assertAntigravityNotCancelled(execution);
+    const binary=await resolveAntigravityBinary({configured:process.env.ANTIGRAVITY_BIN,dataDir:DATA_DIR,homeDir:DEFAULT_HOME,pathEnv:process.env.PATH});assertAntigravityNotCancelled(execution);
+    const env={...process.env,HOME:profile.homeDir,XDG_CONFIG_HOME:path.join(profile.homeDir,'.config'),XDG_CACHE_HOME:path.join(profile.homeDir,'.cache')};
+    execution.phase='spawning';assertAntigravityNotCancelled(execution);
+    const child=spawn(binary,args,{cwd:String(body.cwd||session.project_dir),env,stdio:['ignore','pipe','pipe'],detached:true});execution.child=child;execution.spawnState='pending';execution.childClosed=antigravityChildClosed(child);execution.spawnOutcome=new Promise(resolve=>{let settled=false;const finish=(state:AntigravitySpawnState)=>{if(settled)return;settled=true;execution.spawnState=state;if(state==='succeeded'&&child.pid&&child.pid>1){execution.processGroupId=child.pid;execution.processGroupLeaderPid=child.pid;const leader=antigravityProcessIdentity(child.pid);execution.processGroupStartTicks=leader?.startTicks||null;if(leader)execution.processGroupMembers=mergeAntigravityProcessGroupMembers(execution.processGroupMembers,[leader]);captureAntigravityProcessGroupMembers(execution);execution.cleanupState='pending';}if(state==='failed'&&!execution.processGroupId){execution.processGroupExited=true;execution.cleanupState='not_required';}resolve(state);};child.once('spawn',()=>finish('succeeded'));child.once('error',()=>finish(child.pid&&child.pid>1?'succeeded':'failed'));if(child.pid&&child.pid>1)queueMicrotask(()=>finish('succeeded'));});
+    const segmentId=String(body.segmentId||turnId),childResult=runAntigravityChild(child,{timeoutMs:0,cleanOutput:cleanRuntimeAgentOutput,onDelta:delta=>{if(delta)void appendEvent(session.id,'item/agentMessage/delta',{method:'item/agentMessage/delta',turnId,segmentId,params:{itemId:execution.itemId,turnId,segmentId,delta}});void persistObserved().catch(()=>{});},onState:state=>{if(state==='output_draining'&&!execution.cancelRequested)void db.run('UPDATE sessions SET status=?1,updated_at=?2 WHERE id=?3',['output_draining',Date.now(),session.id]);}});
+    void childResult.catch(()=>{});
+    await antigravityLifecycleTestDelay('after_spawn');
+    if(execution.cancelRequested){await terminateAntigravityExecution(execution);throw new AntigravityCancellation(execution.cancelReason||'Antigravity cancelled');}
+    execution.phase='running';
+    await appendEvent(session.id,'turn/start',{result:{turn:{id:turnId,status:'inProgress'}},turnId,segmentId:String(body.segmentId||turnId),clientMessageId:String(body.clientMessageId||''),messageId:String(body.messageId||''),retryOf:String(body.retryOf||''),provider:'antigravity'});
+    assertAntigravityNotCancelled(execution);
+    const timeoutMs=Number(process.env.ANTIGRAVITY_TURN_TIMEOUT_MS||DEFAULT_ANTIGRAVITY_TURN_TIMEOUT_MS);
+    execution.timeout=setTimeout(()=>{void requestAntigravityCancellation(execution,'failed','antigravity_timeout').catch(error=>app.log.error({sessionId:execution.sessionId,error:safeAntigravitySummary(error?.message||String(error))},'Antigravity timeout finalization failed'));},timeoutMs);execution.timeout.unref?.();
+    const result=await childResult;
+    await antigravityLifecycleTestDelay('after_child_close');
+    assertAntigravityNotCancelled(execution);
+    try{await completeAntigravityProcessGroup(execution);}catch(cleanupError:any){tryClaimAntigravityTerminal(execution,{terminal:'failed',reason:'antigravity_process_group_cleanup_failed',message:safeAntigravitySummary(cleanupError?.message||String(cleanupError)),assistantText:null});await persistAntigravityTerminalIntent(execution,execution.terminalDecision!);execution.finalizationError=safeAntigravitySummary(cleanupError?.message||String(cleanupError));throw cleanupError;}
+    await persistObserved();
+    if(!observed)throw new Error('Antigravity conversation ID was not recorded');
+    if(requested&&!rebuild&&observed!==requested){await db.run('UPDATE sessions SET provider_session_id=NULL,upstream_thread_id=NULL,interruption_reason=?1 WHERE id=?2',['antigravity_resume_mismatch',session.id]);throw new Error('Antigravity did not resume the requested conversation; refusing silent fallback');}
+    await decideAndFinalizeAntigravityExecution(execution,{terminal:'completed',reason:null,message:null,assistantText:result.output});
+  }catch(e:any){
+    await persistObserved().catch(()=>{});
+    if(!execution.terminalDecision){const reason='antigravity_turn_failed';await decideAndFinalizeAntigravityExecution(execution,{terminal:'failed',reason,message:safeAntigravitySummary(e?.message||String(e||reason)),assistantText:null});}
+    else if(!execution.finalizationCommitted)throw e;
+    if(!(e instanceof AntigravityCancellation))throw e;
+  }
+}
+
+function validateAntigravityRuntimeAttachments(sessionId:string,raw:any){const items=Array.isArray(raw)?raw:[];if(!items.length)return[];const root=realpathSync(path.join(DATA_DIR,'attachments',sessionId));return items.map((item:any)=>{const rp=realpathSync(String(item?.path||''));if(!rp.startsWith(root+path.sep)||!existsSync(rp))throw new Error('invalid Antigravity attachment path');return{...item,path:rp};});}
+function cleanRuntimeAgentOutput(text:string){return String(text||'').replace(/\x1B\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,'').trim();}
 
 function claudePermissionMode(mode:any) {
   const v = String(mode || '');
@@ -997,6 +1305,18 @@ async function getOrEnsureCodexTurnAccount(id:string, codexHome:any) {
 }
 
 async function bootstrapRuntimeRecovery() {
+  if(process.env.NODE_ENV==='test'&&Number(process.env.ANTIGRAVITY_TEST_BOOTSTRAP_DELAY_MS||0)>0)await sleep(Number(process.env.ANTIGRAVITY_TEST_BOOTSTRAP_DELAY_MS));
+  await mkdir(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,{recursive:true,mode:0o700});await chmod(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,0o700);
+  const sidecars=(await readdir(ANTIGRAVITY_TERMINAL_JOURNAL_DIR)).filter(name=>name.endsWith('.json')).sort();
+  for(const name of sidecars){const filePath=path.join(ANTIGRAVITY_TERMINAL_JOURNAL_DIR,name);let journal:AntigravityTerminalJournal|null=null;try{journal=await readAntigravityTerminalJournal(filePath);await upsertAntigravityIntentFromJournal(journal);let intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[journal.sessionId,journal.turnId]);if(!intent)throw new Error('sidecar intent upsert did not persist');await cleanupAntigravityTerminalIntent(intent);intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[journal.sessionId,journal.turnId]);await commitAntigravityTerminalIntent(intent,takeAntigravityTerminalFault());await rm(filePath,{force:true});}catch(error:any){app.log.error({sessionId:journal?.sessionId||null,turnId:journal?.turnId||null,pgid:journal?.processGroupId||null,attempt:journal?.cleanupAttempts||0,recoveryStage:'sidecar',file:name,error:safeAntigravitySummary(error?.message||String(error))},'Antigravity sidecar recovery failed');throw error;}}
+  const pendingIntents=await db.all('SELECT * FROM antigravity_terminal_intents ORDER BY created_at,session_id');
+  for(const intent of pendingIntents)try{await cleanupAntigravityTerminalIntent(intent);const ready=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1 AND turn_id=?2',[intent.session_id,intent.turn_id]);if(!ready)throw new Error('pending intent disappeared before commit');await commitAntigravityTerminalIntent(ready,takeAntigravityTerminalFault());}catch(error:any){app.log.error({sessionId:intent.session_id,turnId:intent.turn_id,pgid:intent.process_group_id||null,attempt:intent.cleanup_attempts||0,recoveryStage:'sqlite_intent',error:safeAntigravitySummary(error?.message||String(error))},'Antigravity pending terminal recovery failed');throw error;}
+  const abandoned=await db.all("SELECT id,active_turn_id FROM sessions WHERE (provider='antigravity' OR provider_id='antigravity') AND (active_turn_id IS NOT NULL OR status IN ('running','planning','output_draining'))");
+  for(const row of abandoned){
+    const turnId=String(row.active_turn_id||`recovery-${row.id}`),payload={method:'turn/interrupted',clientMessageId:'',reason:'runtime_restarted',params:{turn:{id:turnId,status:'interrupted'}}},now=Date.now();
+    await db.run(`INSERT OR IGNORE INTO antigravity_terminal_intents(session_id,turn_id,terminal,reason,client_message_id,assistant_item_json,terminal_payload_json,created_at,updated_at,last_error) VALUES (?1,?2,'interrupted','runtime_restarted','',NULL,?3,?4,?4,NULL)`,[row.id,turnId,JSON.stringify(payload),now]);
+    const intent=await db.get('SELECT * FROM antigravity_terminal_intents WHERE session_id=?1',[row.id]);if(intent)try{await commitAntigravityTerminalIntent(intent);}catch(error:any){app.log.error({sessionId:row.id,turnId,recoveryStage:'abandoned_claim',error:safeAntigravitySummary(error?.message||String(error))},'Antigravity abandoned terminal recovery failed');throw error;}
+  }
   const rows = await db.all(
     `SELECT DISTINCT accounts.*
      FROM accounts
@@ -1053,8 +1373,10 @@ async function handleCodexNotification(account:Account, msg:any) {
   if (!upstreamThreadId) return;
   const session = await sessionForThread(upstreamThreadId, true);
   if (!session) return;
+  const notificationTurnId=String(msg.params?.turn?.id||msg.params?.turnId||session.active_turn_id||''),lineage=notificationTurnId?await runtimeLineage(session.id,notificationTurnId):null;
+  const durableMsg=lineage?{...msg,turnId:notificationTurnId,segmentId:lineage.segmentId,clientMessageId:lineage.clientMessageId,messageId:lineage.messageId,retryOf:lineage.retryOf}:msg;
   if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) diagnostics.deltasReceived++;
-  appendEvent(session.id, msg.method, msg).catch(e => app.log.error({ err:e }, 'event append failed'));
+  await appendEvent(session.id,msg.method,durableMsg);
   if (msg.method === 'turn/started' && msg.params?.turn?.id) {
     const next=codexSessionStateForNotification(session as any,msg.method,msg.params);
     await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,interruption_reason=?3,updated_at=?4 WHERE id=?5', [next.active_turn_id,next.status,next.interruption_reason||null,Date.now(),session.id]);
@@ -1073,6 +1395,7 @@ async function handleCodexNotification(account:Account, msg:any) {
     const next=codexSessionStateForNotification(authoritative as any,msg.method,msg.params);
     await db.run('UPDATE sessions SET active_turn_id=NULL,status=?1,interruption_reason=?2,updated_at=?3 WHERE id=?4', [next.status,next.interruption_reason||null,Date.now(),authoritative.id]);
     invalidateThreadSessionCache(authoritative);
+    if(notificationTurnId)await deleteRuntimeTurnLineage(session.id,notificationTurnId);
   }
 }
 
@@ -1389,7 +1712,7 @@ async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Numb
         .filter((item:any) => item?.type === 'text' && String(item.text || '').trim())
         .map((item:any) => ({ type:'text', text:stripProviderOnlyRecoveryText(String(item.text || '')).trim() }))
         .filter((item:any) => item.text);
-      if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage', content });
+      if (content.length) items.push({ id:`user-${event.sequence}`, type:'userMessage',clientMessageId:payload?.clientMessageId||null,turnId:payload?.turnId||null,segmentId:payload?.segmentId||payload?.turnId||null, content });
       continue;
     }
     if (eventType === 'item/completed') {
@@ -1943,6 +2266,14 @@ async function shutdownGracefully(signal:string) {
     app.log.warn({ signal, error:e?.message || String(e), drainState:await drainState().catch(()=>null) }, 'runtime drain timed out before shutdown');
   }
   runtimeLifecycle = 'stopping';
+  const activeAntigravity=[...antigravityTurns.values()];
+  const cancellation=await Promise.allSettled(activeAntigravity.map(execution=>requestAntigravityCancellation(execution,'interrupted','runtime_shutdown')));
+  const failed=cancellation.filter(result=>result.status==='rejected') as PromiseRejectedResult[];
+  if(failed.length){
+    app.log.error({signal,failedFinalizations:failed.length,errors:failed.map(result=>safeAntigravitySummary(result.reason?.message||String(result.reason)))},'Antigravity durable shutdown finalization failed');
+    await eventStore.drain().catch(()=>{});await subscriptions.drain().catch(()=>{});subscriptions.closeAll();await app.close().catch(()=>{});db.close();process.exit(1);return;
+  }
+  await Promise.all(activeAntigravity.map(execution=>execution.done));
   await eventStore.drain();
   await subscriptions.drain();
   subscriptions.closeAll();

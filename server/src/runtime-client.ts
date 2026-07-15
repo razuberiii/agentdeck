@@ -32,6 +32,7 @@ export class RuntimeClient {
   answerClaudeApproval(requestId:string, body:any) { return this.request('POST', `/claude/approvals/${encodeURIComponent(requestId)}`, body); }
   createCodexSession(body:any) { return this.request('POST', '/codex/sessions', body); }
   createGeminiSession(body:any) { return this.request('POST', '/gemini/sessions', body); }
+  createAntigravitySession(body:any) { return this.request('POST', '/antigravity/sessions', body); }
   createClaudeSession(body:any) { return this.request('POST', '/claude/sessions', body); }
   setGeminiSessionModel(id:string, model:string | null) { return this.request('POST', `/gemini/sessions/${encodeURIComponent(id)}/model`, { model }); }
   resumeCodexSession(body:any) { return this.request('POST', '/codex/sessions/resume', body); }

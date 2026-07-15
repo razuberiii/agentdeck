@@ -97,7 +97,7 @@ test('spawn errors and timeouts are explicit terminal failures', async () => {
   await assert.rejects(spawnPromise, error => error instanceof AntigravityProcessError && error.kind === 'spawn');
 
   const timeoutChild = new FakeChild();
-  const timeoutPromise = runAntigravityChild(timeoutChild, { timeoutMs:5, killGraceMs:1000, cleanOutput:clean });
+  const timeoutPromise = runAntigravityChild(timeoutChild, { timeoutMs:5, cleanOutput:clean, onTimeout:()=>timeoutChild.kill('SIGTERM') });
   await new Promise(resolve=>setTimeout(resolve, 15));
   timeoutChild.emit('exit', null, 'SIGTERM');
   timeoutChild.stdout.end();
@@ -107,7 +107,7 @@ test('spawn errors and timeouts are explicit terminal failures', async () => {
     assert.ok(error instanceof AntigravityProcessError);
     assert.equal(error.kind, 'timeout');
     assert.equal(error.result.timedOut, true);
-    assert.deepEqual(timeoutChild.killedWith, ['SIGTERM']);
+    assert.deepEqual(timeoutChild.killedWith, ['SIGTERM'], 'the caller-provided strategy owns timeout termination');
     return true;
   });
 });

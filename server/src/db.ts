@@ -58,12 +58,13 @@ CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT PRIMARY KEY, count INTEGER NO
     return this.open().transaction(fn)();
   }
 
-  transactionRun(statements:Array<{ sql:string; params?:unknown[] }>) {
+  transactionRun(statements:Array<{ sql:string; params?:unknown[]; requireChanges?:number }>) {
     const db = this.open();
     return db.transaction(() => {
       const results:Array<{changes:number;lastInsertRowid:number}>=[];
       for (const statement of statements) {
         const info=db.prepare(statement.sql).run(this.bind(statement.sql, statement.params || []));
+        if(statement.requireChanges!==undefined&&info.changes<statement.requireChanges)throw new Error(`transaction statement changed ${info.changes} rows; required ${statement.requireChanges}`);
         results.push({changes:info.changes,lastInsertRowid:Number(info.lastInsertRowid)});
       }
       return results;

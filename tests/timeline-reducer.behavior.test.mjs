@@ -228,3 +228,25 @@ test('active turn status beats active session status and waiting states have pri
     assert.equal(resolveTurnUiStatus({status:'idle'}, [], false), 'idle');
   `);
 });
+
+test('only structured durable turn terminals decide the current turn status',()=>{
+  runReducerScenario(`
+    const interruptedActivity={type:'activity',activityId:'cmd-1',phase:'interrupted',turnId:'t1'};
+    assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t1',status:'running'}},[],false,'interrupted',[interruptedActivity]),'running');
+    assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t1',status:'running'}},[],false,'unknown',[]),'running');
+    assert.equal(resolveTurnUiStatus({status:'idle'},[],false,'interrupted',[interruptedActivity,{type:'codex',method:'turn/completed',turnId:'t1',params:{turn:{id:'t1',status:'completed'}}}]),'completed');
+    assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t2',status:'running'}},[],false,'interrupted',[{type:'codex',method:'turn/interrupted',turnId:'t1',params:{turn:{id:'t1',status:'interrupted'}}},{type:'codex',method:'turn/started',turnId:'t2',params:{turn:{id:'t2',status:'running'}}}]),'running');
+    assert.equal(resolveTurnUiStatus({status:'interrupted'},[],false,'unknown',[{type:'codex',method:'turn/interrupted',turnId:'t1',params:{turn:{id:'t1',status:'interrupted'}}}]),'interrupted');
+  `);
+});
+
+test('latest sequenced structured turn event outranks stale deltas and interrupted activities',()=>{
+  runReducerScenario(`
+    const delta={type:'codex',method:'item/agentMessage/delta',turnId:'t1',runtimeSequence:10,params:{turnId:'t1',delta:'x'}};
+    for(const [method,status] of [['turn/completed','completed'],['turn/failed','failed'],['turn/interrupted','interrupted']])assert.equal(resolveTurnUiStatus({status},[],false,'unknown',[delta,{type:'codex',method,turnId:'t1',runtimeSequence:20,params:{turn:{id:'t1',status}}}]),status);
+    assert.equal(resolveTurnUiStatus({status:'idle'},[],false,'unknown',[delta,{type:'activity',activityId:'c',turnId:'t1',phase:'interrupted',runtimeSequence:15},{type:'codex',method:'turn/completed',turnId:'t1',runtimeSequence:20,params:{turn:{id:'t1',status:'completed'}}}]),'completed');
+    assert.equal(resolveTurnUiStatus({status:'running'},[],false,'unknown',[{type:'codex',method:'turn/interrupted',turnId:'t1',runtimeSequence:20,params:{turn:{id:'t1',status:'interrupted'}}},{type:'codex',method:'turn/started',turnId:'t2',runtimeSequence:30,params:{turn:{id:'t2',status:'running'}}}]),'running');
+    assert.equal(resolveTurnUiStatus({status:'idle'},[],false,'unknown',[{type:'codex',method:'turn/completed',turnId:'t1',runtimeSequence:20,params:{turn:{id:'t1',status:'completed'}}},{...delta,runtimeSequence:10}]),'completed');
+    assert.equal(resolveTurnUiStatus({status:'running'},[],false,'unknown',[{type:'codex',method:'turn/completed',turnId:'t1',runtimeSequence:20,params:{turn:{id:'t1',status:'completed'}}},{type:'codex',method:'turn/started',turnId:'t2',runtimeSequence:30,params:{turn:{id:'t2',status:'running'}}},{...delta,turnId:'t2',runtimeSequence:31}]),'running');
+  `);
+});

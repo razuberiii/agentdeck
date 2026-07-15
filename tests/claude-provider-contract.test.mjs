@@ -15,7 +15,8 @@ const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.
 test('Claude Code is registered as the second provider and Gemini remains last', () => {
   assert.match(registrySource, /PROVIDER_ORDER:\s*AgentProviderId\[\]\s*=\s*\['codex', 'claude', 'antigravity', 'gemini'\]/);
   assert.match(registrySource, /claude:\s*\{\s*id:'claude', displayName:'Claude Code', order:1/);
-  assert.match(clientSource, /const PROVIDER_ORDER:ProviderId\[\]\s*=\s*\['codex','claude','antigravity','gemini'\]/);
+  assert.match(clientSource, /function visibleProviderIds/);
+  assert.doesNotMatch(clientSource, /const PROVIDER_ORDER/);
 });
 
 test('Claude capabilities are explicit and do not invent quota or model discovery', () => {
@@ -84,7 +85,9 @@ test('Claude SDK mapper emits canonical events and redacts before persistence', 
 test('Claude web integration keeps canonical user messages separate from provider attachment paths', () => {
   assert.match(serverSource, /buildClaudeTurnInput\(threadId, text, attachments\)/);
   assert.match(serverSource, /attachment_path/);
-  assert.match(serverSource, /saveCanonicalUserMessage\(threadId, text, attachments, clientMessageId, turnId\)/);
+  assert.match(serverSource, /await saveCanonicalUserMessage\(threadId, text, attachments, clientMessageId, turnId,retryOf,messageId\)/);
+  assert.doesNotMatch(serverSource, /saveCanonicalUserMessage\([^;]+\.catch\(\(\)=>\{\}\)/);
+  assert.match(runtimeManagerSource, /turnId:input\.turnId,segmentId:input\.segmentId,clientMessageId:input\.clientMessageId,messageId:input\.messageId,retryOf:input\.retryOf/);
   assert.match(serverSource, /answerClaudeApproval/);
   assert.match(clientSource, /accept_session/);
   assert.match(clientSource, /ClaudeProfileForm/);
