@@ -49,6 +49,7 @@ test('draining waits for active turns, submitting turns, and pending event pushe
 });
 
 test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
+test('Codex turn lineage is durable across Runtime restart and removed only at terminal',()=>{assert.match(runtime,/INSERT INTO runtime_turn_lineage/);assert.match(runtime,/await runtimeLineage\(session\.id,notificationTurnId\)/);assert.match(runtime,/await deleteRuntimeTurnLineage\(session\.id,notificationTurnId\)/);});
 
 test('Antigravity durable shutdown failure is fatal without changing Codex or Claude cancellation',()=>{const stop=runtime.slice(runtime.indexOf("app.post('/sessions/:id/stop'"),runtime.indexOf("await app.listen")),shutdown=runtime.slice(runtime.indexOf('async function shutdownGracefully'),runtime.indexOf('async function ensureCodexAppServer'));assert.match(stop,/claudeManager\.cancel\(session\.id\)/);assert.match(stop,/turn\/interrupt/);assert.match(shutdown,/Antigravity durable shutdown finalization failed/);assert.match(shutdown,/process\.exit\(1\)/);assert.match(shutdown,/eventStore\.drain/);assert.match(shutdown,/subscriptions\.drain/);});
 

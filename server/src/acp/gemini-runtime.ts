@@ -44,8 +44,11 @@ type GeminiSessionState = {
   model: string | null;
   activePrompt: Promise<any> | null;
   promptController: AbortController | null;
+  activePromptLineage:GeminiPromptLineage|null;
   permissionMode:FilePermissionMode;
 };
+export type GeminiPromptLineage={turnId:string;segmentId:string;clientMessageId:string;messageId:string;retryOf:string};
+function geminiLineagePayload(lineage:GeminiPromptLineage,payload:any={}){const params=payload?.params?{...payload.params,turnId:payload.params.turnId||lineage.turnId,segmentId:payload.params.segmentId||lineage.segmentId}:payload?.params;if(params?.item)params.item={...params.item,turnId:params.item.turnId||lineage.turnId,segmentId:params.item.segmentId||lineage.segmentId};return{...payload,...lineage,...(params?{params}:{})};}
 
 export class GeminiModelSwitchUnsupportedError extends Error {
   code = 'gemini_model_switch_unsupported';
@@ -134,6 +137,7 @@ export class GeminiAcpRuntime {
       model: params.model || currentGeminiModelFromOptions(response.configOptions) || null,
       activePrompt: null,
       promptController: null,
+      activePromptLineage:null,
       permissionMode:normalizeFileMode(params.mode),
     };
     this.sessions.set(params.localSessionId, state);
@@ -254,34 +258,36 @@ export class GeminiAcpRuntime {
     }
   }
 
-  async prompt(localSessionId: string, prompt: ContentBlock[]) {
+  async prompt(localSessionId: string, prompt: ContentBlock[], lineage:GeminiPromptLineage) {
     const state = this.sessions.get(localSessionId);
     if (!state) throw new Error('Gemini session is not initialized');
     if (state.activePrompt) throw new Error('Gemini turn already running');
     const controller = new AbortController();
     state.promptController = controller;
+    state.activePromptLineage=lineage;
     const task = Promise.resolve().then(async () => {
-      await this.options.updateSession(localSessionId, { status: 'running', updated_at: Date.now() });
-      await this.options.appendEvent(localSessionId, 'turn/started', { provider:'gemini', providerSessionId:state.providerSessionId });
+      await this.options.updateSession(localSessionId, { status: 'running',active_turn_id:lineage.turnId, updated_at: Date.now() });
+      await this.options.appendEvent(localSessionId, 'turn/started', geminiLineagePayload(lineage,{ provider:'gemini', providerSessionId:state.providerSessionId }));
       const started = Date.now();
       const response = await this.agent!.request(methods.agent.session.prompt, {
         sessionId: state.providerSessionId,
         prompt,
       }, { cancellationSignal: controller.signal });
-      await this.options.appendEvent(localSessionId, 'turn/completed', { provider:'gemini', providerSessionId:state.providerSessionId, response, elapsedMs:Date.now() - started });
+      await this.options.appendEvent(localSessionId, 'turn/completed', geminiLineagePayload(lineage,{ provider:'gemini', providerSessionId:state.providerSessionId, response, elapsedMs:Date.now() - started }));
       await this.options.updateSession(localSessionId, { status: 'idle', active_turn_id: null, updated_at: Date.now() });
       return response;
     }).catch(async e => {
       const message = e?.message || String(e);
       this.noteAuthError(e);
       await Promise.allSettled([
-        this.options.appendEvent(localSessionId, 'turn/failed', { provider:'gemini', providerSessionId:state.providerSessionId, error:{ message } }),
+        this.options.appendEvent(localSessionId, 'turn/failed', geminiLineagePayload(lineage,{ provider:'gemini', providerSessionId:state.providerSessionId, error:{ message } })),
         this.options.updateSession(localSessionId, { status: 'interrupted', active_turn_id: null, interruption_reason: 'gemini_prompt_failed', updated_at: Date.now() }),
       ]);
       throw e;
     }).finally(() => {
       state.activePrompt = null;
       state.promptController = null;
+      state.activePromptLineage=null;
     });
     state.activePrompt = task;
     return task;
@@ -298,7 +304,8 @@ export class GeminiAcpRuntime {
         this.permissions.delete(id);
       }
     }
-    await this.options.appendEvent(localSessionId, 'turn/interrupted', { provider:'gemini', providerSessionId:state.providerSessionId, reason:'manual_stop' });
+    const lineage=state.activePromptLineage;
+    await this.options.appendEvent(localSessionId, 'turn/interrupted', lineage?geminiLineagePayload(lineage,{ provider:'gemini', providerSessionId:state.providerSessionId, reason:'manual_stop' }):{ provider:'gemini', providerSessionId:state.providerSessionId, reason:'manual_stop' });
     await this.options.updateSession(localSessionId, { status:'interrupted', active_turn_id:null, interruption_reason:'manual_stop', updated_at:Date.now() });
     return { ok:true };
   }
@@ -318,7 +325,7 @@ export class GeminiAcpRuntime {
         const response = await this.agent!.request(methods.agent.session.load, { sessionId:providerSessionId, cwd, mcpServers:[] } as any);
         if (response !== undefined) {
           const configOptions = Array.isArray((response as any)?.configOptions) ? (response as any).configOptions : [];
-          const state = { localSessionId, providerSessionId, cwd, configOptions, model:currentGeminiModelFromOptions(configOptions), activePrompt:null, promptController:null,permissionMode:normalizeFileMode(mode) };
+          const state = { localSessionId, providerSessionId, cwd, configOptions, model:currentGeminiModelFromOptions(configOptions), activePrompt:null, promptController:null,activePromptLineage:null,permissionMode:normalizeFileMode(mode) };
           this.sessions.set(localSessionId, state);
           this.providerToLocal.set(providerSessionId, localSessionId);
           await this.options.appendEvent(localSessionId, 'runtime/recovering', { provider:'gemini', loaded:true, providerSessionId });
@@ -419,14 +426,16 @@ export class GeminiAcpRuntime {
     const localSessionId = this.providerToLocal.get(notification.sessionId);
     if (!localSessionId) return;
     const mapped = mapGeminiUpdate(notification.update);
-    if (mapped) await this.options.appendEvent(localSessionId, mapped.eventType, { provider:'gemini', providerSessionId:notification.sessionId, ...mapped.payload, acp:{ sessionUpdate:notification.update.sessionUpdate } });
+    const lineage=this.sessions.get(localSessionId)?.activePromptLineage;
+    if (mapped) await this.options.appendEvent(localSessionId, mapped.eventType, lineage?geminiLineagePayload(lineage,{ provider:'gemini', providerSessionId:notification.sessionId, ...mapped.payload, acp:{ sessionUpdate:notification.update.sessionUpdate } }):{ provider:'gemini', providerSessionId:notification.sessionId, ...mapped.payload, acp:{ sessionUpdate:notification.update.sessionUpdate } });
   }
 
   private async handlePermission(request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const localSessionId = this.providerToLocal.get(request.sessionId);
     if (!localSessionId) return { outcome:{ outcome:'cancelled' } };
     const requestId = `gemini-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    await this.options.appendEvent(localSessionId, 'approval/requested', { provider:'gemini', requestId, request });
+    const lineage=this.sessions.get(localSessionId)?.activePromptLineage;
+    await this.options.appendEvent(localSessionId, 'approval/requested', lineage?geminiLineagePayload(lineage,{ provider:'gemini', requestId, request }):{ provider:'gemini', requestId, request });
     return new Promise(resolve => {
       this.permissions.set(requestId, { requestId, localSessionId, providerSessionId:request.sessionId, request, createdAt:Date.now(), resolve });
       setTimeout(() => {

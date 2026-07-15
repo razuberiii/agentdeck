@@ -4945,6 +4945,8 @@ async function saveCanonicalUserMessage(threadId:string, text:string, attachment
 }
 async function findCanonicalUserForRuntimeEvent(threadId:string, payload:any, text:string) {
   const clientMessageId = String(payload?.clientMessageId || payload?.client_message_id || '').trim();
+  const messageId=String(payload?.messageId||payload?.message_id||'').trim(),turnId=String(payload?.turnId||payload?.params?.turn?.id||'').trim(),segmentId=String(payload?.segmentId||payload?.params?.segmentId||'').trim();
+  if(messageId){const byMessage=await db.get(`SELECT * FROM agent_messages WHERE session_id=?1 AND role='user' AND id=?2`,[threadId,messageId]);if(byMessage)return byMessage;}
   if (clientMessageId) {
     const byClient = await db.get(
       `SELECT * FROM agent_messages WHERE session_id=?1 AND role='user' AND client_message_id=?2`,
@@ -4952,6 +4954,8 @@ async function findCanonicalUserForRuntimeEvent(threadId:string, payload:any, te
     );
     if (byClient) return byClient;
   }
+  if(turnId||segmentId){const byLineage=await db.get(`SELECT * FROM agent_messages WHERE session_id=?1 AND role='user' AND (turn_id=?2 OR segment_id=?3) ORDER BY created_at DESC,id DESC LIMIT 1`,[threadId,turnId||'__missing__',segmentId||'__missing__']);if(byLineage)return byLineage;}
+  if(messageId||clientMessageId||turnId||segmentId)return null;
   const cleanText = stripProviderOnlyText(stripInternalAttachmentPrompt(String(text || ''))).trim();
   if (!cleanText) return null;
   return db.get(
