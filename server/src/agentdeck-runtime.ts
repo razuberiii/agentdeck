@@ -1376,7 +1376,7 @@ async function handleCodexNotification(account:Account, msg:any) {
   const notificationTurnId=String(msg.params?.turn?.id||msg.params?.turnId||session.active_turn_id||''),lineage=notificationTurnId?await runtimeLineage(session.id,notificationTurnId):null;
   const durableMsg=lineage?{...msg,turnId:notificationTurnId,segmentId:lineage.segmentId,clientMessageId:lineage.clientMessageId,messageId:lineage.messageId,retryOf:lineage.retryOf}:msg;
   if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) diagnostics.deltasReceived++;
-  appendEvent(session.id,msg.method,durableMsg).catch(e=>app.log.error({err:e},'event append failed'));
+  await appendEvent(session.id,msg.method,durableMsg);
   if (msg.method === 'turn/started' && msg.params?.turn?.id) {
     const next=codexSessionStateForNotification(session as any,msg.method,msg.params);
     await db.run('UPDATE sessions SET active_turn_id=?1,status=?2,interruption_reason=?3,updated_at=?4 WHERE id=?5', [next.active_turn_id,next.status,next.interruption_reason||null,Date.now(),session.id]);
