@@ -89,6 +89,10 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(server, /if\(messageId\|\|clientMessageId\|\|turnId\|\|segmentId\)return null/);
   assert.match(server, /userMessageAttachmentsFromRow/);
   assert.match(server, /turn\.items\[index\]=\{\.\.\.item,\.\.\.canonicalUserMessageItem\(canonical\)/);
+  assert.match(server, /textMatches\.length===1/);
+  assert.match(server, /const containingTurnId=String\(turn\?\.id\|\|turn\?\.turnId/);
+  assert.match(server, /claimedCanonicalIds\.has\(String\(row\.id\)\)/);
+  assert.match(server, /runtimeTurnId=String\(payload\?\.turnId\|\|payload\?\.segmentId/);
   assert.match(server, /item\?\.type === 'userMessage' && canonicalUsers\.length\) continue/);
   assert.match(server, /await ensureCanonicalUsersInThreadSnapshot\(thread, threadId\)/);
   assert.match(client, /reconcileTimelineEvents/);

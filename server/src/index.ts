@@ -4327,7 +4327,8 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       if (inputHasProviderOnlyRecovery(payload?.input)) continue;
       const canonical = canonicalUsers[canonicalUserIndex++] as any;
       if (canonical) {
-        items.push(canonicalUserMessageItem(canonical));
+        const runtimeTurnId=String(payload?.turnId||payload?.segmentId||canonical.turn_id||'');
+        items.push({...canonicalUserMessageItem(canonical),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null});
         continue;
       }
       const input = Array.isArray(payload?.input) ? payload.input : [];
@@ -5671,12 +5672,22 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
   ).catch(()=>[]);
   if (!canonicalUsers.length) return;
   const existing = new Set<string>();
+  const claimedCanonicalIds = new Set<string>();
   for (const turn of thread?.turns || []) {
     for (let index=0;index<(turn.items||[]).length;index++) {
       const item=turn.items[index];
       if (item?.type !== 'userMessage') continue;
-      const canonical=canonicalUsers.find((row:any)=>(row.id&&String(row.id)===String(item.id||''))||(row.client_message_id&&String(row.client_message_id)===String(item.clientMessageId||'')));
-      if(canonical){turn.items[index]={...item,...canonicalUserMessageItem(canonical),turnId:String(canonical.turn_id||item.turnId||''),segmentId:String(canonical.segment_id||canonical.turn_id||item.segmentId||item.turnId||'')};}
+      const itemText=userMessageItemText(item);
+      let canonical=canonicalUsers.find((row:any)=>!claimedCanonicalIds.has(String(row.id))&&((row.id&&String(row.id)===String(item.id||''))||(row.client_message_id&&String(row.client_message_id)===String(item.clientMessageId||''))));
+      if(!canonical&&itemText){
+        const textMatches=canonicalUsers.filter((row:any)=>!claimedCanonicalIds.has(String(row.id))&&normalizeUserSnapshotText(String(row.original_text||row.text||''))===itemText);
+        if(textMatches.length===1)canonical=textMatches[0];
+      }
+      if(canonical){
+        claimedCanonicalIds.add(String(canonical.id));
+        const containingTurnId=String(turn?.id||turn?.turnId||item.turnId||canonical.turn_id||'');
+        turn.items[index]={...item,...canonicalUserMessageItem(canonical),turnId:containingTurnId||null,segmentId:containingTurnId||null};
+      }
       const enriched=turn.items[index];
       if (enriched.id) existing.add(`id:${String(enriched.id)}`);
       if (enriched.clientMessageId) existing.add(`client:${String(enriched.clientMessageId)}`);
@@ -5688,6 +5699,7 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
     if(canonicalItems.length)turn.items=[...canonicalItems,...turn.items.filter((item:any)=>!canonicalItems.includes(item))];
   }
   const missing = canonicalUsers.filter((row:any) => {
+    if(claimedCanonicalIds.has(String(row.id)))return false;
     const id = String(row.id || '');
     const client = String(row.client_message_id || '');
     const text = normalizeUserSnapshotText(String(row.original_text || row.text || ''));
