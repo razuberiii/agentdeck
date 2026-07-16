@@ -4313,7 +4313,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
      ) ORDER BY created_at ASC, id ASC`,
     [threadId]
   ).catch(()=>[]);
-  let canonicalUserIndex = 0;
+  const claimedCanonicalUsers = new Set<string>();
   const items:any[] = [];
   const completedItemIds = new Set<string>();
   const deltaText = new Map<string, string>();
@@ -4325,8 +4325,15 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     try { payload = JSON.parse(String(event.payload_json || '{}')); } catch {}
     if (eventType === 'user') {
       if (inputHasProviderOnlyRecovery(payload?.input)) continue;
-      const canonical = canonicalUsers[canonicalUserIndex++] as any;
+      const payloadMessageId=String(payload?.messageId||payload?.message_id||'');
+      const payloadClientMessageId=String(payload?.clientMessageId||payload?.client_message_id||'');
+      let canonical = canonicalUsers.find((row:any)=>!claimedCanonicalUsers.has(String(row.id))&&((payloadMessageId&&String(row.id)===payloadMessageId)||(payloadClientMessageId&&String(row.client_message_id||'')===payloadClientMessageId))) as any;
+      if(!canonical){
+        const inputText=normalizeUserSnapshotText((Array.isArray(payload?.input)?payload.input:[]).filter((part:any)=>part?.type==='text').map((part:any)=>String(part.text||'')).join('\n'));
+        if(inputText){const matches=canonicalUsers.filter((row:any)=>!claimedCanonicalUsers.has(String(row.id))&&normalizeUserSnapshotText(String(row.original_text||row.text||''))===inputText);if(matches.length===1)canonical=matches[0];}
+      }
       if (canonical) {
+        claimedCanonicalUsers.add(String(canonical.id));
         const runtimeTurnId=String(payload?.turnId||payload?.segmentId||canonical.turn_id||'');
         items.push({...canonicalUserMessageItem(canonical),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null});
         continue;
@@ -4343,7 +4350,10 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       const item = payload?.params?.item || payload?.item;
       if (item?.id) completedItemIds.add(String(item.id));
       if (item?.type === 'userMessage' && canonicalUsers.length) continue;
-      if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) items.push(compactSnapshotItem(item));
+      if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) {
+        const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
+        items.push({...compactSnapshotItem(item),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null});
+      }
       continue;
     }
     if (eventType === 'item/agentMessage/delta') {
@@ -4362,9 +4372,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage',turnId:terminalTurnId||null,segmentId:terminalTurnId||null,text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
     }
   }
-  while (canonicalUserIndex < canonicalUsers.length) {
-    items.push(canonicalUserMessageItem(canonicalUsers[canonicalUserIndex++]));
-  }
+  for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
   for (const itemId of deltaOrder) {
     const text = String(deltaText.get(itemId) || '').trim();
     if (text && !completedItemIds.has(itemId)){const turnId=deltaTurn.get(itemId)||'';items.push({id:itemId,type:'agentMessage',turnId:turnId||null,segmentId:turnId||null,text,phase:'commentary'});}
