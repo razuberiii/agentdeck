@@ -488,11 +488,17 @@ make_release() {
   cd "$release_path" || return $?
   ensure_playwright_browsers || return $?
   run_as_service_user npm ci || return $?
-  run_as_service_user npm run typecheck || return $?
-  run_as_service_user npm run lint || return $?
+  if [ "${AGENTDECK_FULL_VERIFY:-0}" = "1" ]; then
+    run_as_service_user npm run typecheck || return $?
+    run_as_service_user npm run lint || return $?
+  fi
   run_as_service_user npm run build || return $?
-  run_as_service_user npm test || return $?
-  run_as_service_user npm run test:e2e || return $?
+  if [ "${AGENTDECK_FULL_VERIFY:-0}" = "1" ]; then
+    run_as_service_user npm test || return $?
+    run_as_service_user npm run test:e2e || return $?
+  else
+    log "using production fast verification; GitHub CI must already be green for $commit"
+  fi
   node_version="$(run_as_service_user node --version)" || return $?
   npm_version="$(run_as_service_user npm --version)" || return $?
   node - "$release_path/deploy-manifest.json" "$release_id" "$commit" "$SOURCE_ROOT" "$branch" "$previous_release" "$built_by" "$node_version" "$npm_version" "$SYSTEMD_UNIT_VERSION" <<'NODE' || return $?
