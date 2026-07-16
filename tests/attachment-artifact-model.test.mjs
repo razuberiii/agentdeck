@@ -155,3 +155,9 @@ test('runtime recovery context stays provider-only and out of visible history', 
   assert.match(client, /hasInternalProviderText/);
   assert.match(client, /if \(hasInternalProviderText\(value\)\) return ''/);
 });
+
+test('signed image paths fit through the router while remaining bounded and verified', () => {
+  assert.match(server, /maxParamLength:2048/);
+  assert.match(server, /token\.length>1800/);
+  assert.match(server, /createHmac\('sha256'/);
+});

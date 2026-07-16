@@ -230,7 +230,7 @@ await ensureProfiles();
 await ensureGeminiProfiles();
 await ensureAdmin();
 await loadProviderInstallJobs();
-const app = Fastify({ bodyLimit: Number(process.env.BODY_LIMIT_BYTES || 25 * 1024 * 1024), logger: { redact: ['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','token','secret'] } });
+const app = Fastify({ bodyLimit: Number(process.env.BODY_LIMIT_BYTES || 25 * 1024 * 1024), maxParamLength:2048, logger: { redact: ['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','token','secret'] } });
 await app.register(cookie, { secret: process.env.COOKIE_SECRET || crypto.randomBytes(32).toString('hex') });
 await app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
 await app.register(websocket);
@@ -5668,7 +5668,7 @@ function decorateThreadImages(thread:any, threadId:string, projectDir:string){
 function imageUrl(threadId:string, filePath:string){ return `/api/sessions/${encodeURIComponent(threadId)}/image-file/${encodeURIComponent(signPathToken(filePath))}`; }
 function attachmentUrlFromPath(threadId:string, filePath:string){ try { const root = realpathSync(attachmentSessionDir(threadId)); const rp = realpathSync(filePath); if (!rp.startsWith(root + path.sep)) return null; const id = path.basename(rp).replace(/\.[^.]+$/, ''); return `/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(id)}`; } catch { return null; } }
 function signPathToken(filePath:string){ const payload = Buffer.from(filePath).toString('base64url'); const sig = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); return `${payload}~${sig}`; }
-function verifyPathToken(token:string){ const [payload, sig] = token.includes('~') ? token.split('~') : token.split('.'); if (!payload || !sig) return null; const expected = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; return Buffer.from(payload, 'base64url').toString(); }
+function verifyPathToken(token:string){ if(!token||token.length>1800||!/^[A-Za-z0-9_-]+[~.][A-Za-z0-9_-]+$/.test(token))return null;const [payload, sig] = token.includes('~') ? token.split('~') : token.split('.'); if (!payload || !sig) return null; const expected = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; return Buffer.from(payload, 'base64url').toString(); }
 function imageFileAllowed(filePath:string, projectDir:string, threadId:string){
   try {
     if (!mimeFromPath(filePath) || !existsSync(filePath)) return false;
