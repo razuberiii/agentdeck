@@ -16,7 +16,11 @@ let db;
 let lastProgress = Date.now();
 let started = Date.now();
 let progress = { totalPages: 0, remainingPages: 0 };
-const cleanup = () => { try { fs.rmSync(partial, { force: true }); } catch {} };
+const cleanup = () => {
+  for (const file of [partial, `${partial}-wal`, `${partial}-shm`]) {
+    try { fs.rmSync(file, { force: true }); } catch {}
+  }
+};
 const fail = error => {
   cleanup();
   try { db?.close(); } catch {}

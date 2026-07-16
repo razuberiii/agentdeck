@@ -40,3 +40,8 @@ test('failed SQLite backup removes its partial output and agentdeckctl applies a
     assert.match(ctl, /AGENTDECK_CANDIDATE_DB_MODE:-minimal/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('cleanup removes SQLite WAL and SHM sidecars belonging to a failed partial backup', async () => {
+  const source = await import('node:fs').then(({ readFileSync }) => readFileSync(helper, 'utf8'));
+  assert.match(source, /\[partial, `\$\{partial\}-wal`, `\$\{partial\}-shm`\]/);
+});
