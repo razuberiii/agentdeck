@@ -96,6 +96,13 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(client, /dedupeAttachments/);
 });
 
+test('unmatched canonical user turns are inserted chronologically instead of appended at the timeline tail', () => {
+  assert.match(server, /insertCanonicalTurnChronologically\(thread\.turns,target,createdAt\)/);
+  assert.match(server, /timestamp>=createdAt/);
+  assert.match(server, /turns\.splice\(index,0,target\)/);
+  assert.doesNotMatch(server, /thread\.turns\.push\(target\)/);
+});
+
 test('runtime recovery context stays provider-only and out of visible history', () => {
   assert.match(runtime, /const RECOVERY_CONTEXT_MARKER = '\[\[AGENT_RUNTIME_RECOVERY_CONTEXT\]\]'/);
   assert.match(runtime, /const codexInput = live\.recovered \? \[await recoveryContextInput\(session\), \.\.\.input\] : input/);

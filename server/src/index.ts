@@ -5688,7 +5688,11 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
   });
   if (!missing.length) return;
   if (!Array.isArray(thread.turns)) thread.turns = [];
-  for(const row of missing){const turnId=String(row.turn_id||row.segment_id||'');let target=turnId?thread.turns.find((turn:any)=>String(turn?.id||turn?.turnId||'')===turnId):null;if(!target){target={id:turnId||`canonical-${row.id}`,turnId:turnId||null,userMessageIds:[String(row.id)],items:[],startedAt:Math.floor(Number(row.created_at||Date.now())/1000)};thread.turns.push(target);}else target.userMessageIds=Array.from(new Set([...(target.userMessageIds||[]),String(row.id)]));if(!Array.isArray(target.items))target.items=[];target.items.unshift(canonicalUserMessageItem(row));}
+  for(const row of missing){const turnId=String(row.turn_id||row.segment_id||'');let target=turnId?thread.turns.find((turn:any)=>String(turn?.id||turn?.turnId||'')===turnId):null;if(!target){const createdAt=Number(row.created_at||Date.now());target={id:turnId||`canonical-${row.id}`,turnId:turnId||null,userMessageIds:[String(row.id)],items:[],startedAt:Math.floor(createdAt/1000)};insertCanonicalTurnChronologically(thread.turns,target,createdAt);}else target.userMessageIds=Array.from(new Set([...(target.userMessageIds||[]),String(row.id)]));if(!Array.isArray(target.items))target.items=[];target.items.unshift(canonicalUserMessageItem(row));}
+}
+function insertCanonicalTurnChronologically(turns:any[], target:any, createdAt:number) {
+  const index=turns.findIndex((turn:any)=>{const raw=turn?.startedAt??turn?.createdAt;const numeric=Number(raw);const timestamp=Number.isFinite(numeric)&&numeric>0?(numeric>1e12?numeric:numeric*1000):(typeof raw==='string'?Date.parse(raw):NaN);return Number.isFinite(timestamp)&&timestamp>=createdAt;});
+  if(index<0)turns.push(target);else turns.splice(index,0,target);
 }
 function userMessageItemText(item:any) {
   const content = Array.isArray(item?.content) ? item.content : [];
