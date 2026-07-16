@@ -218,8 +218,13 @@ export function sortRuntimeMessages(items: any[]): any[] {
 export function reconcileTimelineEvents<T extends TimelineDisplayEvent>(items: T[]): T[] {
   const out: T[] = [];
   const userIndex = new Map<string, number>();
+  const assistantIndex = new Map<string, number>();
   for (const item of items) {
     if (item.role !== 'user') {
+      const assistantKey=item.role==='assistant'&&item.key?String(item.key):'';
+      const prior=assistantKey?assistantIndex.get(assistantKey):undefined;
+      if(prior!=null){out[prior]={...out[prior],...item,key:out[prior].key};continue;}
+      if(assistantKey)assistantIndex.set(assistantKey,out.length);
       out.push(item);
       continue;
     }

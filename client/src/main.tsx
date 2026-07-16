@@ -525,7 +525,7 @@ function itemToEvent(item:any):DisplayEvent|null{
     return {key:item.id,role:'image',title:'文件',text:'', [target]:[a]} as DisplayEvent;
   }
   if(item.type==='artifactCollection'&&Array.isArray(item.artifacts)){const artifacts=item.artifacts,targeted=artifacts.reduce((out:any,a:any)=>{out[String(a.type||'').startsWith('image/')?'images':'files'].push(a);return out;},{images:[],files:[]});return{key:item.id,role:'image',title:item.title||'可下载文件',text:'',images:targeted.images,files:targeted.files};}
-  if(item.type==='codeChanges'&&Array.isArray(item.changes)){const text=item.changes.map((change:any)=>`${change.status} ${change.path}${change.toPath?` → ${change.toPath}`:''}`).join('\n');return text?{key:item.id,role:'reasoning',title:item.title||'本轮代码变更',text,open:false}:null;}
+  if(item.type==='codeChanges'&&Array.isArray(item.changes)){const changes=item.changes.filter((change:any)=>change?.path);return changes.length?{key:item.id,role:'changes',title:item.title||'本轮代码变更',text:'',changes}:null;}
   if(item.type==='dynamicToolCall'&&item.contentItems?.length) {
     const images = item.contentItems.filter((x:any)=>x.type==='inputImage').map((x:any,i:number)=>({id:item.id+i,name:'image',type:'image',size:0,url:x.imageUrl}));
     return images.length ? {key:item.id,role:'image',title:item.tool||'工具结果',text:'',images} : null;
@@ -649,6 +649,7 @@ function canvasToBlob(canvas:HTMLCanvasElement,type:string,quality:number){ retu
 function EventCard({e,onImage,onMediaLoad}:{e:DisplayEvent;onImage:(a:Attachment)=>void;onMediaLoad?:()=>void}){
   const toast=useToast();
   if(e.role==='system') return <div className={`sys ${e.text.includes('完成')?'complete':''}`}>{e.text.includes('任务完成')?'已完成':e.text}</div>;
+  if(e.role==='changes') return <ChangeSetCard title={e.title||'本轮代码变更'} changes={e.changes||[]}/>;
   if(e.role==='user'||e.role==='assistant'||e.role==='image') {
     const userAttachments = e.attachments || [];
     const images = [...userAttachments.filter(a=>String(a.type||'').startsWith('image/')),...(e.images||[])];
@@ -658,6 +659,13 @@ function EventCard({e,onImage,onMediaLoad}:{e:DisplayEvent;onImage:(a:Attachment
   }
   return <details className={`event ${e.role}`} open={e.open}><summary><b>{e.title||e.role}</b>{e.meta&&<span>{e.meta}</span>}</summary><CopyButton text={e.text} onDone={(ok)=>toast(ok?'success':'error',ok?'已复制':'复制失败')}/><pre>{e.text}</pre></details>;
 }
+function ChangeSetCard({title,changes}:{title:string;changes:Array<{status:string;path:string;toPath?:string}>}){
+  const counts=changes.reduce((out,change)=>{const key=changeStatusKey(change.status);out[key]=(out[key]||0)+1;return out;},{} as Record<string,number>);
+  return <section className="changeSetCard"><header><span><i>∆</i><b>{title}</b></span><em>{changes.length} 个文件</em></header><div className="changeSummary">{counts.modified&&<span className="modified">修改 {counts.modified}</span>}{counts.added&&<span className="added">新增 {counts.added}</span>}{counts.deleted&&<span className="deleted">删除 {counts.deleted}</span>}{counts.renamed&&<span className="renamed">重命名 {counts.renamed}</span>}</div><div className="changeList">{changes.map((change,index)=><ChangeRow key={`${change.path}:${index}`} change={change}/>)}</div></section>;
+}
+function ChangeRow({change}:{change:{status:string;path:string;toPath?:string}}){const kind=changeStatusKey(change.status),parts=String(change.path).split('/'),name=parts.pop()||change.path,dir=parts.join('/');return <div className={`changeRow ${kind}`}><span>{changeStatusLabel(kind)}</span><div><b>{name}</b>{dir&&<small>{dir}/</small>}{change.toPath&&<small>→ {change.toPath}</small>}</div></div>;}
+function changeStatusKey(status:string){const value=String(status||'').toUpperCase();return value==='A'||value==='ADDED'||value==='CREATED'?'added':value==='D'||value==='DELETED'?'deleted':value==='R'||value==='RENAMED'?'renamed':'modified';}
+function changeStatusLabel(kind:string){return kind==='added'?'+':kind==='deleted'?'−':kind==='renamed'?'→':'M';}
 function LiveTrace({events}:{events:DisplayEvent[]}){
   return <aside className="liveTrace" aria-live="polite"><header><span>LIVE / CONTEXT</span><b>正在推进这件事</b><i/></header><div>{events.map((event,index)=><article className={event.role} key={event.key||index}><em>{event.role==='command'?'RUN':event.role==='file'?'FILE':'THINK'}</em><span><b>{event.title||event.meta||'处理中'}</b><small>{String(event.text||event.meta||'').replace(/\s+/g,' ').slice(0,180)}</small></span></article>)}</div></aside>;
 }

@@ -4315,6 +4315,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
   ).catch(()=>[]);
   const claimedCanonicalUsers = new Set<string>();
   const items:any[] = [];
+  const pendingCanonicalUsersByText = new Map<string, any[]>();
   const deltaText = new Map<string, string>();
   const deltaItems = new Map<string, any>();
   for (const event of events as any[]) {
@@ -4333,7 +4334,10 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       if (canonical) {
         claimedCanonicalUsers.add(String(canonical.id));
         const runtimeTurnId=String(payload?.turnId||payload?.segmentId||canonical.turn_id||'');
-        items.push({...canonicalUserMessageItem(canonical),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null});
+        const canonicalItem={...canonicalUserMessageItem(canonical),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
+        items.push(canonicalItem);
+        const canonicalText=normalizeUserSnapshotText(String(canonical.original_text||canonical.text||''));
+        if(canonicalText)pendingCanonicalUsersByText.set(canonicalText,[...(pendingCanonicalUsersByText.get(canonicalText)||[]),canonicalItem]);
         continue;
       }
       const input = Array.isArray(payload?.input) ? payload.input : [];
@@ -4346,7 +4350,14 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     }
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
-      if (item?.type === 'userMessage' && canonicalUsers.length) continue;
+      if (item?.type === 'userMessage' && canonicalUsers.length) {
+        const providerText=userMessageItemText(item);
+        const pending=providerText?pendingCanonicalUsersByText.get(providerText):undefined;
+        const canonicalItem=pending?.shift();
+        if(pending&&!pending.length)pendingCanonicalUsersByText.delete(providerText);
+        if(canonicalItem){const providerTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');if(providerTurnId){canonicalItem.turnId=providerTurnId;canonicalItem.segmentId=providerTurnId;}}
+        continue;
+      }
       if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) {
         const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
         const completed={...compactSnapshotItem(item),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};

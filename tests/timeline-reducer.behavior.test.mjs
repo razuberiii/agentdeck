@@ -231,6 +231,19 @@ test('canonical and provider user echoes sharing a turn stay at the canonical po
   `);
 });
 
+test('completed assistant item replaces its streamed copy without moving or duplicating it', () => {
+  runReducerScenario(`
+    const events=reconcileTimelineEvents([
+      {key:'answer-1',role:'assistant',text:'partial',meta:'正在回复'},
+      {key:'user-2',role:'user',clientMessageId:'client-2',text:'follow up',attachments:[]},
+      {key:'answer-1',role:'assistant',text:'complete answer',meta:'最终回答'},
+    ]);
+    assert.deepEqual(events.map(event=>event.key),['answer-1','user-2']);
+    assert.equal(events[0].text,'complete answer');
+    assert.equal(events[0].meta,'最终回答');
+  `);
+});
+
 test('durable failure status updates a user already absorbed by the snapshot', () => {
   runReducerScenario(`
     let state=applyTimelineSnapshot(emptyTimelineState(0),[
