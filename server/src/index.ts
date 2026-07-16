@@ -4565,7 +4565,8 @@ async function joinAndResume(id:string,ws:any,lastSequence=0,options:JoinOptions
   app.log.info({sessionId:id,threadId,connectionGeneration:ws.agentdeckGeneration||null,subscriberCount:clients.get(threadId)?.size||0,replayFrom:Number(lastSequence||0),browserAppliedSequence:options.browserAppliedSequence||0,snapshotCoveredSequence:options.snapshotCoveredSequence||0,runtimeGeneration:options.requestedRuntimeGeneration||null,recoveryEpoch:options.recoveryEpoch||0,joinRequestId:options.joinRequestId||null},'websocket joined session');
   if (row && normalizeProvider(row.provider_id) === 'antigravity' && !runtimeBackedAntigravity) {
     clients.get(threadId)!.add(ws);
-    ws.send(JSON.stringify({type:'joined',sessionId:threadId,runtimeConnection:'connected',clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0}));
+    const through=Number(lastSequence||0),replay=browserDelivery.beginReplay(ws,threadId,{clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||'',recoveryEpoch:options.recoveryEpoch||0},through,through);
+    if(replay)await browserDelivery.finishReplay(ws,threadId,replay.state,replay.groups,{type:'joined',sessionId:threadId,runtimeConnection:'connected',clientConnectionId:options.clientConnectionId||'',joinRequestId:options.joinRequestId||null,recoveryEpoch:options.recoveryEpoch||0});
     return;
   }
   if (USE_AGENT_RUNTIME) {
@@ -4679,7 +4680,7 @@ function ensureRuntimePushSubscription(threadId:string) {
       if(authoritativeSequence!==state.committedSequence||generationChanged){
         await db.run('INSERT INTO runtime_ingestion_cursors (session_id,committed_sequence,runtime_generation,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(session_id) DO UPDATE SET committed_sequence=excluded.committed_sequence,runtime_generation=excluded.runtime_generation,updated_at=excluded.updated_at',[threadId,authoritativeSequence,state.generation||null,Date.now()]);
         state.receivedSequence=authoritativeSequence;state.committedSequence=authoritativeSequence;state.lastSequence=authoritativeSequence;persistedIngestionCursors.set(threadId,authoritativeSequence);persistedIngestionGenerations.set(threadId,state.generation||'');
-        if(authoritativeSequence!==Number(error?.requestedAfter??authoritativeSequence)&&!generationTransition)browserDelivery.releaseSession(threadId);
+        if(authoritativeSequence!==Number(error?.requestedAfter??authoritativeSequence)&&!generationTransition){browserDelivery.releaseSession(threadId);broadcast(threadId,{type:'resnapshot_required',sessionId:threadId,latestSequence:authoritativeSequence,runtimeGeneration:state.generation||null});}
         app.log.warn({sessionId:threadId,requestedAfter:error?.requestedAfter,replayFrom:error?.replayFrom,authoritativeSequence,runtimeGeneration:state.generation||null},'runtime ingestion cursor rebased to authoritative watermark');
       }
       state.connecting=false; state.connected=true; state.lastStatus='connected';
@@ -5671,13 +5672,20 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
   if (!canonicalUsers.length) return;
   const existing = new Set<string>();
   for (const turn of thread?.turns || []) {
-    for (const item of turn.items || []) {
+    for (let index=0;index<(turn.items||[]).length;index++) {
+      const item=turn.items[index];
       if (item?.type !== 'userMessage') continue;
-      if (item.id) existing.add(`id:${String(item.id)}`);
-      if (item.clientMessageId) existing.add(`client:${String(item.clientMessageId)}`);
-      const text = userMessageItemText(item);
+      const canonical=canonicalUsers.find((row:any)=>(row.id&&String(row.id)===String(item.id||''))||(row.client_message_id&&String(row.client_message_id)===String(item.clientMessageId||'')));
+      if(canonical){turn.items[index]={...item,...canonicalUserMessageItem(canonical),turnId:String(canonical.turn_id||item.turnId||''),segmentId:String(canonical.segment_id||canonical.turn_id||item.segmentId||item.turnId||'')};}
+      const enriched=turn.items[index];
+      if (enriched.id) existing.add(`id:${String(enriched.id)}`);
+      if (enriched.clientMessageId) existing.add(`client:${String(enriched.clientMessageId)}`);
+      const text = userMessageItemText(enriched);
       if (text) existing.add(`text:${text}`);
     }
+    const canonicalIds=new Set(canonicalUsers.flatMap((row:any)=>[row.id?`id:${String(row.id)}`:'',row.client_message_id?`client:${String(row.client_message_id)}`:'']).filter(Boolean));
+    const canonicalItems=(turn.items||[]).filter((item:any)=>(item.id&&canonicalIds.has(`id:${String(item.id)}`))||(item.clientMessageId&&canonicalIds.has(`client:${String(item.clientMessageId)}`)));
+    if(canonicalItems.length)turn.items=[...canonicalItems,...turn.items.filter((item:any)=>!canonicalItems.includes(item))];
   }
   const missing = canonicalUsers.filter((row:any) => {
     const id = String(row.id || '');

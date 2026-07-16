@@ -231,6 +231,17 @@ test('canonical and provider user echoes sharing a turn stay at the canonical po
   `);
 });
 
+test('durable failure status updates a user already absorbed by the snapshot', () => {
+  runReducerScenario(`
+    let state=applyTimelineSnapshot(emptyTimelineState(0),[
+      {key:'canonical',role:'user',clientMessageId:'client-1',turnId:'turn-1',text:'执行',deliveryStatus:'accepted'},
+    ],10);
+    state=applyTimelineMessage(state,{type:'messageStatus',clientMessageId:'client-1',status:'failed',error:'provider failed',runtimeSequence:10});
+    assert.equal(state.snapshotEvents[0].deliveryStatus,'failed');
+    assert.equal(state.snapshotEvents[0].deliveryError,'provider failed');
+  `);
+});
+
 test('active turn status beats active session status and waiting states have priority', () => {
   runReducerScenario(`
     assert.equal(resolveTurnUiStatus({status:'active', activeTurn:{turnId:'t1', status:'running'}}, [], false), 'running');

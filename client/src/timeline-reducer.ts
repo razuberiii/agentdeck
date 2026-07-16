@@ -101,6 +101,7 @@ export function applyTimelineMessage(state: TimelineState, msg: any): TimelineSt
     state=beginTimelineGeneration(state,generation);
   } else if (generation && !state.runtimeGeneration) state={...state,runtimeGeneration:generation};
   if(msg?.type==='runtime_cursor')return applyCursorRange(state,msg);
+  if(msg?.type==='messageStatus'&&msg.clientMessageId)state=applySnapshotMessageStatus(state,msg);
   if (seq && seq <= state.coveredSequence) {
     return { ...state, appliedSequence: Math.max(state.appliedSequence, seq),contiguousAppliedSequence:Math.max(state.contiguousAppliedSequence,seq),highestSeenSequence:Math.max(state.highestSeenSequence,seq) };
   }
@@ -147,6 +148,11 @@ function applyContiguousMessage(state:TimelineState,msg:any):TimelineState {
     contiguousAppliedSequence:seq ? Math.max(state.contiguousAppliedSequence,seq) : state.contiguousAppliedSequence,
     highestSeenSequence:Math.max(state.highestSeenSequence,seq),
   });
+}
+
+function applySnapshotMessageStatus(state:TimelineState,msg:any):TimelineState{
+  const clientMessageId=String(msg.clientMessageId);
+  return{...state,snapshotEvents:state.snapshotEvents.map(event=>event.role==='user'&&String(event.clientMessageId||'')===clientMessageId?{...event,deliveryStatus:String(msg.status||event.deliveryStatus||''),deliveryError:msg.error||undefined}:event)};
 }
 
 function advancePending(state:TimelineState):TimelineState {
