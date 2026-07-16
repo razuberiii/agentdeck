@@ -28,7 +28,7 @@ run_as_service_user(){
 }
 systemctl(){ echo restart >> "$ROOT/restarts"; }
 ensure_dirs;mkdir -p "$RELEASES_DIR/old" "$RELEASES_DIR/prev";ln -s releases/old "$CURRENT_RUNTIME_LINK";ln -s releases/prev "$PREVIOUS_RUNTIME_LINK";write_job test accepted accepted;worker_deploy test runtime 0`;
-  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,SOURCE:source,ROOT:root,FAIL_STEP:step,AGENTDECK_ROOT:control,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(control,'state'),DATA_DIR:data}});
+  const run=spawnSync('bash',['-c',script],{encoding:'utf8',env:{...process.env,REPO:repo,SOURCE:source,ROOT:root,FAIL_STEP:step,AGENTDECK_FULL_VERIFY:'1',AGENTDECK_ROOT:control,AGENTDECK_SOURCE_ROOT:repo,AGENTDECK_DEPLOY_STATE_DIR:join(control,'state'),DATA_DIR:data}});
   try{
     assert.equal(run.status,code,run.stderr);const journal=readFileSync(join(control,'state/test.stages'),'utf8');const releaseId=journal.match(/^release_id=(.+)$/m)?.[1];assert.ok(releaseId);
     assert.equal(existsSync(join(control,'releases',releaseId)),false);assert.equal(existsSync(join(root,'manifest-attempts')),false);assert.equal(existsSync(join(root,'restarts')),false);
@@ -44,4 +44,11 @@ test('deploy safety helpers explicitly propagate critical command failures',()=>
   const switching=block('switch_component','snapshot_deploy_pointers');
   assert.equal((switching.match(/\|\| return \$\?/g)||[]).length>=5,true);
   for(const name of ['snapshot_deploy_pointers','restore_component_pointer_snapshot','cleanup_release_worktree','deploy_recover_once','recover_incomplete_deploy_journals'])assert.match(ctl,new RegExp(`${name}\\(\\) \\{[\\s\\S]*?\\|\\| return \\$\\?`),name);
+});
+
+test('production release defaults to fast verification while retaining an explicit full mode',()=>{
+  const make=ctl.slice(ctl.indexOf('make_release() {'),ctl.indexOf('assert_release_unit_requirement() {'));
+  assert.match(make,/AGENTDECK_FULL_VERIFY:-0/);
+  assert.match(make,/using production fast verification/);
+  assert.match(make,/npm run build[^\n]*\|\| return \$\?/);
 });
