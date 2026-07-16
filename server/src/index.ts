@@ -1531,7 +1531,7 @@ app.post('/api/sessions/:id/attachments', { preHandler: ensureAuth }, async (req
   if (!looksLikeImage(buffer, type)) return reply.code(400).send({error:'image content does not match type'});
   const threadId = String(row.codex_thread_id || row.id);
   const attachmentId = crypto.randomBytes(16).toString('base64url');
-  const dir = path.join(ATTACHMENTS_DIR, threadId, attachmentId);
+  const dir = path.join(attachmentSessionDir(threadId), attachmentId);
   await mkdir(dir, { recursive: true, mode:0o700 });
   const filename = cleanFileName(name).replace(/\.[^.]+$/, '') + ext;
   const filePath = path.join(dir, filename);
@@ -4227,7 +4227,7 @@ function attachmentCapabilities(geminiRuntime:any = null) {
     maxAttachmentsPerMessage: Number(process.env.MAX_ATTACHMENTS_PER_MESSAGE || 10),
     maxTotalAttachmentBytes: Number(process.env.MAX_TOTAL_ATTACHMENT_BYTES || 64 * 1024 * 1024),
     providers: {
-      codex: { imageInput:true, fileInput:false, fileTransport:'path' },
+      codex: { imageInput:true, fileInput:true, fileTransport:'verified_path' },
       gemini: {
         imageInput: !!geminiRuntime?.capabilities?.promptCapabilities?.image,
         fileInput: true,
@@ -4837,7 +4837,7 @@ async function sendTurnClaimed(id:string, text:string, attachments:any[] = [], c
     }
     return;
   }
-  const input = await buildTurnInput(threadId, providerText, attachments);
+  const input = await buildCodexTurnInput(threadId, providerText, attachments);
   const opts = modeOptions(sessionMode(row), await effectiveModel(row));
   const continuePreflight = await codexContinueSessionPreflight();
   if (!continuePreflight.ok) {
@@ -5486,6 +5486,27 @@ async function buildTurnInput(threadId:string, text:string, attachments:any[]){
   if (!input.length) throw new Error('empty message');
   return input;
 }
+async function buildCodexTurnInput(threadId:string,text:string,attachments:any[]){
+  if(attachments.length>MAX_ATTACHMENTS_PER_MESSAGE)throw Object.assign(new Error(`最多添加 ${MAX_ATTACHMENTS_PER_MESSAGE} 个附件`),{statusCode:413});
+  const ids=new Set<string>(),metas:any[]=[];let total=0;
+  for(const attachment of attachments){
+    const id=String(attachment?.id||'');
+    if(!id||ids.has(id))throw Object.assign(new Error('附件 ID 无效或重复'),{statusCode:400});
+    ids.add(id);
+    const meta=await readAttachmentMeta(threadId,id);
+    total+=Number(meta.size||0);
+    if(total>MAX_TOTAL_ATTACHMENT_BYTES)throw Object.assign(new Error(`附件总大小超过 ${MAX_TOTAL_ATTACHMENT_BYTES} bytes`),{statusCode:413});
+    metas.push(meta);
+  }
+  const input:any[]=[];
+  if(text.trim())input.push({type:'text',text,text_elements:[]});
+  for(const meta of metas){
+    if(String(meta.kind||'').startsWith('image')||String(meta.type||meta.mime||'').startsWith('image/'))input.push({type:'localImage',path:meta.path,detail:'high'});
+    else input.push({type:'text',text:`Attachment: ${meta.name}\nMIME: ${meta.type||meta.mime}\nSize: ${meta.size} bytes\nLocal path: ${meta.path}\nRead this file from the local path if needed.`,text_elements:[]});
+  }
+  if(!input.length)throw new Error('empty message');
+  return input;
+}
 async function buildClaudeTurnInput(threadId:string, text:string, attachments:any[]){
   const input:any[] = [];
   if (text.trim()) input.push({ type:'text', text, text_elements: [] });
@@ -5511,7 +5532,7 @@ async function uploadMultipartAttachment(req:any, reply:any, row:any) {
   const threadId = String(row.codex_thread_id || row.id);
   const attachmentId = crypto.randomBytes(16).toString('base64url');
   const name = cleanFileName(String(part.filename || 'attachment'));
-  const dir = path.join(ATTACHMENTS_DIR, threadId, attachmentId);
+  const dir = path.join(attachmentSessionDir(threadId), attachmentId);
   const tmpDir = path.join(ATTACHMENTS_DIR, '.tmp');
   await mkdir(dir, { recursive:true, mode:0o700 });
   await mkdir(tmpDir, { recursive:true, mode:0o700 });
@@ -5520,6 +5541,7 @@ async function uploadMultipartAttachment(req:any, reply:any, row:any) {
   part.file.on('data', (chunk:Buffer) => { size += chunk.length; });
   try {
     await pipeline(part.file, createWriteStream(tmp, { flags:'wx', mode:0o600 }));
+    if(part.file.truncated)throw Object.assign(new Error(`file exceeds ${MAX_ATTACHMENT_BYTES} bytes`),{statusCode:413});
     const st = await stat(tmp);
     size = st.size;
     if (!size) throw Object.assign(new Error('empty file'), { statusCode:400 });
@@ -5581,14 +5603,19 @@ function looksLikeImage(buffer:Buffer, type:string){
 }
 async function readAttachmentMeta(threadId:string, attachmentId:string){
   if (!/^[A-Za-z0-9_-]{10,80}$/.test(attachmentId)) throw new Error('bad attachment id');
-  const dir = path.join(ATTACHMENTS_DIR, threadId);
+  const dir = attachmentSessionDir(threadId);
   const nested = path.join(dir, attachmentId, 'meta.json');
   const legacy = path.join(dir, `${attachmentId}.json`);
   const meta = JSON.parse(await readFile(existsSync(nested) ? nested : legacy, 'utf8'));
-  const rp = realpathSync(meta.path);
+  const rp = realpathSync(String(meta.path||''));
   const root = realpathSync(dir);
   if (!rp.startsWith(root + path.sep)) throw new Error('attachment outside session');
   return { ...meta, type:meta.type || meta.mime, mime:meta.mime || meta.type, path: rp };
+}
+function attachmentSessionDir(threadId:string){
+  const root=path.resolve(ATTACHMENTS_DIR),dir=path.resolve(root,String(threadId||''));
+  if(!threadId||!dir.startsWith(root+path.sep))throw new Error('invalid attachment session path');
+  return dir;
 }
 function attachmentDto(meta:any){ return { id: meta.id, name: meta.name, type: meta.type || meta.mime, mime:meta.mime || meta.type, kind:meta.kind || ((meta.type || meta.mime || '').startsWith('image/') ? 'image' : 'binary'), size: meta.size, url: `/api/sessions/${encodeURIComponent(meta.sessionId)}/attachments/${encodeURIComponent(meta.id)}`, previewUrl: safeInlineMime(meta.type || meta.mime || '') ? `/api/sessions/${encodeURIComponent(meta.sessionId)}/attachments/${encodeURIComponent(meta.id)}` : undefined }; }
 function decorateThreadImages(thread:any, threadId:string, projectDir:string){
@@ -5599,7 +5626,7 @@ function decorateThreadImages(thread:any, threadId:string, projectDir:string){
   }
 }
 function imageUrl(threadId:string, filePath:string){ return `/api/sessions/${encodeURIComponent(threadId)}/image-file/${encodeURIComponent(signPathToken(filePath))}`; }
-function attachmentUrlFromPath(threadId:string, filePath:string){ try { const root = realpathSync(path.join(ATTACHMENTS_DIR, threadId)); const rp = realpathSync(filePath); if (!rp.startsWith(root + path.sep)) return null; const id = path.basename(rp).replace(/\.[^.]+$/, ''); return `/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(id)}`; } catch { return null; } }
+function attachmentUrlFromPath(threadId:string, filePath:string){ try { const root = realpathSync(attachmentSessionDir(threadId)); const rp = realpathSync(filePath); if (!rp.startsWith(root + path.sep)) return null; const id = path.basename(rp).replace(/\.[^.]+$/, ''); return `/api/sessions/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(id)}`; } catch { return null; } }
 function signPathToken(filePath:string){ const payload = Buffer.from(filePath).toString('base64url'); const sig = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); return `${payload}~${sig}`; }
 function verifyPathToken(token:string){ const [payload, sig] = token.includes('~') ? token.split('~') : token.split('.'); if (!payload || !sig) return null; const expected = crypto.createHmac('sha256', process.env.COOKIE_SECRET || 'agentdeck').update(payload).digest('base64url'); if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; return Buffer.from(payload, 'base64url').toString(); }
 function imageFileAllowed(filePath:string, projectDir:string, threadId:string){

@@ -55,7 +55,7 @@ const codexCapabilities: ProviderCapabilities = {
   approvals:supported(),
   askUserQuestion:unsupported('capability_not_exposed', 'Codex 当前协议未作为独立 AskUserQuestion 能力暴露'),
   cancellation:supported(),
-  attachments:supported({ imageInput:true, fileInput:false, fileTransport:'path' }),
+  attachments:supported({ imageInput:true, fileInput:true, fileTransport:'verified_path' }),
   imageInput:supported(),
   modelSelection:supported(),
   modelDiscovery:supported(),
