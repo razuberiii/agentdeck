@@ -116,6 +116,12 @@ test('unmatched canonical user turns are inserted chronologically instead of app
   assert.doesNotMatch(server, /thread\.turns\.push\(target\)/);
 });
 
+test('duplicate concurrent HTTP snapshot reads share one reconstruction flight', () => {
+  assert.match(server, /runtimeThreadSnapshotSingleFlight\(threadId, runtimeRow, snapshotWatermark\)/);
+  assert.match(server, /runtimeThreadSnapshotFlights\.get\(key\)/);
+  assert.match(server, /return structuredClone\(await flight\)/);
+});
+
 test('runtime recovery context stays provider-only and out of visible history', () => {
   assert.match(runtime, /const RECOVERY_CONTEXT_MARKER = '\[\[AGENT_RUNTIME_RECOVERY_CONTEXT\]\]'/);
   assert.match(runtime, /const codexInput = live\.recovered \? \[await recoveryContextInput\(session\), \.\.\.input\] : input/);

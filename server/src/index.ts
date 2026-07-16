@@ -1418,7 +1418,7 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [String(runtimeRow.status), Date.now(), threadId]).catch(()=>{});
     }
     const snapshotWatermark=Number(runtimeRow?.last_sequence||0);
-    const thread = await runtimeThreadFromEvents(threadId, runtimeRow, snapshotWatermark);
+    const thread = await runtimeThreadSnapshotSingleFlight(threadId, runtimeRow, snapshotWatermark);
     decorateThreadImages(thread, threadId, String(runtimeRow.project_dir || row.project_dir));
     const [branch] = await Promise.all([
       gitBranch(String(runtimeRow.project_dir || row.project_dir)).catch(()=>null),
@@ -4261,6 +4261,13 @@ function threadFromRow(row:any) {
     turns: [],
     path: null,
   };
+}
+const runtimeThreadSnapshotFlights=new Map<string,Promise<any>>();
+async function runtimeThreadSnapshotSingleFlight(threadId:string,row:any,snapshotWatermark=Number(row?.last_sequence||0)){
+  const key=`${threadId}:${snapshotWatermark}`;
+  let flight=runtimeThreadSnapshotFlights.get(key);
+  if(!flight){flight=runtimeThreadFromEvents(threadId,row,snapshotWatermark);runtimeThreadSnapshotFlights.set(key,flight);const cleanup=()=>{if(runtimeThreadSnapshotFlights.get(key)===flight)runtimeThreadSnapshotFlights.delete(key);};void flight.then(cleanup,cleanup);}
+  return structuredClone(await flight);
 }
 async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWatermark=Number(row?.last_sequence||0)) {
   const events = await runtimeDb.all(
