@@ -1,6 +1,7 @@
-import assert from'node:assert/strict';import{execFileSync}from'node:child_process';import test from'node:test';
+import assert from'node:assert/strict';import{execFileSync}from'node:child_process';import{readFileSync}from'node:fs';import test from'node:test';
 const moduleUrl=new URL('../client/src/browser-outbox.ts',import.meta.url).href;
 function run(source){execFileSync(process.execPath,['--experimental-strip-types','--input-type=module','-e',`import assert from'node:assert/strict';import{BrowserOutbox,OutboxRetryScheduler}from ${JSON.stringify(moduleUrl)};${source}`]);}
+test('durable delivery does not poll every accepted message status',()=>{const source=readFileSync(new URL('../client/src/main.tsx',import.meta.url),'utf8');assert.equal(source.match(/messages\/\$\{encodeURIComponent\(record\.clientMessageId\)\}\/status/g)?.length,1);assert.doesNotMatch(source,/record\.status==='accepted'/);});
 test('newer fallback terminal state wins over stale IndexedDB sent state',()=>run(`
  const storage=new Map();globalThis.localStorage={getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)};
  const base={clientMessageId:'m',sessionId:'s',text:'secret',attachments:[],planMode:'direct',createdAt:1,attempts:1};
