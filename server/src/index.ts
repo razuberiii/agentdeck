@@ -1417,18 +1417,21 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     if (runtimeRow?.status && runtimeRow.status !== row.status) {
       await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3', [String(runtimeRow.status), Date.now(), threadId]).catch(()=>{});
     }
-    const snapshotWatermark=Number(runtimeRow?.last_sequence||0);
-    const thread = await runtimeThreadSnapshotSingleFlight(threadId, runtimeRow, snapshotWatermark);
+    const latestSequence=Number(runtimeRow?.last_sequence||0);
+    const requestedBefore=Math.max(0,Number(req.query?.beforeSequence||0));
+    const snapshotWatermark=requestedBefore?Math.min(latestSequence,requestedBefore-1):latestSequence;
+    const historyWindow=await runtimeHistoryWindow(threadId,snapshotWatermark,12);
+    const thread = await runtimeThreadSnapshotSingleFlight(threadId, runtimeRow, snapshotWatermark,historyWindow.startSequence);
     decorateThreadImages(thread, threadId, String(runtimeRow.project_dir || row.project_dir));
     const [branch] = await Promise.all([
       gitBranch(String(runtimeRow.project_dir || row.project_dir)).catch(()=>null),
-      injectArtifacts(thread, threadId).catch(()=>{}),
+      injectArtifacts(thread, threadId, true).catch(()=>{}),
     ]);
     sanitizeThreadForMobile(thread);
-    const coveredSequence = snapshotWatermark;
+    const coveredSequence = requestedBefore?snapshotWatermark:latestSequence;
     const snapshot = { coveredSequence, throughSequence:coveredSequence, latestSequence:coveredSequence, generation:String(runtimeRow?.upstream_generation || '') || null };
     app.log.info({ requestId, localSessionId:threadId, upstreamThreadId:String(runtimeRow?.upstream_thread_id || threadId), status:runtimeRow.status, latestSequence:Number(runtimeRow?.last_sequence || 0), operation:'GET /api/sessions/:id', sqliteDurationMs:Date.now() - sqliteStartedAt, totalDurationMs:Date.now() - startedAt }, 'web session snapshot returned');
-    return { session: rowSessionDto(runtimeRow), thread, snapshot, branch, interrupted: (runtimeRow?.status === 'interrupted'), interactiveRequests: await listInteractiveRequests(threadId) };
+    return { session: rowSessionDto(runtimeRow), thread, snapshot, history:{beforeSequence:historyWindow.startSequence,hasMore:historyWindow.hasMore}, branch, interrupted: (runtimeRow?.status === 'interrupted'), interactiveRequests: await listInteractiveRequests(threadId) };
   }
   let read:any;
   try { read = await codex.readThread(threadId, true); }
@@ -4263,20 +4266,28 @@ function threadFromRow(row:any) {
   };
 }
 const runtimeThreadSnapshotFlights=new Map<string,Promise<any>>();
-async function runtimeThreadSnapshotSingleFlight(threadId:string,row:any,snapshotWatermark=Number(row?.last_sequence||0)){
-  const key=`${threadId}:${snapshotWatermark}`;
+async function runtimeThreadSnapshotSingleFlight(threadId:string,row:any,snapshotWatermark=Number(row?.last_sequence||0),startSequence=0){
+  const key=`${threadId}:${startSequence}:${snapshotWatermark}`;
   let flight=runtimeThreadSnapshotFlights.get(key);
-  if(!flight){flight=runtimeThreadFromEvents(threadId,row,snapshotWatermark);runtimeThreadSnapshotFlights.set(key,flight);const cleanup=()=>{if(runtimeThreadSnapshotFlights.get(key)===flight)runtimeThreadSnapshotFlights.delete(key);};void flight.then(cleanup,cleanup);}
+  if(!flight){flight=runtimeThreadFromEvents(threadId,row,snapshotWatermark,startSequence);runtimeThreadSnapshotFlights.set(key,flight);const cleanup=()=>{if(runtimeThreadSnapshotFlights.get(key)===flight)runtimeThreadSnapshotFlights.delete(key);};void flight.then(cleanup,cleanup);}
   return structuredClone(await flight);
 }
-async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWatermark=Number(row?.last_sequence||0)) {
+async function runtimeHistoryWindow(threadId:string,throughSequence:number,turnLimit:number){
+  if(!throughSequence)return{startSequence:0,hasMore:false};
+  const boundary:any=await runtimeDb.get(`SELECT MIN(sequence) AS start_sequence FROM (SELECT sequence FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='user' ORDER BY sequence DESC LIMIT ?3)`,[threadId,throughSequence,turnLimit]).catch(()=>null);
+  const startSequence=Math.max(0,Number(boundary?.start_sequence||0));
+  if(!startSequence)return{startSequence:0,hasMore:false};
+  const older:any=await runtimeDb.get(`SELECT 1 AS found FROM events WHERE session_id=?1 AND sequence<?2 AND event_type='user' LIMIT 1`,[threadId,startSequence]).catch(()=>null);
+  return{startSequence,hasMore:!!older};
+}
+async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWatermark=Number(row?.last_sequence||0),startSequence=0) {
   const events = await runtimeDb.all(
     `SELECT session_id,sequence,event_type,payload_json,created_at
      FROM (
        SELECT session_id,sequence,event_type,payload_json,created_at FROM (
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
-         WHERE session_id=?1 AND sequence<=?2
+         WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
            AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
          ORDER BY sequence DESC
          LIMIT 80
@@ -4285,7 +4296,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
        SELECT session_id,sequence,event_type,payload_json,created_at FROM (
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
-         WHERE session_id=?1 AND sequence<=?2
+         WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
            AND event_type='item/completed'
            AND length(payload_json)<300000
            AND (
@@ -4302,23 +4313,25 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
        SELECT session_id,sequence,event_type,payload_json,created_at FROM (
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
-         WHERE session_id=?1 AND sequence<=?2
+         WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
            AND event_type IN ('item/agentMessage/delta','assistant/delta')
          ORDER BY sequence DESC
          LIMIT 1000
        )
       )
       ORDER BY sequence ASC`,
-    [threadId,snapshotWatermark]
+    [threadId,snapshotWatermark,startSequence]
   ).catch(()=>[]);
+  const eventTimes=(events as any[]).map(event=>Number(event.created_at||0)).filter(Number.isFinite);
+  const minEventTime=eventTimes.length?Math.min(...eventTimes):0,maxEventTime=eventTimes.length?Math.max(...eventTimes):Number.MAX_SAFE_INTEGER;
   const canonicalUsers = await db.all(
     `SELECT * FROM (
        SELECT * FROM agent_messages
-       WHERE session_id=?1 AND role='user'
+       WHERE session_id=?1 AND role='user' AND created_at>=?2 AND created_at<=?3
        ORDER BY created_at DESC, id DESC
        LIMIT 80
      ) ORDER BY created_at ASC, id ASC`,
-    [threadId]
+    [threadId,Math.max(0,minEventTime-60_000),maxEventTime+60_000]
   ).catch(()=>[]);
   const claimedCanonicalUsers = new Set<string>();
   const items:any[] = [];
@@ -4393,7 +4406,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage',turnId:terminalTurnId||null,segmentId:terminalTurnId||null,text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
     }
   }
-  for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
+  if(!startSequence)for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
   const turns:any[]=[];const turnsById=new Map<string,any>();
   for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
   return {
@@ -5851,7 +5864,7 @@ function artifactPathIsInternal(relativePath:string) {
   if (/\.(sqlite|sqlite3|db|db-wal|db-shm|sqlite-wal|sqlite-shm)$/i.test(base)) return true;
   return false;
 }
-async function injectArtifacts(thread:any, threadId:string){
+async function injectArtifacts(thread:any, threadId:string, anchoredOnly=false){
   const rows = (await db.all('SELECT * FROM artifacts WHERE session_id=?1 AND anchor_item_id IS NOT NULL ORDER BY created_at ASC LIMIT 100', [threadId])).filter((row:any)=>artifactEligibleForDownload(String(row.relative_path||row.name),String(row.operation||'created')));
   const codeRows=await db.all('SELECT * FROM turn_code_changes WHERE session_id=?1 AND anchor_item_id IS NOT NULL ORDER BY created_at ASC LIMIT 100',[threadId]);
   if (!rows.length&&!codeRows.length) return;
@@ -5862,9 +5875,9 @@ async function injectArtifacts(thread:any, threadId:string){
     const turn = { items:[artifactMessageItem(group.map(artifactDto), newest)], startedAt:Math.floor(newest/1000), completedAt:Math.floor(newest/1000), durationMs:null };
     const insertAfter = turnIndexForAnchor(thread.turns, group[0]?.anchor_item_id);
     if (insertAfter !== null && insertAfter >= 0) thread.turns.splice(insertAfter + 1, 0, turn);
-    else thread.turns.push(turn);
+    else if(!anchoredOnly) thread.turns.push(turn);
   }
-  for(const row of codeRows){let changes:any[]=[];try{changes=JSON.parse(String(row.changes_json||'[]'));}catch{}if(!changes.length)continue;const stamp=Number(row.created_at||Date.now()),turn={items:[codeChangesItem(String(row.turn_id),changes)],startedAt:Math.floor(stamp/1000),completedAt:Math.floor(stamp/1000),durationMs:null},insertAfter=turnIndexForAnchor(thread.turns,row.anchor_item_id);if(insertAfter!==null&&insertAfter>=0)thread.turns.splice(insertAfter+1,0,turn);else thread.turns.push(turn);}
+  for(const row of codeRows){let changes:any[]=[];try{changes=JSON.parse(String(row.changes_json||'[]'));}catch{}if(!changes.length)continue;const stamp=Number(row.created_at||Date.now()),turn={items:[codeChangesItem(String(row.turn_id),changes)],startedAt:Math.floor(stamp/1000),completedAt:Math.floor(stamp/1000),durationMs:null},insertAfter=turnIndexForAnchor(thread.turns,row.anchor_item_id);if(insertAfter!==null&&insertAfter>=0)thread.turns.splice(insertAfter+1,0,turn);else if(!anchoredOnly)thread.turns.push(turn);}
 }
 async function artifactForSession(threadId:string, artifactId:string): Promise<any | null>{
   if (!/^[A-Za-z0-9_-]{8,80}$/.test(artifactId)) return null;

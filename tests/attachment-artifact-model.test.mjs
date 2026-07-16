@@ -117,9 +117,16 @@ test('unmatched canonical user turns are inserted chronologically instead of app
 });
 
 test('duplicate concurrent HTTP snapshot reads share one reconstruction flight', () => {
-  assert.match(server, /runtimeThreadSnapshotSingleFlight\(threadId, runtimeRow, snapshotWatermark\)/);
+  assert.match(server, /runtimeThreadSnapshotSingleFlight\(threadId, runtimeRow, snapshotWatermark,historyWindow\.startSequence\)/);
   assert.match(server, /runtimeThreadSnapshotFlights\.get\(key\)/);
   assert.match(server, /return structuredClone\(await flight\)/);
+});
+
+test('long runtime histories load in bounded turn windows with an older-page cursor', () => {
+  assert.match(server, /runtimeHistoryWindow\(threadId,snapshotWatermark,12\)/);
+  assert.match(server, /event_type='user' ORDER BY sequence DESC LIMIT \?3/);
+  assert.match(server, /history:\{beforeSequence:historyWindow\.startSequence,hasMore:historyWindow\.hasMore\}/);
+  assert.match(readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8'), /beforeSequence=\$\{historyCursor\}/);
 });
 
 test('runtime recovery context stays provider-only and out of visible history', () => {
