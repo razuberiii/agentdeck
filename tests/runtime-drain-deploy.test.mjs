@@ -5,6 +5,7 @@ import test from 'node:test';
 const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
 const deploy = readFileSync(new URL('../scripts/deploy.sh', import.meta.url), 'utf8');
 const ctl = readFileSync(new URL('../scripts/agentdeckctl', import.meta.url), 'utf8');
+const sqliteBackup = readFileSync(new URL('../scripts/sqlite-backup.cjs', import.meta.url), 'utf8');
 const runtimeUnit = readFileSync(new URL('../deploy/systemd/agentdeck-runtime.service', import.meta.url), 'utf8');
 
 test('runtime exposes lifecycle draining and rejects new work while draining', () => {
@@ -71,7 +72,10 @@ test('deploy supports component scoped web runtime provider and changed modes', 
 });
 
 test('candidate runtime sqlite backup is bounded and fails closed', () => {
-  assert.match(ctl, /sqlite backup stalled for 30 seconds/);
+  assert.match(sqliteBackup, /SQLITE_BACKUP_STALL_MS \|\| 30_000/);
+  assert.match(sqliteBackup, /SQLITE_BACKUP_OVERALL_MS \|\| 300_000/);
+  assert.match(sqliteBackup, /quick_check/);
+  assert.match(ctl, /timeout --kill-after=10s 310s/);
   assert.match(ctl, /live sqlite backup failed; candidate validation cancelled/);
 });
 

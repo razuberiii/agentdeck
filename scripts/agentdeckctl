@@ -571,39 +571,17 @@ sqlite_backup() {
     : > "$dest_db"
     return
   fi
-  if ! node - "$source_db" "$dest_db" <<'NODE'
-const Database = require('better-sqlite3');
-const source = process.argv[2], dest = process.argv[3];
-const db = new Database(source, { readonly:true, fileMustExist:true });
-db.pragma('busy_timeout = 1000');
-let lastProgress = Date.now();
-const watchdog = setInterval(() => {
-  if (Date.now() - lastProgress < 30000) return;
-  console.error('sqlite backup stalled for 30 seconds');
-  process.exit(1);
-}, 1000);
-db.backup(dest, { progress(){ lastProgress=Date.now(); return 100; } }).then(() => {
-  clearInterval(watchdog);
-  db.close();
-}).catch(err => {
-  clearInterval(watchdog);
-  try { db.close(); } catch {}
-  console.error(err.message);
-  process.exit(1);
-});
-NODE
+  if ! timeout --kill-after=10s 310s node "$SOURCE_ROOT/scripts/sqlite-backup.cjs" "$source_db" "$dest_db"
   then log "live sqlite backup failed; candidate validation cancelled"; return 1; fi
 }
 
 candidate_db_mode() {
-  local release_path="$1" override="${AGENTDECK_CANDIDATE_DB_MODE:-}" current_commit next_commit files
+  local release_path="$1" override="${AGENTDECK_CANDIDATE_DB_MODE:-}"
   case "$override" in minimal|copy) printf '%s\n' "$override"; return ;; '') ;; *) die "invalid AGENTDECK_CANDIDATE_DB_MODE: $override" ;; esac
-  next_commit="$(git -C "$release_path" rev-parse HEAD 2>/dev/null || true)"
-  current_commit="$(git -C "$(readlink -f "$CURRENT_RUNTIME_LINK" 2>/dev/null || true)" rev-parse HEAD 2>/dev/null || true)"
-  [ -n "$current_commit" ] && [ -n "$next_commit" ] || { printf 'copy\n'; return; }
-  files="$(git -C "$SOURCE_ROOT" diff --name-only "$current_commit..$next_commit" 2>/dev/null)" || { printf 'copy\n'; return; }
-  if printf '%s\n' "$files" | grep -Eq '(^|/)(migration|migrations|migration-runner|event-store|db)\.(ts|js|sql)$|(^|/)migrations/|package(-lock)?\.json$'; then printf 'copy\n'; return; fi
-  if printf '%s\n' "$files" | grep -qx 'server/src/agentdeck-runtime.ts' && git -C "$SOURCE_ROOT" diff -U0 "$current_commit..$next_commit" -- server/src/agentdeck-runtime.ts | grep -Eq '^\+.*(CREATE TABLE|ALTER TABLE|CREATE (UNIQUE )?INDEX|schema_migrations|payload_json|last_sequence|event_type)'; then printf 'copy\n'; else printf 'minimal\n'; fi
+  # Candidate validation exercises migrations and API contracts on an isolated
+  # database. Copying a live, append-heavy events database is opt-in because it
+  # can prevent deployment from ever reaching the drain/cutover stage.
+  printf 'minimal\n'
 }
 
 prepare_candidate_runtime_db() {
@@ -623,17 +601,7 @@ sqlite_file_backup() {
   if [ ! -f "$source_db" ]; then
     return 0
   fi
-  if node - "$source_db" "$dest_db" <<'NODE'
-const Database = require('better-sqlite3');
-const source = process.argv[2], dest = process.argv[3];
-const db = new Database(source, { readonly:true, fileMustExist:true });
-db.pragma('busy_timeout = 1000');
-db.backup(dest).then(() => db.close()).catch(err => {
-  try { db.close(); } catch {}
-  console.error(err.message);
-  process.exit(1);
-});
-NODE
+  if timeout --kill-after=10s 310s node "$SOURCE_ROOT/scripts/sqlite-backup.cjs" "$source_db" "$dest_db"
   then
     return 0
   fi
@@ -833,7 +801,10 @@ start_candidate_web() {
   pid_file="$candidate_dir/web.pid"
   mkdir -p "$candidate_dir"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
-  sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$candidate_dir/agentdeck.sqlite3"
+  rm -f "$candidate_dir/agentdeck.sqlite3"*
+  if [ "${AGENTDECK_CANDIDATE_DB_MODE:-minimal}" = "copy" ]; then
+    sqlite_file_backup "$DATA_DIR/agentdeck.sqlite3" "$candidate_dir/agentdeck.sqlite3"
+  fi
   chown -R "$SERVICE_USER:$SERVICE_USER" "$candidate_dir"
   run_as_service_user bash -c 'set -a; [ -f "$8" ] && . "$8"; set +a; cd "$1"; PORT="$2" DATA_DIR="$3" ADMIN_PASSWORD=agentdeck-candidate-smoke-only SMOKE_TEST_MODE=1 USE_AGENT_RUNTIME=1 AGENT_RUNTIME_URL="$4" AGENTDECK_RELEASE_ID="$5" node server/dist/index.js >>"$6" 2>&1 & echo $! > "$7"' _ "$release_path" "$WEB_CANDIDATE_PORT" "$candidate_dir" "http://127.0.0.1:$RUNTIME_CANDIDATE_PORT" "$(basename "$release_path")" "$LOG_DIR/$job_id.candidate-web.log" "$pid_file" "$ENV_DIR/web.env"
   wait_http "http://127.0.0.1:$WEB_CANDIDATE_PORT/internal/deep-health" 30
