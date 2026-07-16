@@ -4315,10 +4315,8 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
   ).catch(()=>[]);
   const claimedCanonicalUsers = new Set<string>();
   const items:any[] = [];
-  const completedItemIds = new Set<string>();
   const deltaText = new Map<string, string>();
-  const deltaTurn = new Map<string, string>();
-  const deltaOrder:string[] = [];
+  const deltaItems = new Map<string, any>();
   for (const event of events as any[]) {
     const eventType = String(event.event_type || '');
     let payload:any = {};
@@ -4348,11 +4346,12 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     }
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
-      if (item?.id) completedItemIds.add(String(item.id));
       if (item?.type === 'userMessage' && canonicalUsers.length) continue;
       if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) {
         const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
-        items.push({...compactSnapshotItem(item),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null});
+        const completed={...compactSnapshotItem(item),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
+        const streamed=deltaItems.get(String(item.id));
+        if(streamed)Object.assign(streamed,completed);else items.push(completed);
       }
       continue;
     }
@@ -4360,9 +4359,13 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       const itemId = String(payload?.params?.itemId || '');
       const delta = String(payload?.params?.delta || '');
       if (itemId && delta) {
-        if (!deltaText.has(itemId)) deltaOrder.push(itemId);
+        if (!deltaItems.has(itemId)) {
+          const turnId=String(payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
+          const streamed={id:itemId,type:'agentMessage',turnId:turnId||null,segmentId:turnId||null,text:'',phase:'commentary'};
+          deltaItems.set(itemId,streamed);items.push(streamed);
+        }
         deltaText.set(itemId, (deltaText.get(itemId) || '') + delta);
-        deltaTurn.set(itemId,String(payload?.turnId||payload?.params?.turnId||payload?.segmentId||''));
+        deltaItems.get(itemId).text=deltaText.get(itemId);
       }
       continue;
     }
@@ -4373,10 +4376,6 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     }
   }
   for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
-  for (const itemId of deltaOrder) {
-    const text = String(deltaText.get(itemId) || '').trim();
-    if (text && !completedItemIds.has(itemId)){const turnId=deltaTurn.get(itemId)||'';items.push({id:itemId,type:'agentMessage',turnId:turnId||null,segmentId:turnId||null,text,phase:'commentary'});}
-  }
   const turns:any[]=[];const turnsById=new Map<string,any>();
   for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
   return {
@@ -5164,7 +5163,7 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
     if (msg.method === 'turn/started' && msg.params?.turn?.id) activeTurns.set(threadId, String(msg.params.turn.id));
     if (msg.method === 'turn/completed' || msg.method === 'turn/failed' || msg.method === 'turn/interrupted') {
       if(msg.method!=='turn/completed'&&payload?.clientMessageId){const deliveryError=String(msg.params?.error?.message||msg.method);await updateMessageReceipt(threadId,String(payload.clientMessageId),'failed',deliveryError).catch(()=>{});out.push({type:'messageStatus',clientMessageId:String(payload.clientMessageId),status:'failed',error:deliveryError,...base});}
-      const artifactTurnId=String(msg.params?.turn?.id||payload?.params?.turn?.id||payload?.turnId||'')||activeArtifactTurns.get(threadId)||activeTurns.get(threadId)||'';
+      const artifactTurnId=String(payload?.segmentId||payload?.clientMessageId||activeArtifactTurns.get(threadId)||msg.params?.turn?.id||payload?.params?.turn?.id||payload?.turnId||activeTurns.get(threadId)||'');
       activeCodexSessions.delete(threadId);
       activeRuntimeProviderSessions.delete(threadId);
       activeTurns.delete(threadId);
