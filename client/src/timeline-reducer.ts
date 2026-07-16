@@ -242,6 +242,8 @@ function userIdentityKeys(e: TimelineDisplayEvent): string[] {
   const keys: string[] = [];
   if (e.clientMessageId) keys.push(`client:${e.clientMessageId}`);
   if (e.messageId) keys.push(`message:${e.messageId}`);
+  if (e.turnId) keys.push(`turn:${e.turnId}`);
+  else if (e.segmentId) keys.push(`segment:${e.segmentId}`);
   if (!hasStableUserId(e)) { const contentKey = userContentIdentityKey(e) || userLooseTextKey(e); if (contentKey) keys.push(contentKey); }
   return keys;
 }
@@ -285,6 +287,8 @@ function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T 
     key: a.key,
     clientMessageId: a.clientMessageId || b.clientMessageId,
     messageId: a.messageId || b.messageId,
+    turnId: a.turnId || b.turnId,
+    segmentId: a.segmentId || b.segmentId,
     text,
     attachments,
     meta: retried ? '已重试' : b.meta || a.meta,

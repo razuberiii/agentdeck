@@ -218,6 +218,19 @@ test('two distinct stable ids with identical text remain two user messages', () 
   `);
 });
 
+test('canonical and provider user echoes sharing a turn stay at the canonical position', () => {
+  runReducerScenario(`
+    const events=reconcileTimelineEvents([
+      {key:'canonical',role:'user',clientMessageId:'client-1',turnId:'turn-1',text:'继续处理',attachments:[]},
+      {key:'answer',role:'assistant',text:'完成'},
+      {key:'provider-echo',role:'user',messageId:'provider-item-1',turnId:'turn-1',text:'继续处理',attachments:[]},
+    ]);
+    assert.deepEqual(events.map(e=>e.key),['canonical','answer']);
+    assert.equal(events[0].clientMessageId,'client-1');
+    assert.equal(events[0].messageId,'provider-item-1');
+  `);
+});
+
 test('active turn status beats active session status and waiting states have priority', () => {
   runReducerScenario(`
     assert.equal(resolveTurnUiStatus({status:'active', activeTurn:{turnId:'t1', status:'running'}}, [], false), 'running');
