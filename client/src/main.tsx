@@ -507,7 +507,7 @@ function itemToEvent(item:any):DisplayEvent|null{
   if(item.type==='commandExecution') {
     const output = String(item.aggregatedOutput || '').trim();
     const failed = item.status && !['completed','success'].includes(item.status);
-    if (!output && !failed) return null;
+    if (!output && !failed && !String(item.command || '').trim()) return null;
     return {key:item.id,role:'command',title:'命令',meta:item.status,text:`$ ${item.command || ''}\n\n${output}`.trim(),open:failed};
   }
   if(item.type==='fileChange') {

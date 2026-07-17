@@ -4302,6 +4302,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
            AND (
              payload_json LIKE '%"type":"agentMessage"%'
              OR payload_json LIKE '%"type":"userMessage"%'
+             OR payload_json LIKE '%"type":"commandExecution"%'
              OR payload_json LIKE '%"type":"imageView"%'
              OR payload_json LIKE '%"type":"imageGeneration"%'
              OR payload_json LIKE '%"type":"artifact"%'
@@ -4378,9 +4379,9 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
         if(canonicalItem){const providerTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');if(providerTurnId){canonicalItem.turnId=providerTurnId;canonicalItem.segmentId=providerTurnId;}}
         continue;
       }
-      if (item?.id && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) {
+      if (item?.id && ['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'].includes(String(item.type))) {
         const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
-        const completed={...compactSnapshotItem(item),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
+        const compact=compactSnapshotItem(item),completed=item.type==='commandExecution'?{...compact,turnId:runtimeTurnId||null,segmentId:String(item?.segmentId||payload?.segmentId||runtimeTurnId)||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||null,completedAtMs:item?.completedAtMs||payload?.params?.completedAtMs||null}:{...compact,turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
         const streamed=deltaItems.get(String(item.id));
         if(streamed)Object.assign(streamed,completed);else items.push(completed);
       }
@@ -5691,6 +5692,7 @@ function sanitizeThreadForMobile(thread:any){
       if (!item?.type) return false;
       if (item.type === 'userMessage') return (item.content || []).some((c:any) => (c.type === 'text' && String(c.text || '').trim()) || c.type === 'image' || c.type === 'localImage');
       if (item.type === 'agentMessage') return !!String(item.text || '').trim();
+      if (item.type === 'commandExecution') return !!String(item.command || '').trim();
       if (item.type === 'imageView' || item.type === 'imageGeneration') return true;
       if (item.type === 'artifactCollection') return Array.isArray(item.artifacts) && item.artifacts.length > 0;
       if (item.type === 'codeChanges') return Array.isArray(item.changes) && item.changes.length > 0;

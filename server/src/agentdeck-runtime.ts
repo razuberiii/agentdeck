@@ -1718,7 +1718,11 @@ async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Numb
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
       if(item?.id)completed.add(String(item.id));
-      if (item && ['userMessage','agentMessage','imageView','imageGeneration','artifact'].includes(String(item.type))) items.push(compactSnapshotItem(item));
+      if (item && ['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'].includes(String(item.type))) {
+        const compact=compactSnapshotItem(item);
+        if(item.type==='commandExecution'){const turnId=String(item?.turnId||payload?.turnId||payload?.params?.turnId||''),segmentId=String(item?.segmentId||payload?.segmentId||turnId);items.push({...compact,turnId:turnId||null,segmentId:segmentId||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||null,completedAtMs:item?.completedAtMs||payload?.params?.completedAtMs||null});}
+        else items.push(compact);
+      }
       continue;
     }
     if(eventType==='item/agentMessage/delta'||eventType==='assistant/delta'){const itemId=String(payload?.params?.itemId||payload?.itemId||'active-agent');const delta=String(payload?.params?.delta||payload?.delta||'');if(delta){if(!deltaText.has(itemId))deltaOrder.push(itemId);deltaText.set(itemId,(deltaText.get(itemId)||'')+delta);}continue;}

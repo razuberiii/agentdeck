@@ -161,3 +161,11 @@ test('signed image paths fit through the router while remaining bounded and veri
   assert.match(server, /token\.length>1800/);
   assert.match(server, /createHmac\('sha256'/);
 });
+
+test('Codex completed command cards survive Runtime-backed snapshot reconstruction', () => {
+  assert.match(server, /payload_json LIKE '%"type":"commandExecution"%'/);
+  assert.match(server, /\['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'\]/);
+  assert.match(server, /item\.type === 'commandExecution'/);
+  assert.match(runtime, /\['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'\]/);
+  assert.match(client, /!output && !failed && !String\(item\.command \|\| ''\)\.trim\(\)/);
+});
