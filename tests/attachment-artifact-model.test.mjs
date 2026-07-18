@@ -50,9 +50,16 @@ test('session snapshots only inject persisted artifacts and keep anchors stable'
 test('HTTP session restore prefers the latest authoritative Runtime thread snapshot',()=>{
   assert.match(server,/latestAuthoritativeRuntimeThread\(threadId,snapshotWatermark\)/);
   assert.match(server,/event_type='thread_snapshot' ORDER BY sequence DESC LIMIT 1/);
-  assert.match(server,/Number\(row\.sequence\)!==snapshotWatermark/);
+  assert.match(server,/eventStartSequence=Math\.max\(startSequence,authoritative\?authoritative\.sequence\+1:0\)/);
+  assert.match(server,/if\(authoritative\?\.sequence===snapshotWatermark\)return authoritative\.thread/);
+  assert.match(server,/const merged=authoritative\.thread/);
   assert.match(server,/thread\.turns=thread\.turns\.slice\(-12\)/);
   assert.match(server,/ensureCanonicalUsersInThreadSnapshot\(thread,threadId\)/);
+});
+
+test('latest authoritative thread snapshot wins over an older interrupted event',()=>{
+  assert.match(server,/event_type IN \('turn\/completed','turn\/failed','turn\/interrupted','thread_snapshot'\)/);
+  assert.match(server,/if\(eventType==='thread_snapshot'\)return/);
 });
 
 test('artifact cards are not duplicated by markdown link parsing', () => {

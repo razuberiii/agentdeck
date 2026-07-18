@@ -4282,7 +4282,8 @@ async function runtimeHistoryWindow(threadId:string,throughSequence:number,turnL
 }
 async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWatermark=Number(row?.last_sequence||0),startSequence=0) {
   const authoritative=await latestAuthoritativeRuntimeThread(threadId,snapshotWatermark);
-  if(authoritative)return authoritative;
+  if(authoritative?.sequence===snapshotWatermark)return authoritative.thread;
+  const eventStartSequence=Math.max(startSequence,authoritative?authoritative.sequence+1:0);
   const events = await runtimeDb.all(
     `SELECT session_id,sequence,event_type,payload_json,created_at
      FROM (
@@ -4324,7 +4325,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
        )
       )
       ORDER BY sequence ASC`,
-    [threadId,snapshotWatermark,startSequence]
+    [threadId,snapshotWatermark,eventStartSequence]
   ).catch(()=>[]);
   const eventTimes=(events as any[]).map(event=>Number(event.created_at||0)).filter(Number.isFinite);
   const minEventTime=eventTimes.length?Math.min(...eventTimes):0,maxEventTime=eventTimes.length?Math.max(...eventTimes):Number.MAX_SAFE_INTEGER;
@@ -4434,7 +4435,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
   if(!startSequence)for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
   const turns:any[]=[];const turnsById=new Map<string,any>();
   for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;if(item?.type==='commandExecution'&&item?.status==='inProgress'&&terminalTurns.has(itemTurnId))continue;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
-  return {
+  const rebuilt={
     id:threadId,
     name:String(row.title || projectNameFromPath(String(row.project_dir || 'Session'))),
     preview:String(row.title || ''),
@@ -4445,17 +4446,21 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     turns,
     path:null,
   };
+  if(!authoritative)return rebuilt;
+  const merged=authoritative.thread,byId=new Map<string,any>((merged.turns||[]).map((turn:any)=>[String(turn?.id||turn?.turnId||''),turn]));
+  for(const turn of rebuilt.turns){const id=String(turn?.id||turn?.turnId||'');const existing:any=byId.get(id);if(!existing){merged.turns.push(turn);byId.set(id,turn);continue;}const seen=new Set((existing.items||[]).map((item:any)=>String(item?.id||'')));for(const item of turn.items||[])if(!item?.id||!seen.has(String(item.id)))existing.items.push(item);}
+  merged.status=rebuilt.status;merged.updatedAt=rebuilt.updatedAt;return merged;
 }
 
 async function latestAuthoritativeRuntimeThread(threadId:string,snapshotWatermark:number){
   const row:any=await runtimeDb.get(`SELECT sequence,payload_json FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='thread_snapshot' ORDER BY sequence DESC LIMIT 1`,[threadId,snapshotWatermark]).catch(()=>null);
-  if(!row?.payload_json||Number(row.sequence)!==snapshotWatermark)return null;
+  if(!row?.payload_json)return null;
   try{
     const payload=JSON.parse(String(row.payload_json)),thread=structuredClone(payload?.thread);
     if(!thread||!Array.isArray(thread.turns))return null;
     thread.turns=thread.turns.slice(-12);
     await ensureCanonicalUsersInThreadSnapshot(thread,threadId).catch(()=>{});
-    return thread;
+    return {sequence:Number(row.sequence),thread};
   }catch{return null;}
 }
 
@@ -5106,7 +5111,7 @@ async function inferredRuntimeStatus(threadId:string, fallback:string) {
     `SELECT event_type,payload_json,sequence
      FROM events
      WHERE session_id=?1
-       AND (event_type IN ('turn/completed','turn/failed','turn/interrupted')
+       AND (event_type IN ('turn/completed','turn/failed','turn/interrupted','thread_snapshot')
          OR (event_type='item/completed' AND payload_json LIKE '%"phase":"final_answer"%'))
      ORDER BY sequence DESC
      LIMIT 1`,
@@ -5117,6 +5122,7 @@ async function inferredRuntimeStatus(threadId:string, fallback:string) {
   let payload:any = {};
   try { payload = JSON.parse(String(row.payload_json || '{}')); } catch {}
   const method = String(payload?.method || eventType);
+  if(eventType==='thread_snapshot')return ['running','active'].includes(String(payload?.status||payload?.thread?.status?.type||''))?'running':'idle';
   if (method === 'turn/failed' || method === 'turn/interrupted') return 'interrupted';
   if (method === 'turn/completed') return turnFailed(payload?.params?.turn || payload?.turn) ? 'interrupted' : 'idle';
   const item = payload?.params?.item || payload?.item;
