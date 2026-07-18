@@ -250,7 +250,7 @@ function Home(){
     catch(e:any){ toast('error','创建失败：'+shortError(e)); }
     finally{ setBusy(''); }
   }
-  async function loadQuota(open=false){ if(open) setQuotaOpen(true); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider))); } catch(e:any){ setQuota({errors:{rateLimits:shortError(e)}}); } }
+  async function loadQuota(open=false){ if(open) setQuotaOpen(true); setQuota(null); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider),{signal:AbortSignal.timeout(12_000)})); } catch(e:any){ setQuota({errors:{rateLimits:e?.name==='TimeoutError'?'额度读取超时，请稍后重试':shortError(e)},checkedAt:Date.now()}); } }
   async function showQuota(){ await loadQuota(true); }
   async function loadSettings(){ setSettingsLoading(true); setSettingsError(''); try{ setSettings(await api('/api/settings?light=1')); } catch(e:any){ const msg=shortError(e); setSettingsError(msg); toast('error','设置读取失败：'+msg); } finally { setSettingsLoading(false); } }
   const [settingsInitialPage,setSettingsInitialPage]=useState<'main'|'agent'>('main');

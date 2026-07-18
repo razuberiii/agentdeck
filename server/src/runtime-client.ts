@@ -14,10 +14,10 @@ export class RuntimeClient {
   ensureDefaultCodexAccount() { return this.request('POST', '/codex/accounts/default'); }
   restartDefaultCodexAccount(body:any) { return this.request('POST', '/codex/accounts/default/restart', body); }
   account(accountId?:string|null, codexHome?:string|null) {
-    return this.request('GET', `/codex/account${codexAccountQuery(accountId, codexHome)}`);
+    return this.request('GET', `/codex/account${codexAccountQuery(accountId, codexHome)}`, undefined, 8_000);
   }
   rateLimits(accountId?:string|null, codexHome?:string|null) {
-    return this.request('GET', `/codex/rate-limits${codexAccountQuery(accountId, codexHome)}`);
+    return this.request('GET', `/codex/rate-limits${codexAccountQuery(accountId, codexHome)}`, undefined, 8_000);
   }
   models(includeHidden = false) { return this.request('GET', `/codex/models?hidden=${includeHidden ? '1' : '0'}`); }
   geminiStatus() { return this.request('GET', '/gemini/status'); }
@@ -96,14 +96,14 @@ export class RuntimeClient {
     return () => req.destroy();
   }
 
-  private request(method:string, path:string, body?:any) {
+  private request(method:string, path:string, body?:any, timeoutMs=120_000) {
     const url = new URL(path, this.baseUrl);
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
     return new Promise<any>((resolve, reject) => {
       const req = http.request(url, {
         method,
         headers: payload ? { 'content-type':'application/json', 'content-length':String(payload.length), ...this.authHeaders() } : this.authHeaders(),
-        timeout: 120_000,
+        timeout: timeoutMs,
       }, res => {
         const chunks:Buffer[] = [];
         res.on('data', d => chunks.push(Buffer.from(d)));

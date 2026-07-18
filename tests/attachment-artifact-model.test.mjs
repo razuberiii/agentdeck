@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 
 const server = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
+const runtimeClient = readFileSync(new URL('../server/src/runtime-client.ts', import.meta.url), 'utf8');
 const client = readFileSync(new URL('../client/src/main.tsx', import.meta.url), 'utf8');
 const schema = readFileSync(new URL('../server/src/schema-migrations.ts', import.meta.url), 'utf8');
 const artifactManifest = readFileSync(new URL('../server/src/artifact-manifest.ts', import.meta.url), 'utf8');
@@ -66,6 +67,13 @@ test('HTTP session restore prefers the latest authoritative Runtime thread snaps
 test('latest authoritative thread snapshot wins over an older interrupted event',()=>{
   assert.match(server,/event_type IN \('turn\/completed','turn\/failed','turn\/interrupted','thread_snapshot'\)/);
   assert.match(server,/if\(eventType==='thread_snapshot'\)return/);
+});
+
+test('Codex quota reads are bounded and coalesced',()=>{
+  assert.match(server,/const codexQuotaCache=new Map/);
+  assert.match(server,/if\(cached\?\.promise\)return/);
+  assert.match(server,/cachedCodexQuota\(accountId,codexHome/);
+  assert.match(runtimeClient,/undefined, 8_000/);
 });
 
 test('artifact cards are not duplicated by markdown link parsing', () => {

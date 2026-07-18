@@ -220,6 +220,7 @@ let claudeStatusCache: { expiresAt:number; promise?:Promise<any>; value?:any } =
 let unifiedProviderStatusCache: { expiresAt:number; promise?:Promise<Record<AgentProviderId, ProviderStatus>>; value?:Record<AgentProviderId, ProviderStatus>; generation:number } = { expiresAt: 0, generation: 0 };
 let antigravityModelsCache: { key:string; expiresAt:number; promise?:Promise<any>; value?:any } = { key:'', expiresAt: 0 };
 const antigravityUsageCache=new Map<string,{expiresAt:number;value:string|null;promise?:Promise<string|null>}>();
+const codexQuotaCache=new Map<string,{expiresAt:number;value?:any;promise?:Promise<any>}>();
 let shutdownRequested = false;
 if (roots.length === 0) throw new Error('No allowed workspaces exist');
 await db.init();
@@ -584,13 +585,15 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
   const activeProfile:any = await getActiveProfile().catch(()=>null);
   const accountId = activeProfile?.id ? String(activeProfile.id) : 'default';
   const codexHome = activeProfile?.codex_home ? String(activeProfile.codex_home) : DEFAULT_CODEX_HOME;
-  const [account, limits] = await Promise.allSettled(USE_AGENT_RUNTIME ? [runtime.account(accountId, codexHome), runtime.rateLimits(accountId, codexHome)] : [codex.account(), codex.rateLimits()]);
+  const quota = await cachedCodexQuota(accountId,codexHome,req.query?.refresh==='1');
+  const {account,limits}=quota;
   if (limits.status === 'fulfilled') {
     app.log.info({ provider:'codex', operation:'quota_read', accountId, cache:'none', ...codexQuotaLogFields(limits.value) }, 'codex quota read');
   }
   return {
     providerId: 'codex',
     accountId,
+    cached:quota.cached,
     account: account.status === 'fulfilled' ? account.value : null,
     rateLimits: limits.status === 'fulfilled' ? limits.value : null,
     errors: {
@@ -600,6 +603,15 @@ app.get('/api/quota', { preHandler: ensureAuth }, async (req:any) => {
     checkedAt: Date.now(),
   };
 });
+async function cachedCodexQuota(accountId:string,codexHome:string,force=false){
+  const key=`${accountId}\0${codexHome}`,now=Date.now(),cached=codexQuotaCache.get(key);
+  if(cached?.promise)return{...await cached.promise,cached:false};
+  if(!force&&cached?.value&&cached.expiresAt>now)return{...cached.value,cached:true};
+  const promise=(async()=>{const [account,limits]=await Promise.allSettled(USE_AGENT_RUNTIME?[runtime.account(accountId,codexHome),runtime.rateLimits(accountId,codexHome)]:[codex.account(),codex.rateLimits()]);return{account,limits};})();
+  codexQuotaCache.set(key,{expiresAt:now+10_000,value:cached?.value,promise});
+  try{const value=await promise;const usable=value.account.status==='fulfilled'||value.limits.status==='fulfilled';codexQuotaCache.set(key,{expiresAt:Date.now()+(usable?60_000:10_000),value});return{...value,cached:false};}
+  catch(error){codexQuotaCache.set(key,{expiresAt:Date.now()+10_000,value:cached?.value});throw error;}
+}
 app.get('/api/settings', { preHandler: ensureAuth }, async (req:any) => {
   const force = req.query?.refresh === '1';
   const light = req.query?.light === '1';
