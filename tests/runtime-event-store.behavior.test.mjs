@@ -9,7 +9,7 @@ function scenario(source) {
     class FakeDb {
       rows=[]; last=0; fail=false; batches=0;
       async get(){ return {sequence:this.last}; }
-      transactionRun(statements){ if(this.fail) throw new Error('sqlite failed'); this.batches++; for(let i=0;i<statements.length;i+=2){ const p=statements[i].params; this.rows.push({sequence:p[4],type:p[2]}); this.last=p[4]; } }
+      transactionRun(statements){ if(this.fail) throw new Error('sqlite failed'); this.batches++; for(const statement of statements){ if(!statement.sql.startsWith('INSERT INTO events'))continue; const p=statement.params; this.rows.push({sequence:p[4],type:p[2]}); this.last=p[4]; } }
     }
     ${source}
   `],{stdio:'pipe'});

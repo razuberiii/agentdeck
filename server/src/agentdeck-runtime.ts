@@ -1375,7 +1375,16 @@ async function handleCodexNotification(account:Account, msg:any) {
   if (!session) return;
   const notificationTurnId=String(msg.params?.turn?.id||msg.params?.turnId||session.active_turn_id||''),lineage=notificationTurnId?await runtimeLineage(session.id,notificationTurnId):null;
   const durableMsg=lineage?{...msg,turnId:notificationTurnId,segmentId:lineage.segmentId,clientMessageId:lineage.clientMessageId,messageId:lineage.messageId,retryOf:lineage.retryOf}:msg;
-  if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) diagnostics.deltasReceived++;
+  if (String(msg.method || '').endsWith('/delta') || String(msg.method || '').endsWith('/outputDelta')) {
+    diagnostics.deltasReceived++;
+    // Do not hold the provider's per-thread notification lane open while the
+    // delta waits for its SQLite flush window.  DurableEventStore still owns
+    // ordering: a later critical event is queued behind these deltas and
+    // flushes them before it commits.  Letting notifications reach that queue
+    // together is what makes batching effective under token-heavy streams.
+    void appendEvent(session.id,msg.method,durableMsg).catch(error=>app.log.error({err:error,sessionId:session.id,eventType:msg.method},'delta event append failed'));
+    return;
+  }
   await appendEvent(session.id,msg.method,durableMsg);
   if (msg.method === 'turn/started' && msg.params?.turn?.id) {
     const next=codexSessionStateForNotification(session as any,msg.method,msg.params);

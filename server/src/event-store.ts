@@ -51,7 +51,11 @@ export class DurableEventStore {
     if(batch.some(item=>item.eventKey)){for(const item of batch)await this.commitOne(sessionId,item);return;}
     this.metrics.pendingSqliteWriteCount++;const started=Date.now();
     try{await this.ensureNoGap(sessionId);const row=await this.db.get('SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE session_id=?1',[sessionId]);let sequence=Number(row?.sequence||0);const now=Date.now();const events=batch.map(item=>({session_id:sessionId,threadId:sessionId,generation:this.generation,sequence:++sequence,event_type:item.eventType,payload_json:JSON.stringify(item.payload),created_at:now}));
-      this.db.transactionRun(events.flatMap(event=>[{sql:'INSERT INTO events (session_id,ts,kind,payload,sequence,event_type,payload_json,created_at,event_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL)',params:[event.session_id,event.created_at,event.event_type,event.payload_json,event.sequence,event.event_type,event.payload_json,event.created_at]},{sql:'UPDATE sessions SET last_sequence=?1,updated_at=?2 WHERE (id=?3 OR codex_thread_id=?3) AND COALESCE(last_sequence,0)<?1',params:[event.sequence,event.created_at,event.session_id]}]));
+      const last=events.at(-1)!;
+      this.db.transactionRun([
+        ...events.map(event=>({sql:'INSERT INTO events (session_id,ts,kind,payload,sequence,event_type,payload_json,created_at,event_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL)',params:[event.session_id,event.created_at,event.event_type,event.payload_json,event.sequence,event.event_type,event.payload_json,event.created_at]})),
+        {sql:'UPDATE sessions SET last_sequence=?1,updated_at=?2 WHERE (id=?3 OR codex_thread_id=?3) AND COALESCE(last_sequence,0)<?1',params:[last.sequence,last.created_at,last.session_id]},
+      ]);
       this.metrics.sqliteBatches++;this.metrics.sqliteRows+=events.length;this.metrics.sqliteMs+=Date.now()-started;for(let i=0;i<events.length;i++){batch[i].resolve(events[i]);try{await this.options.onCommitted?.(events[i]);}catch{/* SQLite commit is authoritative; transport publication recovers from durable replay. */}}
     }catch(error){for(const item of batch)item.reject(error);}finally{this.metrics.pendingSqliteWriteCount--;}
   }
