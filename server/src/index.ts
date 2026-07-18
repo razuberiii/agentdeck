@@ -5195,7 +5195,10 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
     const thread = payload?.thread;
     if (thread && row) {
       decorateThreadImages(thread, threadId, String(row.project_dir));
-      await injectArtifacts(thread, threadId).catch(()=>{});
+      // Runtime snapshots are intentionally windowed. Never append artifacts
+      // whose anchor is outside that window: doing so makes old artifact cards
+      // reappear at the bottom every time a later turn completes.
+      await injectArtifacts(thread, threadId, true).catch(()=>{});
       await ensureCanonicalUsersInThreadSnapshot(thread, threadId).catch(()=>{});
       sanitizeThreadForMobile(thread);
     }

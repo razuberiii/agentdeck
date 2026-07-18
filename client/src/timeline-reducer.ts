@@ -348,10 +348,13 @@ export function resolveTurnUiStatus(session: any, approvals: any[] = [], cancell
   const structured=latestStructuredTurnEvent(live);
   if(structured?.method==='turn/started')return'running';
   if(structured?.method==='turn/completed')return turnStatusFromTerminal(structured,'completed');
-  if(structured?.method==='turn/failed')return'failed';
-  if(structured?.method==='turn/interrupted')return'interrupted';
-  if(live.some(m=>m?.type==='codex'&&m.method==='item/agentMessage/delta'))return'running';
   const sessionStatus = normalizeTurnStatus(session?.status);
+  // An idle authoritative snapshot has already incorporated the terminal
+  // event. Do not let a retained terminal frame from an older turn paint the
+  // session as interrupted again after reconnect or terminal resync.
+  if(structured?.method==='turn/failed')return sessionStatus==='idle'?'idle':'failed';
+  if(structured?.method==='turn/interrupted')return sessionStatus==='idle'?'idle':'interrupted';
+  if(live.some(m=>m?.type==='codex'&&m.method==='item/agentMessage/delta'))return'running';
   if (['running','waiting_approval','waiting_input','cancelling','failed','interrupted'].includes(sessionStatus)) return sessionStatus;
   if(['running','waiting_approval','waiting_input','cancelling'].includes(current))return current;
   return 'idle';

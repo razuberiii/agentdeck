@@ -274,6 +274,7 @@ test('only structured durable turn terminals decide the current turn status',()=
     assert.equal(resolveTurnUiStatus({status:'idle'},[],false,'interrupted',[interruptedActivity,{type:'codex',method:'turn/completed',turnId:'t1',params:{turn:{id:'t1',status:'completed'}}}]),'completed');
     assert.equal(resolveTurnUiStatus({status:'running',activeTurn:{turnId:'t2',status:'running'}},[],false,'interrupted',[{type:'codex',method:'turn/interrupted',turnId:'t1',params:{turn:{id:'t1',status:'interrupted'}}},{type:'codex',method:'turn/started',turnId:'t2',params:{turn:{id:'t2',status:'running'}}}]),'running');
     assert.equal(resolveTurnUiStatus({status:'interrupted'},[],false,'unknown',[{type:'codex',method:'turn/interrupted',turnId:'t1',params:{turn:{id:'t1',status:'interrupted'}}}]),'interrupted');
+    assert.equal(resolveTurnUiStatus({status:'idle'},[],false,'interrupted',[{type:'codex',method:'turn/interrupted',turnId:'old',params:{turn:{id:'old',status:'interrupted'}}}]),'idle');
   `);
 });
 

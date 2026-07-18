@@ -45,6 +45,9 @@ test('session snapshots only inject persisted artifacts and keep anchors stable'
   assert.doesNotMatch(route, /injectGeneratedImages/);
   assert.match(server, /turnIndexForAnchor\(thread\.turns, group\[0\]\?\.anchor_item_id\)/);
   assert.doesNotMatch(server, /turnIndexMentioningArtifacts\(thread\.turns, group\)/);
+  const runtimeSnapshotStart = server.indexOf("if (eventType === 'thread_snapshot')");
+  const runtimeSnapshotEnd = server.indexOf("if (eventType === 'output_gap')", runtimeSnapshotStart);
+  assert.match(server.slice(runtimeSnapshotStart, runtimeSnapshotEnd), /injectArtifacts\(thread, threadId, true\)/);
 });
 
 test('HTTP session restore prefers the latest authoritative Runtime thread snapshot',()=>{
