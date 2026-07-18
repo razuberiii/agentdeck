@@ -58,6 +58,9 @@ test('HTTP session restore prefers the latest authoritative Runtime thread snaps
   assert.match(server,/const merged=authoritative\.thread/);
   assert.match(server,/thread\.turns=thread\.turns\.slice\(-12\)/);
   assert.match(server,/ensureCanonicalUsersInThreadSnapshot\(thread,threadId\)/);
+  assert.match(server,/Only coalesce adjacent items with the same id/);
+  assert.doesNotMatch(server,/const turns:any\[\]=\[\];const turnsById=new Map/);
+  assert.match(server,/Append their contiguous blocks in event order/);
 });
 
 test('latest authoritative thread snapshot wins over an older interrupted event',()=>{

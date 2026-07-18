@@ -4433,8 +4433,12 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     }
   }
   if(!startSequence)for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
-  const turns:any[]=[];const turnsById=new Map<string,any>();
-  for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;if(item?.type==='commandExecution'&&item?.status==='inProgress'&&terminalTurns.has(itemTurnId))continue;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
+  const turns:any[]=[];
+  // Keep persisted event order. A provider may omit turnId from commentary
+  // items while user messages submitted during the same long-running turn have
+  // local ids. Grouping globally by turnId pulls every unscoped reply above all
+  // of those user messages. Only coalesce adjacent items with the same id.
+  for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;if(item?.type==='commandExecution'&&item?.status==='inProgress'&&terminalTurns.has(itemTurnId))continue;let turn=turns.at(-1);if(String(turn?.id||'')!==itemTurnId){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
   const rebuilt={
     id:threadId,
     name:String(row.title || projectNameFromPath(String(row.project_dir || 'Session'))),
@@ -4447,8 +4451,11 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     path:null,
   };
   if(!authoritative)return rebuilt;
-  const merged=authoritative.thread,byId=new Map<string,any>((merged.turns||[]).map((turn:any)=>[String(turn?.id||turn?.turnId||''),turn]));
-  for(const turn of rebuilt.turns){const id=String(turn?.id||turn?.turnId||'');const existing:any=byId.get(id);if(!existing){merged.turns.push(turn);byId.set(id,turn);continue;}const seen=new Set((existing.items||[]).map((item:any)=>String(item?.id||'')));for(const item of turn.items||[])if(!item?.id||!seen.has(String(item.id)))existing.items.push(item);}
+  const merged=authoritative.thread,seen=new Set<string>((merged.turns||[]).flatMap((turn:any)=>(turn.items||[]).map((item:any)=>String(item?.id||'')).filter(Boolean)));
+  // All rebuilt events are newer than the authoritative snapshot watermark.
+  // Append their contiguous blocks in event order; merging back into an older
+  // turn with the same id would reorder interleaved user and assistant items.
+  for(const turn of rebuilt.turns){const fresh=(turn.items||[]).filter((item:any)=>!item?.id||!seen.has(String(item.id)));for(const item of fresh)if(item?.id)seen.add(String(item.id));if(fresh.length)merged.turns.push({...turn,items:fresh,userMessageIds:fresh.filter((item:any)=>item?.type==='userMessage'&&item?.id).map((item:any)=>String(item.id))});}
   merged.status=rebuilt.status;merged.updatedAt=rebuilt.updatedAt;return merged;
 }
 
