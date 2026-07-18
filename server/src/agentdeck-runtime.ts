@@ -1394,6 +1394,14 @@ async function handleCodexNotification(account:Account, msg:any) {
   if (msg.method === 'thread/status/changed') {
     const authoritative=await sessionForThread(upstreamThreadId,true);
     if (!authoritative) return;
+    if(statusName(msg.params?.status)==='idle'&&authoritative.active_turn_id){
+      try{
+        const result=await readAuthoritativeThread(authoritative);
+        if(result?.thread){await reconcileThread(authoritative,result.thread,'thread_idle_terminal_recovery',true);return;}
+      }catch(error:any){
+        app.log.warn({sessionId:authoritative.id,turnId:authoritative.active_turn_id,error:error?.message||String(error)},'idle thread terminal recovery failed; preserving active turn');
+      }
+    }
     const next=codexSessionStateForNotification(authoritative as any,msg.method,msg.params);
     await db.run('UPDATE sessions SET status=?1,active_turn_id=?2,updated_at=?3 WHERE id=?4', [next.status,next.active_turn_id,Date.now(),authoritative.id]);
     invalidateThreadSessionCache(authoritative);
@@ -1463,7 +1471,7 @@ async function reconcileThread(session:RuntimeSession, thread:any, source:string
   const lastTurn = turns[turns.length - 1];
   const hasFinalAnswer = lastTurnHasFinalAnswer(lastTurn);
   const status = reconciledThreadStatus(thread, lastTurn, hasFinalAnswer);
-  const activeTurnId = !hasFinalAnswer && lastTurn?.status === 'inProgress' && lastTurn?.id ? String(lastTurn.id) : null;
+  const activeTurnId = status==='running'&&!hasFinalAnswer&&lastTurn?.status==='inProgress'&&lastTurn?.id ? String(lastTurn.id) : null;
   const finalStatus = status === 'active' ? 'running' : status;
   await db.run('UPDATE sessions SET status=?1, active_turn_id=?2, interruption_reason=?3, updated_at=?4 WHERE id=?5', [finalStatus, activeTurnId, finalStatus === 'interrupted' ? source : null, Date.now(), session.id]);
   await appendEvent(session.id, publishSnapshot ? 'thread_snapshot' : 'thread/read', { source, thread, status:finalStatus, activeTurnId });
@@ -1474,8 +1482,10 @@ function lastTurnHasFinalAnswer(turn:any) {
 }
 
 function reconciledThreadStatus(thread:any, lastTurn:any, hasFinalAnswer:boolean) {
+  const threadStatus=statusName(thread?.status);
   if (!lastTurn) return statusName(thread?.status);
-  if (hasFinalAnswer) return statusName(thread?.status) === 'running' ? 'idle' : statusName(thread?.status);
+  if(threadStatus!=='running')return threadStatus;
+  if (hasFinalAnswer) return 'idle';
   const turnStatus = String(lastTurn.status || '');
   if (turnStatus === 'inProgress') return 'running';
   return 'interrupted';

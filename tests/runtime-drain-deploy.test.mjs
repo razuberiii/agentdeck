@@ -56,6 +56,13 @@ test('drain audits database-active Codex turns against the authoritative runtime
   assert.match(runtime,/preserving active state/);
 });
 
+test('idle thread status recovers a missing terminal event and authoritative final answer',()=>{
+  assert.match(runtime,/statusName\(msg\.params\?\.status\)==='idle'&&authoritative\.active_turn_id/);
+  assert.match(runtime,/thread_idle_terminal_recovery/);
+  assert.match(runtime,/if\(threadStatus!=='running'\)return threadStatus/);
+  assert.match(runtime,/status==='running'&&!hasFinalAnswer/);
+});
+
 test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
 test('Codex turn lineage is durable across Runtime restart and removed only at terminal',()=>{assert.match(runtime,/INSERT INTO runtime_turn_lineage/);assert.match(runtime,/await runtimeLineage\(session\.id,notificationTurnId\)/);assert.match(runtime,/await deleteRuntimeTurnLineage\(session\.id,notificationTurnId\)/);});
 
