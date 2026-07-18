@@ -1696,12 +1696,15 @@ function threadFromSession(session:RuntimeSession) {
 
 async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Number(session.last_sequence||0)) {
   const rows:any[]=(await db.all(`SELECT session_id,sequence,event_type,payload_json,created_at FROM (
-    SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream','approval/requested') ORDER BY sequence DESC LIMIT 80)
-    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='item/completed' AND length(payload_json)<300000 ORDER BY sequence DESC LIMIT 80)
-    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type IN ('item/agentMessage/delta','assistant/delta') ORDER BY sequence DESC LIMIT 1000)
+    SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type IN ('user','turn/completed','turn/failed','turn/interrupted','thread_recovered_with_new_upstream','approval/requested') ORDER BY sequence DESC LIMIT 80)
+    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='item/completed' AND length(payload_json)<300000 ORDER BY sequence DESC LIMIT 320)
+    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='item/started' ORDER BY sequence DESC LIMIT 80)
+    UNION ALL SELECT * FROM (SELECT session_id,sequence,event_type,payload_json,created_at FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type IN ('item/agentMessage/delta','assistant/delta','item/commandExecution/outputDelta') ORDER BY sequence DESC LIMIT 1000)
   ) ORDER BY sequence ASC`,[session.id,snapshotWatermark])).map(row=>({...row,threadId:session.id,generation:RUNTIME_GENERATION}));
   const items:any[] = [];
   const completed=new Set<string>(),deltaText=new Map<string,string>(),deltaOrder:string[]=[];
+  const activeCommands=new Map<string,any>();
+  const terminalTurns=new Set<string>();
   for (const event of rows) {
     const eventType = String(event.event_type || '');
     let payload:any = {};
@@ -1717,17 +1720,35 @@ async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Numb
     }
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
-      if(item?.id)completed.add(String(item.id));
+      const activeCommand=item?.id?activeCommands.get(String(item.id)):null;
+      if(item?.id){completed.add(String(item.id));activeCommands.delete(String(item.id));}
       if (item && ['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'].includes(String(item.type))) {
         const compact=compactSnapshotItem(item);
-        if(item.type==='commandExecution'){const turnId=String(item?.turnId||payload?.turnId||payload?.params?.turnId||''),segmentId=String(item?.segmentId||payload?.segmentId||turnId);items.push({...compact,turnId:turnId||null,segmentId:segmentId||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||null,completedAtMs:item?.completedAtMs||payload?.params?.completedAtMs||null});}
+        if(item.type==='commandExecution'){const turnId=String(item?.turnId||payload?.turnId||payload?.params?.turnId||''),segmentId=String(item?.segmentId||payload?.segmentId||turnId),command={...compact,turnId:turnId||null,segmentId:segmentId||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||null,completedAtMs:item?.completedAtMs||payload?.params?.completedAtMs||null};if(activeCommand)Object.assign(activeCommand,command);else items.push(command);}
         else items.push(compact);
       }
       continue;
     }
+    if(eventType==='item/started'){
+      const item=payload?.params?.item||payload?.item;
+      if(item?.id&&item?.type==='commandExecution'){
+        const turnId=String(item?.turnId||payload?.turnId||payload?.params?.turnId||''),segmentId=String(item?.segmentId||payload?.segmentId||turnId);
+        const command={...compactSnapshotItem(item),status:'inProgress',turnId:turnId||null,segmentId:segmentId||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||event.created_at||null,aggregatedOutput:String(item?.aggregatedOutput||'')};
+        activeCommands.set(String(item.id),command);items.push(command);
+      }
+      continue;
+    }
+    if(eventType==='item/commandExecution/outputDelta'){
+      const itemId=String(payload?.params?.itemId||payload?.itemId||''),command=activeCommands.get(itemId),delta=String(payload?.params?.delta||payload?.delta||'');
+      if(command&&delta)command.aggregatedOutput=String(command.aggregatedOutput||'')+delta;
+      continue;
+    }
     if(eventType==='item/agentMessage/delta'||eventType==='assistant/delta'){const itemId=String(payload?.params?.itemId||payload?.itemId||'active-agent');const delta=String(payload?.params?.delta||payload?.delta||'');if(delta){if(!deltaText.has(itemId))deltaOrder.push(itemId);deltaText.set(itemId,(deltaText.get(itemId)||'')+delta);}continue;}
-    if (eventType === 'turn/failed' || eventType === 'turn/interrupted') {
+    if (eventType === 'turn/completed' || eventType === 'turn/failed' || eventType === 'turn/interrupted') {
       const reason = payload?.reason || payload?.params?.reason || payload?.error?.message || payload?.params?.error?.message || '';
+      const terminalTurnId=String(payload?.turnId||payload?.params?.turn?.id||'');
+      if(terminalTurnId)terminalTurns.add(terminalTurnId);
+      if(eventType==='turn/completed')continue;
       items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage', text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
       continue;
     }
@@ -1736,7 +1757,8 @@ async function threadFromSnapshot(session:RuntimeSession, snapshotWatermark=Numb
     }
   }
   for(const itemId of deltaOrder)if(!completed.has(itemId))items.push({id:itemId,type:'agentMessage',text:deltaText.get(itemId)||'',status:'inProgress'});
-  return { ...threadFromSession(session), turns:items.length ? [{ id:`snapshot-${session.id}`, items }] : [] };
+  const visibleItems=items.filter(item=>!(item?.type==='commandExecution'&&item?.status==='inProgress'&&terminalTurns.has(String(item?.turnId||item?.segmentId||''))));
+  return { ...threadFromSession(session), turns:visibleItems.length ? [{ id:`snapshot-${session.id}`, items:visibleItems }] : [] };
 }
 
 function compactSnapshotItem(item:any) {
@@ -1787,7 +1809,9 @@ async function appendEvent(sessionId:string, eventType:string, payload:any) {
   // event_key de-duplication is intentionally performed by DurableEventStore's
   // per-session commit lane.  Checking here used to race concurrent callbacks
   // and could allocate a sequence that was never committed.
-  const event = await eventStore.append(sessionId,eventType,payload,eventKey,isCriticalEvent(eventType),isDeltaEvent(eventType));
+  const item=payload?.params?.item||payload?.item;
+  const commandStarted=eventType==='item/started'&&item?.type==='commandExecution';
+  const event = await eventStore.append(sessionId,eventType,payload,eventKey,isCriticalEvent(eventType)||commandStarted,isDeltaEvent(eventType));
   diagnostics.sqliteBatches=eventStore.metrics.sqliteBatches;
   diagnostics.sqliteRows=eventStore.metrics.sqliteRows;
   diagnostics.sqliteMs=eventStore.metrics.sqliteMs;

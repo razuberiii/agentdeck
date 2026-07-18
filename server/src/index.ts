@@ -4288,7 +4288,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
          WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
-           AND event_type IN ('user','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
+           AND event_type IN ('user','turn/completed','turn/failed','turn/interrupted','thread_recovered_with_new_upstream')
          ORDER BY sequence DESC
          LIMIT 80
        )
@@ -4299,14 +4299,15 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
          WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
            AND event_type='item/completed'
            AND length(payload_json)<300000
-           AND (
-             payload_json LIKE '%"type":"agentMessage"%'
-             OR payload_json LIKE '%"type":"userMessage"%'
-             OR payload_json LIKE '%"type":"commandExecution"%'
-             OR payload_json LIKE '%"type":"imageView"%'
-             OR payload_json LIKE '%"type":"imageGeneration"%'
-             OR payload_json LIKE '%"type":"artifact"%'
-           )
+         ORDER BY sequence DESC
+         LIMIT 320
+       )
+       UNION ALL
+       SELECT session_id,sequence,event_type,payload_json,created_at FROM (
+         SELECT session_id,sequence,event_type,payload_json,created_at
+         FROM events
+         WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
+           AND event_type='item/started'
          ORDER BY sequence DESC
          LIMIT 80
        )
@@ -4315,7 +4316,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
          SELECT session_id,sequence,event_type,payload_json,created_at
          FROM events
          WHERE session_id=?1 AND sequence<=?2 AND sequence>=?3
-           AND event_type IN ('item/agentMessage/delta','assistant/delta')
+           AND event_type IN ('item/agentMessage/delta','assistant/delta','item/commandExecution/outputDelta')
          ORDER BY sequence DESC
          LIMIT 1000
        )
@@ -4339,6 +4340,8 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
   const pendingCanonicalUsersByText = new Map<string, any[]>();
   const deltaText = new Map<string, string>();
   const deltaItems = new Map<string, any>();
+  const activeCommands = new Map<string, any>();
+  const terminalTurns=new Set<string>();
   for (const event of events as any[]) {
     const eventType = String(event.event_type || '');
     let payload:any = {};
@@ -4371,6 +4374,8 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     }
     if (eventType === 'item/completed') {
       const item = payload?.params?.item || payload?.item;
+      const activeCommand=item?.id?activeCommands.get(String(item.id)):null;
+      if(item?.id)activeCommands.delete(String(item.id));
       if (item?.type === 'userMessage' && canonicalUsers.length) {
         const providerText=userMessageItemText(item);
         const pending=providerText?pendingCanonicalUsersByText.get(providerText):undefined;
@@ -4382,9 +4387,24 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       if (item?.id && ['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'].includes(String(item.type))) {
         const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
         const compact=compactSnapshotItem(item),completed=item.type==='commandExecution'?{...compact,turnId:runtimeTurnId||null,segmentId:String(item?.segmentId||payload?.segmentId||runtimeTurnId)||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||null,completedAtMs:item?.completedAtMs||payload?.params?.completedAtMs||null}:{...compact,turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
-        const streamed=deltaItems.get(String(item.id));
+        const streamed=activeCommand||deltaItems.get(String(item.id));
         if(streamed)Object.assign(streamed,completed);else items.push(completed);
       }
+      continue;
+    }
+    if(eventType==='item/started'){
+      const item=payload?.params?.item||payload?.item;
+      if(item?.id&&item?.type==='commandExecution'){
+        const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
+        const command={...compactSnapshotItem(item),status:'inProgress',turnId:runtimeTurnId||null,segmentId:String(item?.segmentId||payload?.segmentId||runtimeTurnId)||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||event.created_at||null,aggregatedOutput:String(item?.aggregatedOutput||'')};
+        activeCommands.set(String(item.id),command);items.push(command);
+      }
+      continue;
+    }
+    if(eventType==='item/commandExecution/outputDelta'){
+      const itemId=String(payload?.params?.itemId||payload?.itemId||'');
+      const command=activeCommands.get(itemId),delta=String(payload?.params?.delta||payload?.delta||'');
+      if(command&&delta)command.aggregatedOutput=String(command.aggregatedOutput||'')+delta;
       continue;
     }
     if (eventType === 'item/agentMessage/delta') {
@@ -4401,15 +4421,17 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       }
       continue;
     }
-    if (eventType === 'turn/failed' || eventType === 'turn/interrupted') {
+    if (eventType === 'turn/completed' || eventType === 'turn/failed' || eventType === 'turn/interrupted') {
       const reason = payload?.reason || payload?.params?.reason || payload?.error?.message || payload?.params?.error?.message || '';
       const terminalTurnId=String(payload?.turnId||payload?.params?.turn?.id||'');
+      if(terminalTurnId)terminalTurns.add(terminalTurnId);
+      if(eventType==='turn/completed')continue;
       items.push({ id:`${eventType}-${event.sequence}`, type:'agentMessage',turnId:terminalTurnId||null,segmentId:terminalTurnId||null,text:eventType === 'turn/failed' ? `请求失败：${reason || 'turn failed'}` : '已停止生成', phase:'final_answer' });
     }
   }
   if(!startSequence)for(const canonical of canonicalUsers)if(!claimedCanonicalUsers.has(String(canonical.id)))items.push(canonicalUserMessageItem(canonical));
   const turns:any[]=[];const turnsById=new Map<string,any>();
-  for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
+  for(const item of items){const itemTurnId=String(item?.turnId||item?.segmentId||'')||`legacy-${threadId}`;if(item?.type==='commandExecution'&&item?.status==='inProgress'&&terminalTurns.has(itemTurnId))continue;let turn=turnsById.get(itemTurnId);if(!turn){turn={id:itemTurnId,turnId:itemTurnId,userMessageIds:[],items:[]};turnsById.set(itemTurnId,turn);turns.push(turn);}turn.items.push(item);if(item?.type==='userMessage'&&item?.id)turn.userMessageIds.push(String(item.id));}
   return {
     id:threadId,
     name:String(row.title || projectNameFromPath(String(row.project_dir || 'Session'))),

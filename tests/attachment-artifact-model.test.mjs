@@ -94,7 +94,7 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(server, /claimedCanonicalIds\.has\(String\(row\.id\)\)/);
   assert.match(server, /runtimeTurnId=String\(payload\?\.turnId\|\|payload\?\.segmentId/);
   assert.match(server, /item\?\.turnId\|\|item\?\.segmentId\|\|payload\?\.turnId/);
-  assert.match(server, /const streamed=deltaItems\.get\(String\(item\.id\)\)/);
+  assert.match(server, /const streamed=activeCommand\|\|deltaItems\.get\(String\(item\.id\)\)/);
   assert.match(server, /if\(streamed\)Object\.assign\(streamed,completed\)/);
   assert.match(server, /payload\?\.segmentId\|\|payload\?\.clientMessageId\|\|activeArtifactTurns\.get\(threadId\)/);
   assert.match(server, /payloadClientMessageId&&String\(row\.client_message_id/);
@@ -163,9 +163,12 @@ test('signed image paths fit through the router while remaining bounded and veri
 });
 
 test('Codex completed command cards survive Runtime-backed snapshot reconstruction', () => {
-  assert.match(server, /payload_json LIKE '%"type":"commandExecution"%'/);
+  assert.doesNotMatch(server, /payload_json LIKE '%"type":"commandExecution"%'/);
+  assert.match(server, /event_type='item\/started'/);
+  assert.match(server, /item\/commandExecution\/outputDelta/);
   assert.match(server, /\['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'\]/);
   assert.match(server, /item\.type === 'commandExecution'/);
   assert.match(runtime, /\['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'\]/);
+  assert.match(runtime, /commandStarted=eventType==='item\/started'&&item\?\.type==='commandExecution'/);
   assert.match(client, /!output && !failed && !String\(item\.command \|\| ''\)\.trim\(\)/);
 });
