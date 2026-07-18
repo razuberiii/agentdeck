@@ -4281,6 +4281,8 @@ async function runtimeHistoryWindow(threadId:string,throughSequence:number,turnL
   return{startSequence,hasMore:!!older};
 }
 async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWatermark=Number(row?.last_sequence||0),startSequence=0) {
+  const authoritative=await latestAuthoritativeRuntimeThread(threadId,snapshotWatermark);
+  if(authoritative)return authoritative;
   const events = await runtimeDb.all(
     `SELECT session_id,sequence,event_type,payload_json,created_at
      FROM (
@@ -4443,6 +4445,18 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
     turns,
     path:null,
   };
+}
+
+async function latestAuthoritativeRuntimeThread(threadId:string,snapshotWatermark:number){
+  const row:any=await runtimeDb.get(`SELECT sequence,payload_json FROM events WHERE session_id=?1 AND sequence<=?2 AND event_type='thread_snapshot' ORDER BY sequence DESC LIMIT 1`,[threadId,snapshotWatermark]).catch(()=>null);
+  if(!row?.payload_json||Number(row.sequence)!==snapshotWatermark)return null;
+  try{
+    const payload=JSON.parse(String(row.payload_json)),thread=structuredClone(payload?.thread);
+    if(!thread||!Array.isArray(thread.turns))return null;
+    thread.turns=thread.turns.slice(-12);
+    await ensureCanonicalUsersInThreadSnapshot(thread,threadId).catch(()=>{});
+    return thread;
+  }catch{return null;}
 }
 
 function compactSnapshotItem(item:any) {

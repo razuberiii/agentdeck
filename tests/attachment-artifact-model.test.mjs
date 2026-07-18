@@ -47,6 +47,14 @@ test('session snapshots only inject persisted artifacts and keep anchors stable'
   assert.doesNotMatch(server, /turnIndexMentioningArtifacts\(thread\.turns, group\)/);
 });
 
+test('HTTP session restore prefers the latest authoritative Runtime thread snapshot',()=>{
+  assert.match(server,/latestAuthoritativeRuntimeThread\(threadId,snapshotWatermark\)/);
+  assert.match(server,/event_type='thread_snapshot' ORDER BY sequence DESC LIMIT 1/);
+  assert.match(server,/Number\(row\.sequence\)!==snapshotWatermark/);
+  assert.match(server,/thread\.turns=thread\.turns\.slice\(-12\)/);
+  assert.match(server,/ensureCanonicalUsersInThreadSnapshot\(thread,threadId\)/);
+});
+
 test('artifact cards are not duplicated by markdown link parsing', () => {
   assert.match(server, /type:'artifactCollection'/);
   assert.match(server, /type:'codeChanges'/);
