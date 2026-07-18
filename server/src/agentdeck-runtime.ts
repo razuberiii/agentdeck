@@ -2187,11 +2187,26 @@ async function startRuntimeDrain(req?:any) {
   if (runtimeLifecycle === 'stopping') return { lifecycle:runtimeLifecycle, ...(await drainState()) };
   const requestedTtlMs = Number(req?.body?.ttlMs || req?.body?.leaseMs || 0);
   const ttlMs = Number.isFinite(requestedTtlMs) && requestedTtlMs > 0 ? Math.min(requestedTtlMs, DRAIN_TIMEOUT_MS) : DRAIN_LEASE_MS;
+  const startingDrain=runtimeLifecycle!=='draining';
   runtimeLifecycle = 'draining';
   drainStartedAt = drainStartedAt || Date.now();
   drainExpiresAt = Date.now() + ttlMs;
   app.log.info({ lifecycle:runtimeLifecycle, drainStartedAt, drainExpiresAt, ttlMs }, 'runtime draining started');
+  if(startingDrain)await reconcileActiveCodexSessionsForDrain();
   return { lifecycle:runtimeLifecycle, ...(await drainState()) };
+}
+
+async function reconcileActiveCodexSessionsForDrain() {
+  const rows=await db.all(`SELECT * FROM sessions WHERE provider='codex' AND (active_turn_id IS NOT NULL OR status IN ('running','active','planning','output_draining'))`).catch(()=>[]);
+  await Promise.allSettled(rows.map(async(row:any)=>{
+    const session=row as RuntimeSession;
+    try{
+      const result=await readAuthoritativeThread(session);
+      if(result?.thread)await reconcileThread(session,result.thread,'deploy_drain_audit');
+    }catch(error:any){
+      app.log.warn({sessionId:session.id,upstreamThreadId:session.upstream_thread_id||session.id,error:error?.message||String(error)},'deploy drain active turn audit failed; preserving active state');
+    }
+  }));
 }
 async function cancelRuntimeDrain() {
   if (runtimeLifecycle === 'draining') runtimeLifecycle = 'accepting';

@@ -49,6 +49,13 @@ test('draining waits for active turns, submitting turns, and pending event pushe
   assert.doesNotMatch(ctl, /active-turns" 2>\/dev\/null \|\| echo '\{"activeTurnCount":0/);
 });
 
+test('drain audits database-active Codex turns against the authoritative runtime',()=>{
+  assert.match(runtime,/if\(startingDrain\)await reconcileActiveCodexSessionsForDrain\(\)/);
+  assert.match(runtime,/readAuthoritativeThread\(session\)/);
+  assert.match(runtime,/deploy_drain_audit/);
+  assert.match(runtime,/preserving active state/);
+});
+
 test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
 test('Codex turn lineage is durable across Runtime restart and removed only at terminal',()=>{assert.match(runtime,/INSERT INTO runtime_turn_lineage/);assert.match(runtime,/await runtimeLineage\(session\.id,notificationTurnId\)/);assert.match(runtime,/await deleteRuntimeTurnLineage\(session\.id,notificationTurnId\)/);});
 

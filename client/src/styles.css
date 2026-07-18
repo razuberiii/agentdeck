@@ -186,6 +186,7 @@ input:hover,textarea:hover{border-color:#34505d}input:focus,textarea:focus{backg
 .launchButton:active:not(:disabled),.composer .sendBtn:active:not(:disabled){background:var(--signal)!important;color:#11160b!important}.launchButton:active:not(:disabled) .uiIcon,.composer .sendBtn:active:not(:disabled) .uiIcon{color:#11160b!important}
 .launchButton:disabled,.composer .sendBtn:disabled{border-color:#242e28!important;background:#0d1310!important;color:#526057!important;opacity:.7!important}.launchButton:disabled:before,.composer .sendBtn:disabled:before{background:#3b493d!important;box-shadow:none!important}.composer .sendBtn:disabled .uiIcon{color:#526057!important}
 .composer .sendBtn{min-height:40px!important;padding:7px 10px 7px 12px!important;font-weight:760!important}
+.composer .sendBtn.updating .uiIcon{animation:composerUpdatingSpin 1.1s linear infinite;color:#77847c!important}@keyframes composerUpdatingSpin{to{rotate:360deg}}
 .composer .stopButton:not(:disabled){border:1px solid #493034!important;background:#171012!important;color:#e88b8f!important}
 @media(max-width:700px){.launchButton{min-width:118px!important}.composer .sendBtn{width:38px!important;height:38px!important;min-height:38px!important;padding:0!important}.composer .sendBtn:before{width:2px!important}}
 
