@@ -6,16 +6,18 @@ const clientSource = readFileSync(new URL('../client/src/main.tsx', import.meta.
 const serverSource = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const runtimeClientSource = readFileSync(new URL('../server/src/runtime-client.ts', import.meta.url), 'utf8');
 
-test('Codex quota reads use the active profile identity and no shared cache', () => {
+test('Codex quota reads use the active profile identity and an account-scoped bounded cache', () => {
   const routeBlock = serverSource.slice(
     serverSource.indexOf("app.get('/api/quota'"),
     serverSource.indexOf("app.get('/api/settings'")
   );
   assert.match(routeBlock, /const activeProfile:any = await getActiveProfile/);
-  assert.match(routeBlock, /runtime\.account\(accountId, codexHome\)/);
-  assert.match(routeBlock, /runtime\.rateLimits\(accountId, codexHome\)/);
-  assert.match(routeBlock, /cache:'none'/);
-  assert.doesNotMatch(routeBlock, /quotaCache/);
+  assert.match(routeBlock, /cachedCodexQuota\(accountId,codexHome,req\.query\?\.refresh==='1'\)/);
+  assert.match(routeBlock, /const key=`\$\{accountId\}\\0\$\{codexHome\}`/);
+  assert.match(routeBlock, /runtime\.account\(accountId,codexHome\)/);
+  assert.match(routeBlock, /runtime\.rateLimits\(accountId,codexHome\)/);
+  assert.match(routeBlock, /if\(cached\?\.promise\)/);
+  assert.match(routeBlock, /usable\?60_000:10_000/);
   assert.match(runtimeClientSource, /codexAccountQuery\(accountId, codexHome\)/);
 });
 

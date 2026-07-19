@@ -263,6 +263,7 @@ test('active turn status beats active session status and waiting states have pri
     assert.equal(resolveTurnUiStatus({status:'active', activeTurn:{turnId:'t1', status:'waiting_input', waitingKind:'input'}}, [], false), 'waiting_input');
     assert.equal(resolveTurnUiStatus({status:'running', activeTurn:{turnId:'t1', status:'running'}}, [], true), 'cancelling');
     assert.equal(resolveTurnUiStatus({status:'idle'}, [], false), 'idle');
+    assert.equal(resolveTurnUiStatus({status:'idle',activeTurn:null},[],false,'cancelling',[]),'idle');
   `);
 });
 

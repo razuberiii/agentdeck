@@ -363,7 +363,7 @@ export function resolveTurnUiStatus(session: any, approvals: any[] = [], cancell
   if(structured?.method==='turn/interrupted')return sessionStatus==='idle'?'idle':'interrupted';
   if(live.some(m=>m?.type==='codex'&&m.method==='item/agentMessage/delta'))return'running';
   if (['running','waiting_approval','waiting_input','cancelling','failed','interrupted'].includes(sessionStatus)) return sessionStatus;
-  if(['running','waiting_approval','waiting_input','cancelling'].includes(current))return current;
+  if(sessionStatus==='unknown'&&['running','waiting_approval','waiting_input','cancelling'].includes(current))return current;
   return 'idle';
 }
 function turnStatusFromTerminal(message:any,fallback:TurnUiStatus):TurnUiStatus{const status=normalizeTurnStatus(message?.params?.turn?.status);return status==='failed'||status==='interrupted'?status:fallback;}

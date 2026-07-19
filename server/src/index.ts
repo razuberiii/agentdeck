@@ -1434,6 +1434,11 @@ app.get('/api/sessions/:id', { preHandler: ensureAuth }, async (req:any, reply) 
     const snapshotWatermark=requestedBefore?Math.min(latestSequence,requestedBefore-1):latestSequence;
     const historyWindow=await runtimeHistoryWindow(threadId,snapshotWatermark,12);
     const thread = await runtimeThreadSnapshotSingleFlight(threadId, runtimeRow, snapshotWatermark,historyWindow.startSequence);
+    // A snapshot reconstruction can be shared with an in-flight websocket
+    // resnapshot that started before the latest local message receipt settled.
+    // Reconcile canonical users at response time so a rejected follow-up is
+    // still durable and visible after Web/Runtime restarts.
+    if(!requestedBefore)await ensureCanonicalUsersInThreadSnapshot(thread,threadId).catch(()=>{});
     decorateThreadImages(thread, threadId, String(runtimeRow.project_dir || row.project_dir));
     const [branch] = await Promise.all([
       gitBranch(String(runtimeRow.project_dir || row.project_dir)).catch(()=>null),

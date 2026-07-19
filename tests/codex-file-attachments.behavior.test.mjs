@@ -20,6 +20,6 @@ test('Codex file input is server-verified and the UI does not persist capability
   assert.match(server,/realpathSync\(String\(meta\.path\|\|''\)\)/);
   assert.match(server,/if \(!rp\.startsWith\(root \+ path\.sep\)\) throw new Error\('attachment outside session'\)/);
   assert.match(server,/MAX_ATTACHMENTS_PER_MESSAGE/);assert.match(server,/MAX_TOTAL_ATTACHMENT_BYTES/);
-  assert.match(client,/disabled=\{!sessionCapabilities\?\.fileInput\}/);
+  assert.match(client,/disabled=\{sessionCapabilities!==undefined&&!sessionCapabilities\.fileInput\}/);
   assert.doesNotMatch(client,/localStorage[^\n]{0,120}fileInput|fileInput[^\n]{0,120}localStorage/);
 });
