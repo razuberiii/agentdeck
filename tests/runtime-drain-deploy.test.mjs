@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const runtime = readFileSync(new URL('../server/src/agentdeck-runtime.ts', import.meta.url), 'utf8');
+const web = readFileSync(new URL('../server/src/index.ts', import.meta.url), 'utf8');
 const deploy = readFileSync(new URL('../scripts/deploy.sh', import.meta.url), 'utf8');
 const ctl = readFileSync(new URL('../scripts/agentdeckctl', import.meta.url), 'utf8');
 const sqliteBackup = readFileSync(new URL('../scripts/sqlite-backup.cjs', import.meta.url), 'utf8');
@@ -57,13 +58,16 @@ test('drain audits database-active Codex turns against the authoritative runtime
 });
 
 test('idle thread status recovers a missing terminal event and authoritative final answer',()=>{
-  assert.match(runtime,/statusName\(msg\.params\?\.status\)==='idle'&&authoritative\.active_turn_id/);
+  assert.match(runtime,/rawStatusName\(msg\.params\?\.status\)==='idle'&&authoritative\.active_turn_id/);
   assert.match(runtime,/thread_idle_terminal_recovery/);
-  assert.match(runtime,/if\(threadStatus!=='running'\)return threadStatus/);
-  assert.match(runtime,/status==='running'&&!hasFinalAnswer/);
+  assert.match(runtime,/turnStatus === 'inProgress'\) return 'running'/);
+  assert.doesNotMatch(runtime,/status==='running'&&!hasFinalAnswer/);
 });
 
+test('active thread notifications cannot enter idle recovery while a turn is in progress',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.match(handler,/rawStatusName\(msg\.params\?\.status\)==='idle'/);assert.doesNotMatch(handler,/statusName\(msg\.params\?\.status\)==='idle'/);const reconcile=runtime.slice(runtime.indexOf('function reconciledThreadStatus'),runtime.indexOf('function turnTerminalStatus'));assert.match(reconcile,/rawThreadStatus==='active'.*\?'running'/);assert.match(reconcile,/turnStatus === 'inProgress'\) return 'running'/);});
+
 test('Codex final answer does not terminate a turn before a terminal turn notification',()=>{const handler=runtime.slice(runtime.indexOf('async function handleCodexNotification'),runtime.indexOf('async function handleCodexRequest'));assert.doesNotMatch(handler,/isFinalAnswerItem[\s\S]*active_turn_id=NULL/);assert.match(handler,/turn\/completed'.*turn\/failed'.*turn\/interrupted'/s);});
+test('web event projection keeps a direct Codex turn active after the final answer item',()=>{const handler=web.slice(web.indexOf("if (eventType.includes('/'))"),web.indexOf('async function interruptTurn'));const finalAnswer=handler.slice(handler.indexOf("if (msg.method === 'item/completed' && isFinalAnswerItem"),handler.indexOf("if (msg.method === 'thread/status/changed')"));assert.doesNotMatch(finalAnswer,/activeCodexSessions\.delete|activeTurns\.delete|status=\?1|maybeExitAfterDrain/);assert.match(finalAnswer,/completePlanTask/);});
 test('Codex turn lineage is durable across Runtime restart and removed only at terminal',()=>{assert.match(runtime,/INSERT INTO runtime_turn_lineage/);assert.match(runtime,/await runtimeLineage\(session\.id,notificationTurnId\)/);assert.match(runtime,/await deleteRuntimeTurnLineage\(session\.id,notificationTurnId\)/);});
 
 test('Antigravity durable shutdown failure is fatal without changing Codex or Claude cancellation',()=>{const stop=runtime.slice(runtime.indexOf("app.post('/sessions/:id/stop'"),runtime.indexOf("await app.listen")),shutdown=runtime.slice(runtime.indexOf('async function shutdownGracefully'),runtime.indexOf('async function ensureCodexAppServer'));assert.match(stop,/claudeManager\.cancel\(session\.id\)/);assert.match(stop,/turn\/interrupt/);assert.match(shutdown,/Antigravity durable shutdown finalization failed/);assert.match(shutdown,/process\.exit\(1\)/);assert.match(shutdown,/eventStore\.drain/);assert.match(shutdown,/subscriptions\.drain/);});

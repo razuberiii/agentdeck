@@ -5277,15 +5277,10 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
       maybeExitAfterDrain();
     }
     if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
-      activeCodexSessions.delete(threadId);
-      activeTurns.delete(threadId);
       const row = await findSession(threadId);
       if (String(row?.status || '') === 'planning') {
         await completePlanTask(threadId, String(msg.params.item.text || ''), String(msg.params.item.id || ''), []);
-      } else {
-        await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),threadId]);
       }
-      maybeExitAfterDrain();
     }
     if (msg.method === 'thread/status/changed') {
       const rawStatus = rawStatusName(msg.params?.status);

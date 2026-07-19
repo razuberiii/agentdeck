@@ -292,6 +292,7 @@ function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T 
   const attachments = dedupeTimelineAttachments([...(a.attachments || []), ...(b.attachments || [])]);
   const text = String(b.text || '').trim() ? b.text : a.text;
   const retried = a.deliveryStatus === 'retried' || b.deliveryStatus === 'retried';
+  const preferredStatus = deliveryStatusPriority(b.deliveryStatus) >= deliveryStatusPriority(a.deliveryStatus) ? b : a;
   return {
     ...a,
     ...b,
@@ -302,20 +303,26 @@ function mergeTimelineUserEvents<T extends TimelineDisplayEvent>(a: T, b: T): T 
     segmentId: a.segmentId || b.segmentId,
     text,
     attachments,
-    meta: retried ? '已重试' : b.meta || a.meta,
-    deliveryStatus:retried ? 'retried' : b.deliveryStatus||a.deliveryStatus,
-    deliveryError:retried ? undefined : b.deliveryError||a.deliveryError,
+    meta: retried ? '已重试' : preferredStatus.meta || b.meta || a.meta,
+    deliveryStatus:retried ? 'retried' : preferredStatus.deliveryStatus||b.deliveryStatus||a.deliveryStatus,
+    deliveryError:retried ? undefined : preferredStatus.deliveryError||b.deliveryError||a.deliveryError,
   };
 }
 
+function deliveryStatusPriority(status?:string):number {
+  return ({draft:0,uploading:1,ready:2,sent:3,received:4,running:5,persisted:6,accepted:7,completed:8,failed:9,cancelled:9,retried:10} as Record<string,number>)[status||''] ?? -1;
+}
+
 function dedupeTimelineAttachments(items: NonNullable<TimelineDisplayEvent['attachments']>) {
-  const seen = new Set<string>();
   const out: NonNullable<TimelineDisplayEvent['attachments']> = [];
+  const indexes = new Map<string,number>();
   for (const item of items) {
     const key = String(item.id || item.url || item.name || '');
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
+    if (!key) continue;
+    const index=indexes.get(key);
+    if(index==null){indexes.set(key,out.length);out.push(item);continue;}
+    const previous=out[index];
+    out[index]={...previous,...item,url:item.url||previous.url};
   }
   return out;
 }

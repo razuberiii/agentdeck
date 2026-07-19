@@ -101,6 +101,10 @@ test('timeline refresh settles at the newest message while the reader is pinned'
   assert.match(client,/window\.setTimeout\(scroll,120\)/);
 });
 
+test('pending user messages are appended after the authoritative and live timeline', () => {
+  assert.match(client,/timeline\.snapshotEvents as DisplayEvent\[\]\),\.\.\.conversationLive,\.\.\.outboxDisplayEvents\(outboxRecords\)/);
+});
+
 test('a streaming answer keeps its first timeline position when a later user message arrives', () => {
   const live=client.slice(client.indexOf('function liveEvents'),client.indexOf('function messageStatusLabel'));
   assert.match(live,/const streamingIndex=new Map/);
