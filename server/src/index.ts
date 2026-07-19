@@ -60,7 +60,7 @@ const CODEX_PROFILE_COLUMNS = 'id,name,codex_home,active,status,email,display_na
 const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_ATTACHMENT_BYTES || 32 * 1024 * 1024);
 const MAX_ATTACHMENTS_PER_MESSAGE = Number(process.env.MAX_ATTACHMENTS_PER_MESSAGE || 10);
 const MAX_TOTAL_ATTACHMENT_BYTES = Number(process.env.MAX_TOTAL_ATTACHMENT_BYTES || 64 * 1024 * 1024);
-const ARCHIVED_SESSION_RETENTION_DAYS = Number(process.env.ARCHIVED_SESSION_RETENTION_DAYS || 30);
+const ARCHIVED_SESSION_RETENTION_DAYS = Number(process.env.ARCHIVED_SESSION_RETENTION_DAYS || 7);
 const ARCHIVED_SESSION_CLEANUP_INTERVAL_MS = Number(process.env.ARCHIVED_SESSION_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000);
 const IMAGE_TYPES: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/pjpeg': '.jpg', 'image/webp': '.webp' };
 const ARTIFACT_TYPES: Record<string, string> = { '.txt':'text/plain; charset=utf-8', '.log':'text/plain; charset=utf-8', '.json':'application/json; charset=utf-8', '.csv':'text/csv; charset=utf-8', '.patch':'text/plain; charset=utf-8', '.diff':'text/plain; charset=utf-8', '.zip':'application/zip', '.tar.gz':'application/gzip', '.conf':'application/x-wireguard-profile', '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp' };
