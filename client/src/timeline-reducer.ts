@@ -39,7 +39,8 @@ export function runtimeMessageKey(msg: any): string {
   const eventId = msg?.eventId || msg?.event_id || msg?.eventKey || msg?.event_key;
   if (eventId) return `event:${eventId}`;
   const seq = runtimeMessageSequence(msg);
-  if (seq) return `${msg?.threadId || msg?.sessionId || 'session'}:${msg?.runtimeGeneration || 'legacy'}:${seq}:${msg?.type || ''}:${msg?.method || msg?.status || ''}`;
+  const projectionId=msg?.projectionId||msg?.activityId||msg?.params?.item?.id||msg?.params?.itemId||'';
+  if (seq) return `${msg?.threadId || msg?.sessionId || 'session'}:${msg?.runtimeGeneration || 'legacy'}:${seq}:${msg?.type || ''}:${msg?.method || msg?.status || ''}:${projectionId}`;
   return `local:${msg?.clientMessageId || msg?.messageId || msg?.requestId || msg?.type || ''}:${JSON.stringify(msg).slice(0, 200)}`;
 }
 

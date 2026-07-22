@@ -1844,8 +1844,8 @@ codex.on('notification', async (msg:any) => {
       } else {
         await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',['idle',Date.now(),sid]);
       }
-      if (found.artifacts.length) broadcast(sid, { type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found.artifacts, Date.now()) } });
-      if(found.codeChanges.length)broadcast(sid,{type:'codex',method:'item/completed',params:{item:codeChangesItem(artifactTurnId,found.codeChanges)}});
+      if (found.artifacts.length) broadcast(sid, { type:'codex', method:'item/completed', projectionId:`artifacts:${artifactTurnId}`, params:{ item:artifactMessageItem(found.artifacts, Date.now()) } });
+      if(found.codeChanges.length)broadcast(sid,{type:'codex',method:'item/completed',projectionId:`code-changes:${artifactTurnId}`,params:{item:codeChangesItem(artifactTurnId,found.codeChanges)}});
       maybeExitAfterDrain();
     }
     if (msg.method === 'thread/status/changed') {
@@ -4378,7 +4378,7 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
       if (canonical) {
         claimedCanonicalUsers.add(String(canonical.id));
         const runtimeTurnId=String(payload?.turnId||payload?.segmentId||canonical.turn_id||'');
-        const canonicalItem={...canonicalUserMessageItem(canonical),turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
+        const canonicalItem={...canonicalUserMessageItem(canonical),turnId:runtimeTurnId||null,segmentId:canonical.segment_id||runtimeTurnId||null};
         items.push(canonicalItem);
         const canonicalText=normalizeUserSnapshotText(String(canonical.original_text||canonical.text||''));
         if(canonicalText)pendingCanonicalUsersByText.set(canonicalText,[...(pendingCanonicalUsersByText.get(canonicalText)||[]),canonicalItem]);
@@ -4401,10 +4401,10 @@ async function runtimeThreadFromEvents(threadId:string, row:any, snapshotWaterma
         const pending=providerText?pendingCanonicalUsersByText.get(providerText):undefined;
         const canonicalItem=pending?.shift();
         if(pending&&!pending.length)pendingCanonicalUsersByText.delete(providerText);
-        if(canonicalItem){const providerTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');if(providerTurnId){canonicalItem.turnId=providerTurnId;canonicalItem.segmentId=providerTurnId;}}
+        if(canonicalItem){const providerTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');if(providerTurnId)canonicalItem.turnId=providerTurnId;}
         continue;
       }
-      if (item?.id && ['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'].includes(String(item.type))) {
+      if (item?.id && ['userMessage','agentMessage','commandExecution','fileChange','imageView','imageGeneration','artifact'].includes(String(item.type))) {
         const runtimeTurnId=String(item?.turnId||item?.segmentId||payload?.turnId||payload?.params?.turnId||payload?.segmentId||'');
         const compact=compactSnapshotItem(item),completed=item.type==='commandExecution'?{...compact,turnId:runtimeTurnId||null,segmentId:String(item?.segmentId||payload?.segmentId||runtimeTurnId)||null,startedAtMs:item?.startedAtMs||payload?.params?.startedAtMs||null,completedAtMs:item?.completedAtMs||payload?.params?.completedAtMs||null}:{...compact,turnId:runtimeTurnId||null,segmentId:runtimeTurnId||null};
         const streamed=activeCommand||deltaItems.get(String(item.id));
@@ -5277,8 +5277,8 @@ async function ingestAndBuildRuntimeFrames(threadId:string,event:any) {
       const nextStatus = msg.method === 'turn/completed' && !turnFailed(msg.params?.turn) ? 'idle' : 'interrupted';
       if (wasPlanning && msg.method === 'turn/completed' && !turnFailed(msg.params?.turn)) await completePlanTask(threadId, '', '', found.artifacts);
       if (!wasPlanning) await db.run('UPDATE sessions SET status=?1, updated_at=?2 WHERE codex_thread_id=?3 OR id=?3',[nextStatus,Date.now(),threadId]);
-      if (found.artifacts.length) out.push({ type:'codex', method:'item/completed', params:{ item:artifactMessageItem(found.artifacts, Date.now()) }, ...base });
-      if(found.codeChanges.length)out.push({type:'codex',method:'item/completed',params:{item:codeChangesItem(artifactTurnId,found.codeChanges)},...base});
+      if (found.artifacts.length) out.push({ type:'codex', method:'item/completed', projectionId:`artifacts:${artifactTurnId}`, params:{ item:artifactMessageItem(found.artifacts, Date.now()) }, ...base });
+      if(found.codeChanges.length)out.push({type:'codex',method:'item/completed',projectionId:`code-changes:${artifactTurnId}`,params:{item:codeChangesItem(artifactTurnId,found.codeChanges)},...base});
       maybeExitAfterDrain();
     }
     if (msg.method === 'item/completed' && isFinalAnswerItem(msg.params?.item)) {
@@ -5757,6 +5757,7 @@ function sanitizeThreadForMobile(thread:any){
       if (item.type === 'userMessage') return (item.content || []).some((c:any) => (c.type === 'text' && String(c.text || '').trim()) || c.type === 'image' || c.type === 'localImage');
       if (item.type === 'agentMessage') return !!String(item.text || '').trim();
       if (item.type === 'commandExecution') return !!String(item.command || '').trim();
+      if (item.type === 'fileChange') return Array.isArray(item.changes) && item.changes.length > 0;
       if (item.type === 'imageView' || item.type === 'imageGeneration') return true;
       if (item.type === 'artifactCollection') return Array.isArray(item.artifacts) && item.artifacts.length > 0;
       if (item.type === 'codeChanges') return Array.isArray(item.changes) && item.changes.length > 0;
@@ -5790,7 +5791,8 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
       if(canonical){
         claimedCanonicalIds.add(String(canonical.id));
         const containingTurnId=String(turn?.id||turn?.turnId||item.turnId||canonical.turn_id||'');
-        turn.items[index]={...item,...canonicalUserMessageItem(canonical),turnId:containingTurnId||null,segmentId:containingTurnId||null};
+        const canonicalItem=canonicalUserMessageItem(canonical);
+        turn.items[index]={...item,...canonicalItem,turnId:containingTurnId||null,segmentId:canonicalItem.segmentId||containingTurnId||null};
       }
       const enriched=turn.items[index];
       if (enriched.id) existing.add(`id:${String(enriched.id)}`);
@@ -5798,9 +5800,6 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
       const text = userMessageItemText(enriched);
       if (text) existing.add(`text:${text}`);
     }
-    const canonicalIds=new Set(canonicalUsers.flatMap((row:any)=>[row.id?`id:${String(row.id)}`:'',row.client_message_id?`client:${String(row.client_message_id)}`:'']).filter(Boolean));
-    const canonicalItems=(turn.items||[]).filter((item:any)=>(item.id&&canonicalIds.has(`id:${String(item.id)}`))||(item.clientMessageId&&canonicalIds.has(`client:${String(item.clientMessageId)}`)));
-    if(canonicalItems.length)turn.items=[...canonicalItems,...turn.items.filter((item:any)=>!canonicalItems.includes(item))];
   }
   const missing = canonicalUsers.filter((row:any) => {
     if(claimedCanonicalIds.has(String(row.id)))return false;
@@ -5812,12 +5811,20 @@ async function ensureCanonicalUsersInThreadSnapshot(thread:any, threadId:string)
   });
   if (!missing.length) return;
   if (!Array.isArray(thread.turns)) thread.turns = [];
-  for(const row of missing){const turnId=String(row.turn_id||row.segment_id||'');let target=turnId?thread.turns.find((turn:any)=>String(turn?.id||turn?.turnId||'')===turnId):null;if(!target){const createdAt=Number(row.created_at||Date.now());target={id:turnId||`canonical-${row.id}`,turnId:turnId||null,userMessageIds:[String(row.id)],items:[],startedAt:Math.floor(createdAt/1000)};insertCanonicalTurnChronologically(thread.turns,target,createdAt);}else target.userMessageIds=Array.from(new Set([...(target.userMessageIds||[]),String(row.id)]));if(!Array.isArray(target.items))target.items=[];const canonicalText=normalizeUserSnapshotText(String(row.original_text||row.text||''));target.items=target.items.filter((item:any)=>item?.type!=='userMessage'||userMessageItemText(item)!==canonicalText);target.items.unshift(canonicalUserMessageItem(row));}
+  for(const row of missing){const turnId=String(row.turn_id||row.segment_id||''),createdAt=Number(row.created_at||Date.now());let target=turnId?thread.turns.findLast((turn:any)=>String(turn?.id||turn?.turnId||'')===turnId):null;if(!target){target={id:turnId||`canonical-${row.id}`,turnId:turnId||null,userMessageIds:[String(row.id)],items:[],startedAt:Math.floor(createdAt/1000)};insertCanonicalTurnChronologically(thread.turns,target,createdAt);}else target.userMessageIds=Array.from(new Set([...(target.userMessageIds||[]),String(row.id)]));if(!Array.isArray(target.items))target.items=[];const canonicalText=normalizeUserSnapshotText(String(row.original_text||row.text||''));target.items=target.items.filter((item:any)=>item?.type!=='userMessage'||userMessageItemText(item)!==canonicalText);insertCanonicalItemChronologically(target,canonicalUserMessageItem(row),createdAt);}
 }
 function insertCanonicalTurnChronologically(turns:any[], target:any, createdAt:number) {
   const index=turns.findIndex((turn:any)=>{const raw=turn?.startedAt??turn?.createdAt;const numeric=Number(raw);const timestamp=Number.isFinite(numeric)&&numeric>0?(numeric>1e12?numeric:numeric*1000):(typeof raw==='string'?Date.parse(raw):NaN);return Number.isFinite(timestamp)&&timestamp>=createdAt;});
   if(index<0)turns.push(target);else turns.splice(index,0,target);
 }
+function insertCanonicalItemChronologically(turn:any,item:any,createdAt:number){
+  const items=Array.isArray(turn?.items)?turn.items:[];
+  const index=items.findIndex((candidate:any)=>{const timestamp=itemTimeMs(candidate);return timestamp!==null&&timestamp>=createdAt;});
+  if(index>=0){items.splice(index,0,item);return;}
+  const rawStart=Number(turn?.startedAt||0),startedAt=rawStart>1e12?rawStart:rawStart>0?rawStart*1000:0;
+  if(startedAt&&createdAt<=startedAt+1000)items.unshift(item);else items.push(item);
+}
+function itemTimeMs(item:any){for(const raw of[item?.createdAt,item?.startedAtMs,item?.completedAtMs,item?.startedAt,item?.completedAt]){const numeric=Number(raw);if(Number.isFinite(numeric)&&numeric>0)return numeric>1e12?numeric:numeric*1000;}return null;}
 function userMessageItemText(item:any) {
   const content = Array.isArray(item?.content) ? item.content : [];
   return normalizeUserSnapshotText(content.filter((part:any) => part?.type === 'text').map((part:any) => part.text || '').join('\n'));
@@ -5939,11 +5946,11 @@ async function injectArtifacts(thread:any, threadId:string, anchoredOnly=false){
   for (const group of groups) {
     const newest = Math.max(...group.map((row:any)=>Number(row.created_at || Date.now())));
     const turn = { items:[artifactMessageItem(group.map(artifactDto), newest)], startedAt:Math.floor(newest/1000), completedAt:Math.floor(newest/1000), durationMs:null };
-    const insertAfter = turnIndexForAnchor(thread.turns, group[0]?.anchor_item_id);
+    const insertAfter = turnIndexForArtifact(thread.turns,group[0]?.anchor_item_id,group[0]?.turn_id);
     if (insertAfter !== null && insertAfter >= 0) thread.turns.splice(insertAfter + 1, 0, turn);
     else if(!anchoredOnly) thread.turns.push(turn);
   }
-  for(const row of codeRows){let changes:any[]=[];try{changes=JSON.parse(String(row.changes_json||'[]'));}catch{}if(!changes.length)continue;const stamp=Number(row.created_at||Date.now()),turn={items:[codeChangesItem(String(row.turn_id),changes)],startedAt:Math.floor(stamp/1000),completedAt:Math.floor(stamp/1000),durationMs:null},insertAfter=turnIndexForAnchor(thread.turns,row.anchor_item_id);if(insertAfter!==null&&insertAfter>=0)thread.turns.splice(insertAfter+1,0,turn);else if(!anchoredOnly)thread.turns.push(turn);}
+  for(const row of codeRows){let changes:any[]=[];try{changes=JSON.parse(String(row.changes_json||'[]'));}catch{}if(!changes.length)continue;const stamp=Number(row.created_at||Date.now()),turn={items:[codeChangesItem(String(row.turn_id),changes)],startedAt:Math.floor(stamp/1000),completedAt:Math.floor(stamp/1000),durationMs:null},insertAfter=turnIndexForArtifact(thread.turns,row.anchor_item_id,row.turn_id);if(insertAfter!==null&&insertAfter>=0)thread.turns.splice(insertAfter+1,0,turn);else if(!anchoredOnly)thread.turns.push(turn);}
 }
 async function artifactForSession(threadId:string, artifactId:string): Promise<any | null>{
   if (!/^[A-Za-z0-9_-]{8,80}$/.test(artifactId)) return null;
@@ -5981,6 +5988,14 @@ function turnIndexForAnchor(turns:any[], anchorItemId:any){
   for (let i = turns.length - 1; i >= 0; i--) {
     if ((turns[i]?.items || []).some((item:any)=>String(item?.id || '') === String(anchorItemId))) return i;
   }
+  return null;
+}
+function turnIndexForArtifact(turns:any[],anchorItemId:any,turnId:any){
+  const anchored=turnIndexForAnchor(turns,anchorItemId);
+  if(anchored!==null)return anchored;
+  const stableTurnId=String(turnId||'');
+  if(!stableTurnId)return null;
+  for(let i=turns.length-1;i>=0;i--){const turn=turns[i];if(String(turn?.id||turn?.turnId||'')===stableTurnId||(turn?.items||[]).some((item:any)=>[item?.turnId,item?.segmentId,item?.clientMessageId].some(value=>String(value||'')===stableTurnId)))return i;}
   return null;
 }
 function turnIndexMentioningArtifacts(turns:any[], rows:any[]){

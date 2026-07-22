@@ -44,11 +44,13 @@ test('session snapshots only inject persisted artifacts and keep anchors stable'
   const route = server.slice(routeStart, routeEnd);
   assert.doesNotMatch(route, /scanArtifactsForTurn/);
   assert.doesNotMatch(route, /injectGeneratedImages/);
-  assert.match(server, /turnIndexForAnchor\(thread\.turns, group\[0\]\?\.anchor_item_id\)/);
+  assert.match(server, /turnIndexForArtifact\(thread\.turns,group\[0\]\?\.anchor_item_id,group\[0\]\?\.turn_id\)/);
   assert.doesNotMatch(server, /turnIndexMentioningArtifacts\(thread\.turns, group\)/);
   const runtimeSnapshotStart = server.indexOf("if (eventType === 'thread_snapshot')");
   const runtimeSnapshotEnd = server.indexOf("if (eventType === 'output_gap')", runtimeSnapshotStart);
   assert.match(server.slice(runtimeSnapshotStart, runtimeSnapshotEnd), /injectArtifacts\(thread, threadId, true\)/);
+  assert.match(server,/turnIndexForArtifact\(thread\.turns,group\[0\]\?\.anchor_item_id,group\[0\]\?\.turn_id\)/);
+  assert.match(server,/\[item\?\.turnId,item\?\.segmentId,item\?\.clientMessageId\]/);
 });
 
 test('HTTP session restore prefers the latest authoritative Runtime thread snapshot',()=>{
@@ -117,7 +119,7 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(server, /findCanonicalUserForRuntimeEvent/);
   assert.match(server, /if\(messageId\|\|clientMessageId\|\|turnId\|\|segmentId\)return null/);
   assert.match(server, /userMessageAttachmentsFromRow/);
-  assert.match(server, /turn\.items\[index\]=\{\.\.\.item,\.\.\.canonicalUserMessageItem\(canonical\)/);
+  assert.match(server, /turn\.items\[index\]=\{\.\.\.item,\.\.\.canonicalItem/);
   assert.match(server, /textMatches\.length===1/);
   assert.match(server, /const containingTurnId=String\(turn\?\.id\|\|turn\?\.turnId/);
   assert.match(server, /claimedCanonicalIds\.has\(String\(row\.id\)\)/);
@@ -136,6 +138,9 @@ test('session restore reconciles canonical user messages with attachments', () =
   assert.match(readFileSync(new URL('../client/src/timeline-reducer.ts', import.meta.url), 'utf8'), /userContentIdentityKey/);
   assert.match(readFileSync(new URL('../client/src/timeline-reducer.ts', import.meta.url), 'utf8'), /userLooseTextKey/);
   assert.match(client, /dedupeAttachments/);
+  assert.doesNotMatch(server,/canonicalItems\.length\)turn\.items=\[\.\.\.canonicalItems/);
+  assert.match(server,/insertCanonicalItemChronologically\(target,canonicalUserMessageItem\(row\),createdAt\)/);
+  assert.match(server,/segmentId:canonicalItem\.segmentId\|\|containingTurnId/);
 });
 
 test('unmatched canonical user turns are inserted chronologically instead of appended at the timeline tail', () => {
@@ -195,7 +200,7 @@ test('Codex completed command cards survive Runtime-backed snapshot reconstructi
   assert.doesNotMatch(server, /payload_json LIKE '%"type":"commandExecution"%'/);
   assert.match(server, /event_type='item\/started'/);
   assert.match(server, /item\/commandExecution\/outputDelta/);
-  assert.match(server, /\['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'\]/);
+  assert.match(server, /\['userMessage','agentMessage','commandExecution','fileChange','imageView','imageGeneration','artifact'\]/);
   assert.match(server, /item\.type === 'commandExecution'/);
   assert.match(runtime, /\['userMessage','agentMessage','commandExecution','imageView','imageGeneration','artifact'\]/);
   assert.match(runtime, /commandStarted=eventType==='item\/started'&&item\?\.type==='commandExecution'/);

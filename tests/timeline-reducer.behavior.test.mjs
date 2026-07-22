@@ -12,6 +12,7 @@ function runReducerScenario(source) {
       emptyTimelineState,
       reconcileTimelineEvents,
       resolveTurnUiStatus,
+      runtimeMessageKey,
     } from ${JSON.stringify(new URL('../client/src/timeline-reducer.ts', import.meta.url).href)};
     const progress = {key:'progress', role:'assistant', text:'progress'};
     const final = {key:'final', role:'assistant', text:'final'};
@@ -141,6 +142,20 @@ test('streaming deltas and live activity stay coalesced instead of growing per t
     assert.equal(state.liveMessages[0].params.delta.length,500);
     for (let sequence=501; sequence<=530; sequence++) state=applyTimelineMessage(state,{type:'activity',activityId:'job-'+sequence,role:'command',title:'运行命令',detail:'test',runtimeSequence:sequence});
     assert.equal(state.liveMessages.filter(item=>item.type==='activity').length,8);
+  `);
+});
+
+test('derived terminal projections share a cursor without colliding',()=>{
+  runReducerScenario(`
+    const artifact={type:'codex',method:'item/completed',projectionId:'artifacts:t1',runtimeSequence:10,runtimeGeneration:'g1',params:{item:{id:'artifacts-1',type:'artifactCollection',artifacts:[{id:'a'}]}}};
+    const changes={type:'codex',method:'item/completed',projectionId:'code-changes:t1',runtimeSequence:10,runtimeGeneration:'g1',params:{item:{id:'changes-1',type:'codeChanges',changes:[{status:'M',path:'a.ts'}]}}};
+    assert.notEqual(runtimeMessageKey(artifact),runtimeMessageKey(changes));
+    let state=emptyTimelineState(9);
+    state=applyTimelineMessage(state,artifact);
+    state=applyTimelineMessage(state,changes);
+    assert.deepEqual(state.liveMessages.map(item=>item.projectionId),['artifacts:t1','code-changes:t1']);
+    state=applyTimelineMessage(state,artifact);
+    assert.equal(state.liveMessages.length,2);
   `);
 });
 
