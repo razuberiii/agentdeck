@@ -39,6 +39,7 @@ import { PROVIDER_DEFINITIONS, PROVIDER_ORDER, VISIBLE_PROVIDER_ORDER, providerD
 import { existingRoots, validateProject, scanProjects, gitBranch, gitDiff } from './workspaces.js';
 import { activateCodexProfileAtomically, evaluateCodexProfileReadiness, type CodexProfileState } from './codex-profile-lifecycle.js';
 import { resolveCodexProfileMetadataFromAuth } from './codex-profile-metadata.js';
+import { adoptExistingCodexAuth } from './codex-auth-bootstrap.js';
 import { safeAntigravitySummary } from './antigravity-turn.js';
 import { loadAntigravityLegacyHistory } from './antigravity-history.js';
 const execFileAsync = promisify(execFile);
@@ -2632,6 +2633,12 @@ function findEmailInText(value:string) {
 }
 async function ensureProfiles() {
   await mkdir(PROFILES_DIR, { recursive:true });
+  try {
+    const adopted = await adoptExistingCodexAuth(DEFAULT_HOME, DEFAULT_CODEX_HOME);
+    if (adopted) app.log.info({ codexHome:DEFAULT_CODEX_HOME }, 'existing Codex login imported into managed default profile');
+  } catch (error:any) {
+    app.log.warn({ error:error?.message || String(error) }, 'existing Codex login import skipped');
+  }
   const existing = await db.get('SELECT * FROM codex_profiles LIMIT 1');
   if (!existing) {
     const email = await readProfileEmail(DEFAULT_CODEX_HOME).catch(()=>null);

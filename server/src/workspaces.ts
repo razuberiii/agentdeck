@@ -12,7 +12,7 @@ export async function scanProjects(roots:string[], limit=80): Promise<Project[]>
   async function walk(dir:string, depth:number) {
     if (found.length >= limit || depth > 3) return;
     let entries; try { entries = await readdir(dir, { withFileTypes:true }); } catch { return; }
-    if (entries.some(e => e.isDirectory() && e.name === '.git')) { found.push(await projectInfo(dir)); return; }
+    if (entries.some(e => e.name === '.git' && (e.isDirectory() || e.isFile()))) { found.push(await projectInfo(dir)); return; }
     for (const e of entries) if (e.isDirectory() && !e.name.startsWith('.') && !['node_modules','vendor','tmp','log','cache'].includes(e.name)) await walk(path.join(dir,e.name), depth+1);
   }
   return found.sort((a,b)=>b.updatedAt-a.updatedAt);
