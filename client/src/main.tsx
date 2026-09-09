@@ -16,7 +16,9 @@ import { uploadInitialTaskAttachments } from './initial-task-attachments';
 import { reconcileModelRevision } from './model-revision';
 import { SnapshotArbiter } from './snapshot-arbiter';
 import { deliveryStatusLabel, outboxDisplayEvents } from './outbox-display';
+import { LAUNCH_DRAFT_KEY, clearSubmittedDraft, loginErrorMessage, matchesTask, parseLaunchDraft, taskBucket, type TaskFilter } from './mobile-workbench';
 import './styles.css';
+import './mobile-workbench.css';
 
 const FALLBACK_WORKSPACE = '/opt/agentdeck';
 const APP_NAME = 'Agent Deck';
@@ -183,9 +185,24 @@ function App(){
 }
 
 function Login({onLogin}:{onLogin:()=>void}){
-  const toast=useToast(); const [password,setPassword]=useState(''); const [busy,setBusy]=useState(false);
-  async function submit(e:any){ e.preventDefault(); setBusy(true); try{ await api('/api/login',{method:'POST',body:JSON.stringify({username:'admin',password})}); haptic(); onLogin(); } catch { toast('error','登录失败'); } finally { setBusy(false); } }
-  return <main className="login"><form onSubmit={submit} className="loginPanel"><img className="loginMark" src="/icons/agentdeck.svg" alt=""/><div><h1>{APP_NAME}</h1><p>回到你的 Agent 工作区</p></div><input autoFocus type="password" placeholder="管理员密码" aria-label="管理员密码" value={password} onChange={e=>setPassword(e.target.value)}/><button className="btn primary" disabled={busy}>{busy?'登录中':'登录并进入工作区'}</button></form></main>;
+  const [password,setPassword]=useState(''); const [busy,setBusy]=useState(false);
+  const [visible,setVisible]=useState(false); const [error,setError]=useState('');
+  const submitting=useRef(false);
+  async function submit(e:React.FormEvent){
+    e.preventDefault(); if(submitting.current || !password) return;
+    submitting.current=true; setBusy(true); setError('');
+    try{ await api('/api/login',{method:'POST',body:JSON.stringify({username:'admin',password})}); haptic(); onLogin(); }
+    catch(error){ setError(loginErrorMessage(error)); }
+    finally{ submitting.current=false; setBusy(false); }
+  }
+  return <main className="login mobileLogin"><form onSubmit={submit} className="loginPanel">
+    <div className="loginBrand"><img src="/icons/agentdeck.svg" alt=""/><strong>AGENT/DECK</strong></div><div className="loginIntro"><span className="loginEyebrow">你的随身工作台</span><h1>接着，把事情做完。</h1><p>任务留在服务器。你可以随时回来。</p></div>
+    <label className="passwordLabel" htmlFor="admin-password">管理员密码</label>
+    <div className="passwordField"><input id="admin-password" type={visible?'text':'password'} autoComplete="current-password" autoCapitalize="none" spellCheck={false} required placeholder="输入管理员密码" aria-invalid={!!error} aria-describedby={error?'login-error':undefined} value={password} onChange={e=>{setPassword(e.target.value);setError('')}}/><button type="button" aria-label={visible?'隐藏密码':'显示密码'} aria-pressed={visible} onClick={()=>setVisible(value=>!value)}>{visible?'隐藏':'显示'}</button></div>
+    {error&&<p id="login-error" className="loginError" role="alert">{error}</p>}
+    <button className="btn primary" disabled={busy||!password}>{busy?'正在验证…':'登录并进入工作区'}<Icon name="arrow"/></button>
+    <div className="loginAddress"><span>当前站点</span><b>{location.host}</b></div>
+  </form></main>;
 }
 
 function DiagnosticsView(){
@@ -221,12 +238,23 @@ function Home(){
   const toast=useToast();
   const [status,setStatus]=useState<Status|null>(null); const [projects,setProjects]=useState<Project[]>([]); const [sessions,setSessions]=useState<Session[]>([]);
   const [dashboard,setDashboard]=useState<Dashboard|null>(null); const [commandOpen,setCommandOpen]=useState(false);
-  const [taskText,setTaskText]=useState('');
+  const [launchDraft,setLaunchDraft]=useState(()=>parseLaunchDraft(storageGet(LAUNCH_DRAFT_KEY)));
+  const [draftSaved,setDraftSaved]=useState(true);
+  const launchDraftRef=useRef(launchDraft);launchDraftRef.current=launchDraft;
+  const taskText=launchDraft.text;
+  const setTaskText=(text:string)=>setLaunchDraft(current=>({...current,text}));
+  const taskInputRef=useRef<HTMLTextAreaElement|null>(null);
+  const taskListRef=useRef<HTMLDivElement|null>(null);
+  const creatingRef=useRef(false);
+  const [taskFilter,setTaskFilter]=useState<TaskFilter>('all');
+  useEffect(()=>{setDraftSaved(storageSet(LAUNCH_DRAFT_KEY,JSON.stringify(launchDraft)))},[launchDraft]);
   const [launchAttachMenu,setLaunchAttachMenu]=useState(false);
   useDismissableMenu('.launchAttachControl',launchAttachMenu,()=>setLaunchAttachMenu(false));
   const [launchFiles,setLaunchFiles]=useState<{id:string;file:File;previewUrl?:string;error?:string}[]>([]);const launchFilesRef=useRef(launchFiles);launchFilesRef.current=launchFiles;const launchImageRef=useRef<HTMLInputElement|null>(null);const launchFileRef=useRef<HTMLInputElement|null>(null);
-  const [launchMode,setLaunchMode]=useState<'direct'|'plan'>('direct');
-  const [workspaceOverride,setWorkspaceOverride]=useState('');
+  const launchMode=launchDraft.mode;
+  const setLaunchMode=(mode:'direct'|'plan')=>setLaunchDraft(current=>({...current,mode}));
+  const workspaceOverride=launchDraft.workspace;
+  const setWorkspaceOverride=(workspace:string)=>setLaunchDraft(current=>({...current,workspace}));
   const [archived,setArchived]=useState(false); const [query,setQuery]=useState(''); const [picker,setPicker]=useState(false); const [busy,setBusy]=useState(''); const [sessionsLoading,setSessionsLoading]=useState(true); const [appStateLoading,setAppStateLoading]=useState(true); const [statusRefreshing,setStatusRefreshing]=useState(false); const [projectsLoading,setProjectsLoading]=useState(false); const [error,setError]=useState('');
   const [quota,setQuota]=useState<any>(null); const [quotaOpen,setQuotaOpen]=useState(false); const [settingsOpen,setSettingsOpen]=useState(false); const [settings,setSettings]=useState<any>(null); const [settingsLoading,setSettingsLoading]=useState(false); const [settingsError,setSettingsError]=useState(''); const [online,setOnline]=useState(navigator.onLine);
   useEffect(()=>{ refresh(); void refreshStatus(); },[archived]);
@@ -244,11 +272,13 @@ function Home(){
   async function addLaunchFiles(files:FileList|File[]){const capabilities=providerAttachmentCapabilities(status?.capabilities,status?.activeProvider||'codex');if(!capabilities?.imageInput&&!capabilities?.fileInput){toast('error','当前 Agent 不支持附件');return;}const maxCount=capabilities.maxAttachmentsPerMessage||10,maxTotal=capabilities.maxTotalAttachmentBytes||maxCount*capabilities.maxAttachmentBytes;const next=[...launchFiles];for(const original of Array.from(files)){const isImage=original.type.startsWith('image/');if((isImage&&!capabilities.imageInput)||(!isImage&&!capabilities.fileInput)){toast('error',`${original.name}：当前 Agent 不支持此附件类型`);continue;}if(next.length>=maxCount){toast('error',`最多添加 ${maxCount} 个附件`);break;}try{const file=original.type.startsWith('image/')?await prepareImageForUpload(original,Math.min(capabilities.maxAttachmentBytes,PUBLIC_UPLOAD_TARGET_BYTES)):original;if(file.size>capabilities.maxAttachmentBytes)throw new Error(`超过 ${formatSize(capabilities.maxAttachmentBytes)}`);if(next.reduce((sum,item)=>sum+item.file.size,0)+file.size>maxTotal)throw new Error(`附件总大小超过 ${formatSize(maxTotal)}`);next.push({id:crypto.randomUUID(),file,previewUrl:file.type.startsWith('image/')?URL.createObjectURL(file):undefined});}catch(error){toast('error',`${original.name}：${shortError(error)}`);}}setLaunchFiles(next);}
   function removeLaunchFile(id:string){setLaunchFiles(items=>{const item=items.find(value=>value.id===id);if(item?.previewUrl)URL.revokeObjectURL(item.previewUrl);return items.filter(value=>value.id!==id);});}
   async function newSession(projectDir:string,title?:string,initialTask='',planMode:'direct'|'plan'=launchMode){
+    if(creatingRef.current) return;
     if(activeProviderStatus && !activeProviderStatus.canCreateSession){ toast('error', activeProviderStatus.message || `${providerLabel(activeProvider)} 当前不能创建会话`); return; }
+    creatingRef.current=true;
     setBusy(projectDir);
-    try{ const s=await api('/api/sessions',{method:'POST',body:JSON.stringify({projectDir,title:title||projectName(projectDir),initialTask:initialTask.trim()||undefined,mode:status?.defaultMode,providerId:status?.activeProvider||'codex'})});const {uploaded,failed,shouldAutoSend}=await uploadInitialTaskAttachments(s.id,launchFiles.map(item=>item.file),api);storageSet(sessionSendModeKey(s.id),planMode);storageSet(draftKey(s.id),initialTask.trim());saveDraftAttachments(s.id,uploaded);if(initialTask.trim()&&shouldAutoSend){storageSet(pendingTaskKey(s.id),initialTask.trim());storageSet(pendingTaskModeKey(s.id),planMode);}if(failed.length)storageSet(`agentdeck:attachmentUploadError:${s.id}`,failed.join('、'));for(const item of launchFiles)if(item.previewUrl)URL.revokeObjectURL(item.previewUrl);setLaunchFiles([]);haptic(); location.hash='#/s/'+s.id; }
+    try{ const s=await api('/api/sessions',{method:'POST',body:JSON.stringify({projectDir,title:title||projectName(projectDir),initialTask:initialTask.trim()||undefined,mode:status?.defaultMode,providerId:status?.activeProvider||'codex'})});const {uploaded,failed,shouldAutoSend}=await uploadInitialTaskAttachments(s.id,launchFiles.map(item=>item.file),api);storageSet(sessionSendModeKey(s.id),planMode);storageSet(draftKey(s.id),initialTask.trim());saveDraftAttachments(s.id,uploaded);if(initialTask.trim()&&shouldAutoSend){storageSet(pendingTaskKey(s.id),initialTask.trim());storageSet(pendingTaskModeKey(s.id),planMode);}if(failed.length)storageSet(`agentdeck:attachmentUploadError:${s.id}`,failed.join('、'));for(const item of launchFiles)if(item.previewUrl)URL.revokeObjectURL(item.previewUrl);setLaunchFiles([]);const nextDraft=clearSubmittedDraft(launchDraftRef.current,initialTask);if(nextDraft!==launchDraftRef.current){storageSet(LAUNCH_DRAFT_KEY,JSON.stringify(nextDraft));setLaunchDraft(nextDraft);}haptic(); location.hash='#/s/'+s.id; }
     catch(e:any){ toast('error','创建失败：'+shortError(e)); }
-    finally{ setBusy(''); }
+    finally{ creatingRef.current=false; setBusy(''); }
   }
   async function loadQuota(open=false){ if(open) setQuotaOpen(true); setQuota(null); try{ setQuota(await api('/api/quota?provider='+encodeURIComponent(activeProvider),{signal:AbortSignal.timeout(12_000)})); } catch(e:any){ setQuota({errors:{rateLimits:e?.name==='TimeoutError'?'额度读取超时，请稍后重试':shortError(e)},checkedAt:Date.now()}); } }
   async function showQuota(){ await loadQuota(true); }
@@ -265,7 +295,10 @@ function Home(){
   const homeCapabilities=providerAttachmentCapabilities(status?.capabilities,activeProvider);
   const activeProviderStatus = (status?.providers||[]).find(p=>p.id===activeProvider) || (activeProvider === 'gemini' ? status?.gemini : activeProvider === 'antigravity' ? status?.antigravity : status?.codex);
   const runtimeForHome = activeProvider === 'gemini' ? status?.gemini?.runtime : null;
-  const filtered=sessions.filter(s=>sessionProvider(s)===activeProvider).filter(s=>(s.title+' '+s.project_dir+' '+s.status).toLowerCase().includes(query.toLowerCase()));
+  const providerSessions=sessions.filter(s=>sessionProvider(s)===activeProvider);
+  const filtered=providerSessions.filter(s=>(taskFilter==='all'||taskBucket(s)===taskFilter)&&matchesTask(s,query,statusLabel(s.activeTurn?.status||s.status)));
+  const runningCount=providerSessions.filter(s=>taskBucket(s)==='running').length;
+  const waitingCount=providerSessions.filter(s=>taskBucket(s)==='waiting').length;
   return <main className="appShell homeShell">
     <header className="homeTop">
       <Brand/>
@@ -273,21 +306,30 @@ function Home(){
     </header>
     {!online&&<InlineNotice tone="error" text="网络已断开，当前页面仍可浏览，恢复后会自动重新连接。"/>}
     <section className="homeHero">
-      <div className="taskLaunch"><span className="heroKicker"><i/>OPEN DESK / {String(new Date().getDate()).padStart(2,'0')}</span><RotatingHeadline/><div className={`taskPrompt ${launchMode==='plan'?'planning':''}`}><div className="taskModeBar" aria-label="任务方式"><button aria-pressed={launchMode==='direct'} className={launchMode==='direct'?'active':''} onClick={()=>setLaunchMode('direct')}><b>执行</b><small>直接处理</small></button><button aria-pressed={launchMode==='plan'} className={launchMode==='plan'?'active':''} onClick={()=>setLaunchMode('plan')}><b>规划</b><small>只读分析</small></button><span>{launchMode==='plan'?'先看清全局，确认后才修改':'立即进入工作区并开始处理'}</span></div><textarea rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter')newSession(selectedWorkspace,'New task',taskText)}} placeholder={launchMode==='plan'?'先说清目标，我们一起定路线…':'写下要发生的事…'}/><footer><button className="workspacePill" aria-label="选择任务目录" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(selectedWorkspace)}</span></button><div className="launchAttachControl"><button type="button" className={launchAttachMenu?'active':''} aria-label="添加附件" aria-expanded={launchAttachMenu} onClick={()=>setLaunchAttachMenu(open=>!open)}><Icon name="attach" size={16}/>{!!launchFiles.length&&<i>{launchFiles.length}</i>}</button>{launchAttachMenu&&<div className="launchAttachMenu"><button type="button" disabled={!canLaunchImages} onClick={()=>{setLaunchAttachMenu(false);launchImageRef.current?.click()}}><span className="launchAttachMenuIcon">▧</span><span><b>照片</b><small>从图库选择或上传截图</small></span></button><button type="button" disabled={!canLaunchFiles} onClick={()=>{setLaunchAttachMenu(false);launchFileRef.current?.click()}}><span className="launchAttachMenuIcon">↗</span><span><b>文件</b><small>文档、源码或压缩包</small></span></button></div>}</div><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!!busy} onClick={()=>newSession(selectedWorkspace,'New task',taskText)}><span>{busy?'创建中':'开工'}</span><Icon name="arrow" size={17}/></button></footer></div>{!!launchFiles.length&&<div className="launchAttachmentBar"><div className="launchAttachmentList">{launchFiles.map(item=><span className="attachmentChip" key={item.id}>{item.previewUrl?<img src={item.previewUrl} alt=""/>:<span className="attachmentFileIcon">{attachmentIconLabel({name:item.file.name,type:item.file.type})}</span>}<small><b>{item.file.name}</b><em>{formatSize(item.file.size)}</em></small><button type="button" aria-label={`移除 ${item.file.name}`} onClick={()=>removeLaunchFile(item.id)}>×</button></span>)}</div></div>}<input ref={launchImageRef} hidden type="file" accept="image/*" multiple onChange={e=>{if(e.target.files)void addLaunchFiles(e.target.files);e.currentTarget.value='';}}/><input ref={launchFileRef} hidden type="file" multiple onChange={e=>{if(e.target.files)void addLaunchFiles(e.target.files);e.currentTarget.value='';}}/><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
+      <div className="taskLaunch"><span className="heroKicker"><i/>OPEN DESK / {String(new Date().getDate()).padStart(2,'0')}</span><RotatingHeadline/><div className={`taskPrompt ${launchMode==='plan'?'planning':''}`}><div className="taskModeBar" aria-label="任务方式"><button aria-pressed={launchMode==='direct'} className={launchMode==='direct'?'active':''} onClick={()=>setLaunchMode('direct')}><b>执行</b><small>直接处理</small></button><button aria-pressed={launchMode==='plan'} className={launchMode==='plan'?'active':''} onClick={()=>setLaunchMode('plan')}><b>规划</b><small>只读分析</small></button><span>{launchMode==='plan'?'先看清全局，确认后才修改':'立即进入工作区并开始处理'}</span></div><textarea ref={taskInputRef} aria-label="新任务内容" rows={4} value={taskText} onChange={event=>setTaskText(event.target.value)} onKeyDown={event=>{if((event.metaKey||event.ctrlKey)&&event.key==='Enter')newSession(selectedWorkspace,'New task',taskText)}} placeholder={launchMode==='plan'?'先说清目标，我们一起定路线…':'写下要发生的事…'}/><footer><button className="workspacePill" aria-label="选择任务目录" onClick={openProjectPicker}><Icon name="folder" size={15}/><span>{projectName(selectedWorkspace)}</span></button><div className="launchAttachControl"><button type="button" className={launchAttachMenu?'active':''} aria-label="添加附件" aria-expanded={launchAttachMenu} onClick={()=>setLaunchAttachMenu(open=>!open)}><Icon name="attach" size={16}/>{!!launchFiles.length&&<i>{launchFiles.length}</i>}</button>{launchAttachMenu&&<div className="launchAttachMenu"><button type="button" disabled={!canLaunchImages} onClick={()=>{setLaunchAttachMenu(false);launchImageRef.current?.click()}}><span className="launchAttachMenuIcon">▧</span><span><b>照片</b><small>从图库选择或上传截图</small></span></button><button type="button" disabled={!canLaunchFiles} onClick={()=>{setLaunchAttachMenu(false);launchFileRef.current?.click()}}><span className="launchAttachMenuIcon">↗</span><span><b>文件</b><small>文档、源码或压缩包</small></span></button></div>}</div><span className="launchHint">⌘ Enter</span><button className="launchButton" aria-label="开始任务" disabled={!!busy} onClick={()=>newSession(selectedWorkspace,'New task',taskText)}><span>{busy?'创建中':'开工'}</span><Icon name="arrow" size={17}/></button></footer></div>{!!launchFiles.length&&<div className="launchAttachmentBar"><div className="launchAttachmentList">{launchFiles.map(item=><span className="attachmentChip" key={item.id}>{item.previewUrl?<img src={item.previewUrl} alt=""/>:<span className="attachmentFileIcon">{attachmentIconLabel({name:item.file.name,type:item.file.type})}</span>}<small><b>{item.file.name}</b><em>{formatSize(item.file.size)}</em></small><button type="button" aria-label={`移除 ${item.file.name}`} onClick={()=>removeLaunchFile(item.id)}>×</button></span>)}</div></div>}<input ref={launchImageRef} hidden type="file" accept="image/*" multiple onChange={e=>{if(e.target.files)void addLaunchFiles(e.target.files);e.currentTarget.value='';}}/><input ref={launchFileRef} hidden type="file" multiple onChange={e=>{if(e.target.files)void addLaunchFiles(e.target.files);e.currentTarget.value='';}}/><div className="draftNote" role="status">{taskText?(draftSaved?'文字草稿已保存在此设备':'此浏览器无法保存草稿，请勿关闭页面'):'先写下想法，准备好再开工'}{!!launchFiles.length&&<span>附件仅保留在当前页面</span>}</div><div className="heroMeta"><span>{online?'工作区在线':'网络离线'}</span><span>{dashboard?.metrics.running?`${dashboard.metrics.running} 个任务正在推进`:'随时可以开始'}</span></div></div>
       <AgentDock status={status} activeProvider={activeProvider} serverLabel={homeServerLabel(error,appStateLoading,statusRefreshing,activeProviderStatus,runtimeForHome)} onSwitch={switchProvider} onManage={()=>showSettings('agent')}/>
     </section>
     {error&&<ErrorState title="连接失败" detail={error} action="重试" onAction={()=>refresh(true)}/>}
-    {dashboard&&!archived&&<WorkPulse dashboard={dashboard} sessions={filtered}/>}
-    <div className="sectionHeading"><div><span>YOUR WORK</span><h2>{archived?'已归档':'最近做的事'}</h2></div><button className="projectShortcut" onClick={openProjectPicker}><Icon name="folder" size={15}/> 切换项目</button></div>
+    {dashboard&&!archived&&<WorkPulse dashboard={dashboard} sessions={providerSessions}/>}
+    <div className="sectionHeading" ref={taskListRef} id="my-tasks"><div><span>YOUR WORK</span><h2>{archived?'已归档':'最近做的事'}</h2></div><button className="projectShortcut" onClick={openProjectPicker}><Icon name="folder" size={15}/> 切换项目</button></div>
     <section className="sessionTools">
-      <div className="seg"><button className={!archived?'active':''} onClick={()=>setArchived(false)}>当前</button><button className={archived?'active':''} onClick={()=>setArchived(true)}>归档</button></div>
-      <label className="searchWrap"><Icon name="search" size={17}/><input className="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索会话、项目或状态"/></label>
+      <div className="seg"><button className={!archived?'active':''} onClick={()=>{setArchived(false);setTaskFilter('all')}}>当前</button><button className={archived?'active':''} onClick={()=>{setArchived(true);setTaskFilter('all')}}>归档</button></div>
+      <label className="searchWrap"><Icon name="search" size={17}/><input className="search" type="search" aria-label="搜索任务" value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索任务、项目或状态"/>{query&&<button className="clearTaskSearch" aria-label="清空搜索" onClick={()=>setQuery('')}>×</button>}</label>
     </section>
+    <div className="taskFilters" role="group" aria-label="任务状态筛选">
+      {([['all','全部',providerSessions.length],['running','执行中',runningCount],['waiting','待处理',waitingCount]] as const).map(([value,label,count])=><button key={value} aria-pressed={taskFilter===value} onClick={()=>setTaskFilter(value)}>{label}<span>{count}</span></button>)}
+      <span className="taskResultCount" role="status">{sessionsLoading?'读取中':`${filtered.length} 个任务`}</span>
+    </div>
     <section className="sessionList" aria-busy={sessionsLoading}>
       {sessionsLoading&&<LoadingRows count={6}/>}
-      {!sessionsLoading&&!filtered.length&&<EmptyState title={archived?'没有归档会话':'还没有最近会话'} detail={query?'换个关键词试试':'选择项目或新建任务开始'} />}
+      {!sessionsLoading&&!filtered.length&&<div className="taskEmpty"><Icon name={query?'search':taskFilter==='waiting'?'pulse':'folder'} size={28}/><EmptyState title={query?'没有匹配的任务':taskFilter==='waiting'?'暂时没有需要你处理的任务':taskFilter==='running'?'暂时没有执行中的任务':archived?'没有归档会话':'你的下一件事，从这里开始'} detail={query?'试试任务名称、项目路径或中文状态':taskFilter!=='all'?'切换到全部，继续之前的工作':'在上方写下目标，选择 Agent 后开始'} />{(query||taskFilter!=='all')&&<button className="resetTaskFilters" onClick={()=>{setQuery('');setTaskFilter('all')}}>查看全部任务</button>}</div>}
       {filtered.map(s=><SessionRow key={s.id} session={s} onArchive={async()=>{ try{ await api(`/api/sessions/${s.id}/${s.archived?'unarchive':'archive'}`,{method:'POST'}); haptic(); toast('success',s.archived?'已恢复':'已归档'); refresh(); } catch(e:any){ toast('error','操作失败：'+shortError(e)); } }}/>)}
     </section>
+    <nav className="mobileWorkbenchNav" aria-label="工作台快捷导航">
+      <button onClick={()=>{taskInputRef.current?.scrollIntoView({block:'center'});taskInputRef.current?.focus({preventScroll:true})}}><Icon name="spark"/><span>写任务</span></button>
+      <button onClick={()=>taskListRef.current?.scrollIntoView({block:'start'})}><Icon name="folder"/><span>我的任务</span>{waitingCount>0&&<i aria-label={`${waitingCount} 个待处理`}>{waitingCount}</i>}</button>
+      <button onClick={()=>showSettings('agent')}><Icon name="settings"/><span>Agent 账号</span></button>
+    </nav>
     {picker&&<ProjectPicker projects={pickerProjects} loading={projectsLoading} onRefresh={()=>loadProjects(true)} onClose={()=>setPicker(false)} onPick={(p)=>{setWorkspaceOverride(p.path);setPicker(false);haptic();toast('success',`任务目录已切换到 ${p.name}`)}}/>}
     {quotaOpen&&<QuotaSheet quota={quota} onRefresh={showQuota} onClose={()=>setQuotaOpen(false)}/>}
     {settingsOpen&&<SettingsErrorBoundary onClose={()=>setSettingsOpen(false)} resetKey={settingsOpen ? String(settings?.settings?.activeProvider || 'open') : 'closed'}><SettingsSheet data={settings} loading={settingsLoading} error={settingsError} initialPage={settingsInitialPage} onRetry={loadSettings} onChanged={async()=>{ await refreshSessions(); await refreshStatus(); const next=await api('/api/settings?light=1'); setSettings(next); return next; }} onClose={()=>setSettingsOpen(false)}/></SettingsErrorBoundary>}
@@ -297,9 +339,9 @@ function Home(){
 
 function SessionRow({session,onArchive}:{session:Session;onArchive:()=>void}){
   const title=displaySessionTitle(session);
-  return <article className="sessionRow">
+  return <article className={`sessionRow taskRow-${taskBucket(session)}`}>
     <button className="sessionGlyph" aria-label={`打开 ${title}`} onClick={()=>location.hash='#/s/'+session.id}>{projectName(session.project_dir).slice(0,1).toUpperCase()}</button><button className="sessionMain" onClick={()=>location.hash='#/s/'+session.id}>
-      <b>{title}</b><span><i className="providerBadge">{providerLabel(sessionProvider(session))}</i>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
+      <b>{title}</b><span><i className="providerBadge">{providerLabel(sessionProvider(session))}</i>{projectName(session.project_dir)}{session.model?` · ${modelLabel(session.model)}`:''} · {statusLabel(session.activeTurn?.status||session.status)} · {formatTime(session.updated_at)}</span><small>{session.project_dir}</small>
     </button>
     <button className="thinBtn sessionArchive" aria-label={session.archived?'恢复':'归档'} title={session.archived?'恢复':'归档'} onClick={onArchive}><Icon name="archive" size={17}/></button>
   </article>;
@@ -317,7 +359,7 @@ function WorkPulse({dashboard,sessions}:{dashboard:Dashboard;sessions:Session[]}
   const recentlyDone=sessions.filter(session=>!session.archived&&!runningIds.has(session.id)&&['idle','complete','completed'].includes(String(session.status))&&Date.now()-Number(session.updated_at||0)<10*60_000).slice(0,running.length?Math.max(0,3-running.length):1);
   const items=[...running,...recentlyDone].slice(0,3);
   if(!items.length) return null;
-  return <section className="workPulse"><header><div><span>{running.length?'IN PROGRESS':'JUST FINISHED'}</span><b>{running.length?`${running.length} 件事正在处理`:`${recentlyDone.length} 件事刚刚完成`}</b></div>{dashboard.metrics.waiting>0&&<i>{dashboard.metrics.waiting} 件需要处理</i>}</header><div className="workPulseList">{items.map(session=>{const done=!runningIds.has(session.id);return <button className={done?'done':''} key={session.id} onClick={()=>location.hash='#/s/'+session.id}><i className={done?'doneDot':'liveDot'}>{done?'✓':''}</i><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {done?`已完成 · ${formatTime(session.updated_at)}`:statusLabel(session.status)}</small></span><Icon name="arrow" size={15}/></button>})}</div></section>;
+  return <section className="workPulse"><header><div><span>{running.length?'IN PROGRESS':'JUST FINISHED'}</span><b>{running.length?`${running.length} 件事正在处理`:`${recentlyDone.length} 件事刚刚完成`}</b></div>{dashboard.metrics.waiting>0&&<i>{dashboard.metrics.waiting} 件需要处理</i>}</header><div className="workPulseList">{items.map(session=>{const done=!runningIds.has(session.id);return <button className={done?'done':''} key={session.id} onClick={()=>location.hash='#/s/'+session.id}><i className={done?'doneDot':'liveDot'}>{done?'✓':''}</i><span><b>{displaySessionTitle(session)}</b><small>{projectName(session.project_dir)} · {done?`已完成 · ${formatTime(session.updated_at)}`:statusLabel(session.activeTurn?.status||session.status)}</small></span><Icon name="arrow" size={15}/></button>})}</div></section>;
 }
 
 function AgentDock({status,activeProvider,serverLabel,onSwitch,onManage}:{status:Status|null;activeProvider:ProviderId;serverLabel:string;onSwitch:(provider:ProviderId)=>void;onManage:()=>void}){

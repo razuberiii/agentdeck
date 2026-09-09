@@ -1,0 +1,61 @@
+/* Mobile workbench: scoped additions to the existing editorial theme. */
+.mobileLogin.login { padding: max(28px, env(safe-area-inset-top)) 24px max(28px, env(safe-area-inset-bottom)); min-height:100dvh; }
+.mobileLogin .loginPanel { width:100%; max-width:420px; gap:0; padding:32px 0; border:0; background:transparent; box-shadow:none; }
+.mobileLogin .loginBrand { display:flex; align-items:center; gap:12px; margin-bottom:48px; }
+.mobileLogin .loginBrand img { width:36px; height:36px; }
+.mobileLogin .loginBrand strong { font-size:14px; letter-spacing:-.03em; }
+.mobileLogin .loginEyebrow { display:block; color:var(--signal,#c8ff57); font-size:12px; letter-spacing:.16em; margin-bottom:16px; }
+.mobileLogin .loginIntro h1 { margin:0 0 14px; font-size:clamp(28px,7vw,38px); line-height:1.25; letter-spacing:-.045em; }
+.mobileLogin .loginIntro p { margin:0 0 36px; color:#94a0a6; font-size:14px; line-height:1.7; }
+.mobileLogin .passwordLabel { color:#b4bec2; font-size:12px; margin-bottom:10px; }
+.mobileLogin .passwordField { display:flex; align-items:center; min-width:0; border:1px solid #354249; background:#0d1519; }
+.mobileLogin .passwordField:focus-within { border-color:var(--signal,#c8ff57); outline:2px solid #c8ff5720; outline-offset:2px; }
+.mobileLogin .passwordField input { width:100%; min-width:0; border:0; border-radius:0; padding:16px; background:transparent; font-size:16px; outline:none; box-shadow:none; }
+.mobileLogin .passwordField button { flex:0 0 60px; min-height:52px; border:0; border-radius:0; background:transparent; color:#b9c7ce; font-size:12px; }
+.mobileLogin .loginError { margin:12px 0 0; padding:12px; border-left:2px solid #ff9d8b; background:#291c1c; color:#ffd2c8; line-height:1.6; font-size:13px; }
+.mobileLogin .btn.primary { display:flex; justify-content:space-between; align-items:center; margin-top:22px; min-height:54px; padding:14px 18px; background:var(--signal,#c8ff57); color:#152006; border:0; border-radius:2px; font-size:14px; }
+.mobileLogin .loginAddress { display:flex; justify-content:space-between; gap:12px; margin-top:32px; padding-top:16px; border-top:1px solid #263138; font-size:11px; color:#75878f; }
+.mobileLogin .loginAddress b { font-weight:500; overflow-wrap:anywhere; color:#a2b1b8; }
+.draftNote { display:flex; flex-wrap:wrap; gap:4px 12px; color:#94a69e; font-size:11px; line-height:1.6; padding:10px 0 0; }
+.draftNote span { color:#98a3a9; }
+.homeShell .searchWrap { position:relative; min-width:0; }
+.homeShell .searchWrap .search { padding-right:44px!important; }
+.homeShell .searchWrap .search::-webkit-search-cancel-button { display:none; }
+.homeShell .clearTaskSearch { position:absolute; right:0; top:50%; transform:translateY(-50%); width:40px; min-height:44px; padding:0; border:0; color:#b9c7ce; background:transparent; font-size:22px; }
+.taskFilters { display:flex; align-items:center; gap:8px; width:100%; max-width:1040px; margin:0 auto 16px; flex-wrap:wrap; }
+.taskFilters button { display:flex; align-items:center; gap:9px; min-height:40px; padding:8px 12px; border:1px solid #303c42; border-radius:3px; background:transparent; color:#a9b6bc; font-size:12px; }
+.taskFilters button[aria-pressed="true"] { color:#d7f5a9; border-color:#6e8249; background:#c8ff570a; }
+.taskFilters button span { padding:1px 5px; min-width:20px; background:#ffffff08; font-size:11px; font-variant-numeric:tabular-nums; text-align:center; }
+.taskResultCount { margin-left:auto; color:#91a0a7; font-size:11px; }
+.homeShell .taskEmpty { display:grid; justify-items:center; gap:14px; padding:36px 18px; border:1px dashed #334149; color:#94a4ad; text-align:center; }
+.homeShell .taskEmpty .empty { padding:0; border:0; background:transparent; place-items:center; gap:8px; }
+.homeShell .taskEmpty .empty b { font-size:15px; }
+.homeShell .resetTaskFilters { min-height:44px; padding:8px 16px; border:1px solid #475845; border-radius:3px; color:#d0e8b3; background:transparent; font-size:13px; }
+.homeShell .taskRow-waiting { border-left:2px solid #e9bd71; padding-left:12px; }
+.homeShell .taskRow-running { border-left:2px solid var(--signal,#c8ff57); padding-left:12px; }
+.mobileWorkbenchNav { display:none; }
+.homeShell #my-tasks { scroll-margin-top:20px; }
+@media(max-width:700px) {
+  .homeShell.appShell { padding-bottom:calc(96px + env(safe-area-inset-bottom)); }
+  .homeShell .homeHero { padding-top:26px; gap:22px; }
+  .homeShell .taskLaunch .rotatingHeadline { font-size:clamp(30px,8.6vw,42px)!important; line-height:1.13!important; max-width:440px!important; }
+  .homeShell .taskPrompt textarea { font-size:16px!important; line-height:1.6!important; min-height:132px; }
+  .homeShell .taskModeBar button { min-height:46px!important; }
+  .homeShell .taskModeBar button b { font-size:13px!important; }
+  .homeShell .taskModeBar button small { font-size:10px!important; }
+  .homeShell .taskModeBar>span { font-size:10px!important; letter-spacing:0!important; }
+  .homeShell .agentDock header b { font-size:15px; }
+  .homeShell .providerDock small { font-size:11px!important; }
+  .homeShell .sessionTools .search { min-height:46px; font-size:16px!important; }
+  .homeShell .taskFilters { gap:6px; }
+  .homeShell .taskFilters button { min-height:44px; padding:8px 10px; }
+  .homeShell .taskResultCount { width:100%; margin:3px 0 0; }
+  .homeShell .sessionRow .sessionMain b { font-size:15px!important; line-height:1.5!important; }
+  .homeShell .sessionRow .sessionMain>span { font-size:11px!important; line-height:1.7!important; }
+  .homeShell .sessionArchive { min-width:44px!important; min-height:44px!important; }
+  .mobileWorkbenchNav { position:fixed; z-index:30; bottom:0; left:0; right:0; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); padding:8px 14px calc(8px + env(safe-area-inset-bottom)); border-top:1px solid #35423f; background:#0b1215f5; backdrop-filter:blur(18px); box-shadow:0 -10px 32px #00000025; }
+  .mobileWorkbenchNav button { position:relative; display:grid; gap:5px; justify-items:center; align-content:center; min-height:52px; padding:6px; border:0; background:transparent; color:#a9bbb9; border-radius:4px; font-size:11px; }
+  .mobileWorkbenchNav button:first-child { color:var(--signal,#c8ff57); }
+  .mobileWorkbenchNav button:active { background:#c8ff5710; }
+  .mobileWorkbenchNav button i { position:absolute; top:2px; left:calc(50% + 10px); min-width:17px; padding:2px 4px; border-radius:9px; background:#e9bd71; color:#241d0e; font-size:10px; font-style:normal; }
+}
