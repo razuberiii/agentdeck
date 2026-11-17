@@ -47,3 +47,9 @@ sudo agentdeckctl deploy all
 ```
 
 只改前端时可执行 `sudo agentdeckctl deploy web`。发布会先运行检查并保留可回滚版本；Runtime 发布会等待活动任务结束。
+
+### 服务重启与已有安装
+
+`install-units` 和 `agentdeckctl` 的 unit 检查共用服务身份解析：显式的 `AGENTDECK_RUN_USER`、`AGENTDECK_RUN_GROUP`、`AGENTDECK_HOME` 优先，其次读取现有 `runtime.env` 中的 `AGENTDECK_SERVICE_USER`、`CODEX_APP_SERVER_GROUP`、`HOME`，新安装才使用 profile 默认值。现有环境文件不会被当作 shell 脚本执行，也不会被覆盖。迁移服务用户时需同时更新环境文件及数据权限。
+
+Runtime 使用 `RuntimeDirectory=agentdeck`，由 systemd 在每次启动时以服务用户创建 `/run/agentdeck`，避免主机重启后锁目录丢失或不可写。更新后执行 `systemctl daemon-reload`，重启服务并检查 `/healthz`、`/api/status` 和外部 HTTPS。

@@ -242,3 +242,40 @@ test('setup supports install profiles without adding extra interactive questions
   assert.match(setup, /useradd --system --create-home --home-dir "\$RUN_HOME"/);
   assert.doesNotMatch(setup, /approval_policy.*read -r|sandbox.*read -r|sudoers.*read -r/);
 });
+
+// Regression: unattended upgrades restart units rendered by a later reinstall.
+test('reinstall preserves the service identity recorded in runtime.env', () => {
+  const rendered = runInstallUnits({}, { envFiles: {
+    'runtime.env': 'AGENTDECK_SERVICE_USER=agentdeck\nCODEX_APP_SERVER_GROUP=agents\nHOME=/var/lib/agentdeck\n',
+  }});
+  try {
+    for (const name of ['agentdeck-web.service', 'agentdeck-runtime.service', 'agentdeck-app-server@.service']) {
+      const unit = readFileSync(join(rendered.systemdDir, name), 'utf8');
+      assert.match(unit, /^User=agentdeck$/m);
+      assert.match(unit, /^Group=agents$/m);
+      assert.match(unit, /^Environment=HOME=\/var\/lib\/agentdeck$/m);
+      assert.doesNotMatch(unit, /\/home\/ubuntu|@CODEX_BIN@/);
+      const preview = join(rendered.dir, name + '.preview');
+      const renderFunction = ctl.slice(ctl.indexOf('render_unit_template()'), ctl.indexOf('check_systemd_units()'));
+      execFileSync('bash', ['-c', renderFunction + '\nrender_unit_template "$1" "$2" "$3"', 'render-test', repoRoot, name, preview], {
+        env: { ...process.env, ENV_DIR: rendered.envDir, DATA_DIR: rendered.dataDir, CURRENT_LINK: '/opt/stacks/agentdeck/current', AGENTDECK_SYSTEMD_DIR: rendered.systemdDir },
+      });
+      assert.equal(readFileSync(preview, 'utf8'), unit, 'controller preview must match installed unit');
+
+    }
+    const runtime = readFileSync(join(rendered.systemdDir, 'agentdeck-runtime.service'), 'utf8');
+    assert.match(runtime, /^RuntimeDirectory=agentdeck$/m);
+    assert.match(runtime, /^RuntimeDirectoryMode=0755$/m);
+  } finally { rmSync(rendered.dir, { recursive: true, force: true }); }
+});
+
+test('explicit identity overrides existing installation identity', () => {
+  const rendered = runInstallUnits({ AGENTDECK_RUN_USER: 'custom', AGENTDECK_RUN_GROUP: 'custom', AGENTDECK_HOME: '/srv/custom' }, { envFiles: {
+    'runtime.env': 'AGENTDECK_SERVICE_USER=agentdeck\nHOME=/var/lib/agentdeck\n',
+  }});
+  try {
+    const unit = readFileSync(join(rendered.systemdDir, 'agentdeck-web.service'), 'utf8');
+    assert.match(unit, /^User=custom$/m);
+    assert.match(unit, /^Environment=HOME=\/srv\/custom$/m);
+  } finally { rmSync(rendered.dir, { recursive: true, force: true }); }
+});

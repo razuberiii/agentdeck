@@ -13,54 +13,7 @@ ROOT=${ROOT:-/opt/agentdeck}
 DATA_DIR=${AGENTDECK_DATA_DIR:-${DATA_DIR:-/opt/data/agentdeck}}
 ENV_DIR=${AGENTDECK_ENV_DIR:-${ENV_DIR:-/etc/agentdeck}}
 SYSTEMD_DIR=${AGENTDECK_SYSTEMD_DIR:-/etc/systemd/system}
-detect_install_profile() {
-  local profile="${AGENTDECK_INSTALL_PROFILE:-}"
-  if [ -n "$profile" ]; then
-    case "$profile" in personal|standard|hardened) printf '%s\n' "$profile" ;; *) echo "ERROR: invalid AGENTDECK_INSTALL_PROFILE: $profile" >&2; exit 1 ;; esac
-    return
-  fi
-  if [ -f "$SYSTEMD_DIR/agentdeck-app-server@.service" ] && grep -Eq 'User=ubuntu|danger-full-access' "$SYSTEMD_DIR/agentdeck-app-server@.service"; then
-    printf '%s\n' personal
-    return
-  fi
-  printf '%s\n' personal
-}
-INSTALL_PROFILE="$(detect_install_profile)"
-if [ -n "${AGENTDECK_RUN_USER:-}" ]; then
-  RUN_USER="$AGENTDECK_RUN_USER"
-elif [ "$INSTALL_PROFILE" = "standard" ] || [ "$INSTALL_PROFILE" = "hardened" ]; then
-  RUN_USER=agentdeck
-else
-  RUN_USER=ubuntu
-fi
-RUN_GROUP=${AGENTDECK_RUN_GROUP:-$RUN_USER}
-if [ -n "${AGENTDECK_HOME:-}" ]; then
-  AGENTDECK_HOME="$AGENTDECK_HOME"
-elif [ "$RUN_USER" = "ubuntu" ]; then
-  AGENTDECK_HOME=/home/ubuntu
-else
-  AGENTDECK_HOME=/var/lib/agentdeck
-fi
-CURRENT_DIR=${AGENTDECK_CURRENT_DIR:-/opt/stacks/agentdeck/current}
-BIN_DIR=${AGENTDECK_BIN_DIR:-/usr/local/bin}
-CODEX_BIN=${AGENTDECK_CODEX_BIN:-${CODEX_BIN:-}}
-if [ -z "$CODEX_BIN" ]; then
-  CODEX_BIN="$AGENTDECK_HOME/.local/bin/codex"
-fi
-case "$INSTALL_PROFILE" in
-  personal)
-    CODEX_APPROVAL_POLICY=${AGENTDECK_CODEX_APPROVAL_POLICY:-never}
-    CODEX_SANDBOX_MODE=${AGENTDECK_CODEX_SANDBOX_MODE:-danger-full-access}
-    ;;
-  standard)
-    CODEX_APPROVAL_POLICY=${AGENTDECK_CODEX_APPROVAL_POLICY:-on-request}
-    CODEX_SANDBOX_MODE=${AGENTDECK_CODEX_SANDBOX_MODE:-workspace-write}
-    ;;
-  hardened)
-    CODEX_APPROVAL_POLICY=${AGENTDECK_CODEX_APPROVAL_POLICY:-on-request}
-    CODEX_SANDBOX_MODE=${AGENTDECK_CODEX_SANDBOX_MODE:-read-only}
-    ;;
-esac
+source "$ROOT/deploy/service-settings.sh"
 LOG=${LOG:-$ROOT/.tools/install-units.log}
 mkdir -p "$ROOT/.tools" "$DATA_DIR"
 exec >>"$LOG" 2>&1
